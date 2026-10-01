@@ -10,6 +10,7 @@ object ControlMsg {
     const val LAUNCH_APP: Byte = 0x10
     const val GO_HOME: Byte = 0x11
     const val GO_BACK: Byte = 0x12
+    const val GO_RECENT: Byte = 0x1F
     const val APP_STARTED: Byte = 0x13
     const val APP_STOPPED: Byte = 0x14
     /** Phone → Car: VD display has no activities (stack empty after back) */
@@ -78,3 +79,4 @@ object InputMsg {
     const val TOUCH_MOVE_BATCH: Byte = 0x04
     const val KEY_EVENT: Byte = 0x10
 }
+

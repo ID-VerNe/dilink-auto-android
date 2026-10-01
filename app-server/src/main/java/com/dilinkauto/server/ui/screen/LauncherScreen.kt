@@ -308,15 +308,7 @@ fun AppGrid(
             )
         )
 
-        Text(
-            text = stringResource(R.string.landscape_app_note),
-            fontSize = 11.sp,
-            color = Color(0xFF666666),
-            textAlign = TextAlign.Center,
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 24.dp, vertical = 4.dp)
-        )
+
     }
 }
 
@@ -612,3 +604,4 @@ fun NowPlayingBar(
         }
     }
 }
+

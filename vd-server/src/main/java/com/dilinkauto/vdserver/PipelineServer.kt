@@ -535,6 +535,7 @@ class PipelineServer(
             ControlMsg.LAUNCH_APP -> launchApp(LaunchAppMessage.decode(f.payload).packageName)
             ControlMsg.GO_BACK -> { execFast("input -d $displayId keyevent 4"); checkStackEmpty() }
             ControlMsg.GO_HOME -> { execFast("input -d $displayId keyevent 3"); checkStackEmpty() }
+            ControlMsg.GO_RECENT -> { execFast("input -d $displayId keyevent 187"); checkStackEmpty() }
             ControlMsg.APP_UNINSTALL -> execShell("pm uninstall ${String(f.payload, Charsets.UTF_8)}")
             ControlMsg.APP_INFO -> { val pkg = String(f.payload, Charsets.UTF_8); val s = execShellOutput("cmd package resolve-activity --brief -a android.settings.APPLICATION_DETAILS_SETTINGS com.android.settings")?.trim(); if (!s.isNullOrEmpty()) execShell("am start --display $displayId -n $s -d \"package:$pkg\"") else execShell("am start --display $displayId -a android.settings.APPLICATION_DETAILS_SETTINGS -d \"package:$pkg\"") }
             ControlMsg.APP_SHORTCUTS -> { val pkg = String(f.payload, Charsets.UTF_8); val o = execShellOutput("cmd shortcut get-shortcuts --package $pkg 2>/dev/null") ?: ""; if (o.isNotBlank()) sendShortcutResult(pkg, o) }
@@ -597,3 +598,4 @@ class PipelineServer(
     private fun createProgram(): Int { val vs = loadShader(GLES20.GL_VERTEX_SHADER, "attribute vec4 aPosition;attribute vec2 aTexCoord;varying vec2 vTexCoord;void main(){gl_Position=aPosition;vTexCoord=aTexCoord;}"); val fs = loadShader(GLES20.GL_FRAGMENT_SHADER, "#extension GL_OES_EGL_image_external:require\nprecision mediump float;varying vec2 vTexCoord;uniform samplerExternalOES sTexture;void main(){gl_FragColor=texture2D(sTexture,vTexCoord);}"); return GLES20.glCreateProgram().also { GLES20.glAttachShader(it, vs); GLES20.glAttachShader(it, fs); GLES20.glLinkProgram(it) } }
     private fun loadShader(type: Int, src: String): Int = GLES20.glCreateShader(type).also { GLES20.glShaderSource(it, src); GLES20.glCompileShader(it) }
 }
+

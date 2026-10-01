@@ -288,12 +288,12 @@ fun NavActionButton(
     icon: ImageVector,
     label: String,
     onClick: () -> Unit,
-    tint: Color = Color(0xFFBBBBBB)
+    tint: Color = Color(0xFFBBBBBB),
+    modifier: Modifier = Modifier
 ) {
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
-        modifier = Modifier
-            .fillMaxWidth()
+        modifier = modifier
             .clip(RoundedCornerShape(8.dp))
             .clickable(onClick = onClick)
             .padding(vertical = 10.dp)
@@ -304,10 +304,9 @@ fun NavActionButton(
             tint = tint,
             modifier = Modifier.size(40.dp)
         )
-        Text(
-            text = label,
-            fontSize = 12.sp,
-            color = Color(0xFF888888)
-        )
+
     }
 }
+
+
+

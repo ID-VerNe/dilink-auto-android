@@ -222,73 +222,131 @@ fun CarShell(service: CarConnectionService) {
     val showStreamingMode = appList.isNotEmpty() && isConnected
 
     if (showStreamingMode) {
-        Row(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(MaterialTheme.colorScheme.background)
-        ) {
-            // Persistent left nav bar (streaming mode only)
-            PersistentNavBar(
-                recentAppsState = recentAppsState,
-                activeAppPackage = activeAppPackage,
-                isPhoneConnected = isConnected,
-                appList = appList,
-                service = service,
-                notificationCount = notifications.size,
-                onAppClick = launchApp,
-                onBack = {
-                    service.goBack()
-                },
-                onHome = {
-                    service.goHome()
-                    currentScreen = Screen.HOME
-                    activeAppPackage = null
-                },
-                onNotifications = {
-                    currentScreen = if (currentScreen == Screen.NOTIFICATIONS) Screen.HOME
-                        else Screen.NOTIFICATIONS
-                },
-                onDisconnect = {
-                    service.disconnectFromPhone()
-                    currentScreen = Screen.HOME
-                    activeAppPackage = null
-                }
-            )
+        val configuration = androidx.compose.ui.platform.LocalConfiguration.current
+        val isLandscape = configuration.screenWidthDp > configuration.screenHeightDp
 
-            // Content area
-            Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
-                // MirrorContent is always composed — never removed during screen navigation.
-                // INVISIBLE when not on Screen.APP keeps the TextureView surface alive.
-                // This eliminates decoder restart storms (stop+start = 3 keyframes dropped,
-                // ~3s of visual artifacts per navigation event).
-                MirrorContent(service = service, visible = currentScreen == Screen.APP)
+        if (isLandscape) {
+            Row(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(MaterialTheme.colorScheme.background)
+            ) {
+                // Persistent left nav bar (streaming mode only)
+                PersistentNavBar(
+                    recentAppsState = recentAppsState,
+                    activeAppPackage = activeAppPackage,
+                    isPhoneConnected = isConnected,
+                    appList = appList,
+                    service = service,
+                    notificationCount = notifications.size,
+                    onAppClick = launchApp,
+                    onBack = { service.goBack() },
+                    onHome = {
+                        service.goHome()
+                        currentScreen = Screen.HOME
+                        activeAppPackage = null
+                    },
+                    onNotifications = {
+                        currentScreen = if (currentScreen == Screen.NOTIFICATIONS) Screen.HOME
+                            else Screen.NOTIFICATIONS
+                    },
+                    onDisconnect = {
+                        service.disconnectFromPhone()
+                        currentScreen = Screen.HOME
+                        activeAppPackage = null
+                    }
+                )
 
-                // Content overlays — rendered on top of the TextureView
-                val showVideoWaitOverlay = !videoReady && currentScreen != Screen.NOTIFICATIONS
-                when {
-                    showVideoWaitOverlay -> {
-                        Box(
-                            modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background),
-                            contentAlignment = androidx.compose.ui.Alignment.Center
-                        ) {
-                            androidx.compose.foundation.layout.Column(
-                                horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally
+                // Content area
+                Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
+                    MirrorContent(service = service, visible = currentScreen == Screen.APP)
+                    val showVideoWaitOverlay = !videoReady && currentScreen != Screen.NOTIFICATIONS
+                    when {
+                        showVideoWaitOverlay -> {
+                            Box(
+                                modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background),
+                                contentAlignment = androidx.compose.ui.Alignment.Center
                             ) {
-                                androidx.compose.material3.CircularProgressIndicator(
-                                    color = MaterialTheme.colorScheme.primary
-                                )
-                                androidx.compose.foundation.layout.Spacer(Modifier.height(16.dp))
-                                androidx.compose.material3.Text(
-                                    statusMessage.ifEmpty { stringResource(R.string.status_starting_vd) },
-                                    color = androidx.compose.ui.graphics.Color.White,
-                                    fontSize = 18.sp
-                                )
+                                androidx.compose.foundation.layout.Column(
+                                    horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally
+                                ) {
+                                    androidx.compose.material3.CircularProgressIndicator(
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                    androidx.compose.foundation.layout.Spacer(Modifier.height(16.dp))
+                                    androidx.compose.material3.Text(
+                                        statusMessage.ifEmpty { stringResource(R.string.status_starting_vd) },
+                                        color = androidx.compose.ui.graphics.Color.White,
+                                        fontSize = 18.sp
+                                    )
+                                }
                             }
                         }
+                        currentScreen == Screen.HOME -> HomeContent(service = service, onAppClick = launchApp)
+                        currentScreen == Screen.NOTIFICATIONS -> NotificationContent(service = service, onAppLaunch = launchApp)
                     }
-                    currentScreen == Screen.HOME -> HomeContent(service = service, onAppClick = launchApp)
-                    currentScreen == Screen.NOTIFICATIONS -> NotificationContent(service = service, onAppLaunch = launchApp)
                 }
+            }
+        } else {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(MaterialTheme.colorScheme.background)
+            ) {
+                // Content area
+                Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                    MirrorContent(service = service, visible = currentScreen == Screen.APP)
+                    val showVideoWaitOverlay = !videoReady && currentScreen != Screen.NOTIFICATIONS
+                    when {
+                        showVideoWaitOverlay -> {
+                            Box(
+                                modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background),
+                                contentAlignment = androidx.compose.ui.Alignment.Center
+                            ) {
+                                androidx.compose.foundation.layout.Column(
+                                    horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally
+                                ) {
+                                    androidx.compose.material3.CircularProgressIndicator(
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                    androidx.compose.foundation.layout.Spacer(Modifier.height(16.dp))
+                                    androidx.compose.material3.Text(
+                                        statusMessage.ifEmpty { stringResource(R.string.status_starting_vd) },
+                                        color = androidx.compose.ui.graphics.Color.White,
+                                        fontSize = 18.sp
+                                    )
+                                }
+                            }
+                        }
+                        currentScreen == Screen.HOME -> HomeContent(service = service, onAppClick = launchApp)
+                        currentScreen == Screen.NOTIFICATIONS -> NotificationContent(service = service, onAppLaunch = launchApp)
+                    }
+                }
+
+                com.dilinkauto.server.ui.nav.PersistentBottomNavBar(
+                    recentAppsState = recentAppsState,
+                    activeAppPackage = activeAppPackage,
+                    isPhoneConnected = isConnected,
+                    appList = appList,
+                    service = service,
+                    notificationCount = notifications.size,
+                    onAppClick = launchApp,
+                    onBack = { service.goBack() },
+                    onHome = {
+                        service.goHome()
+                        currentScreen = Screen.HOME
+                        activeAppPackage = null
+                    },
+                    onNotifications = {
+                        currentScreen = if (currentScreen == Screen.NOTIFICATIONS) Screen.HOME
+                            else Screen.NOTIFICATIONS
+                    },
+                    onDisconnect = {
+                        service.disconnectFromPhone()
+                        currentScreen = Screen.HOME
+                        activeAppPackage = null
+                    }
+                )
             }
         }
     } else {

@@ -379,8 +379,23 @@ class ConnectionService : Service() {
         // Create VD at car viewport size.
         // Auto-calibrate DPI: ensure portrait apps get at least ~380dp logical width in landscape
         // (iPad-like phone app display) instead of crushing into an unusable 140dp sliver.
-        val vdWidth = request.screenWidth and 0x7FFFFFFE.toInt()
-        val vdHeight = request.screenHeight and 0x7FFFFFFE.toInt()
+        var vdWidth = request.screenWidth and 0x7FFFFFFE.toInt()
+        var vdHeight = request.screenHeight and 0x7FFFFFFE.toInt()
+        
+        // Anti-Crop Scale: Ensure Virtual Display width is at least the phone's physical width.
+        // Many Chinese ROMs (like Meizu, Xiaomi) hardcode the IME width to the physical display width.
+        // If the car viewport is narrower than the phone, the keyboard gets horizontally chopped.
+        // Scaling up the VD preserves the car's aspect ratio while satisfying the OS width.
+        val dm = resources.displayMetrics
+        val isCarLandscape = vdWidth > vdHeight
+        val isPhoneLandscape = dm.widthPixels > dm.heightPixels
+        val phonePhysicalWidth = if (isPhoneLandscape == isCarLandscape) dm.widthPixels else dm.heightPixels
+        if (vdWidth < phonePhysicalWidth) {
+            val scale = phonePhysicalWidth.toFloat() / vdWidth
+            vdWidth = (vdWidth * scale).toInt() and 0x7FFFFFFE.toInt()
+            vdHeight = (vdHeight * scale).toInt() and 0x7FFFFFFE.toInt()
+            FileLog.i(TAG, "Scaled VD to ${vdWidth}x${vdHeight} (scale=$scale) to prevent IME crop")
+        }
         val displayDpi = VideoConfig.calculateOptimalDpi(vdWidth, vdHeight, request.screenDpi)
         FileLog.i(TAG, "VD: ${vdWidth}x${vdHeight} @${displayDpi}dpi (car reported ${request.screenDpi}dpi, auto-calibrated optimal touch scale)")
 
@@ -1470,3 +1485,4 @@ class ConnectionService : Service() {
             private set
     }
 }
+

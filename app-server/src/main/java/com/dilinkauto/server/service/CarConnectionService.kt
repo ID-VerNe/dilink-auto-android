@@ -384,9 +384,9 @@ class CarConnectionService : Service() {
                 carLogSend("Control connected to $host:$port — sending handshake")
 
                 val displayMetrics = resources.displayMetrics
-                val navBarPx = navBarWidthPx(displayMetrics.density, displayMetrics.widthPixels)
-                val viewportWidth = (displayMetrics.widthPixels - navBarPx) and 0x7FFFFFFE.toInt()
-                val viewportHeight = displayMetrics.heightPixels and 0x7FFFFFFE.toInt()
+                val vp = getViewportSize(displayMetrics.widthPixels, displayMetrics.heightPixels, displayMetrics.density)
+                val viewportWidth = vp.first
+                val viewportHeight = vp.second
                 val handshake = HandshakeRequest(
                     deviceName = "DiLink-${android.os.Build.MODEL}",
                     screenWidth = viewportWidth,
@@ -861,12 +861,9 @@ class CarConnectionService : Service() {
         vdServerStarted = true  // Set early to prevent duplicate deploys
         scope.launch(Dispatchers.IO) {
             val displayMetrics = resources.displayMetrics
-            val navBarPx = navBarWidthPx(displayMetrics.density, displayMetrics.widthPixels)
-            val viewportWidth = displayMetrics.widthPixels - navBarPx
-            val viewportHeight = displayMetrics.heightPixels
-            // VD created at car viewport size — no GPU downscale needed
-            val vdW = viewportWidth and 0x7FFFFFFE.toInt()
-            val vdH = viewportHeight and 0x7FFFFFFE.toInt()
+            val vp = getViewportSize(displayMetrics.widthPixels, displayMetrics.heightPixels, displayMetrics.density)
+            val vdW = vp.first
+            val vdH = vp.second
             val phoneDpi = if (handshakeVdDpi > 0) handshakeVdDpi else VideoConfig.calculateOptimalDpi(vdW, vdH, displayMetrics.densityDpi)
 
             val jarPath = vdServerJarPath
@@ -996,6 +993,10 @@ class CarConnectionService : Service() {
         sendCommandToVd(ControlMsg.LAUNCH_APP, LaunchAppMessage(packageName).encode())
     }
 
+    fun goRecent() {
+        sendCommandToVd(com.dilinkauto.protocol.ControlMsg.GO_RECENT)
+    }
+
     fun goHome() {
         sendCommandToVd(ControlMsg.GO_HOME)
     }
@@ -1017,9 +1018,9 @@ class CarConnectionService : Service() {
      */
     fun onCarViewportChanged(widthPx: Int, heightPx: Int, dpi: Int) {
         val dm = resources.displayMetrics
-        val navBarPx = navBarWidthPx(dm.density, widthPx)
-        val newVpW = (widthPx - navBarPx) and 0x7FFFFFFE.toInt()
-        val newVpH = heightPx and 0x7FFFFFFE.toInt()
+        val vp = getViewportSize(widthPx, heightPx, dm.density)
+        val newVpW = vp.first
+        val newVpH = vp.second
         if (newVpW == vdWidth && newVpH == vdHeight) return
         if (_state.value != State.STREAMING && _state.value != State.CONNECTED) return
         val ctrl = controlConnection ?: return
@@ -1239,11 +1240,9 @@ class CarConnectionService : Service() {
         if (vdServerStarted) return
         vdServerStarted = true  // Set early to prevent duplicate deploys
         val displayMetrics = resources.displayMetrics
-        val navBarPx = navBarWidthPx(displayMetrics.density, displayMetrics.widthPixels)
-        val viewportWidth = displayMetrics.widthPixels - navBarPx
-        val viewportHeight = displayMetrics.heightPixels
-        val vdW = viewportWidth and 0x7FFFFFFE.toInt()
-        val vdH = viewportHeight and 0x7FFFFFFE.toInt()
+        val vp = getViewportSize(displayMetrics.widthPixels, displayMetrics.heightPixels, displayMetrics.density)
+        val vdW = vp.first
+        val vdH = vp.second
         val phoneDpi = if (handshakeVdDpi > 0) handshakeVdDpi else VideoConfig.calculateOptimalDpi(vdW, vdH, displayMetrics.densityDpi)
         val args = "$vdW $vdH $phoneDpi 127.0.0.1 $vdW $vdH $targetFps"
         _statusMessage.value = getString(R.string.status_preparing_vd)
@@ -1342,6 +1341,14 @@ class CarConnectionService : Service() {
         const val NOTIFICATION_ID = 2001
         const val NAV_BAR_TARGET_DP = 76f
 
+        fun getViewportSize(widthPx: Int, heightPx: Int, density: Float): Pair<Int, Int> {
+            val isLandscape = widthPx > heightPx
+            val navBarPx = navBarWidthPx(density, if (isLandscape) widthPx else heightPx)
+            val viewportWidth = if (isLandscape) widthPx - navBarPx else widthPx
+            val viewportHeight = if (isLandscape) heightPx else heightPx - navBarPx
+            return Pair(viewportWidth and 0x7FFFFFFE.toInt(), viewportHeight and 0x7FFFFFFE.toInt())
+        }
+
         fun navBarWidthPx(density: Float, screenWidthPx: Int): Int {
             val targetPx = (NAV_BAR_TARGET_DP * density).toInt()
             val viewport = screenWidthPx - targetPx
@@ -1349,3 +1356,6 @@ class CarConnectionService : Service() {
         }
     }
 }
+
+
+

@@ -126,7 +126,8 @@ fun PersistentNavBar(
         NavActionButton(
             icon = Icons.Default.Home,
             label = stringResource(R.string.nav_home),
-            onClick = onHome
+            onClick = onHome,
+            modifier = Modifier.weight(1f)
         )
 
         Spacer(Modifier.height(4.dp))
@@ -135,7 +136,70 @@ fun PersistentNavBar(
         NavActionButton(
             icon = Icons.Default.ArrowBack,
             label = stringResource(R.string.nav_back),
-            onClick = onBack
+            onClick = onBack,
+            modifier = Modifier.weight(1f)
         )
     }
 }
+@Composable
+fun PersistentBottomNavBar(
+    recentAppsState: RecentAppsState,
+    activeAppPackage: String?,
+    isPhoneConnected: Boolean,
+    appList: List<AppInfo>,
+    service: CarConnectionService,
+    notificationCount: Int = 0,
+    onAppClick: (String) -> Unit,
+    onBack: () -> Unit,
+    onHome: () -> Unit,
+    onNotifications: () -> Unit = {},
+    onDisconnect: () -> Unit = {}
+) {
+    val appMap = remember(appList) { appList.associateBy { it.packageName } }
+    val density = androidx.compose.ui.platform.LocalDensity.current
+    val screenWidthPx = androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp.let {
+        (it * density.density).toInt()
+    }
+    val navBarPx = com.dilinkauto.server.service.CarConnectionService.navBarWidthPx(density.density, screenWidthPx)
+    val navBarDp = with(density) { navBarPx.toDp() }
+
+    Row(
+        horizontalArrangement = Arrangement.SpaceEvenly,
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(navBarDp)
+            .background(Color(0xFF0A0E14))
+            .padding(horizontal = 12.dp, vertical = 4.dp)
+    ) {
+        // Disconnect button
+        NavActionButton(
+            icon = Icons.Default.LinkOff,
+            label = stringResource(R.string.nav_eject),
+            onClick = onDisconnect,
+            tint = Color(0xFFFF5252),
+            modifier = Modifier.weight(1f)
+        )
+
+        // Home button
+        NavActionButton(
+            icon = Icons.Default.Home,
+            label = stringResource(R.string.nav_home),
+            onClick = onHome,
+            modifier = Modifier.weight(1f)
+        )
+
+        // Back button
+        NavActionButton(
+            icon = Icons.Default.ArrowBack,
+            label = stringResource(R.string.nav_back),
+            onClick = onBack,
+            modifier = Modifier.weight(1f)
+        )
+    }
+}
+
+
+
+
+
