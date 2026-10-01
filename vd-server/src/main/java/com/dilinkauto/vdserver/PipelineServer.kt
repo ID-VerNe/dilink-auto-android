@@ -23,6 +23,7 @@ import java.nio.FloatBuffer
 import java.nio.channels.ServerSocketChannel
 import java.nio.channels.SocketChannel
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.LockSupport
 
 class PipelineServer(
@@ -32,6 +33,7 @@ class PipelineServer(
 ) {
     private val frameIntervalNanos = 1_000_000_000L / fps
     @Volatile private var running = true
+    private val cleanedUp = AtomicBoolean(false)
     private var displayId = -1
     private var virtualDisplay: VirtualDisplay? = null
     private var encoder: MediaCodec? = null
@@ -49,6 +51,7 @@ class PipelineServer(
     private var savedScreenOffTimeout: String? = null
     private var savedLiftWakeup: String? = null
     private var savedProximityWakeup: String? = null
+    private var savedDefaultIme: String? = null
     private var lastPowerOffTime = 0L
 
     // SurfaceTexture + VD surface (created on pipeline thread, used by VD)
@@ -83,6 +86,7 @@ class PipelineServer(
         private const val MAX_POINTERS = 10
         private const val VIDEO_PORT = 9638
         private const val INPUT_PORT = 9639
+        private const val WATCHDOG_GRACE_MS = 3000L
         private const val LIFECYCLE_PORT = 19647
         private var displayControlClass: Class<*>? = null
         private var displayControlLoaded = false
@@ -100,24 +104,29 @@ class PipelineServer(
     }
 
     fun run() {
-        initInputManager()
-        initPersistentShell()
-        try { setupEncoder() } catch (e: Exception) { err("Fatal: encoder: ${e.message}"); return }
-        val enc = encoder ?: return
-        encoderSurface = enc.createInputSurface()
-        enc.start()
-        // Start pipeline thread — it initializes EGL/GL and signals when VD input surface is ready
-        val pipelineThread = Thread({ runPipeline() }, "Pipeline").apply { start() }
-        try { inputSurfaceReady.await() } catch (_: InterruptedException) { return }
-        if (!createVirtualDisplay()) { running = false; err("Fatal: failed to create VD"); return }
-        val conns = bindAndAccept() ?: run { running = false; return }
-        startLifecycleReader(conns.phoneChannel)
-        startTouchReader(conns.carInput)
-        // Signal pipeline to begin rendering with the car video channel
-        carVideoChannel = conns.carVideo
-        LockSupport.unpark(pipelineThread)
-        try { pipelineThread.join() } catch (_: InterruptedException) {}
-        cleanup()
+        Runtime.getRuntime().addShutdownHook(Thread({ cleanup() }, "ShutdownHook"))
+        startWatchdog()
+        try {
+            initInputManager()
+            initPersistentShell()
+            try { setupEncoder() } catch (e: Exception) { err("Fatal: encoder: ${e.message}"); return }
+            val enc = encoder ?: return
+            encoderSurface = enc.createInputSurface()
+            enc.start()
+            // Start pipeline thread — it initializes EGL/GL and signals when VD input surface is ready
+            val pipelineThread = Thread({ runPipeline() }, "Pipeline").apply { start() }
+            try { inputSurfaceReady.await() } catch (_: InterruptedException) { return }
+            if (!createVirtualDisplay()) { running = false; err("Fatal: failed to create VD"); return }
+            val conns = bindAndAccept() ?: run { running = false; return }
+            startLifecycleReader(conns.phoneChannel)
+            startTouchReader(conns.carInput)
+            // Signal pipeline to begin rendering with the car video channel
+            carVideoChannel = conns.carVideo
+            LockSupport.unpark(pipelineThread)
+            try { pipelineThread.join() } catch (_: InterruptedException) {}
+        } finally {
+            cleanup()
+        }
     }
 
     private fun initInputManager() {
@@ -200,10 +209,19 @@ class PipelineServer(
             } catch (e: Exception) { err("DisplayManager: ${e.message}") }
         }
 
-        if (displayId < 0) { err("Failed to create VD"); return false }
-
+        try {
+            val cur = execShellOutput("settings get secure default_input_method")?.trim()
+            if (!cur.isNullOrBlank() && cur != "null" && !cur.contains("linkpc", ignoreCase = true)) {
+                savedDefaultIme = cur
+                log("Saved original IME: $savedDefaultIme")
+            }
+        } catch (_: Exception) {}
         try { setDisplayImePolicy(displayId) } catch (_: Exception) {}
-        try { execShell("settings put global force_resizable_activities 1") } catch (_: Exception) {}
+        try {
+            // Apply iPad-like letterbox style on Android 12L+ (aspectRatio=1.6 / 16:10, cornerRadius=24, center)
+            execShell("cmd window set-letterbox-style --aspectRatio 1.6 --cornerRadius 24 --horizontalPositionMultiplier 0.5")
+            log("Configured iPad-like letterbox style: aspectRatio=1.6, cornerRadius=24")
+        } catch (_: Exception) {}
         try {
             savedScreenOffTimeout = execShellOutput("settings get system screen_off_timeout")?.trim() ?: "60000"
             execShell("settings put system screen_off_timeout 2147483647"); log("Screen timeout disabled")
@@ -395,9 +413,61 @@ class PipelineServer(
     // ── Lifecycle + Touch ──
 
     private fun startLifecycleReader(ch: SocketChannel) { Thread({ try { readLifecycleCommands(ch) } catch (e: Exception) { if (running) err("Lifecycle: ${e.message}") } }, "Lifecycle").apply { isDaemon = true }.start() }
-    private fun readLifecycleCommands(ch: SocketChannel) { val r = NioReader(ch, 4096, frameIntervalNanos/1_000_000); try { while (running) { if ((r.readByteBlocking().toInt() and 0xFF) == CMD_STOP) { log("CMD_STOP"); running = false } } } catch (e: IOException) { if (running) err("Lifecycle: ${e.message}") } finally { r.close(); try { ch.close() } catch (_: Exception) {} } }
+    private fun readLifecycleCommands(ch: SocketChannel) {
+        val r = NioReader(ch, 4096, frameIntervalNanos / 1_000_000)
+        try {
+            while (running) {
+                if ((r.readByteBlocking().toInt() and 0xFF) == CMD_STOP) {
+                    log("CMD_STOP")
+                    break
+                }
+            }
+        } catch (e: IOException) {
+            if (running) err("Lifecycle: ${e.message}")
+        } finally {
+            running = false
+            r.close()
+            try { ch.close() } catch (_: Exception) {}
+            cleanup()
+        }
+    }
 
     private fun startTouchReader(carInput: SocketChannel) { Thread({ try { readTouchAndCommands(carInput) } catch (e: Exception) { err("Touch: ${e.message}") } }, "TouchReader").apply { isDaemon = true }.start() }
+
+    /**
+     * Watchdog: when the lifecycle channel breaks, readLifecycleCommands sets
+     * running=false and calls cleanup() in its finally block. But if the
+     * pipeline thread is stuck in a native MediaCodec call (dequeueOutputBuffer
+     * after stop()), the run() finally { cleanup() } never executes, and the
+     * physical panel stays powered off → phone is unusable (black screen).
+     *
+     * This daemon polls running and cleanedUp. If running went false but
+     * cleanup did not complete within GRACE_MS, it forces cleanup() directly
+     * and then System.exit(1) so the JVM ShutdownHook also fires. The forced
+     * path restores the panel via DisplayControl reflection — same mechanism
+     * setPhysicalDisplayPower uses — and does NOT depend on Shizuku.
+     */
+    private fun startWatchdog() {
+        Thread({
+            while (running) {
+                try { Thread.sleep(500) } catch (_: InterruptedException) { break }
+            }
+            val deadline = System.currentTimeMillis() + WATCHDOG_GRACE_MS
+            while (System.currentTimeMillis() < deadline) {
+                if (cleanedUp.get()) return@Thread
+                try { Thread.sleep(200) } catch (_: InterruptedException) { break }
+            }
+            if (!cleanedUp.get()) {
+                err("Watchdog: cleanup did not complete within ${WATCHDOG_GRACE_MS}ms — forcing panel restore + exit")
+                try { cleanup() } catch (e: Exception) { err("Watchdog cleanup error: ${e.message}") }
+                // Give cleanup's setPhysicalDisplayPower(true) time to land before
+                // halt() tears the process down (halt bypasses ShutdownHook).
+                try { Thread.sleep(500) } catch (_: Exception) {}
+                Runtime.getRuntime().halt(1)
+            }
+        }, "Watchdog").apply { isDaemon = true }.start()
+    }
+
     private fun readTouchAndCommands(ch: SocketChannel) { val r = NioReader(ch, 65536, frameIntervalNanos/1_000_000); while (running) { val f = try { FrameCodec.readFrameBlocking(r) } catch (e: Exception) { null }; if (f == null) break; when (f.channel) { Channel.INPUT -> handleTouchFrame(f); Channel.CONTROL -> handleCarCommand(f) } }; r.close() }
 
     private fun handleTouchFrame(f: FrameCodec.Frame) {
@@ -409,16 +479,54 @@ class PipelineServer(
     private fun injectTouch(action: Int, ptr: Int, x: Int, y: Int, pressure: Float) {
         if (inputManager == null || injectInputEventMethod == null) { try { if (action == 0 || action == 2) execFast("input -d $displayId tap $x $y") } catch (_: Exception) {}; return }
         try {
-            if (action == 2) activePointers.remove(ptr) else activePointers[ptr] = floatArrayOf(x.toFloat(), y.toFloat(), pressure)
+            activePointers[ptr] = floatArrayOf(x.toFloat(), y.toFloat(), pressure)
             if (activePointers.isEmpty()) return
-            val now = SystemClock.uptimeMillis(); val pts = activePointers.entries.toList()
-            for ((i, e) in pts.withIndex()) { val k = e.key; val v = e.value; propsPool[i] = (propsPool[i] ?: MotionEvent.PointerProperties()).also { it.id = k; it.toolType = MotionEvent.TOOL_TYPE_FINGER }; coordsPool[i] = (coordsPool[i] ?: MotionEvent.PointerCoords()).also { it.x = v[0]; it.y = v[1]; it.pressure = v[2]; it.size = 1f } }
-            val ma = if (action == 0) { touchDownTime = now; if (pts.size == 1) MotionEvent.ACTION_DOWN else MotionEvent.ACTION_POINTER_DOWN or (pts.indexOfFirst { it.key == ptr } shl MotionEvent.ACTION_POINTER_INDEX_SHIFT) }
-            else if (action == 2) { if (pts.isEmpty()) MotionEvent.ACTION_UP else return }
-            else MotionEvent.ACTION_MOVE
+            val now = SystemClock.uptimeMillis()
+            val pts = activePointers.entries.toList()
+            val ptrIndex = pts.indexOfFirst { it.key == ptr }
+            if (ptrIndex < 0) return
+
+            for ((i, e) in pts.withIndex()) {
+                val k = e.key
+                val v = e.value
+                propsPool[i] = (propsPool[i] ?: MotionEvent.PointerProperties()).also {
+                    it.id = k
+                    it.toolType = MotionEvent.TOOL_TYPE_FINGER
+                }
+                coordsPool[i] = (coordsPool[i] ?: MotionEvent.PointerCoords()).also {
+                    it.x = v[0]
+                    it.y = v[1]
+                    it.pressure = v[2]
+                    it.size = 1f
+                }
+            }
+
+            val ma = when (action) {
+                0 -> {
+                    touchDownTime = now
+                    if (pts.size == 1) MotionEvent.ACTION_DOWN
+                    else MotionEvent.ACTION_POINTER_DOWN or (ptrIndex shl MotionEvent.ACTION_POINTER_INDEX_SHIFT)
+                }
+                2 -> {
+                    if (pts.size == 1) MotionEvent.ACTION_UP
+                    else MotionEvent.ACTION_POINTER_UP or (ptrIndex shl MotionEvent.ACTION_POINTER_INDEX_SHIFT)
+                }
+                else -> MotionEvent.ACTION_MOVE
+            }
+
             val ev = MotionEvent.obtain(touchDownTime, now, ma, pts.size, propsPool, coordsPool, 0, 0, 1f, 1f, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0)
-            setDisplayIdMethod?.invoke(ev, displayId); injectInputEventMethod!!.invoke(inputManager, ev, 0); ev.recycle()
-            if (running && System.currentTimeMillis() - lastPowerOffTime > 1000) { lastPowerOffTime = System.currentTimeMillis(); Thread({ setPhysicalDisplayPower(false) }, "PowerOff").start() }
+            setDisplayIdMethod?.invoke(ev, displayId)
+            injectInputEventMethod!!.invoke(inputManager, ev, 0)
+            ev.recycle()
+
+            if (action == 2) {
+                activePointers.remove(ptr)
+            }
+
+            if (running && System.currentTimeMillis() - lastPowerOffTime > 1000) {
+                lastPowerOffTime = System.currentTimeMillis()
+                Thread({ setPhysicalDisplayPower(false) }, "PowerOff").start()
+            }
         } catch (_: Exception) {}
     }
 
@@ -426,7 +534,7 @@ class PipelineServer(
         when (f.messageType) {
             ControlMsg.LAUNCH_APP -> launchApp(LaunchAppMessage.decode(f.payload).packageName)
             ControlMsg.GO_BACK -> { execFast("input -d $displayId keyevent 4"); checkStackEmpty() }
-            ControlMsg.GO_HOME -> {}
+            ControlMsg.GO_HOME -> { execFast("input -d $displayId keyevent 3"); checkStackEmpty() }
             ControlMsg.APP_UNINSTALL -> execShell("pm uninstall ${String(f.payload, Charsets.UTF_8)}")
             ControlMsg.APP_INFO -> { val pkg = String(f.payload, Charsets.UTF_8); val s = execShellOutput("cmd package resolve-activity --brief -a android.settings.APPLICATION_DETAILS_SETTINGS com.android.settings")?.trim(); if (!s.isNullOrEmpty()) execShell("am start --display $displayId -n $s -d \"package:$pkg\"") else execShell("am start --display $displayId -a android.settings.APPLICATION_DETAILS_SETTINGS -d \"package:$pkg\"") }
             ControlMsg.APP_SHORTCUTS -> { val pkg = String(f.payload, Charsets.UTF_8); val o = execShellOutput("cmd shortcut get-shortcuts --package $pkg 2>/dev/null") ?: ""; if (o.isNotBlank()) sendShortcutResult(pkg, o) }
@@ -456,6 +564,7 @@ class PipelineServer(
     private fun setDisplayImePolicy(id: Int) { try { val wm = Class.forName("android.view.IWindowManager\$Stub").getDeclaredMethod("asInterface", android.os.IBinder::class.java).invoke(null, Class.forName("android.os.ServiceManager").getDeclaredMethod("getService", String::class.java).invoke(null, "window")); wm.javaClass.getDeclaredMethod("setDisplayImePolicy", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType).invoke(wm, id, 0) } catch (_: Exception) {} }
 
     private fun cleanup() {
+        if (!cleanedUp.compareAndSet(false, true)) return
         running = false
         // Restore screen BEFORE killing shell (order matters: execShell needs shellInput alive)
         setPhysicalDisplayPower(true)
@@ -463,6 +572,17 @@ class PipelineServer(
         savedScreenOffTimeout?.let { if (it != "2147483647") execShell("settings put system screen_off_timeout $it") }
         savedLiftWakeup?.let { execShell("settings put system lift_wakeup_enabled $it") }
         savedProximityWakeup?.let { execShell("settings put system proximity_wakeup_enabled $it") }
+        savedDefaultIme?.let { ime ->
+            if (ime.isNotBlank() && ime != "null" && !ime.contains("linkpc", ignoreCase = true)) {
+                try {
+                    execShell("ime enable $ime")
+                    execShell("ime set $ime")
+                    execShell("settings put secure default_input_method $ime")
+                    log("Restored original IME: $ime")
+                } catch (_: Exception) {}
+            }
+        }
+        try { execShell("cmd window reset-letterbox-style") } catch (_: Exception) {}
         // Now kill the shell
         persistentShell?.let { try { shellInput?.close() } catch (_: Exception) {}; it.destroy() }
         // EGL cleanup

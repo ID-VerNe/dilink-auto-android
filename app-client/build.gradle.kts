@@ -1,3 +1,8 @@
+import java.net.URLClassLoader
+import java.io.FileOutputStream
+import java.util.zip.ZipOutputStream
+import java.util.zip.ZipEntry
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -13,6 +18,13 @@ android {
         targetSdk = 34
         versionCode = project.property("app.versionCode").toString().toInt()
         versionName = project.property("app.versionName").toString()
+    }
+
+    signingConfigs {
+        getByName("debug") {
+            enableV1Signing = true
+            enableV2Signing = true
+        }
     }
 
     val releaseKeystorePassword = System.getenv("RELEASE_KEYSTORE_PASSWORD")
@@ -66,6 +78,9 @@ android {
             "-opt-in=androidx.compose.material3.ExperimentalMaterial3Api"
         )
     }
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 dependencies {
@@ -86,6 +101,9 @@ dependencies {
     implementation("dev.rikka.shizuku:api:13.1.5")
     implementation("dev.rikka.shizuku:aidl:13.1.5")
     implementation("dev.rikka.shizuku:provider:13.1.5")
+
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3")
 }
 
 // Build the VD server JAR and copy to assets before the client APK is assembled.
@@ -116,12 +134,17 @@ tasks.register("buildVdServer") {
         file("${assetsDir}/vd-server.dex").delete()
 
         // DEX vd-server + protocol + kotlin stdlib (needed for app_process runtime)
-        exec {
-            val inputs = listOf(vdClassesJar.absolutePath, protocolJar.absolutePath) +
-                kotlinLibs.map { it.absolutePath }
-            commandLine(listOf("java", "-cp", d8Jar.absolutePath,
-                "com.android.tools.r8.D8",
-                "--output", vdBuildDir.absolutePath) + inputs)
+        val inputs = listOf(vdClassesJar.absolutePath, protocolJar.absolutePath) +
+            kotlinLibs.map { it.absolutePath }
+        val d8Args = (listOf("--output", vdBuildDir.absolutePath) + inputs).toTypedArray()
+
+        val d8ClassLoader = URLClassLoader(arrayOf(d8Jar.toURI().toURL()), javaClass.classLoader)
+        try {
+            val d8Class = d8ClassLoader.loadClass("com.android.tools.r8.D8")
+            val mainMethod = d8Class.getMethod("main", Array<String>::class.java)
+            mainMethod.invoke(null, d8Args)
+        } finally {
+            d8ClassLoader.close()
         }
 
         // Rename to vd-server.dex (delete old first — renameTo fails silently on Windows if dest exists)
@@ -135,17 +158,11 @@ tasks.register("buildVdServer") {
 
         // Create JAR (ZIP containing vd-server.dex as classes.dex)
         val jarFile = file("${vdBuildDir}/vd-server.jar")
-        val jarClassesDex = file("${vdBuildDir}/classes.dex")
         jarFile.delete()
-        jarClassesDex.delete()
-        try {
-            serverDex.copyTo(jarClassesDex, overwrite = true)
-            exec {
-                workingDir(vdBuildDir)
-                commandLine("jar", "cf", "vd-server.jar", "classes.dex")
-            }
-        } finally {
-            jarClassesDex.delete()
+        ZipOutputStream(FileOutputStream(jarFile)).use { zos ->
+            zos.putNextEntry(ZipEntry("classes.dex"))
+            serverDex.inputStream().use { it.copyTo(zos) }
+            zos.closeEntry()
         }
 
         // Copy to phone app assets only (car deploys it over USB-ADB)

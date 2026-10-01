@@ -4,6 +4,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.content.res.Configuration
 import android.os.Bundle
 import android.os.IBinder
 import android.view.View
@@ -34,12 +35,17 @@ import com.dilinkauto.server.ui.theme.CarTheme
 class MainActivity : ComponentActivity() {
 
     private var carService: CarConnectionService? = null
+    internal var pendingUsbDevice: android.hardware.usb.UsbDevice? = null
     private var serviceBound by mutableStateOf(false)
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
             carService = (binder as CarConnectionService.LocalBinder).service
             serviceBound = true
+            pendingUsbDevice?.let { device ->
+                carService?.onUsbDeviceFromActivity(device)
+                pendingUsbDevice = null
+            }
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -76,7 +82,7 @@ class MainActivity : ComponentActivity() {
         handleUsbIntent(intent)
     }
 
-    private fun handleUsbIntent(intent: Intent?) {
+    internal fun handleUsbIntent(intent: Intent?) {
         if (intent?.action == android.hardware.usb.UsbManager.ACTION_USB_DEVICE_ATTACHED) {
             val device = intent.getParcelableExtra<android.hardware.usb.UsbDevice>(
                 android.hardware.usb.UsbManager.EXTRA_DEVICE
@@ -84,7 +90,12 @@ class MainActivity : ComponentActivity() {
             if (device != null) {
                 android.util.Log.i("MainActivity", "USB device from intent: ${device.productName}")
                 // Forward to service — it handles USB ADB
-                carService?.onUsbDeviceFromActivity(device)
+                val service = carService
+                if (service != null) {
+                    service.onUsbDeviceFromActivity(device)
+                } else {
+                    pendingUsbDevice = device
+                }
             }
         }
     }
@@ -92,6 +103,16 @@ class MainActivity : ComponentActivity() {
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) enableImmersiveMode()
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        // Rotatable car panel: when the viewport dimensions change (rotation),
+        // re-handshake mid-stream so the phone recreates the VD at the new
+        // orientation. The control connection is reused; only video/input and
+        // the VD server are recycled.
+        val dm = resources.displayMetrics
+        carService?.onCarViewportChanged(dm.widthPixels, dm.heightPixels, dm.densityDpi)
     }
 
     @Suppress("DEPRECATION")

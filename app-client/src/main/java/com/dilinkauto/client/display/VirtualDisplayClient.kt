@@ -70,9 +70,13 @@ class VirtualDisplayClient(
      */
     suspend fun acceptConnection(port: Int = SERVER_PORT, timeoutMs: Int = 60000): Boolean {
         return withContext(Dispatchers.IO) {
-            val ch = serverChannel
+            var ch = serverChannel
             if (ch == null || !ch.isOpen) {
-                FileLog.e(TAG, "acceptConnection: ServerSocket not open, call startListening() first")
+                startListening(port)
+                ch = serverChannel
+            }
+            if (ch == null || !ch.isOpen) {
+                FileLog.e(TAG, "acceptConnection: Failed to open ServerSocket on port $port")
                 return@withContext false
             }
             try {

@@ -385,8 +385,8 @@ class CarConnectionService : Service() {
 
                 val displayMetrics = resources.displayMetrics
                 val navBarPx = navBarWidthPx(displayMetrics.density, displayMetrics.widthPixels)
-                val viewportWidth = displayMetrics.widthPixels - navBarPx
-                val viewportHeight = displayMetrics.heightPixels
+                val viewportWidth = (displayMetrics.widthPixels - navBarPx) and 0x7FFFFFFE.toInt()
+                val viewportHeight = displayMetrics.heightPixels and 0x7FFFFFFE.toInt()
                 val handshake = HandshakeRequest(
                     deviceName = "DiLink-${android.os.Build.MODEL}",
                     screenWidth = viewportWidth,
@@ -649,6 +649,11 @@ class CarConnectionService : Service() {
             usbConnecting = false
             usbReady = true
 
+            if (handshakeDone && !vdServerStarted) {
+                carLogSend("USB ADB ready after handshake — deploying VD server")
+                deployVdServer()
+            }
+
             // If we're not in a connecting flow yet, start one
             if (_state.value == State.IDLE) {
                 withContext(Dispatchers.Main) { startConnection() }
@@ -683,9 +688,13 @@ class CarConnectionService : Service() {
                     carLogSend("Shizuku mode — phone will deploy VD server, waiting for VD_PORTS_BOUND")
                 } else {
                     // Car deploys VD server via ADB (USB or TCP).
-                    // Don't deploy here — ADB may not be ready yet.
-                    // connectTcpAdb() will call deployVdServer() once ADB connects.
-                    carLogSend("Handshake OK — waiting for ADB to deploy VD server")
+                    if (isAdbAvailable() && !vdServerStarted) {
+                        carLogSend("ADB available at handshake — deploying VD server")
+                        deployVdServer()
+                    } else if (!vdServerStarted) {
+                        carLogSend("Handshake OK — attempting deploy/fallback to phone")
+                        deployVdServer()
+                    }
                 }
             }
             ControlMsg.VD_PORTS_BOUND -> {
@@ -783,11 +792,11 @@ class CarConnectionService : Service() {
             DataMsg.NOTIFICATION_POST -> {
                 val n = NotificationData.decode(frame.payload)
                 // Replace existing notification with same ID (handles progress updates)
-                _notifications.value = _notifications.value.filter { it.id != n.id } + n
+                _notifications.value = _notifications.value.filter { it.id != n.id || it.packageName != n.packageName } + n
             }
             DataMsg.NOTIFICATION_REMOVE -> {
                 val n = NotificationData.decode(frame.payload)
-                _notifications.value = _notifications.value.filter { it.id != n.id }
+                _notifications.value = _notifications.value.filter { it.id != n.id || it.packageName != n.packageName }
             }
             DataMsg.MEDIA_METADATA -> { _mediaMetadata.value = MediaMetadata.decode(frame.payload) }
             DataMsg.MEDIA_PLAYBACK_STATE -> { _playbackState.value = PlaybackState.decode(frame.payload) }
@@ -855,11 +864,10 @@ class CarConnectionService : Service() {
             val navBarPx = navBarWidthPx(displayMetrics.density, displayMetrics.widthPixels)
             val viewportWidth = displayMetrics.widthPixels - navBarPx
             val viewportHeight = displayMetrics.heightPixels
-            val phoneDpi = handshakeVdDpi
-
             // VD created at car viewport size — no GPU downscale needed
             val vdW = viewportWidth and 0x7FFFFFFE.toInt()
             val vdH = viewportHeight and 0x7FFFFFFE.toInt()
+            val phoneDpi = if (handshakeVdDpi > 0) handshakeVdDpi else VideoConfig.calculateOptimalDpi(vdW, vdH, displayMetrics.densityDpi)
 
             val jarPath = vdServerJarPath
 
@@ -994,6 +1002,66 @@ class CarConnectionService : Service() {
 
     fun goBack() {
         sendCommandToVd(ControlMsg.GO_BACK)
+    }
+
+    /**
+     * Called by MainActivity.onConfigurationChanged when the car panel rotates.
+     * If the viewport dimensions changed, re-handshake on the existing control
+     * connection so the phone recreates the VD at the new orientation. Video
+     * and input connections are recycled; the control channel stays alive.
+     *
+     * Mid-stream re-handshake: the phone tears down the old VD server and
+     * deploys a fresh one at the new dims, then re-binds 9638/9639 and sends
+     * VD_PORTS_BOUND again — same flow as the initial connect, just without
+     * re-establishing the control TCP connection.
+     */
+    fun onCarViewportChanged(widthPx: Int, heightPx: Int, dpi: Int) {
+        val dm = resources.displayMetrics
+        val navBarPx = navBarWidthPx(dm.density, widthPx)
+        val newVpW = (widthPx - navBarPx) and 0x7FFFFFFE.toInt()
+        val newVpH = heightPx and 0x7FFFFFFE.toInt()
+        if (newVpW == vdWidth && newVpH == vdHeight) return
+        if (_state.value != State.STREAMING && _state.value != State.CONNECTED) return
+        val ctrl = controlConnection ?: return
+        if (!ctrl.isConnected) return
+        carLogSend("Car viewport changed -> re-handshake ${newVpW}x${newVpH} (was ${vdWidth}x${vdHeight})")
+        scope.launch(Dispatchers.IO) {
+            // Tear down video/input — clear disconnect listeners so handleDisconnect()
+            // is not invoked for this intentional mid-stream rotation teardown.
+            videoConnection?.clearDisconnectListener()
+            inputConnection?.clearDisconnectListener()
+            videoConnection?.disconnect(); videoConnection = null
+            inputConnection?.disconnect(); inputConnection = null
+            videoDecoder.stop()
+            releaseOffscreenSurface()
+            _videoReady.value = false
+            wifiReady = false
+            vdServerStarted = false
+            handshakeDone = false
+            vdWidth = newVpW
+            vdHeight = newVpH
+            _state.value = State.CONNECTING
+            _statusMessage.value = getString(R.string.status_starting_vd)
+            val handshake = HandshakeRequest(
+                deviceName = "DiLink-${android.os.Build.MODEL}",
+                screenWidth = newVpW,
+                screenHeight = newVpH,
+                screenDpi = dpi,
+                appVersionCode = packageManager.getPackageInfo(packageName, 0).let {
+                    @Suppress("DEPRECATION") it.versionCode
+                },
+                targetFps = targetFps,
+                appVersionName = packageManager.getPackageInfo(packageName, 0).let {
+                    it.versionName ?: ""
+                }
+            )
+            try {
+                ctrl.sendControl(ControlMsg.HANDSHAKE_REQUEST, handshake.encode())
+            } catch (e: Exception) {
+                carLogSend("Re-handshake send failed: ${e.message}")
+                handleDisconnect()
+            }
+        }
     }
 
     fun requestUninstall(packageName: String) {
@@ -1174,9 +1242,9 @@ class CarConnectionService : Service() {
         val navBarPx = navBarWidthPx(displayMetrics.density, displayMetrics.widthPixels)
         val viewportWidth = displayMetrics.widthPixels - navBarPx
         val viewportHeight = displayMetrics.heightPixels
-        val phoneDpi = handshakeVdDpi
         val vdW = viewportWidth and 0x7FFFFFFE.toInt()
         val vdH = viewportHeight and 0x7FFFFFFE.toInt()
+        val phoneDpi = if (handshakeVdDpi > 0) handshakeVdDpi else VideoConfig.calculateOptimalDpi(vdW, vdH, displayMetrics.densityDpi)
         val args = "$vdW $vdH $phoneDpi 127.0.0.1 $vdW $vdH $targetFps"
         _statusMessage.value = getString(R.string.status_preparing_vd)
         carLogSend("VD server: ${vdW}x${vdH}@${phoneDpi}dpi (car-native, no downscale)")

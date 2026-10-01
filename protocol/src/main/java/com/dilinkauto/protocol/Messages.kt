@@ -47,7 +47,7 @@ data class HandshakeRequest(
         fun decode(data: ByteArray): HandshakeRequest {
             val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
             val version = buf.getInt()
-            val nameLen = buf.getShort().toInt()
+            val nameLen = buf.getShort().toInt() and 0xFFFF
             val nameBytes = ByteArray(nameLen)
             buf.get(nameBytes)
             val request = HandshakeRequest(
@@ -61,7 +61,7 @@ data class HandshakeRequest(
                 appVersionCode = if (buf.remaining() >= 4) buf.getInt() else 0,
                 targetFps = if (buf.remaining() >= 4) buf.getInt() else 30,
                 appVersionName = if (buf.remaining() >= 2) {
-                    val vnLen = buf.getShort().toInt().coerceAtMost(buf.remaining())
+                    val vnLen = (buf.getShort().toInt() and 0xFFFF).coerceAtMost(buf.remaining())
                     if (vnLen > 0) {
                         val vnBytes = ByteArray(vnLen)
                         buf.get(vnBytes)
@@ -111,7 +111,7 @@ data class HandshakeResponse(
             val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
             val version = buf.getInt()
             val accepted = buf.get() != 0.toByte()
-            val nameLen = buf.getShort().toInt()
+            val nameLen = buf.getShort().toInt() and 0xFFFF
             val nameBytes = ByteArray(nameLen)
             buf.get(nameBytes)
             val dw = buf.getInt()
@@ -119,7 +119,7 @@ data class HandshakeResponse(
             val vdId = if (buf.hasRemaining()) buf.getInt() else -1
             val adbP = if (buf.hasRemaining()) buf.getInt() else 5555
             val jarPath = if (buf.remaining() >= 2) {
-                val pathLen = buf.getShort().toInt()
+                val pathLen = buf.getShort().toInt() and 0xFFFF
                 if (pathLen > 0 && buf.remaining() >= pathLen) {
                     val pathBytes = ByteArray(pathLen)
                     buf.get(pathBytes)
@@ -283,7 +283,7 @@ data class NotificationData(
             val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
             val id = buf.getInt()
             fun readString(): String {
-                val len = buf.getShort().toInt()
+                val len = buf.getShort().toInt() and 0xFFFF
                 val bytes = ByteArray(len)
                 buf.get(bytes)
                 return String(bytes, Charsets.UTF_8)
@@ -366,10 +366,10 @@ data class AppListMessage(val apps: List<AppInfo>) {
     companion object {
         fun decode(data: ByteArray): AppListMessage {
             val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
-            val count = buf.getShort().toInt()
+            val count = buf.getShort().toInt() and 0xFFFF
             val apps = (0 until count).map {
                 fun readStr(): String {
-                    val len = buf.getShort().toInt()
+                    val len = buf.getShort().toInt() and 0xFFFF
                     val bytes = ByteArray(len)
                     buf.get(bytes)
                     return String(bytes, Charsets.UTF_8)
@@ -382,7 +382,7 @@ data class AppListMessage(val apps: List<AppInfo>) {
                     ByteArray(iconSize).also { buf.get(it) }
                 } else ByteArray(0)
                 val iconHash = if (buf.remaining() >= 2) {
-                    val hashLen = buf.getShort().toInt().coerceAtMost(buf.remaining())
+                    val hashLen = (buf.getShort().toInt() and 0xFFFF).coerceAtMost(buf.remaining())
                     if (hashLen > 0) {
                         val hashBytes = ByteArray(hashLen)
                         buf.get(hashBytes)
@@ -427,7 +427,7 @@ data class MediaMetadata(
         fun decode(data: ByteArray): MediaMetadata {
             val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
             fun readStr(): String {
-                val len = buf.getShort().toInt()
+                val len = buf.getShort().toInt() and 0xFFFF
                 val bytes = ByteArray(len)
                 buf.get(bytes)
                 return String(bytes, Charsets.UTF_8)
@@ -494,7 +494,7 @@ data class ClearNotificationMessage(
         fun decode(data: ByteArray): ClearNotificationMessage {
             val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
             val id = buf.getInt()
-            val pkgLen = buf.getShort().toInt()
+            val pkgLen = buf.getShort().toInt() and 0xFFFF
             val pkgBytes = ByteArray(pkgLen)
             buf.get(pkgBytes)
             return ClearNotificationMessage(id, String(pkgBytes, Charsets.UTF_8))
@@ -609,14 +609,14 @@ data class AppShortcutsListMessage(
     companion object {
         fun decode(data: ByteArray): AppShortcutsListMessage {
             val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
-            val pkgLen = buf.getShort().toInt()
+            val pkgLen = buf.getShort().toInt() and 0xFFFF
             val pkgBytes = ByteArray(pkgLen)
             buf.get(pkgBytes)
             val pkg = String(pkgBytes, Charsets.UTF_8)
-            val count = buf.getShort().toInt()
+            val count = buf.getShort().toInt() and 0xFFFF
             val shortcuts = (0 until count).map {
                 fun readStr(): String {
-                    val len = buf.getShort().toInt()
+                    val len = buf.getShort().toInt() and 0xFFFF
                     val bytes = ByteArray(len)
                     buf.get(bytes)
                     return String(bytes, Charsets.UTF_8)
@@ -648,10 +648,10 @@ data class AppShortcutActionMessage(
     companion object {
         fun decode(data: ByteArray): AppShortcutActionMessage {
             val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
-            val pkgLen = buf.getShort().toInt()
+            val pkgLen = buf.getShort().toInt() and 0xFFFF
             val pkgBytes = ByteArray(pkgLen)
             buf.get(pkgBytes)
-            val idLen = buf.getShort().toInt()
+            val idLen = buf.getShort().toInt() and 0xFFFF
             val idBytes = ByteArray(idLen)
             buf.get(idBytes)
             return AppShortcutActionMessage(

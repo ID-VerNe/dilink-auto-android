@@ -223,8 +223,12 @@ object UpdateManager {
             // Silent install via Shizuku — no system confirmation dialog
             _updateState.value = UpdateState.Installing(version)
             scope.launch(Dispatchers.IO) {
+                val tmpPath = "/data/local/tmp/update.apk"
                 try {
-                    val result = ShizukuManager.execAndWait("pm install -r ${apkFile.absolutePath}")
+                    stageApkForShizuku(apkFile, tmpPath)
+                    val result = ShizukuManager.execAndWait("pm install -r $tmpPath")
+                    ShizukuManager.execAndWait("rm -f $tmpPath")
+                    try { File(tmpPath).delete() } catch (_: Exception) {}
                     if (result != null && result.contains("Success")) {
                         FileLog.i(TAG, "Shizuku install succeeded: $result")
                         _updateState.value = UpdateState.Installed
@@ -245,6 +249,19 @@ object UpdateManager {
             // Fallback to system package installer
             launchSystemInstaller(context, apkFile)
         }
+    }
+
+    internal fun stageApkForShizuku(apkFile: File, tmpPath: String = "/data/local/tmp/update.apk"): Boolean {
+        val tmpFile = File(tmpPath)
+        val directCopy = try {
+            apkFile.copyTo(tmpFile, overwrite = true)
+            tmpFile.setReadable(true, false)
+            true
+        } catch (_: Exception) {
+            false
+        }
+        if (directCopy) return true
+        return ShizukuManager.copyToFile(apkFile, tmpPath)
     }
 
     private suspend fun tryDadbInstall(apkFile: File, version: String) {

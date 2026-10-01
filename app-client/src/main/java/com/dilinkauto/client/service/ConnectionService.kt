@@ -53,6 +53,7 @@ class ConnectionService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     private var packageRemovedReceiver: BroadcastReceiver? = null
+    @Volatile private var savedDefaultIme: String? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -66,7 +67,21 @@ class ConnectionService : Service() {
         registerPackageRemovedReceiver()
         deployAssets()
         logDeviceInfo()
+        cacheDefaultIme()
         UpdateManager.checkForUpdate(force = false)
+    }
+
+    private fun cacheDefaultIme() {
+        try {
+            val currentIme = android.provider.Settings.Secure.getString(contentResolver, android.provider.Settings.Secure.DEFAULT_INPUT_METHOD)
+            if (!currentIme.isNullOrBlank() && currentIme != "null" && !currentIme.contains("linkpc", ignoreCase = true)) {
+                savedDefaultIme = currentIme
+                getSharedPreferences("dilinkauto", MODE_PRIVATE).edit().putString("saved_default_ime", currentIme).apply()
+                FileLog.i(TAG, "Cached default IME: $currentIme")
+            }
+        } catch (e: Exception) {
+            FileLog.w(TAG, "Failed to cache default IME: ${e.message}")
+        }
     }
 
     private fun logDeviceInfo() {
@@ -349,12 +364,25 @@ class ConnectionService : Service() {
         FileLog.i(TAG, "Car display: ${request.screenWidth}x${request.screenHeight} @${request.screenDpi}dpi fps=${request.targetFps}")
         targetFps = request.targetFps
 
-        // Create VD at car viewport size — no GPU downscale needed.
-        // Keep phone DPI (480) so apps don't blow up at car's low DPI (240).
-        val displayDpi = VideoConfig.VIRTUAL_DISPLAY_DPI
+        cacheDefaultIme()
+
+        // Mid-stream re-handshake: the car rotated and is reusing the control
+        // connection. Tear down the old VD before creating a new one at the
+        // new orientation. Old VD exits via its watchdog, restoring the panel.
+        if (vdClient != null) {
+            FileLog.i(TAG, "Re-handshake: tearing down old VD (rotation)")
+            vdClient?.stopVdServer()
+            vdClient?.disconnect()
+            vdClient = null
+        }
+
+        // Create VD at car viewport size.
+        // Auto-calibrate DPI: ensure portrait apps get at least ~380dp logical width in landscape
+        // (iPad-like phone app display) instead of crushing into an unusable 140dp sliver.
         val vdWidth = request.screenWidth and 0x7FFFFFFE.toInt()
         val vdHeight = request.screenHeight and 0x7FFFFFFE.toInt()
-        FileLog.i(TAG, "VD: ${vdWidth}x${vdHeight} @${displayDpi}dpi (car-native res, no downscale)")
+        val displayDpi = VideoConfig.calculateOptimalDpi(vdWidth, vdHeight, request.screenDpi)
+        FileLog.i(TAG, "VD: ${vdWidth}x${vdHeight} @${displayDpi}dpi (car reported ${request.screenDpi}dpi, auto-calibrated optimal touch scale)")
 
         // Open lifecycle channel if not already open (survives re-handshakes)
         if (vdClient == null) {
@@ -391,7 +419,7 @@ class ConnectionService : Service() {
             java.io.File(android.os.Environment.getExternalStorageDirectory(), "DiLinkAuto"),
             "vd-server.jar"
         ).absolutePath
-        val connMethod = if (ShizukuManager.isAvailable) CONNECTION_METHOD_SHIZUKU else CONNECTION_METHOD_USB_ADB
+        val connMethod = if (ShizukuManager.checkPermission()) CONNECTION_METHOD_SHIZUKU else CONNECTION_METHOD_USB_ADB
         val resp = HandshakeResponse(
             accepted = true,
             deviceName = android.os.Build.MODEL,
@@ -460,6 +488,11 @@ class ConnectionService : Service() {
                     FileLog.i(TAG, "Car app up-to-date ($carVersionName)")
                 }
 
+                // If Shizuku is available, deploy VD server directly BEFORE waiting for lifecycle connection
+                if (ShizukuManager.isAvailable) {
+                    startVdServerViaShizuku(request.screenWidth, request.screenHeight, vdWidth, vdHeight, displayDpi)
+                }
+
                 // Wait for VD to connect on the lifecycle channel already opened.
                 // Runs inside handshakeJob — cancelled properly on reconnect.
                 val client = vdClient ?: return@launch
@@ -476,11 +509,6 @@ class ConnectionService : Service() {
                         FileLog.w(TAG, "VD server did not connect within timeout")
                     }
                 }
-
-                // If Shizuku is available, deploy VD server directly
-                if (ShizukuManager.isAvailable) {
-                    startVdServerViaShizuku(request.screenWidth, request.screenHeight, vdWidth, vdHeight)
-                }
             }
         }
     }
@@ -494,34 +522,32 @@ class ConnectionService : Service() {
      * without waiting for the car's USB ADB connection. The VD server will
      * reverse-connect to localhost:19647 as usual.
      */
-    private fun startVdServerViaShizuku(carWidth: Int, carHeight: Int, vdWidth: Int, vdHeight: Int) {
+    private suspend fun startVdServerViaShizuku(carWidth: Int, carHeight: Int, vdWidth: Int, vdHeight: Int, dpi: Int = VideoConfig.DEFAULT_FALLBACK_DPI) {
         if (!ShizukuManager.isAvailable) {
             FileLog.w(TAG, "Shizuku not available — cannot start VD server")
             return
         }
-        serviceScope.launch(Dispatchers.IO) {
-            try {
-                val phoneDpi = VideoConfig.VIRTUAL_DISPLAY_DPI
-                val jarPath = java.io.File(
-                    java.io.File(android.os.Environment.getExternalStorageDirectory(), "DiLinkAuto"),
-                    "vd-server.jar"
-                ).absolutePath
-                val logFile = "/sdcard/DiLinkAuto/vd-server.log"
-                // Args: W H DPI PHONE_HOST EW EH FPS
-                // VD binds 9638/9639 on 0.0.0.0, connects lifecycle to phoneHost:19647
-                val args = "$vdWidth $vdHeight $phoneDpi 127.0.0.1 $carWidth $carHeight $targetFps"
+        try {
+            val dir = java.io.File(android.os.Environment.getExternalStorageDirectory(), "DiLinkAuto")
+            if (!dir.exists()) dir.mkdirs()
+            val jarPath = java.io.File(dir, "vd-server.jar").absolutePath
+            val logFile = java.io.File(dir, "vd-server.log").absolutePath
+            // Args: W H DPI PHONE_HOST EW EH FPS
+            // VD binds 9638/9639 on 0.0.0.0, connects lifecycle to phoneHost:19647.
+            // encode dims MUST be even (AVC encoder rejects odd width/height) — use the
+            // already-aligned vdWidth/vdHeight for both VD and encode size.
+            val args = "$vdWidth $vdHeight $dpi 127.0.0.1 $vdWidth $vdHeight $targetFps"
 
-                ShizukuManager.execAndWait("pkill -f PipelineServer 2>/dev/null")
-                delay(200)
+            ShizukuManager.execAndWait("pkill -f PipelineServer 2>/dev/null")
+            delay(200)
 
-                val cmd = "CLASSPATH=$jarPath app_process / " +
-                        "com.dilinkauto.vdserver.PipelineServer $args" +
-                        " >$logFile 2>&1 &"
-                ShizukuManager.execBackground(cmd)
-                FileLog.i(TAG, "VD server started via Shizuku: ${vdWidth}x${vdHeight}")
-            } catch (e: Exception) {
-                FileLog.e(TAG, "Shizuku VD server start failed", e)
-            }
+            val cmd = "CLASSPATH=$jarPath exec app_process / " +
+                    "com.dilinkauto.vdserver.PipelineServer $args" +
+                    " >$logFile 2>&1"
+            ShizukuManager.execBackground(cmd)
+            FileLog.i(TAG, "VD server started via Shizuku: ${vdWidth}x$vdHeight @${dpi}dpi")
+        } catch (e: Exception) {
+            FileLog.e(TAG, "Shizuku VD server start failed", e)
         }
     }
 
@@ -1251,7 +1277,8 @@ class ConnectionService : Service() {
         vdWaitJob?.cancel()
         vdWaitJob = null
         vdClient?.stopVdServer()
-        // Don't disconnect lifecycle channel — keep it open for VD reconnection
+        vdClient?.disconnect()
+        vdClient = null
         InputInjectionService.instance?.clearVirtualDisplay()
         controlConnection?.disconnect()
         controlConnection = null
@@ -1276,6 +1303,36 @@ class ConnectionService : Service() {
         serviceScope.launch(Dispatchers.IO) {
             try {
                 FileLog.i(TAG, "Force-waking physical display")
+
+                // Layer 0: Restore SurfaceFlinger-level display power via Shizuku.
+                // The VD server powers off the physical panel directly via
+                // DisplayControl.setDisplayPowerMode(0) — a deeper off than PowerManager
+                // can recover from. Its own cleanup() only runs if the process exits
+                // cleanly (CMD_STOP received). When the lifecycle channel breaks so
+                // CMD_STOP never arrives, or the process hangs in a native futex,
+                // cleanup() never runs and the panel stays off → phone is unusable.
+                // PowerManager wakeUp/wake-locks cannot reverse this; only
+                // setDisplayPowerMode(2) / "cmd display power-on" can, which needs
+                // shell privileges (Shizuku). Kill the VD server first so it stops
+                // re-powering-off the panel every second during touch injection.
+                if (ShizukuManager.isAvailable) {
+                    try {
+                        ShizukuManager.execAndWait("pkill -9 -f PipelineServer 2>/dev/null")
+                        delay(150)
+                        ShizukuManager.execAndWait("cmd display power-on 0 2>/dev/null")
+                        val targetIme = savedDefaultIme
+                            ?: getSharedPreferences("dilinkauto", MODE_PRIVATE).getString("saved_default_ime", null)
+                        if (!targetIme.isNullOrBlank() && targetIme != "null" && !targetIme.contains("linkpc", ignoreCase = true)) {
+                            ShizukuManager.execAndWait("ime enable $targetIme; ime set $targetIme; settings put secure default_input_method $targetIme 2>/dev/null")
+                            FileLog.i(TAG, "Original IME restored via Shizuku: $targetIme")
+                        }
+                        savedDefaultIme = null
+                        FileLog.i(TAG, "Physical display restored via Shizuku (pkill + power-on + IME)")
+                    } catch (e: Exception) {
+                        FileLog.w(TAG, "Shizuku display restore failed: ${e.message}")
+                    }
+                }
+
                 val pm = getSystemService(POWER_SERVICE) as PowerManager
 
                 // Layer 1: PowerManager.wakeUp() — direct system call

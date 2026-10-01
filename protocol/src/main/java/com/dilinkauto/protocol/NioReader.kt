@@ -5,6 +5,7 @@ import kotlinx.coroutines.yield
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.channels.ClosedSelectorException
 import java.nio.channels.SelectionKey
 import java.nio.channels.Selector
 import java.nio.channels.SocketChannel
@@ -98,9 +99,13 @@ class NioReader(
                     android.util.Log.d("NioReader", "no data #$noDataCount: needed=$needed remaining=${buf.remaining()} capacity=${buf.capacity()}")
                 }
                 yield() // cooperate with coroutine cancellation
-                if (!coroutineContext.isActive || !selector.isOpen) return false
-                selector.select(selectTimeoutMs) // blocks thread until data or timeout
-                if (selector.isOpen) selector.selectedKeys().clear()
+                try {
+                    if (!coroutineContext.isActive || !selector.isOpen) return false
+                    selector.select(selectTimeoutMs) // blocks thread until data or timeout
+                    if (selector.isOpen) selector.selectedKeys().clear()
+                } catch (_: ClosedSelectorException) {
+                    return false
+                }
             }
         }
         return true
@@ -160,9 +165,13 @@ class NioReader(
             buf.flip()
             if (n == -1) return false
             if (n == 0) {
-                if (!selector.isOpen) return false
-                selector.select(selectTimeoutMs)
-                if (selector.isOpen) selector.selectedKeys().clear()
+                try {
+                    if (!selector.isOpen) return false
+                    selector.select(selectTimeoutMs)
+                    if (selector.isOpen) selector.selectedKeys().clear()
+                } catch (_: ClosedSelectorException) {
+                    return false
+                }
             }
         }
         return true

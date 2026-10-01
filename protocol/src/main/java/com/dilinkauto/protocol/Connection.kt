@@ -7,7 +7,6 @@ import java.nio.ByteBuffer
 import java.nio.channels.ServerSocketChannel
 import java.nio.channels.SocketChannel
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -15,7 +14,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Handles frame reading/writing, heartbeats, and channel dispatch.
  *
  * All I/O is non-blocking NIO. Reads use NioReader (Selector-based).
- * Writes use a dedicated writer coroutine with a lock-free queue —
+ * Writes use a dedicated writer coroutine with a non-blocking coroutine Channel —
  * no synchronized blocks on the write path, no spin-waiting.
  */
 class Connection(
@@ -39,9 +38,8 @@ class Connection(
     private val reader = NioReader(channel)
     private val connected = AtomicBoolean(true)
 
-    // Write queue: lock-free enqueue from any thread, drained by dedicated writer coroutine.
-    private val writeQueue = ConcurrentLinkedQueue<FrameCodec.Frame>()
-    @Volatile private var writerThread: Thread? = null
+    // Write queue: non-blocking coroutine channel, drained by dedicated writer coroutine.
+    private val writeQueue = kotlinx.coroutines.channels.Channel<FrameCodec.Frame>(kotlinx.coroutines.channels.Channel.UNLIMITED)
 
     private val frameListeners = ConcurrentHashMap<Byte, (FrameCodec.Frame) -> Unit>()
     private var disconnectListener: (() -> Unit)? = null
@@ -102,6 +100,8 @@ class Connection(
                         }
                     }
                 }
+            } catch (e: java.nio.channels.ClosedSelectorException) {
+                // Selector closed by disconnect() — normal shutdown
             } catch (e: IOException) {
                 disconnectReason = "reader: IOException: ${e.message}"
                 log(disconnectReason)
@@ -120,13 +120,8 @@ class Connection(
             val headerBuf = ByteArray(FrameCodec.HEADER_SIZE)
             var writeCount = 0L
             try {
-                while (isActive && connected.get()) {
-                    writerThread = Thread.currentThread()
-                    val frame = writeQueue.poll()
-                    if (frame == null) {
-                        java.util.concurrent.locks.LockSupport.park() // unparked by enqueueFrame
-                        continue
-                    }
+                for (frame in writeQueue) {
+                    if (!connected.get() || !isActive) break
 
                     // Encode header
                     val frameLength = 2 + frame.payload.size
@@ -146,9 +141,13 @@ class Connection(
                     writeBuffersToChannel(bufs)
                     writeCount++
                     if (frame.channel == Channel.VIDEO && writeCount % 60 == 0L) {
-                        log("writer: frame #$writeCount ch=${frame.channel} size=${frame.payload.size} queue=${writeQueue.size} stalls=$writeStallCount")
+                        log("writer: frame #$writeCount ch=${frame.channel} size=${frame.payload.size} stalls=$writeStallCount")
                     }
                 }
+            } catch (e: kotlinx.coroutines.channels.ClosedReceiveChannelException) {
+                // Channel closed by disconnect() — normal shutdown
+            } catch (e: CancellationException) {
+                // Coroutine cancelled — normal shutdown
             } catch (e: java.nio.channels.ClosedSelectorException) {
                 // Selector closed by disconnect() — normal shutdown
             } catch (e: IOException) {
@@ -207,7 +206,7 @@ class Connection(
             writeStallCount++
             if (writeStallCount % 100 == 1L) {
                 val remaining = bufs.sumOf { it.remaining().toLong() }
-                log("write stall #$writeStallCount: remaining=$remaining queue=${writeQueue.size}")
+                log("write stall #$writeStallCount: remaining=$remaining")
             }
             delay(1)
         }
@@ -218,17 +217,22 @@ class Connection(
      */
     private fun enqueueFrame(frame: FrameCodec.Frame) {
         if (!connected.get()) throw IOException("Not connected")
-        writeQueue.add(frame)
-        val wt = writerThread
-        if (wt != null) java.util.concurrent.locks.LockSupport.unpark(wt)
+        val result = writeQueue.trySend(frame)
+        if (result.isFailure) {
+            throw IOException("Failed to enqueue frame: channel closed")
+        }
     }
 
     fun onFrames(channel: Byte, listener: (FrameCodec.Frame) -> Unit) {
         frameListeners[channel] = listener
     }
 
-    fun onDisconnect(listener: () -> Unit) {
+    fun onDisconnect(listener: (() -> Unit)?) {
         disconnectListener = listener
+    }
+
+    fun clearDisconnectListener() {
+        disconnectListener = null
     }
 
     fun onLog(listener: (String) -> Unit) {
@@ -275,9 +279,8 @@ class Connection(
             writerJob?.cancel()
             heartbeatJob?.cancel()
             watchdogJob?.cancel()
+            writeQueue.close()
             reader.close()
-            val wt = writerThread
-            if (wt != null) java.util.concurrent.locks.LockSupport.unpark(wt)
             try { channel.close() } catch (_: Exception) {}
             try { disconnectListener?.invoke() } catch (_: Exception) {}
         }

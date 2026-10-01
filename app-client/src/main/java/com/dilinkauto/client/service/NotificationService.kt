@@ -35,9 +35,12 @@ class NotificationService : NotificationListenerService() {
         val extras = sbn.notification.extras
         val title = extras.getCharSequence("android.title")?.toString() ?: ""
         val text = extras.getCharSequence("android.text")?.toString() ?: ""
-        val appName = packageManager.getApplicationLabel(
-            packageManager.getApplicationInfo(sbn.packageName, 0)
-        ).toString()
+        val appName = try {
+            val appInfo = packageManager.getApplicationInfo(sbn.packageName, 0)
+            packageManager.getApplicationLabel(appInfo).toString()
+        } catch (_: Exception) {
+            sbn.packageName
+        }
 
         // Skip our own notifications
         if (sbn.packageName == packageName) return

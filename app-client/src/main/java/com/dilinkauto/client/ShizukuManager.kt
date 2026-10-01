@@ -8,7 +8,9 @@ import android.os.ParcelFileDescriptor
 import android.util.Log
 import moe.shizuku.server.IShizukuService
 import rikka.shizuku.Shizuku
+import java.io.File
 import java.io.FileInputStream
+import java.io.FileOutputStream
 
 /**
  * Manages Shizuku lifecycle and provides shell-level command execution.
@@ -67,12 +69,13 @@ object ShizukuManager {
         }
     }
 
-    private fun checkPermission() {
+    fun checkPermission(): Boolean {
         isAvailable = try {
             Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
         } catch (e: Exception) {
             false
         }
+        return isAvailable
     }
 
     /**
@@ -130,7 +133,7 @@ object ShizukuManager {
 
             // Duplicate FDs — ParcelFileDescriptors from binder transactions
             // can become invalid (EBADF) when the original is garbage collected
-            val stdoutOrig = process.outputStream
+            val stdoutOrig = process.inputStream
             val stderrOrig = process.errorStream
             val stdoutFd = ParcelFileDescriptor.dup(stdoutOrig.fileDescriptor)
             val stderrFd = ParcelFileDescriptor.dup(stderrOrig.fileDescriptor)
@@ -156,13 +159,37 @@ object ShizukuManager {
     }
 
     /**
+     * Copy a local file to a destination path using Shizuku shell STDIN pipe.
+     * Useful when direct file copy fails due to SELinux/permission restrictions.
+     */
+    fun copyToFile(source: File, destinationPath: String): Boolean {
+        if (!isAvailable) return false
+        return try {
+            val service = getService() ?: return false
+            val process = service.newProcess(arrayOf("sh", "-c", "cat > '$destinationPath'"), null, null)
+            val stdinOrig = process.outputStream
+            val stdinFd = ParcelFileDescriptor.dup(stdinOrig.fileDescriptor)
+            stdinOrig.close()
+            FileOutputStream(stdinFd.fileDescriptor).use { out ->
+                source.inputStream().use { it.copyTo(out) }
+            }
+            stdinFd.close()
+            process.waitFor() == 0
+        } catch (e: Exception) {
+            FileLog.w(TAG, "copyToFile via Shizuku failed: ${e.message}")
+            false
+        }
+    }
+
+    /**
      * Execute a shell command in the background (fire and forget).
      */
     fun execBackground(command: String) {
         if (!isAvailable) return
         try {
             val service = getService() ?: return
-            service.newProcess(arrayOf("sh", "-c", "$command &"), null, null)
+            val sanitized = command.trim().removeSuffix("&").trim()
+            service.newProcess(arrayOf("sh", "-c", "$sanitized &"), null, null)
         } catch (e: Exception) {
             FileLog.w(TAG, "Shizuku execBackground failed: ${e.message}")
         }
