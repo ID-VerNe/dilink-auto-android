@@ -52,75 +52,21 @@ fun PersistentNavBar(
 
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.SpaceEvenly,
         modifier = Modifier
             .width(navBarDp)
             .fillMaxHeight()
             .background(Color(0xFF0A0E14))
             .padding(vertical = 12.dp, horizontal = 4.dp)
     ) {
-        // Clock
-        ClockDisplay()
-
-        Spacer(Modifier.height(8.dp))
-
-        // Disconnect / Connection status
-        if (isPhoneConnected) {
-            NavActionButton(
-                icon = Icons.Default.LinkOff,
-                label = stringResource(R.string.nav_eject),
-                onClick = onDisconnect,
-                tint = Color(0xFFFF5252)
-            )
-        } else {
-            NetworkInfo(isConnected = false)
-        }
-
-        Spacer(Modifier.height(8.dp))
-
-        // Notifications button with badge
-        Box {
-            NavActionButton(
-                icon = Icons.Default.Notifications,
-                label = stringResource(R.string.nav_alerts),
-                onClick = onNotifications
-            )
-            if (notificationCount > 0) {
-                androidx.compose.material3.Badge(
-                    containerColor = Color(0xFFFF5252),
-                    modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .padding(end = 8.dp)
-                ) {
-                    Text("$notificationCount")
-                }
-            }
-        }
-
-        Spacer(Modifier.height(8.dp))
-
-        // Divider
-        Divider(color = Color(0xFF2A2F3A), thickness = 1.dp, modifier = Modifier.padding(horizontal = 8.dp))
-
-        Spacer(Modifier.height(8.dp))
-
-        // Recent apps
-        recentAppsState.recentApps.forEach { pkg ->
-            RecentAppIcon(
-                app = appMap[pkg],
-                isActive = pkg == activeAppPackage,
-                service = service,
-                onClick = { onAppClick(pkg) }
-            )
-            Spacer(Modifier.height(4.dp))
-        }
-
-        // Push bottom buttons to the bottom
-        Spacer(Modifier.weight(1f))
-
-        // Divider
-        Divider(color = Color(0xFF2A2F3A), thickness = 1.dp, modifier = Modifier.padding(horizontal = 8.dp))
-
-        Spacer(Modifier.height(8.dp))
+        // Disconnect button
+        NavActionButton(
+            icon = Icons.Default.LinkOff,
+            label = stringResource(R.string.nav_eject),
+            onClick = onDisconnect,
+            tint = Color(0xFFFF5252),
+            modifier = Modifier.weight(1f)
+        )
 
         // Home button
         NavActionButton(
@@ -129,8 +75,6 @@ fun PersistentNavBar(
             onClick = onHome,
             modifier = Modifier.weight(1f)
         )
-
-        Spacer(Modifier.height(4.dp))
 
         // Back button
         NavActionButton(

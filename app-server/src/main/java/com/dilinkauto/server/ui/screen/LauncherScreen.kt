@@ -5,6 +5,7 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.*
@@ -237,8 +238,24 @@ fun AppGrid(
     var searchQuery by remember { mutableStateOf("") }
     val gridState = rememberLazyGridState()
 
-    val filteredApps = remember(apps, searchQuery) {
-        val sorted = apps.sortedBy { it.appName.lowercase() }.distinctBy { it.packageName }
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val prefs = remember { context.getSharedPreferences("dilinkauto_pinned", android.content.Context.MODE_PRIVATE) }
+    var pinnedApps by remember {
+        mutableStateOf(prefs.getStringSet("pinned_apps", emptySet())?.toSet() ?: emptySet())
+    }
+
+    val togglePin: (String) -> Unit = { pkg ->
+        val newPinned = if (pinnedApps.contains(pkg)) pinnedApps - pkg else pinnedApps + pkg
+        pinnedApps = newPinned
+        prefs.edit().putStringSet("pinned_apps", newPinned).apply()
+    }
+
+    val filteredApps = remember(apps, searchQuery, pinnedApps) {
+        val distinct = apps.distinctBy { it.packageName }
+        val sorted = distinct.sortedWith(
+            compareByDescending<AppInfo> { pinnedApps.contains(it.packageName) }
+                .thenBy { it.appName.lowercase() }
+        )
         if (searchQuery.isBlank()) sorted
         else sorted.filter { it.appName.contains(searchQuery, ignoreCase = true) }
     }
@@ -266,7 +283,9 @@ fun AppGrid(
                             app = app,
                             iconSizePx = iconSizePx,
                             onClick = { onAppClick(app.packageName) },
-                            service = service
+                            service = service,
+                            isPinned = pinnedApps.contains(app.packageName),
+                            onTogglePin = { togglePin(app.packageName) }
                         )
                     }
                 }
@@ -318,7 +337,9 @@ fun AppTile(
     app: AppInfo,
     iconSizePx: Int,
     onClick: () -> Unit,
-    service: CarConnectionService
+    service: CarConnectionService,
+    isPinned: Boolean = false,
+    onTogglePin: () -> Unit = {}
 ) {
     val categoryIcon = when (app.category) {
         AppCategory.NAVIGATION -> Icons.Default.Navigation
@@ -342,7 +363,10 @@ fun AppTile(
 
     Column(
         modifier = Modifier
-            .clickable(indication = null, interactionSource = remember { MutableInteractionSource() }, onClick = onClick)
+            .combinedClickable(
+                onClick = onClick,
+                onLongClick = { menuExpanded = true }
+            )
             .padding(8.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
@@ -384,6 +408,19 @@ fun AppTile(
                 .clip(RoundedCornerShape(12.dp))
                 .background(MaterialTheme.colorScheme.surfaceVariant)
         ) {
+            DropdownMenuItem(
+                text = {
+                    Text(if (isPinned) "Unpin from Top" else "Pin to Top", color = Color.White, fontSize = 18.sp)
+                },
+                onClick = {
+                    menuExpanded = false
+                    onTogglePin()
+                },
+                leadingIcon = {
+                    Icon(if (isPinned) Icons.Default.PushPin else Icons.Default.PushPin, null, tint = Color(0xFFFFD54F), modifier = Modifier.size(28.dp))
+                },
+                modifier = Modifier.padding(vertical = 4.dp)
+            )
             DropdownMenuItem(
                 text = {
                     Text(stringResource(R.string.action_uninstall), color = Color.White, fontSize = 18.sp)
