@@ -45,8 +45,7 @@ Last updated: 2026-05-09
 
 - **Notification per-item dismiss and Clear All**: Car notification screen now has per-item dismiss buttons with slide-out animations and a "Clear All" header button. New protocol messages: `NOTIFICATION_CLEAR` (0x04) and `NOTIFICATION_CLEAR_ALL` (0x05) on data channel. Per-item icons from phone's `iconPng` payload.
 - **App context actions**: Long-press on app tiles (launcher) and nav bar recent apps shows dropdown menu with Uninstall and App Info. Uninstall propagation via `APP_UNINSTALL` (0x1B) / `APP_UNINSTALLED` (0x06). App Info displays car-side dialog with `APP_INFO_DATA` (0x07) metadata from phone. Context menu actions route through VD server for shell-level access.
-- **App shortcuts infrastructure** (disabled in UI): Protocol messages `APP_SHORTCUTS` (0x18) / `APP_SHORTCUTS_LIST` (0x19) / `APP_SHORTCUT_ACTION` (0x1A) with VD server query + APK XML fallback. Disabled while label resolution is refined (issue #57).
-- **Back button fix**: GO_BACK now closes activities one-by-one before returning to the home menu, using proper stack tracking and `FOCUSED_APP` (0x16) messages.
+- **Back button fix**: GO_BACK now closes activities one-by-one before returning to the home menu, using proper stack tracking via `dumpsys activity activities` on the VD server.
 - **Samsung DeX / Desktop Mode DPI** (reverted): Initial implementation using `UiModeManager.currentModeType` detection and 213dpi was reverted in dev-02. Replaced by VD-level flag removal approach.
 
 ### v0.16.0 (2026-04-29)
@@ -421,7 +420,6 @@ Phone (Xiaomi 17 Pro Max, HyperOS 3, Android 16)
 │   │   ├── acceptConnection() — NIO non-blocking accept
 │   │   ├── NioReader (Selector-based, FRAME_INTERVAL_MS timeout)
 │   │   └── Video relay via videoConnection, stack empty via controlConnection
-│   └── NotificationService (captures phone notifications with progress)
 │
 ├── VD Server (app_process, shell UID 2000)
 │   ├── NIO write queue (ConcurrentLinkedQueue) + Selector-based command reader

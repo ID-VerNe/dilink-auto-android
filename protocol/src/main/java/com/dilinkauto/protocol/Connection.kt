@@ -247,7 +247,7 @@ class Connection(
     }
 
     fun sendFrame(frame: FrameCodec.Frame) {
-        // Public senders run on arbitrary threads (UI, NotificationService, etc).
+        // Public senders run on arbitrary threads (UI, service scope, etc).
         // Route through the scope so the suspending enqueueFrame can apply
         // backpressure without forcing every caller to be a suspend function.
         if (!connected.get()) throw IOException("Not connected")

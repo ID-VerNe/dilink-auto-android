@@ -71,8 +71,6 @@
     <string name="perm_battery_granted">Maintient la diffusion même écran éteint</string>
     <string name="perm_accessibility">Service d\'accessibilité</string>
     <string name="perm_accessibility_granted">Permet le contrôle tactile depuis la voiture</string>
-    <string name="perm_notifications">Accès aux notifications</string>
-    <string name="perm_notifications_granted">Transmet les notifications sur l\'écran de la voiture</string>
     <string name="perm_granted">Accordé</string>
     <string name="perm_usb_debugging">Débogage USB</string>
     <string name="perm_usb_desc">Requis sur le téléphone et la voiture</string>
@@ -110,8 +108,6 @@
     <string name="onboarding_battery_desc">Maintient la connexion quand l\'écran est éteint. Sans cela, la diffusion s\'arrête en veille.</string>
     <string name="onboarding_accessibility_title">Service d\'accessibilité</string>
     <string name="onboarding_accessibility_desc">Permet à l\'écran de la voiture de contrôler le téléphone. Sans cela, vous verrez l\'écran sans pouvoir toucher.</string>
-    <string name="onboarding_notification_title">Accès aux notifications</string>
-    <string name="onboarding_notification_desc">Affiche les notifications du téléphone sur l\'écran de la voiture. Sans cela, vous manquerez appels et messages.</string>
     <string name="onboarding_car_setup_title">Avant de connecter</string>
     <string name="onboarding_car_setup_desc">Assurez-vous que tout est prêt avant de connecter :</string>
     <string name="onboarding_car_prereq_wifi_adb">Débogage Wi-Fi ADB activé sur la voiture</string>
@@ -171,6 +167,13 @@
 
     <!-- Settings Sections -->
     <string name="settings_distribution">Distribution</string>
+    <!-- Car App Allowlist -->
+    <string name="allowlist_title">Car app allowlist</string>
+    <string name="allowlist_desc">Choose which apps appear on the car. Unselected apps never reach the car, reducing load.</string>
+    <string name="allowlist_select_all">Select all</string>
+    <string name="allowlist_deselect_all">Deselect all</string>
+    <string name="allowlist_search_hint">Search apps</string>
+    <string name="allowlist_empty">No apps selected — the car home screen will be empty.</string>
 
     <!-- Install on Car Status -->
     <string name="car_install_status_searching">Recherche de la voiture</string>

@@ -53,7 +53,7 @@ data class HandshakeRequest(
     val deviceName: String,
     val screenWidth: Int,
     val screenHeight: Int,
-    val supportedFeatures: Int = FEATURE_VIDEO or FEATURE_AUDIO or FEATURE_NOTIFICATIONS,
+    val supportedFeatures: Int = FEATURE_VIDEO or FEATURE_AUDIO,
     val displayMode: Byte = DISPLAY_MODE_VIRTUAL,
     val screenDpi: Int = 160,
     val appVersionCode: Int,
@@ -242,90 +242,6 @@ data class TouchMoveBatch(val pointers: List<TouchEvent>) {
     }
 }
 
-// ─── Notifications ───
-
-data class NotificationData(
-    val id: Int,
-    val packageName: String,
-    val appName: String,
-    val title: String,
-    val text: String,
-    val timestamp: Long,
-    val progressIndeterminate: Boolean = false,
-    val progress: Int = 0,
-    val progressMax: Int = 0,
-    val iconPng: ByteArray = ByteArray(0)
-) {
-    fun encode(): ByteArray {
-        val fields = listOf(packageName, appName, title, text)
-        val fieldBytes = fields.map { it.toByteArray(Charsets.UTF_8) }
-        val baseSize = 4 + fieldBytes.sumOf { 2 + it.size } + 8 + 1
-        val progSize = if (progressIndeterminate) 0 else 4 + 4
-        val iconSize = 4 + iconPng.size
-        val totalSize = baseSize + progSize + iconSize
-        val buf = ByteBuffer.allocate(totalSize).order(ByteOrder.BIG_ENDIAN)
-        buf.putInt(id)
-        fieldBytes.forEach { bytes ->
-            buf.putShort(bytes.size.toShort())
-            buf.put(bytes)
-        }
-        buf.putLong(timestamp)
-        buf.put(if (progressIndeterminate) 1.toByte() else 0.toByte())
-        if (!progressIndeterminate) {
-            buf.putInt(progress)
-            buf.putInt(progressMax)
-        }
-        buf.putInt(iconPng.size)
-        if (iconPng.isNotEmpty()) buf.put(iconPng)
-        return buf.array()
-    }
-
-    override fun equals(other: Any?): Boolean {
-        if (this === other) return true
-        if (other !is NotificationData) return false
-        return id == other.id && packageName == other.packageName &&
-            appName == other.appName && title == other.title &&
-            text == other.text && timestamp == other.timestamp &&
-            progressIndeterminate == other.progressIndeterminate &&
-            progress == other.progress && progressMax == other.progressMax &&
-            iconPng.contentEquals(other.iconPng)
-    }
-
-    override fun hashCode(): Int {
-        var result = id
-        result = 31 * result + packageName.hashCode()
-        result = 31 * result + appName.hashCode()
-        result = 31 * result + title.hashCode()
-        result = 31 * result + text.hashCode()
-        result = 31 * result + timestamp.hashCode()
-        result = 31 * result + progressIndeterminate.hashCode()
-        result = 31 * result + progress
-        result = 31 * result + progressMax
-        result = 31 * result + iconPng.contentHashCode()
-        return result
-    }
-
-    companion object {
-        fun decode(data: ByteArray): NotificationData {
-            val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
-            val id = buf.getInt()
-            val pkg = buf.readShortLengthPrefixed()
-            val app = buf.readShortLengthPrefixed()
-            val title = buf.readShortLengthPrefixed()
-            val text = buf.readShortLengthPrefixed()
-            val ts = buf.getLong()
-            val indeterminate = if (buf.remaining() >= 1) buf.get() != 0.toByte() else false
-            val prog = if (!indeterminate && buf.remaining() >= 4) buf.getInt() else 0
-            val progMax = if (!indeterminate && buf.remaining() >= 4) buf.getInt() else 0
-            val iconPng = if (buf.remaining() >= 4) {
-                val iconLen = buf.getInt()
-                if (iconLen > 0 && buf.remaining() >= iconLen) buf.readBytes(iconLen) else ByteArray(0)
-            } else ByteArray(0)
-            return NotificationData(id, pkg, app, title, text, ts, indeterminate, prog, progMax, iconPng)
-        }
-    }
-}
-
 // ─── App List ───
 
 data class AppInfo(
@@ -479,31 +395,6 @@ enum class MediaAction(val id: Byte) {
     }
 }
 
-// ─── Notification Clear (car → phone) ───
-
-data class ClearNotificationMessage(
-    val id: Int,
-    val packageName: String
-) {
-    fun encode(): ByteArray {
-        val pkgBytes = packageName.toByteArray(Charsets.UTF_8)
-        val buf = ByteBuffer.allocate(4 + 2 + pkgBytes.size).order(ByteOrder.BIG_ENDIAN)
-        buf.putInt(id)
-        buf.putShort(pkgBytes.size.toShort())
-        buf.put(pkgBytes)
-        return buf.array()
-    }
-
-    companion object {
-        fun decode(data: ByteArray): ClearNotificationMessage {
-            val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
-            val id = buf.getInt()
-            val pkg = buf.readShortLengthPrefixed()
-            return ClearNotificationMessage(id, pkg)
-        }
-    }
-}
-
 // ─── Launch App (car → phone) ───
 
 data class LaunchAppMessage(val packageName: String) {
@@ -565,87 +456,6 @@ data class AppInfoDataMessage(
     }
 }
 
-/** Shortcut info for an app */
-data class AppShortcut(
-    val id: String,
-    val shortLabel: String,
-    val longLabel: String = ""
-)
-
-/** Phone → Car: list of shortcuts for a requested app */
-data class AppShortcutsListMessage(
-    val packageName: String,
-    val shortcuts: List<AppShortcut>
-) {
-    fun encode(): ByteArray {
-        val pkgBytes = packageName.toByteArray(Charsets.UTF_8)
-        val shortcutBuffers = shortcuts.map { s ->
-            val idBytes = s.id.toByteArray(Charsets.UTF_8)
-            val shortBytes = s.shortLabel.toByteArray(Charsets.UTF_8)
-            val longBytes = s.longLabel.toByteArray(Charsets.UTF_8)
-            ByteBuffer.allocate(2 + idBytes.size + 2 + shortBytes.size + 2 + longBytes.size)
-                .order(ByteOrder.BIG_ENDIAN)
-                .putShort(idBytes.size.toShort())
-                .apply { put(idBytes) }
-                .putShort(shortBytes.size.toShort())
-                .apply { put(shortBytes) }
-                .putShort(longBytes.size.toShort())
-                .apply { put(longBytes) }
-                .array()
-        }
-        val totalSize = 2 + pkgBytes.size + 2 + shortcutBuffers.sumOf { it.size }
-        val buf = ByteBuffer.allocate(totalSize).order(ByteOrder.BIG_ENDIAN)
-        buf.putShort(pkgBytes.size.toShort())
-        buf.put(pkgBytes)
-        buf.putShort(shortcuts.size.toShort())
-        shortcutBuffers.forEach { buf.put(it) }
-        return buf.array()
-    }
-
-    companion object {
-        fun decode(data: ByteArray): AppShortcutsListMessage {
-            val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
-            val pkg = buf.readShortLengthPrefixed()
-            val count = buf.getShort().toInt() and 0xFFFF
-            val shortcuts = (0 until count).map {
-                AppShortcut(
-                    id = buf.readShortLengthPrefixed(),
-                    shortLabel = buf.readShortLengthPrefixed(),
-                    longLabel = buf.readShortLengthPrefixed()
-                )
-            }
-            return AppShortcutsListMessage(pkg, shortcuts)
-        }
-    }
-}
-
-/** Car → Phone: execute a shortcut action */
-data class AppShortcutActionMessage(
-    val packageName: String,
-    val shortcutId: String
-) {
-    fun encode(): ByteArray {
-        val pkgBytes = packageName.toByteArray(Charsets.UTF_8)
-        val idBytes = shortcutId.toByteArray(Charsets.UTF_8)
-        val buf = ByteBuffer.allocate(2 + pkgBytes.size + 2 + idBytes.size)
-            .order(ByteOrder.BIG_ENDIAN)
-        buf.putShort(pkgBytes.size.toShort())
-        buf.put(pkgBytes)
-        buf.putShort(idBytes.size.toShort())
-        buf.put(idBytes)
-        return buf.array()
-    }
-
-    companion object {
-        fun decode(data: ByteArray): AppShortcutActionMessage {
-            val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
-            val pkg = buf.readShortLengthPrefixed()
-            val shortcutId = buf.readShortLengthPrefixed()
-            return AppShortcutActionMessage(pkg, shortcutId)
-        }
-    }
-}
-
 // ─── Constants ───
 
 const val PROTOCOL_VERSION = 1
@@ -655,7 +465,6 @@ const val DISPLAY_MODE_VIRTUAL: Byte = 1
 
 const val FEATURE_VIDEO = 0x01
 const val FEATURE_AUDIO = 0x02
-const val FEATURE_NOTIFICATIONS = 0x04
 const val FEATURE_MEDIA_CONTROL = 0x08
 const val FEATURE_NAVIGATION = 0x10
 

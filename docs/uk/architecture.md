@@ -104,7 +104,6 @@ DiLink-Auto/
 |-----------|------|---------|
 | ConnectionService | `service/ConnectionService.kt` | Прийом на 3 портах (9637/9638/9639), розгортання VD JAR, автооновлення автомобіля, розумний мережевий зворотний виклик |
 | VirtualDisplayClient | `display/VirtualDisplayClient.kt` | NIO прийом на localhost:19637, ретрансляція відео (videoConnection), пересилання дотиків, порожній стек (controlConnection) |
-| NotificationService | `service/NotificationService.kt` | Захоплення та пересилання сповіщень телефону з прогресом |
 | InputInjectionService | `service/InputInjectionService.kt` | Резервний метод ін'єкції дотиків (фізичний дисплей) |
 | FileLog | `FileLog.kt` | Файлове логування до `/sdcard/DiLinkAuto/client.log`, ротація, обхід фільтрації logcat |
 | MainActivity | `MainActivity.kt` | UI — старт/стоп, статус дозволів, кнопка Install on Car |

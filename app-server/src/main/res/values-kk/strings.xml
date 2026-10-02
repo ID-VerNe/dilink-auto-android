@@ -94,4 +94,5 @@
     <string name="status_updating_please_wait">Автокөлік қолданбасы жаңартылуда… Күте тұрыңыз</string>
     <string name="action_uninstall">Жою</string>
     <string name="action_app_info">Қолданба туралы ақпарат</string>
+    <string name="home_allowlist_empty">No apps allowed. Open the phone app and select apps in Settings > Car app allowlist.</string>
 </resources>

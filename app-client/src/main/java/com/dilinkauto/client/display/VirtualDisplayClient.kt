@@ -6,16 +6,14 @@ import com.dilinkauto.protocol.NioReader
 import kotlinx.coroutines.*
 import java.net.InetSocketAddress
 import java.nio.ByteBuffer
-import java.util.concurrent.ConcurrentHashMap
 import java.nio.channels.ServerSocketChannel
 import java.nio.channels.SocketChannel
 
 /**
  * Lifecycle channel to the VD server process running as shell UID.
  *
- * Receives display-ready signal, stack-empty and focused-app notifications,
- * and shortcut query results from the VD server over localhost.
- * Sends CMD_STOP and shortcut queries to the VD server.
+ * Receives display-ready and stack-empty notifications from the VD server over
+ * localhost. Sends CMD_STOP to the VD server.
  *
  * Video and touch flow directly between VD server and car (ports 9638/9639).
  * This class handles only the lifecycle/command channel on localhost:19647.
@@ -43,11 +41,7 @@ class VirtualDisplayClient(
 
     // Callbacks for relaying VD signals to ConnectionService
     var onStackEmpty: (() -> Unit)? = null
-    var onFocusedApp: ((String) -> Unit)? = null
     var onDisplayReady: (() -> Unit)? = null
-
-    // Async response channels for VD server shortcut queries
-    private val shortcutResponses = ConcurrentHashMap<String, CompletableDeferred<String>>()
 
     /**
      * Opens the ServerSocket immediately (synchronous, instant).
@@ -130,7 +124,7 @@ class VirtualDisplayClient(
     }
 
     /**
-     * Reads non-video messages from the VD server (stack empty, focused app, shortcut results).
+     * Reads non-video messages from the VD server (stack empty).
      */
     private fun startCommandRelay() {
         commandRelayJob = scope.launch(Dispatchers.IO) {
@@ -145,26 +139,6 @@ class VirtualDisplayClient(
                             FileLog.i(TAG, "VD stack empty")
                             onStackEmpty?.invoke()
                         }
-                        MSG_FOCUSED_APP -> {
-                            val pkgLen = rdr.readInt()
-                            val pkgBytes = ByteArray(pkgLen)
-                            rdr.readFully(pkgBytes, 0, pkgLen)
-                            val focusedPkg = String(pkgBytes, Charsets.UTF_8)
-                            FileLog.i(TAG, "VD focused app: $focusedPkg")
-                            onFocusedApp?.invoke(focusedPkg)
-                        }
-                        MSG_SHORTCUTS_RESULT -> {
-                            val pkgLen = rdr.readInt()
-                            val pkgBytes = ByteArray(pkgLen)
-                            rdr.readFully(pkgBytes, 0, pkgLen)
-                            val pkg = String(pkgBytes, Charsets.UTF_8)
-                            val dataLen = rdr.readInt()
-                            val dataBytes = ByteArray(dataLen)
-                            rdr.readFully(dataBytes, 0, dataLen)
-                            val data = String(dataBytes, Charsets.UTF_8)
-                            FileLog.i(TAG, "Shortcut result for $pkg: ${data.length} chars")
-                            shortcutResponses.remove(pkg)?.complete(data)
-                        }
                         else -> {
                             FileLog.w(TAG, "Unknown VD msg type: 0x${msgType.toString(16)}")
                         }
@@ -174,33 +148,6 @@ class VirtualDisplayClient(
                 FileLog.e(TAG, "Command relay error", e)
                 isConnected = false
             }
-        }
-    }
-
-    /**
-     * Query app shortcuts via the VD server (which has shell access).
-     * Returns the raw output from "cmd shortcut get-shortcuts" or null on timeout/failure.
-     */
-    suspend fun queryShortcuts(packageName: String): String? {
-        val ch = channel ?: return null
-        val deferred = CompletableDeferred<String>()
-        shortcutResponses[packageName] = deferred
-        try {
-            val buf = ByteBuffer.allocate(1024)
-            val bytes = packageName.toByteArray(Charsets.UTF_8)
-            buf.put(CMD_QUERY_SHORTCUTS.toByte())
-            buf.putInt(bytes.size)
-            buf.put(bytes)
-            buf.flip()
-            synchronized(writeLock) {
-                FrameCodec.writeAll(ch, buf)
-            }
-            return withTimeout(5000L) { deferred.await() }
-        } catch (e: Exception) {
-            FileLog.w(TAG, "VD shortcut query failed for $packageName: ${e.message}")
-            return null
-        } finally {
-            shortcutResponses.remove(packageName)
         }
     }
 
@@ -223,8 +170,6 @@ class VirtualDisplayClient(
     fun disconnect() {
         isConnected = false
         commandRelayJob?.cancel()
-        shortcutResponses.values.forEach { try { it.complete("") } catch (_: Exception) {} }
-        shortcutResponses.clear()
         reader?.close()
         try { serverChannel?.close() } catch (_: Exception) {}
         try { channel?.close() } catch (_: Exception) {}
@@ -242,10 +187,7 @@ class VirtualDisplayClient(
         // Must match VirtualDisplayServer constants
         private const val MSG_DISPLAY_READY: Byte = 0x10
         private const val MSG_STACK_EMPTY: Byte = 0x11
-        private const val MSG_FOCUSED_APP: Byte = 0x12
-        private const val MSG_SHORTCUTS_RESULT: Byte = 0x13
 
-        private const val CMD_QUERY_SHORTCUTS = 0x25
         private const val CMD_STOP = 0xFF
     }
 }

@@ -104,7 +104,6 @@ VD serverini joylashtirishni, avtomobilni avto-yangilashni, 3-ulanish releysini 
 |-----------|------|---------|
 | ConnectionService | `service/ConnectionService.kt` | 3-port qabul qilish (9637/9638/9639), VD JAR joylashtirish, avtomobil avto-yangilash, aqlli tarmoq qayta chaqiruvi |
 | VirtualDisplayClient | `display/VirtualDisplayClient.kt` | localhost:19637 da NIO qabul qilish, video releyi (videoConnection), teginishlarni yo'naltirish, bo'sh stek (controlConnection) |
-| NotificationService | `service/NotificationService.kt` | Progress bilan telefon xabarnomalarini olish va yo'naltirish |
 | InputInjectionService | `service/InputInjectionService.kt` | Teginish inyeksiyasining zaxira usuli (fizik displey) |
 | FileLog | `FileLog.kt` | `/sdcard/DiLinkAuto/client.log` ga faylga jurnal yozish, rotatsiya, logcat filtrlashini aylanib o'tish |
 | MainActivity | `MainActivity.kt` | UI — ishga tushirish/to'xtatish, ruxsat holati, Install on Car tugmasi |

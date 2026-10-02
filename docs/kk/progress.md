@@ -23,8 +23,7 @@
 
 - **Хабарландыруларды бір-бірден жабу және Барлығын тазарту**: Көлік хабарландыру экранында енді slide-out анимациясымен элемент бойынша жабу түймелері және тақырыпта "Clear All" түймесі бар. Жаңа протокол хабарламалары: деректер арнасында `NOTIFICATION_CLEAR` (0x04) және `NOTIFICATION_CLEAR_ALL` (0x05). Телефонның `iconPng` жүктемесінен элемент иконкалары.
 - **Қолданба контекстік әрекеттері**: Қолданба плиткаларын (іске қосқыш) және навигация панеліндегі соңғы қолданбаларды ұзақ басу Жою және Қолданба туралы ақпарат бар ашылмалы мәзірді көрсетеді. Жою `APP_UNINSTALL` (0x1B) / `APP_UNINSTALLED` (0x06) арқылы таралады. Қолданба туралы ақпарат телефоннан `APP_INFO_DATA` (0x07) метадеректерімен көлік жағындағы диалогты көрсетеді. Контекстік мәзір әрекеттері shell деңгейінде қол жеткізу үшін VD сервері арқылы бағытталады.
-- **Қолданба жарлықтары инфрақұрылымы** (UI-де өшірілген): VD сервері сұрауы + APK XML резервімен `APP_SHORTCUTS` (0x18) / `APP_SHORTCUTS_LIST` (0x19) / `APP_SHORTCUT_ACTION` (0x1A) протокол хабарламалары. Белгілерді ажырату нақтыланғанша өшірілген (issue #57).
-- **Артқа түймесін түзету**: GO_BACK енді басты мәзірге оралмас бұрын әрекеттерді бір-бірден жабады, дұрыс стек бақылауын және `FOCUSED_APP` (0x16) хабарламаларын пайдаланады.
+- **Артқа түймесін түзету**: GO_BACK енді басты мәзірге оралмас бұрын әрекеттерді бір-бірден жабады, дұрыс стек бақылауын және `dumpsys activity activities` (0x16) хабарламаларын пайдаланады.
 - **Samsung DeX / Жұмыс үстелі режимі DPI** (кері қайтарылды): `UiModeManager.currentModeType` анықтауын және 213dpi пайдаланатын бастапқы іске асыру dev-02-де кері қайтарылды. VD деңгейіндегі жалаушаны жою тәсілімен ауыстырылды.
 
 ### v0.16.0 (2026-04-29)
@@ -399,7 +398,6 @@ Phone (Xiaomi 17 Pro Max, HyperOS 3, Android 16)
 │   │   ├── acceptConnection() — NIO non-blocking accept
 │   │   ├── NioReader (Selector-based, FRAME_INTERVAL_MS timeout)
 │   │   └── Video relay via videoConnection, stack empty via controlConnection
-│   └── NotificationService (captures phone notifications with progress)
 │
 ├── VD Server (app_process, shell UID 2000)
 │   ├── NIO write queue (ConcurrentLinkedQueue) + Selector-based command reader

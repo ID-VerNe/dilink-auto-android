@@ -23,8 +23,7 @@
 
 - **Закрыццё апавяшчэнняў па адным і Clear All**: Экран апавяшчэнняў аўтамабіля цяпер мае кнопкі закрыцця па элеменце з анімацыяй slide-out і кнопку "Clear All" у загалоўку. Новыя паведамленні пратаколу: `NOTIFICATION_CLEAR` (0x04) і `NOTIFICATION_CLEAR_ALL` (0x05) на канале даных. Іконкі элементаў з payload `iconPng` тэлефона.
 - **Кантэкстныя дзеянні прыкладанняў**: Доўгі націск на пліткі прыкладанняў (launcher) і нядаўнія прыкладанні панэлі навігацыі паказвае выпадальнае меню з Выдаліць і Інфармацыя пра прыкладанне. Распаўсюджанне выдалення праз `APP_UNINSTALL` (0x1B) / `APP_UNINSTALLED` (0x06). Інфармацыя пра прыкладанне паказвае дыялог на баку аўтамабіля з метаданымі `APP_INFO_DATA` (0x07) ад тэлефона. Дзеянні кантэкстнага меню праходзяць праз VD-сервер для доступу на ўзроўні shell.
-- **Інфраструктура ярлыкоў прыкладанняў** (адключана ў UI): Паведамленні пратаколу `APP_SHORTCUTS` (0x18) / `APP_SHORTCUTS_LIST` (0x19) / `APP_SHORTCUT_ACTION` (0x1A) з запытам праз VD-сервер + APK XML fallback. Адключана да дапрацоўкі разрознення метак (issue #57).
-- **Выпраўленне кнопкі назад**: GO_BACK цяпер закрывае актыўнасці па адной перад вяртаннем у галоўнае меню, выкарыстоўваючы адсочванне стэку і паведамленні `FOCUSED_APP` (0x16).
+- **Выпраўленне кнопкі назад**: GO_BACK цяпер закрывае актыўнасці па адной перад вяртаннем у галоўнае меню, выкарыстоўваючы адсочванне стэку і паведамленні `dumpsys activity activities` (0x16).
 - **DPI для Samsung DeX / Рэжым працоўнага стала** (адменена): Першапачатковая рэалізацыя з выяўленнем `UiModeManager.currentModeType` і 213dpi была адменена ў dev-02. Заменена падыходам выдалення флага на ўзроўні VD.
 
 ### v0.16.0 (2026-04-29)
@@ -399,7 +398,6 @@ Phone (Xiaomi 17 Pro Max, HyperOS 3, Android 16)
 │   │   ├── acceptConnection() — NIO non-blocking accept
 │   │   ├── NioReader (Selector-based, FRAME_INTERVAL_MS timeout)
 │   │   └── Video relay via videoConnection, stack empty via controlConnection
-│   └── NotificationService (captures phone notifications with progress)
 │
 ├── VD Server (app_process, shell UID 2000)
 │   ├── NIO write queue (ConcurrentLinkedQueue) + Selector-based command reader

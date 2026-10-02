@@ -16,8 +16,7 @@
 
 - **Закриття сповіщень по одному та Очистити всі**: Екран сповіщень автомобіля тепер має кнопки закриття по елементу з анімацією slide-out та кнопку "Очистити всі" у заголовку. Нові повідомлення протоколу: `NOTIFICATION_CLEAR` (0x04) та `NOTIFICATION_CLEAR_ALL` (0x05) на каналі даних. Іконки елементів з payload `iconPng` телефону.
 - **Контекстні дії додатків**: Довге натискання на плитки додатків (лаунчер) та нещодавні додатки панелі навігації показує випадаюче меню з Видалити та Інформація про додаток. Поширення видалення через `APP_UNINSTALL` (0x1B) / `APP_UNINSTALLED` (0x06). Інформація про додаток показує діалог на стороні автомобіля з метаданими `APP_INFO_DATA` (0x07) від телефону. Дії контекстного меню проходять через VD-сервер для доступу на рівні shell.
-- **Інфраструктура ярликів додатків** (відключено в UI): Повідомлення протоколу `APP_SHORTCUTS` (0x18) / `APP_SHORTCUTS_LIST` (0x19) / `APP_SHORTCUT_ACTION` (0x1A) із запитом через VD-сервер + APK XML fallback. Відключено до доопрацювання розрізнення міток (issue #57).
-- **Виправлення кнопки назад**: GO_BACK тепер закриває активності по одній перед поверненням до головного меню, використовуючи відстеження стеку та повідомлення `FOCUSED_APP` (0x16).
+- **Виправлення кнопки назад**: GO_BACK тепер закриває активності по одній перед поверненням до головного меню, використовуючи відстеження стеку та повідомлення `dumpsys activity activities` (0x16).
 - **DPI для Samsung DeX / Режим робочого столу** (скасовано): Початкова реалізація з виявленням `UiModeManager.currentModeType` та 213dpi була скасована в dev-02. Замінена підходом видалення прапора на рівні VD.
 
 ### v0.16.0 (2026-04-29)
@@ -392,7 +391,6 @@ Phone (Xiaomi 17 Pro Max, HyperOS 3, Android 16)
 │   │   ├── acceptConnection() — NIO non-blocking accept
 │   │   ├── NioReader (Selector-based, FRAME_INTERVAL_MS timeout)
 │   │   └── Video relay via videoConnection, stack empty via controlConnection
-│   └── NotificationService (captures phone notifications with progress)
 │
 ├── VD Server (app_process, shell UID 2000)
 │   ├── NIO write queue (ConcurrentLinkedQueue) + Selector-based command reader

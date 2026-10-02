@@ -115,25 +115,9 @@ Same format as LAUNCH_APP. Confirms the app was launched.
 
 Empty payload. Sent after GO_BACK when the VD server detects no remaining app tasks on the virtual display (via `dumpsys activity activities`). The car uses this to switch from mirror view to home screen.
 
-### FOCUSED_APP (0x16) -- Phone -> Car
-
-Payload: UTF-8 package name. Sent when an app gains focus on the virtual display. The car uses this to update its app tracking state.
-
 ### APP_INFO (0x17) -- Car -> Phone
 
 Payload: UTF-8 package name. Car requests the phone to open the system app info/settings screen for the given package.
-
-### APP_SHORTCUTS (0x18) -- Car -> Phone
-
-Payload: UTF-8 package name. Car requests available Android 7.1+ app shortcuts for the given package. **Disabled in UI** — infrastructure (VD server query + APK XML fallback) is in place but shortcuts are hidden pending refinement (issue #57).
-
-### APP_SHORTCUTS_LIST (0x19) -- Phone -> Car
-
-Payload: `AppShortcutsListMessage` — package name + list of shortcut descriptors (id, shortLabel, longLabel). Sent in response to APP_SHORTCUTS request.
-
-### APP_SHORTCUT_ACTION (0x1A) -- Car -> Phone
-
-Payload: `AppShortcutActionMessage` — package name + shortcut id. Starts the specific shortcut on the virtual display.
 
 ### APP_UNINSTALL (0x1B) -- Car -> Phone
 

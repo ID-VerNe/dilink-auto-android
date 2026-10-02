@@ -115,25 +115,9 @@ Mesmo formato de LAUNCH_APP. Confirma que o app foi iniciado.
 
 Carga vazia. Enviado apos GO_BACK quando o servidor VD detecta que nao ha tarefas de app restantes no virtual display (via `dumpsys activity activities`). O carro usa isso para mudar da visualizacao de espelho para a tela home.
 
-### FOCUSED_APP (0x16) -- Celular -> Carro
-
-Carga: UTF-8 nome do pacote. Enviado quando um app ganha foco no virtual display. O carro usa isso para atualizar seu estado de rastreamento de apps.
-
 ### APP_INFO (0x17) -- Carro -> Celular
 
 Carga: UTF-8 nome do pacote. O carro solicita que o celular abra a tela de informacoes/configuracoes do sistema para o pacote fornecido.
-
-### APP_SHORTCUTS (0x18) -- Carro -> Celular
-
-Carga: UTF-8 nome do pacote. O carro solicita os atalhos de app Android 7.1+ disponiveis para o pacote fornecido. **Desativado na UI** — a infraestrutura (consulta do servidor VD + fallback APK XML) esta pronta, mas os atalhos estao ocultos pendentes de refinamento (issue #57).
-
-### APP_SHORTCUTS_LIST (0x19) -- Celular -> Carro
-
-Carga: `AppShortcutsListMessage` — nome do pacote + lista de descritores de atalho (id, shortLabel, longLabel). Enviado em resposta a solicitacao APP_SHORTCUTS.
-
-### APP_SHORTCUT_ACTION (0x1A) -- Carro -> Celular
-
-Carga: `AppShortcutActionMessage` — nome do pacote + id do atalho. Inicia o atalho especifico no virtual display.
 
 ### APP_UNINSTALL (0x1B) -- Carro -> Celular
 

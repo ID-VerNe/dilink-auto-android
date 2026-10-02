@@ -115,25 +115,9 @@ LAUNCH_APP bilan bir xil format. Ilova ishga tushirilganini tasdiqlaydi.
 
 Bo'sh yuklama. GO_BACK dan keyin VD serveri virtual displeyda qolgan ilova vazifalari yo'qligini aniqlaganda yuboriladi (`dumpsys activity activities` orqali). Avtomobil buni ko'zgu ko'rinishidan bosh ekranga o'tish uchun ishlatadi.
 
-### FOCUSED_APP (0x16) -- Phone -> Car
-
-Yuklama: UTF-8 package name. Virtual displeyda ilova fokus olganda yuboriladi. Avtomobil buni ilova kuzatish holatini yangilash uchun ishlatadi.
-
 ### APP_INFO (0x17) -- Car -> Phone
 
 Yuklama: UTF-8 package name. Avtomobil telefondan berilgan paket uchun tizim ilova ma'lumot/sozlamalar ekranini ochishni so'raydi.
-
-### APP_SHORTCUTS (0x18) -- Car -> Phone
-
-Yuklama: UTF-8 package name. Avtomobil berilgan paket uchun mavjud Android 7.1+ ilova yorliqlarini so'raydi. **UI da o'chirilgan** — infratuzilma (VD server so'rovi + APK XML zaxirasi) mavjud, ammo yorliqlar aniqlashtirilguncha yashirilgan (issue #57).
-
-### APP_SHORTCUTS_LIST (0x19) -- Phone -> Car
-
-Yuklama: `AppShortcutsListMessage` — package name + yorliq deskriptorlari ro'yxati (id, shortLabel, longLabel). APP_SHORTCUTS so'roviga javob sifatida yuboriladi.
-
-### APP_SHORTCUT_ACTION (0x1A) -- Car -> Phone
-
-Yuklama: `AppShortcutActionMessage` — package name + shortcut id. Virtual displeyda aniq yorliqni ishga tushiradi.
 
 ### APP_UNINSTALL (0x1B) -- Car -> Phone
 

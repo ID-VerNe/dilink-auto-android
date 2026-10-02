@@ -25,11 +25,9 @@ import androidx.compose.ui.unit.sp
 import com.dilinkauto.server.R
 import com.dilinkauto.server.service.CarConnectionService
 import com.dilinkauto.server.ui.nav.PersistentNavBar
-import com.dilinkauto.server.ui.nav.RecentAppsState
 import com.dilinkauto.server.ui.screen.CarLaunchScreen
 import com.dilinkauto.server.ui.screen.HomeContent
 import com.dilinkauto.server.ui.screen.MirrorContent
-import com.dilinkauto.server.ui.screen.NotificationContent
 import com.dilinkauto.server.ui.theme.CarTheme
 
 class MainActivity : ComponentActivity() {
@@ -137,54 +135,36 @@ class MainActivity : ComponentActivity() {
 }
 
 enum class Screen {
-    HOME, APP, NOTIFICATIONS
+    HOME, APP
 }
 
 @Composable
 fun CarShell(service: CarConnectionService) {
-    val context = androidx.compose.ui.platform.LocalContext.current
-    val recentAppsState = remember { RecentAppsState(context) }
     var currentScreen by remember { mutableStateOf(Screen.HOME) }
-    var activeAppPackage by remember { mutableStateOf<String?>(null) }
 
     val state by service.state.collectAsState()
     val appList by service.appList.collectAsState()
-    val notifications by service.notifications.collectAsState()
     val statusMessage by service.statusMessage.collectAsState()
     val videoReady by service.videoReady.collectAsState()
     val isConnected = state == CarConnectionService.State.STREAMING ||
             state == CarConnectionService.State.CONNECTED
 
+    // During a mid-stream rotation, onCarViewportChanged sets state to CONNECTING but
+    // keeps the app list (a real disconnect clears it in handleDisconnect). Keep the
+    // streaming layout visible so CarContentArea's video-wait overlay covers the ~2s
+    // VD redeploy gap instead of flashing the full CarLaunchScreen.
+    val showStreamingMode = appList.isNotEmpty() &&
+            (isConnected || state == CarConnectionService.State.CONNECTING)
+
     // When VD stack empties (after back presses), go to home screen
     LaunchedEffect(Unit) {
         service.vdStackEmpty.collect {
             currentScreen = Screen.HOME
-            activeAppPackage = null
-        }
-    }
-
-    // When the focused app changes on the VD (after back presses close an app),
-    // update the nav bar to reflect the new active app
-    LaunchedEffect(Unit) {
-        service.focusedApp.collect { pkg ->
-            if (pkg != null) {
-                activeAppPackage = pkg
-                currentScreen = Screen.APP
-            }
-        }
-    }
-
-    // Prune recent apps when the app list updates
-    LaunchedEffect(appList) {
-        if (appList.isNotEmpty()) {
-            recentAppsState.pruneUnavailable(appList.map { it.packageName }.toSet())
         }
     }
 
     val launchApp: (String) -> Unit = { pkg ->
         service.launchApp(pkg)
-        activeAppPackage = pkg
-        recentAppsState.onAppLaunched(pkg)
         currentScreen = Screen.APP
     }
 
@@ -219,8 +199,6 @@ fun CarShell(service: CarConnectionService) {
         )
     }
 
-    val showStreamingMode = appList.isNotEmpty() && isConnected
-
     if (showStreamingMode) {
         val configuration = androidx.compose.ui.platform.LocalConfiguration.current
         val isLandscape = configuration.screenWidthDp > configuration.screenHeightDp
@@ -231,33 +209,18 @@ fun CarShell(service: CarConnectionService) {
                     .fillMaxSize()
                     .background(MaterialTheme.colorScheme.background)
             ) {
-                // Persistent left nav bar (streaming mode only)
                 PersistentNavBar(
-                    recentAppsState = recentAppsState,
-                    activeAppPackage = activeAppPackage,
-                    isPhoneConnected = isConnected,
-                    appList = appList,
-                    service = service,
-                    notificationCount = notifications.size,
-                    onAppClick = launchApp,
                     onBack = { service.goBack() },
                     onHome = {
                         service.goHome()
                         currentScreen = Screen.HOME
-                        activeAppPackage = null
-                    },
-                    onNotifications = {
-                        currentScreen = if (currentScreen == Screen.NOTIFICATIONS) Screen.HOME
-                            else Screen.NOTIFICATIONS
                     },
                     onDisconnect = {
                         service.disconnectFromPhone()
                         currentScreen = Screen.HOME
-                        activeAppPackage = null
                     }
                 )
 
-                // Content area
                 CarContentArea(
                     service = service,
                     currentScreen = currentScreen,
@@ -273,7 +236,6 @@ fun CarShell(service: CarConnectionService) {
                     .fillMaxSize()
                     .background(MaterialTheme.colorScheme.background)
             ) {
-                // Content area
                 CarContentArea(
                     service = service,
                     currentScreen = currentScreen,
@@ -284,27 +246,14 @@ fun CarShell(service: CarConnectionService) {
                 )
 
                 com.dilinkauto.server.ui.nav.PersistentBottomNavBar(
-                    recentAppsState = recentAppsState,
-                    activeAppPackage = activeAppPackage,
-                    isPhoneConnected = isConnected,
-                    appList = appList,
-                    service = service,
-                    notificationCount = notifications.size,
-                    onAppClick = launchApp,
                     onBack = { service.goBack() },
                     onHome = {
                         service.goHome()
                         currentScreen = Screen.HOME
-                        activeAppPackage = null
-                    },
-                    onNotifications = {
-                        currentScreen = if (currentScreen == Screen.NOTIFICATIONS) Screen.HOME
-                            else Screen.NOTIFICATIONS
                     },
                     onDisconnect = {
                         service.disconnectFromPhone()
                         currentScreen = Screen.HOME
-                        activeAppPackage = null
                     }
                 )
             }
@@ -317,10 +266,9 @@ fun CarShell(service: CarConnectionService) {
 
 /**
  * Shared content area for streaming mode. Renders the mirror surface, the
- * "waiting for video" overlay when the stream isn't ready, and the
- * home/notifications screens. Used by both the landscape (Row) and portrait
- * (Column) layouts in [CarShell] so the two branches differ only in nav-bar
- * placement.
+ * "waiting for video" overlay when the stream isn't ready, and the home
+ * screen. Used by both the landscape (Row) and portrait (Column) layouts in
+ * [CarShell] so the two branches differ only in nav-bar placement.
  */
 @Composable
 private fun CarContentArea(
@@ -356,7 +304,6 @@ private fun CarContentArea(
                 }
             }
             currentScreen == Screen.HOME -> HomeContent(service = service, onAppClick = launchApp)
-            currentScreen == Screen.NOTIFICATIONS -> NotificationContent(service = service, onAppLaunch = launchApp)
         }
     }
 }

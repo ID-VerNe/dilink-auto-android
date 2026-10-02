@@ -115,25 +115,9 @@ Control-з'єднання встановлюється першим (тут ві
 
 Порожній payload. Надсилається після GO_BACK, коли VD-сервер виявляє відсутність залишкових задач додатків на віртуальному дисплеї (через `dumpsys activity activities`). Автомобіль використовує це для перемикання з дзеркального вигляду на домашній екран.
 
-### FOCUSED_APP (0x16) -- Phone -> Car
-
-Payload: UTF-8 package name. Надсилається, коли додаток отримує фокус на віртуальному дисплеї. Автомобіль використовує це для оновлення стану відстеження додатків.
-
 ### APP_INFO (0x17) -- Car -> Phone
 
 Payload: UTF-8 package name. Автомобіль запитує телефон відкрити системний екран інформації/налаштувань для зазначеного пакету.
-
-### APP_SHORTCUTS (0x18) -- Car -> Phone
-
-Payload: UTF-8 package name. Автомобіль запитує доступні ярлики додатків Android 7.1+ для зазначеного пакету. **Відключено в UI** — інфраструктура (запит VD-сервера + APK XML fallback) готова, але ярлики приховані до доопрацювання (issue #57).
-
-### APP_SHORTCUTS_LIST (0x19) -- Phone -> Car
-
-Payload: `AppShortcutsListMessage` — package name + список дескрипторів ярликів (id, shortLabel, longLabel). Надсилається у відповідь на запит APP_SHORTCUTS.
-
-### APP_SHORTCUT_ACTION (0x1A) -- Car -> Phone
-
-Payload: `AppShortcutActionMessage` — package name + shortcut id. Запускає конкретний ярлик на віртуальному дисплеї.
 
 ### APP_UNINSTALL (0x1B) -- Car -> Phone
 

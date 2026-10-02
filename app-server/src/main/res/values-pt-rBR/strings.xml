@@ -94,4 +94,5 @@
     <string name="status_updating_please_wait">Atualizando app do carro… Aguarde</string>
     <string name="action_uninstall">Desinstalar</string>
     <string name="action_app_info">Info do app</string>
+    <string name="home_allowlist_empty">No apps allowed. Open the phone app and select apps in Settings > Car app allowlist.</string>
 </resources>

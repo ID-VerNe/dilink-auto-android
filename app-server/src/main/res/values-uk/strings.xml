@@ -94,4 +94,5 @@
     <string name="status_updating_please_wait">Оновлення застосунку авто… Будь ласка, зачекайте</string>
     <string name="action_uninstall">Видалити</string>
     <string name="action_app_info">Відомості</string>
+    <string name="home_allowlist_empty">No apps allowed. Open the phone app and select apps in Settings > Car app allowlist.</string>
 </resources>

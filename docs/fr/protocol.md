@@ -115,25 +115,9 @@ Même format que LAUNCH_APP. Confirme que l'application a été lancée.
 
 Charge utile vide. Envoyé après GO_BACK quand le serveur VD détecte qu'il ne reste plus de tâches d'application sur le virtual display (via `dumpsys activity activities`). La voiture utilise cela pour passer de la vue miroir à l'écran d'accueil.
 
-### FOCUSED_APP (0x16) -- Téléphone -> Voiture
-
-Payload : UTF-8 package name. Envoyé quand une application gagne le focus sur le virtual display. La voiture utilise cela pour mettre à jour son état de suivi d'application.
-
 ### APP_INFO (0x17) -- Voiture -> Téléphone
 
 Payload : UTF-8 package name. La voiture demande au téléphone d'ouvrir l'écran d'infos/paramètres système pour le package donné.
-
-### APP_SHORTCUTS (0x18) -- Voiture -> Téléphone
-
-Payload : UTF-8 package name. La voiture demande les raccourcis d'application Android 7.1+ disponibles pour le package donné. **Désactivé dans l'UI** — l'infrastructure (requête serveur VD + fallback APK XML) est en place mais les raccourcis sont masqués en attente de raffinement (issue #57).
-
-### APP_SHORTCUTS_LIST (0x19) -- Téléphone -> Voiture
-
-Payload : `AppShortcutsListMessage` — package name + liste de descripteurs de raccourcis (id, shortLabel, longLabel). Envoyé en réponse à la requête APP_SHORTCUTS.
-
-### APP_SHORTCUT_ACTION (0x1A) -- Voiture -> Téléphone
-
-Payload : `AppShortcutActionMessage` — package name + shortcut id. Démarre le raccourci spécifique sur le virtual display.
 
 ### APP_UNINSTALL (0x1B) -- Voiture -> Téléphone
 

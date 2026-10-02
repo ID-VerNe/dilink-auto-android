@@ -107,7 +107,6 @@ Gère le déploiement du serveur VD, la mise à jour automatique de la voiture, 
 |-----------|------|---------|
 | ConnectionService | `service/ConnectionService.kt` | Acceptation 3 ports (9637/9638/9639), déploiement JAR VD, mise à jour auto voiture, callback réseau intelligent |
 | VirtualDisplayClient | `display/VirtualDisplayClient.kt` | Acceptation NIO sur localhost:19637, relais vidéo (videoConnection), transfert tactile, pile vide (controlConnection) |
-| NotificationService | `service/NotificationService.kt` | Capture et transfère les notifications du téléphone avec progression |
 | InputInjectionService | `service/InputInjectionService.kt` | Solution de repli pour l'injection tactile (écran physique) |
 | FileLog | `FileLog.kt` | Journalisation fichier vers `/sdcard/DiLinkAuto/client.log`, rotation, contourne le filtrage logcat |
 | MainActivity | `MainActivity.kt` | UI — démarrer/arrêter, statut des permissions, bouton Installer sur la voiture |

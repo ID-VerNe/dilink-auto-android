@@ -128,9 +128,6 @@ class CarConnectionService : Service() {
     private val _appList = MutableStateFlow<List<AppInfo>>(emptyList())
     val appList: StateFlow<List<AppInfo>> = _appList.asStateFlow()
 
-    private val _notifications = MutableStateFlow<List<NotificationData>>(emptyList())
-    val notifications: StateFlow<List<NotificationData>> = _notifications.asStateFlow()
-
     private val _mediaMetadata = MutableStateFlow<MediaMetadata?>(null)
     val mediaMetadata: StateFlow<MediaMetadata?> = _mediaMetadata.asStateFlow()
 
@@ -140,17 +137,11 @@ class CarConnectionService : Service() {
     private val _vdStackEmpty = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     val vdStackEmpty: SharedFlow<Unit> = _vdStackEmpty.asSharedFlow()
 
-    private val _focusedApp = MutableStateFlow<String?>(null)
-    val focusedApp: StateFlow<String?> = _focusedApp.asStateFlow()
-
     private val _videoReady = MutableStateFlow(false)
     val videoReady: StateFlow<Boolean> = _videoReady.asStateFlow()
 
     private val _statusMessage = MutableStateFlow("")
     val statusMessage: StateFlow<String> = _statusMessage.asStateFlow()
-
-    private val _shortcutsCache = MutableStateFlow<Map<String, List<AppShortcut>>>(emptyMap())
-    val shortcutsCache: StateFlow<Map<String, List<AppShortcut>>> = _shortcutsCache.asStateFlow()
 
     private val _appInfoData = MutableStateFlow<AppInfoDataMessage?>(null)
     val appInfoData: StateFlow<AppInfoDataMessage?> = _appInfoData.asStateFlow()
@@ -718,18 +709,7 @@ class CarConnectionService : Service() {
             }
             ControlMsg.VD_STACK_EMPTY -> {
                 carLogSend("VD stack empty — switching to home")
-                _focusedApp.value = null
                 _vdStackEmpty.tryEmit(Unit)
-            }
-            ControlMsg.APP_SHORTCUTS_LIST -> {
-                val msg = AppShortcutsListMessage.decode(frame.payload)
-                carLogSend("Shortcuts received: ${msg.shortcuts.size} for ${msg.packageName}")
-                _shortcutsCache.value = _shortcutsCache.value + (msg.packageName to msg.shortcuts)
-            }
-            ControlMsg.FOCUSED_APP -> {
-                val pkg = String(frame.payload, Charsets.UTF_8)
-                carLogSend("Focused app: $pkg")
-                _focusedApp.value = pkg
             }
         }
     }
@@ -783,15 +763,6 @@ class CarConnectionService : Service() {
                     val prepared = ServerApp.iconCache.prepareAll(apps, gridIconPx)
                     carLogSend("App list: ${apps.size} apps, ${prepared} icons prepared @ ${gridIconPx}px")
                 }
-            }
-            DataMsg.NOTIFICATION_POST -> {
-                val n = NotificationData.decode(frame.payload)
-                // Replace existing notification with same ID (handles progress updates)
-                _notifications.value = _notifications.value.filter { it.id != n.id || it.packageName != n.packageName } + n
-            }
-            DataMsg.NOTIFICATION_REMOVE -> {
-                val n = NotificationData.decode(frame.payload)
-                _notifications.value = _notifications.value.filter { it.id != n.id || it.packageName != n.packageName }
             }
             DataMsg.MEDIA_METADATA -> { _mediaMetadata.value = MediaMetadata.decode(frame.payload) }
             DataMsg.MEDIA_PLAYBACK_STATE -> { _playbackState.value = PlaybackState.decode(frame.payload) }
@@ -1077,41 +1048,6 @@ class CarConnectionService : Service() {
     fun requestAppInfo(packageName: String) {
         sendCommandToVd(ControlMsg.APP_INFO, packageName.toByteArray(Charsets.UTF_8))
         carLogSend("Requested app info: $packageName")
-    }
-
-    fun requestShortcuts(packageName: String) {
-        // Shortcuts still go through phone (request-reply via lifecycle channel 19647)
-        _shortcutsCache.value = _shortcutsCache.value - packageName
-        scope.launch(Dispatchers.IO) {
-            try {
-                controlConnection?.sendControl(ControlMsg.APP_SHORTCUTS, packageName.toByteArray(Charsets.UTF_8))
-                carLogSend("Requested shortcuts: $packageName")
-            } catch (e: Exception) { carLogSend("requestShortcuts failed: ${e.message}", "E") }
-        }
-    }
-
-    fun executeShortcut(packageName: String, shortcutId: String) {
-        val msg = AppShortcutActionMessage(packageName, shortcutId)
-        sendCommandToVd(ControlMsg.APP_SHORTCUT_ACTION, msg.encode())
-        carLogSend("Execute shortcut: $shortcutId for $packageName")
-    }
-
-    fun clearNotification(id: Int, packageName: String) {
-        _notifications.value = _notifications.value.filter { it.id != id || it.packageName != packageName }
-        scope.launch(Dispatchers.IO) {
-            try {
-                val msg = ClearNotificationMessage(id, packageName)
-                controlConnection?.sendData(DataMsg.NOTIFICATION_CLEAR, msg.encode())
-            } catch (e: Exception) { carLogSend("clearNotification failed: ${e.message}", "E") }
-        }
-    }
-
-    fun clearAllNotifications() {
-        _notifications.value = emptyList()
-        scope.launch(Dispatchers.IO) {
-            try { controlConnection?.sendData(DataMsg.NOTIFICATION_CLEAR_ALL, ByteArray(0)) }
-            catch (e: Exception) { carLogSend("clearAllNotifications failed: ${e.message}", "E") }
-        }
     }
 
     fun disconnectFromPhone() {

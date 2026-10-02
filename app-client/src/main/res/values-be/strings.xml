@@ -71,8 +71,6 @@
     <string name="perm_battery_granted">Падтрымлівае трансляцыю, калі экран выключаны</string>
     <string name="perm_accessibility">Спецыяльныя магчымасці</string>
     <string name="perm_accessibility_granted">Уключае сэнсарнае кіраванне з аўтамабіля</string>
-    <string name="perm_notifications">Доступ да апавяшчэнняў</string>
-    <string name="perm_notifications_granted">Перасылае апавяшчэнні на дысплей аўтамабіля</string>
     <string name="perm_granted">Дазволена</string>
     <string name="perm_usb_debugging">Адладка праз USB</string>
     <string name="perm_usb_desc">Патрэбна на тэлефоне і аўтамабілі</string>
@@ -108,8 +106,6 @@
     <string name="onboarding_battery_desc">Падтрымлівае злучэнне, калі экран выключаны. Без гэтага трансляцыя спыняецца, калі тэлефон засынае.</string>
     <string name="onboarding_accessibility_title">Спецыяльныя магчымасці</string>
     <string name="onboarding_accessibility_desc">Дазваляе сэнсарнаму экрану аўтамабіля кіраваць тэлефонам. Без гэтага вы будзеце бачыць экран, але не зможаце націскаць.</string>
-    <string name="onboarding_notification_title">Доступ да апавяшчэнняў</string>
-    <string name="onboarding_notification_desc">Паказвае апавяшчэнні тэлефона на дысплеі аўтамабіля. Без гэтага вы прапусціце званкі і паведамленні падчас кіравання.</string>
     <string name="onboarding_car_setup_title">Перад падключэннем</string>
     <string name="onboarding_car_setup_desc">Пераканайцеся, што ўсё гатова да падключэння:</string>
     <string name="onboarding_car_prereq_wifi_adb">Wi-Fi ADB уключаны на аўто</string>
@@ -171,6 +167,13 @@
 
     <!-- Settings Sections -->
     <string name="settings_distribution">Распаўсюджванне</string>
+    <!-- Car App Allowlist -->
+    <string name="allowlist_title">Car app allowlist</string>
+    <string name="allowlist_desc">Choose which apps appear on the car. Unselected apps never reach the car, reducing load.</string>
+    <string name="allowlist_select_all">Select all</string>
+    <string name="allowlist_deselect_all">Deselect all</string>
+    <string name="allowlist_search_hint">Search apps</string>
+    <string name="allowlist_empty">No apps selected — the car home screen will be empty.</string>
 
     <!-- Install on Car Status -->
     <string name="car_install_status_searching">Пошук аўтамабіля</string>

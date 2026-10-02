@@ -71,8 +71,6 @@
     <string name="perm_battery_granted">Экран өшірулі кезде трансляцияны сақтайды</string>
     <string name="perm_accessibility">Арнайы мүмкіндіктер қызметі</string>
     <string name="perm_accessibility_granted">Автокөліктен сенсорлық басқаруды қосады</string>
-    <string name="perm_notifications">Хабарландыруларға қол жеткізу</string>
-    <string name="perm_notifications_granted">Хабарландыруларды автокөлік дисплейіне жібереді</string>
     <string name="perm_granted">Берілді</string>
     <string name="perm_usb_debugging">USB арқылы жөндеу</string>
     <string name="perm_usb_desc">Телефонда да, автокөлікте де қажет</string>
@@ -108,8 +106,6 @@
     <string name="onboarding_battery_desc">Экран өшірулі кезде қосылымды сақтайды. Онсыз телефон ұйқы режиміне өткенде трансляция тоқтайды.</string>
     <string name="onboarding_accessibility_title">Арнайы мүмкіндіктер қызметі</string>
     <string name="onboarding_accessibility_desc">Автокөліктің сенсорлық экраны телефонды басқаруына мүмкіндік береді. Онсыз экранды көресіз, бірақ түрте алмайсыз.</string>
-    <string name="onboarding_notification_title">Хабарландыруларға қол жеткізу</string>
-    <string name="onboarding_notification_desc">Телефон хабарландыруларын автокөлік дисплейінде көрсетеді. Онсыз жүргізу кезінде қоңыраулар мен хабарларды өткізіп аласыз.</string>
     <string name="onboarding_car_setup_title">Қосылу алдында</string>
     <string name="onboarding_car_setup_desc">Қосылу алдында барлығы дайын екеніне көз жеткізіңіз:</string>
     <string name="onboarding_car_prereq_wifi_adb">Автокөлікте Wi-Fi ADB қосулы</string>
@@ -171,6 +167,13 @@
 
     <!-- Settings Sections -->
     <string name="settings_distribution">Тарату</string>
+    <!-- Car App Allowlist -->
+    <string name="allowlist_title">Car app allowlist</string>
+    <string name="allowlist_desc">Choose which apps appear on the car. Unselected apps never reach the car, reducing load.</string>
+    <string name="allowlist_select_all">Select all</string>
+    <string name="allowlist_deselect_all">Deselect all</string>
+    <string name="allowlist_search_hint">Search apps</string>
+    <string name="allowlist_empty">No apps selected — the car home screen will be empty.</string>
 
     <!-- Install on Car Status -->
     <string name="car_install_status_searching">Автокөлік ізделуде</string>

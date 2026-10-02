@@ -54,7 +54,23 @@ fun HomeContent(
 
     Column(Modifier.fillMaxSize()) {
         // Main content
-        if (state == CarConnectionService.State.STREAMING && appList.isNotEmpty()) {
+        if (state == CarConnectionService.State.STREAMING && appList.isEmpty()) {
+            // Connected but no apps in the allowlist — show an explanatory empty state
+            // instead of the connection screen, which would imply the link is down.
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(32.dp),
+                contentAlignment = androidx.compose.ui.Alignment.Center
+            ) {
+                Text(
+                    stringResource(R.string.home_allowlist_empty),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontSize = 16.sp,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                )
+            }
+        } else if (state == CarConnectionService.State.STREAMING && appList.isNotEmpty()) {
             AppGrid(
                 apps = appList,
                 onAppClick = onAppClick,

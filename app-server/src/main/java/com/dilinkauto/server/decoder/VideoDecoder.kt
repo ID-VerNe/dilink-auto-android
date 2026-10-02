@@ -54,6 +54,12 @@ class VideoDecoder {
     // before start() is called or while the queue is full.
     @Volatile
     private var configData: ByteArray? = null
+    // Most recent IDR keyframe cached while the decoder is stopped. On rotation the
+    // decoder stops before the fresh IDR arrives; without this cache the new codec
+    // instance would have CONFIG but no reference frame, so P-frames render nothing
+    // until the next live IDR (1-2s of black). start() feeds this right after CONFIG.
+    @Volatile
+    private var cachedKeyFrame: ByteArray? = null
     @Volatile
     private var seekingKeyFrame = false
 
@@ -157,6 +163,16 @@ class VideoDecoder {
                 log("Feeding cached CONFIG (${config.size} bytes)")
                 feedBuffer(decoder, config, MediaCodec.BUFFER_FLAG_CODEC_CONFIG)
                 configFed = true
+            }
+
+            // Feed the cached IDR (captured while the decoder was stopped) so the
+            // codec has a reference frame immediately and P-frames render without
+            // waiting for the next live IDR. seekingKeyFrame stays false — this
+            // keyframe IS the reference, not a post-flush resync.
+            cachedKeyFrame?.let { key ->
+                log("Feeding cached KEYFRAME for cold-start reference (${key.size} bytes)")
+                feedBuffer(decoder, key, 0)
+                cachedKeyFrame = null
             }
 
             // With 4-frame queue, catchup is unnecessary — frames arrive on time or get dropped.
@@ -314,13 +330,19 @@ class VideoDecoder {
         if (isConfig || isKey || receiveCount <= 3 || receiveCount % 60 == 0L) {
             log("onFrameReceived #$receiveCount isConfig=$isConfig isKey=$isKey size=${data.size} running=${running.get()} queue=${frameQueue.size}")
         }
-        // Always cache CONFIG — needed to bootstrap the next decoder instance
+        // Always cache CONFIG — needed to bootstrap the next decoder instance.
+        // A fresh CONFIG establishes a new stream boundary, so any stale cached
+        // keyframe from the previous stream must be discarded.
         if (isConfig) {
             configData = data
+            cachedKeyFrame = null
         }
-        // When stopped, only cache CONFIG.
+        // When stopped, cache the most recent IDR so start() can feed it as a
+        // reference frame. P-frames are dropped (no codec to decode them).
         if (!running.get() && !isConfig) {
-            if (isKey) keyFramesDropped++
+            if (isKey) {
+                cachedKeyFrame = data
+            }
             return
         }
         val frame = FrameData(isConfig, isKey, data)
@@ -372,6 +394,7 @@ class VideoDecoder {
         if (!running.getAndSet(false)) return
         log("Stopping decoder: fed=$frameCount rendered=$renderCount drops=$dropCount inputFails=$inputFailCount")
         frameQueue.clear()
+        cachedKeyFrame = null
         feedThread?.interrupt()
         try { feedThread?.join(2000) } catch (_: InterruptedException) {}
         feedThread = null

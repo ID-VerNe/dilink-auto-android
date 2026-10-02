@@ -108,47 +108,7 @@ class AdversarialDecodingTest {
         assertEquals("", decoded.vdServerJarPath)
     }
 
-    // ─── 3. NotificationData Boundaries ───
-
-    @Test
-    fun testNotificationData_MSBStringLengths() {
-        val buf = ByteBuffer.allocate(30).order(ByteOrder.BIG_ENDIAN)
-        buf.putInt(1) // id
-        buf.putShort(0x8000.toShort()) // pkg len = 32768
-        try {
-            NotificationData.decode(buf.array())
-            fail("Expected ProtocolDecodeException")
-        } catch (e: NegativeArraySizeException) {
-            fail("NegativeArraySizeException thrown: MSB not masked!")
-        } catch (e: ProtocolDecodeException) {
-            // Expected
-        }
-    }
-
-    @Test
-    fun testNotificationData_NegativeIconLenSafe() {
-        val n = NotificationData(
-            id = 1,
-            packageName = "pkg",
-            appName = "app",
-            title = "title",
-            text = "text",
-            timestamp = 1000L
-        )
-        val encoded = n.encode()
-        // Corrupt icon length to negative integer (-1)
-        val corrupted = encoded.clone()
-        val iconLenOffset = encoded.size - 4
-        corrupted[iconLenOffset] = 0xFF.toByte()
-        corrupted[iconLenOffset + 1] = 0xFF.toByte()
-        corrupted[iconLenOffset + 2] = 0xFF.toByte()
-        corrupted[iconLenOffset + 3] = 0xFF.toByte()
-
-        val decoded = NotificationData.decode(corrupted)
-        assertEquals(0, decoded.iconPng.size)
-    }
-
-    // ─── 4. AppListMessage Boundaries ───
+    // ─── 3. AppListMessage Boundaries ───
 
     @Test
     fun testAppListMessage_MSBCount() {
@@ -171,7 +131,7 @@ class AdversarialDecodingTest {
         assertTrue(decoded.apps.isEmpty())
     }
 
-    // ─── 5. MediaMetadata & ClearNotification Boundaries ───
+    // ─── 5. MediaMetadata Boundaries ───
 
     @Test
     fun testMediaMetadata_MSBLengths() {
@@ -187,50 +147,7 @@ class AdversarialDecodingTest {
         }
     }
 
-    @Test
-    fun testClearNotification_MSBLength() {
-        val buf = ByteBuffer.allocate(10).order(ByteOrder.BIG_ENDIAN)
-        buf.putInt(100)
-        buf.putShort(0xFFFF.toShort())
-        try {
-            ClearNotificationMessage.decode(buf.array())
-            fail("Expected ProtocolDecodeException")
-        } catch (e: NegativeArraySizeException) {
-            fail("NegativeArraySizeException thrown!")
-        } catch (e: ProtocolDecodeException) {
-            // Expected
-        }
-    }
-
-    // ─── 6. AppShortcutsList & Action Boundaries ───
-
-    @Test
-    fun testAppShortcutsList_MSBLengths() {
-        val buf = ByteBuffer.allocate(10).order(ByteOrder.BIG_ENDIAN)
-        buf.putShort(0x8000.toShort()) // pkgLen
-        try {
-            AppShortcutsListMessage.decode(buf.array())
-            fail("Expected ProtocolDecodeException")
-        } catch (e: NegativeArraySizeException) {
-            fail("NegativeArraySizeException thrown!")
-        } catch (e: ProtocolDecodeException) {
-            // Expected
-        }
-    }
-
-    @Test
-    fun testAppShortcutsAction_MSBLengths() {
-        val buf = ByteBuffer.allocate(10).order(ByteOrder.BIG_ENDIAN)
-        buf.putShort(0x8000.toShort()) // pkgLen
-        try {
-            AppShortcutActionMessage.decode(buf.array())
-            fail("Expected ProtocolDecodeException")
-        } catch (e: NegativeArraySizeException) {
-            fail("NegativeArraySizeException thrown!")
-        } catch (e: ProtocolDecodeException) {
-            // Expected
-        }
-    }
+    // ─── 6. AppInfoData Boundaries ───
 
     @Test
     fun testAppInfoDataMessage_MSBLengths() {

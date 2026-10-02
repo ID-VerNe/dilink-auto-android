@@ -73,8 +73,6 @@
     <string name="perm_battery_granted">Keeps streaming alive when screen is off</string>
     <string name="perm_accessibility">Accessibility Service</string>
     <string name="perm_accessibility_granted">Enables car touchscreen control</string>
-    <string name="perm_notifications">Notification Access</string>
-    <string name="perm_notifications_granted">Forwards notifications to car display</string>
     <string name="perm_granted">Granted</string>
     <string name="perm_usb_debugging">USB Debugging</string>
     <string name="perm_usb_desc">Required on both phone and car</string>
@@ -114,8 +112,6 @@
     <string name="onboarding_battery_desc">Keeps the connection alive when your screen is off. Without this, streaming stops whenever your phone sleeps.</string>
     <string name="onboarding_accessibility_title">Accessibility Service</string>
     <string name="onboarding_accessibility_desc">Lets the car\'s touchscreen control your phone. Without this, you\'ll see the screen but can\'t tap anything.</string>
-    <string name="onboarding_notification_title">Notification Access</string>
-    <string name="onboarding_notification_desc">Shows phone notifications on the car display. Without this, you\'ll miss calls and messages while driving.</string>
     <string name="onboarding_car_setup_title">Before You Connect</string>
     <string name="onboarding_car_setup_desc">Make sure everything is ready before connecting:</string>
     <string name="onboarding_car_prereq_wifi_adb">Wi-Fi ADB enabled on car</string>
@@ -176,6 +172,14 @@
     <!-- Settings Sections -->
     <string name="settings_distribution">Distribution</string>
     <string name="settings_debug">Debug</string>
+
+    <!-- Car App Allowlist -->
+    <string name="allowlist_title">Car app allowlist</string>
+    <string name="allowlist_desc">Choose which apps appear on the car. Unselected apps never reach the car, reducing load.</string>
+    <string name="allowlist_select_all">Select all</string>
+    <string name="allowlist_deselect_all">Deselect all</string>
+    <string name="allowlist_search_hint">Search apps</string>
+    <string name="allowlist_empty">No apps selected — the car home screen will be empty.</string>
     <string name="log_enabled">Diagnostic logs</string>
     <string name="log_enabled_desc">Write logs to file for troubleshooting. Disable for better performance.</string>
 

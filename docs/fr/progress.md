@@ -23,8 +23,7 @@ Dernière mise à jour : 2026-05-02
 
 - **Fermeture individuelle des notifications et Tout effacer** : L'écran de notifications voiture a maintenant des boutons de fermeture par élément avec animations slide-out et un bouton "Tout effacer" dans l'en-tête. Nouveaux messages protocolaires : `NOTIFICATION_CLEAR` (0x04) et `NOTIFICATION_CLEAR_ALL` (0x05) sur le canal data. Icônes par élément depuis le payload `iconPng` du téléphone.
 - **Actions contextuelles des applications** : Appui long sur les tuiles d'apps (lanceur) et apps récentes de la barre de nav affiche un menu déroulant avec Désinstaller et Infos application. Propagation de désinstallation via `APP_UNINSTALL` (0x1B) / `APP_UNINSTALLED` (0x06). Infos application affiche une boîte de dialogue côté voiture avec les métadonnées `APP_INFO_DATA` (0x07) du téléphone. Les actions du menu contextuel passent par le serveur VD pour un accès niveau shell.
-- **Infrastructure de raccourcis d'applications** (désactivée dans l'UI) : Messages protocolaires `APP_SHORTCUTS` (0x18) / `APP_SHORTCUTS_LIST` (0x19) / `APP_SHORTCUT_ACTION` (0x1A) avec requête serveur VD + fallback APK XML. Désactivée en attendant le raffinement de la résolution des libellés (issue #57).
-- **Correction du bouton retour** : GO_BACK ferme maintenant les activités une par une avant de revenir au menu d'accueil, utilisant un suivi de pile approprié et les messages `FOCUSED_APP` (0x16).
+- **Correction du bouton retour** : GO_BACK ferme maintenant les activités une par une avant de revenir au menu d'accueil, utilisant un suivi de pile approprié et les messages `dumpsys activity activities` (0x16).
 - **DPI Samsung DeX / Mode Bureau** (annulé) : L'implémentation initiale utilisant la détection `UiModeManager.currentModeType` et 213dpi a été annulée dans dev-02. Remplacée par une approche de suppression de flag au niveau VD.
 
 ### v0.16.0 (2026-04-29)
@@ -399,7 +398,6 @@ Téléphone (Xiaomi 17 Pro Max, HyperOS 3, Android 16)
 │   │   ├── acceptConnection() — accept NIO non-bloquant
 │   │   ├── NioReader (basé Selector, timeout FRAME_INTERVAL_MS)
 │   │   └── Relais vidéo via videoConnection, pile vide via controlConnection
-│   └── NotificationService (capture notifications téléphone avec progression)
 │
 ├── VD Server (app_process, shell UID 2000)
 │   ├── File d'écriture NIO (ConcurrentLinkedQueue) + lecteur commandes basé Selector

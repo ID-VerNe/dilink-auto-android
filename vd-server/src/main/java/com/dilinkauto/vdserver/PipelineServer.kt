@@ -77,10 +77,7 @@ class PipelineServer(
     companion object {
         private const val MSG_DISPLAY_READY: Byte = 0x10
         private const val MSG_STACK_EMPTY: Byte = 0x11
-        private const val MSG_FOCUSED_APP: Byte = 0x12
-        private const val MSG_SHORTCUTS_RESULT: Byte = 0x13
         private const val CMD_STOP = 0xFF
-        private const val CMD_QUERY_SHORTCUTS: Byte = 0x25
         private const val BITRATE = 8_000_000
         private const val I_FRAME_INTERVAL = 1
         private const val MAX_POINTERS = 10
@@ -565,12 +562,11 @@ class PipelineServer(
             ControlMsg.GO_RECENT -> { execShell("input -d $displayId keyevent 187"); checkStackEmpty() }
             ControlMsg.APP_UNINSTALL -> execShell("pm uninstall ${String(f.payload, Charsets.UTF_8)}")
             ControlMsg.APP_INFO -> { val pkg = String(f.payload, Charsets.UTF_8); val s = execShellOutput("cmd package resolve-activity --brief -a android.settings.APPLICATION_DETAILS_SETTINGS com.android.settings")?.trim(); if (!s.isNullOrEmpty()) execShell("am start --display $displayId -n $s -d \"package:$pkg\"") else execShell("am start --display $displayId -a android.settings.APPLICATION_DETAILS_SETTINGS -d \"package:$pkg\"") }
-            ControlMsg.APP_SHORTCUTS -> { val pkg = String(f.payload, Charsets.UTF_8); val o = execShellOutput("cmd shortcut get-shortcuts --package $pkg 2>/dev/null") ?: ""; if (o.isNotBlank()) sendShortcutResult(pkg, o) }
         }
     }
     private fun launchApp(pkg: String) { try { val c = execShellOutput("cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.LAUNCHER $pkg 2>/dev/null | tail -1")?.trim(); if (!c.isNullOrEmpty()) execShell("am start --display $displayId -n $c") else execShell("am start --display $displayId -a android.intent.action.MAIN -c android.intent.category.LAUNCHER $pkg") } catch (e: Exception) { err("launch: ${e.message}") } }
 
-    private fun checkStackEmpty() { Thread({ try { Thread.sleep(300); val d = execShellOutput("dumpsys activity activities 2>/dev/null") ?: ""; val m = "Display #$displayId "; val s = d.indexOf(m); if (s < 0) { enqueueResponse(MSG_STACK_EMPTY, ByteArray(0)) } else { val nd = d.indexOf("Display #", s+m.length); val sec = if (nd >= 0) d.substring(s, nd) else d.substring(s); if (sec.lines().none { it.contains("Task{") }) enqueueResponse(MSG_STACK_EMPTY, ByteArray(0)); else { Regex("topResumedActivity=ActivityRecord\\{[^}]*\\s+(\\S+)/").find(sec)?.let { enqueueResponse(MSG_FOCUSED_APP, it.groupValues[1].toByteArray(Charsets.UTF_8)) } ?: enqueueResponse(MSG_STACK_EMPTY, ByteArray(0)) } } } catch (_: Exception) {} }, "StackCheck").start() }
+    private fun checkStackEmpty() { Thread({ try { Thread.sleep(300); val d = execShellOutput("dumpsys activity activities 2>/dev/null") ?: ""; val m = "Display #$displayId "; val s = d.indexOf(m); if (s < 0) { enqueueResponse(MSG_STACK_EMPTY, ByteArray(0)) } else { val nd = d.indexOf("Display #", s+m.length); val sec = if (nd >= 0) d.substring(s, nd) else d.substring(s); if (sec.lines().none { it.contains("Task{") }) enqueueResponse(MSG_STACK_EMPTY, ByteArray(0)) } } catch (_: Exception) {} }, "StackCheck").start() }
 
     private val lifecycleWriteQueue = java.util.concurrent.ArrayBlockingQueue<ByteBuffer>(16)
     private val lifeWriterThread = Thread({
@@ -586,7 +582,7 @@ class PipelineServer(
                     }
                 }
             } catch (_: Exception) {
-                // Swallowed: lifecycle responses are advisory (stack-empty, focused-app).
+                // Swallowed: lifecycle responses are advisory (stack-empty).
                 // Dropping one on a transient I/O error is preferable to crashing the
                 // pipeline, which a configureBlocking(true) toggle would do (see below).
             }
@@ -596,9 +592,9 @@ class PipelineServer(
     /** Enqueue a response on the lifecycle channel through the dedicated LifeWriter
      *  thread. The lifecycle Channel is registered for OP_READ by NioReader; toggling
      *  its blocking mode to write synchronously throws IllegalBlockingModeException,
-     *  which the old try/catch silently swallowed — so every MSG_STACK_EMPTY /
-     *  MSG_FOCUSED_APP / MSG_SHORTCUTS_RESULT was dropped. The single-writer thread
-     *  performs a non-blocking spin write without touching blocking mode. */
+     *  which the old try/catch silently swallowed — so every MSG_STACK_EMPTY was
+     *  dropped. The single-writer thread performs a non-blocking spin write without
+     *  touching blocking mode. */
     private fun enqueueResponse(msgType: Byte, payload: ByteArray) {
         try {
             val len = if (payload.isEmpty()) 1 else 5 + payload.size
@@ -606,15 +602,6 @@ class PipelineServer(
             buf.put(msgType)
             if (payload.isNotEmpty()) { buf.putInt(payload.size); buf.put(payload) }
             buf.flip()
-            lifecycleWriteQueue.offer(buf)
-        } catch (_: Exception) {}
-    }
-    private fun sendShortcutResult(pkg: String, data: String) {
-        try {
-            val pb = pkg.toByteArray(Charsets.UTF_8)
-            val db = data.toByteArray(Charsets.UTF_8)
-            val buf = ByteBuffer.allocate(1+4+pb.size+4+db.size)
-            buf.put(MSG_SHORTCUTS_RESULT); buf.putInt(pb.size); buf.put(pb); buf.putInt(db.size); buf.put(db); buf.flip()
             lifecycleWriteQueue.offer(buf)
         } catch (_: Exception) {}
     }

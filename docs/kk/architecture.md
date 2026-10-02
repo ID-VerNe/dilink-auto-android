@@ -104,7 +104,6 @@ VD серверін орналастыруды, көлікті авто-жаңа
 |-----------|------|---------|
 | ConnectionService | `service/ConnectionService.kt` | 3-порт қабылдау (9637/9638/9639), VD JAR орналастыру, көлік авто-жаңарту, ақылды желі кері шақыруы |
 | VirtualDisplayClient | `display/VirtualDisplayClient.kt` | localhost:19637 бойынша NIO қабылдау, бейне релесі (videoConnection), жанасуды жіберу, бос стек (controlConnection) |
-| NotificationService | `service/NotificationService.kt` | Прогрессі бар телефон хабарландыруларын алу және жіберу |
 | InputInjectionService | `service/InputInjectionService.kt` | Жанасу енгізуінің резервтік әдісі (физикалық дисплей) |
 | FileLog | `FileLog.kt` | `/sdcard/DiLinkAuto/client.log` файлына журнал жүргізу, ротация, logcat сүзгісін айналып өту |
 | MainActivity | `MainActivity.kt` | UI — іске қосу/тоқтату, рұқсат күйі, Install on Car түймесі |

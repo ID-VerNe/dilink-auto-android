@@ -94,4 +94,5 @@
     <string name="status_updating_please_wait">Абнаўленне праграмы аўто… Калі ласка, пачакайце</string>
     <string name="action_uninstall">Выдаліць</string>
     <string name="action_app_info">Звесткі</string>
+    <string name="home_allowlist_empty">No apps allowed. Open the phone app and select apps in Settings > Car app allowlist.</string>
 </resources>

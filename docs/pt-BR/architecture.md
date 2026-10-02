@@ -108,7 +108,6 @@ Gerencia a implantacao do servidor VD, auto-atualizacao do carro, retransmissao 
 |-----------|---------|-----------|
 | ConnectionService | `service/ConnectionService.kt` | Aceita 3 portas (9637/9638/9639), implante do JAR VD, auto-atualizacao do carro, callback de rede inteligente |
 | VirtualDisplayClient | `display/VirtualDisplayClient.kt` | Aceita NIO em localhost:19637, retransmissao de video (videoConnection), encaminhamento de toque, pilha vazia (controlConnection) |
-| NotificationService | `service/NotificationService.kt` | Captura e encaminha notificacoes do celular com progresso |
 | InputInjectionService | `service/InputInjectionService.kt` | Fallback de injecao de toque (tela fisica) |
 | FileLog | `FileLog.kt` | Log baseado em arquivo em `/sdcard/DiLinkAuto/client.log`, rotacao, ignora filtragem do logcat |
 | MainActivity | `MainActivity.kt` | UI — iniciar/parar, status de permissoes, botao Instalar no Carro |

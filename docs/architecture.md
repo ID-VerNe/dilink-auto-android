@@ -103,9 +103,8 @@ Manages VD server deployment, car auto-update, 3-connection relay, and FileLog.
 
 | Component | File | Purpose |
 |-----------|------|---------|
-| ConnectionService | `service/ConnectionService.kt` | 3-port accept (9637/9638/9639), VD JAR deploy, car auto-update, smart network callback |
+| ConnectionService | `service/ConnectionService.kt` | 3-port accept (9637/9638/9639), VD JAR deploy, car auto-update, smart network callback, app allowlist filter |
 | VirtualDisplayClient | `display/VirtualDisplayClient.kt` | NIO accept on localhost:19637, video relay (videoConnection), touch forwarding, stack empty (controlConnection) |
-| NotificationService | `service/NotificationService.kt` | Captures and forwards phone notifications with progress |
 | InputInjectionService | `service/InputInjectionService.kt` | Touch injection fallback (physical display) |
 | FileLog | `FileLog.kt` | File-based logging to `/sdcard/DiLinkAuto/client.log`, rotation, bypasses logcat filtering |
 | MainActivity | `MainActivity.kt` | UI — start/stop, permission status, Install on Car button |

@@ -104,52 +104,6 @@ class MessagesTest {
     }
 
     @Test
-    fun testNotificationDataRoundTrip() {
-        val original = NotificationData(
-            id = 1234,
-            packageName = "com.test.app",
-            appName = "TestApp",
-            title = "Notification Title",
-            text = "Notification message text",
-            timestamp = 1700000000000L,
-            progressIndeterminate = false,
-            progress = 50,
-            progressMax = 100,
-            iconPng = byteArrayOf(1, 2, 3, 4)
-        )
-        val encoded = original.encode()
-        val decoded = NotificationData.decode(encoded)
-
-        assertEquals(original.id, decoded.id)
-        assertEquals(original.packageName, decoded.packageName)
-        assertEquals(original.appName, decoded.appName)
-        assertEquals(original.title, decoded.title)
-        assertEquals(original.text, decoded.text)
-        assertEquals(original.timestamp, decoded.timestamp)
-        assertEquals(original.progressIndeterminate, decoded.progressIndeterminate)
-        assertEquals(original.progress, decoded.progress)
-        assertEquals(original.progressMax, decoded.progressMax)
-        assertArrayEquals(original.iconPng, decoded.iconPng)
-    }
-
-    @Test
-    fun testNotificationDataUnsignedStringLength() {
-        val buf = ByteBuffer.allocate(100).order(ByteOrder.BIG_ENDIAN)
-        buf.putInt(10) // id
-        buf.putShort(0x8003.toShort()) // pkg len with sign bit
-        val data = buf.array()
-
-        try {
-            NotificationData.decode(data)
-            fail("Expected ProtocolDecodeException")
-        } catch (e: NegativeArraySizeException) {
-            fail("NegativeArraySizeException thrown in NotificationData.decode!")
-        } catch (e: ProtocolDecodeException) {
-            // Expected
-        }
-    }
-
-    @Test
     fun testAppListMessageRoundTrip() {
         val apps = listOf(
             AppInfo("com.example.app1", "App One", AppCategory.MUSIC, iconPng = byteArrayOf(10, 20), iconHash = "hash1"),
@@ -189,35 +143,22 @@ class MessagesTest {
     }
 
     @Test
-    fun testClearNotificationMessageRoundTrip() {
-        val original = ClearNotificationMessage(id = 999, packageName = "com.pkg.test")
-        val encoded = original.encode()
-        val decoded = ClearNotificationMessage.decode(encoded)
-
-        assertEquals(original.id, decoded.id)
-        assertEquals(original.packageName, decoded.packageName)
-    }
-
-    @Test
-    fun testAppShortcutsRoundTrip() {
-        val shortcuts = listOf(
-            AppShortcut("s1", "Short 1", "Long Label 1"),
-            AppShortcut("s2", "Short 2", "Long Label 2")
+    fun testAppInfoDataMessageRoundTrip() {
+        val original = AppInfoDataMessage(
+            packageName = "com.test.app",
+            appName = "Test App",
+            versionName = "1.0",
+            versionCode = 100L,
+            installTime = 1234567890L,
+            targetSdk = 33
         )
-        val listMsg = AppShortcutsListMessage("com.app.test", shortcuts)
-        val encodedList = listMsg.encode()
-        val decodedList = AppShortcutsListMessage.decode(encodedList)
-
-        assertEquals("com.app.test", decodedList.packageName)
-        assertEquals(2, decodedList.shortcuts.size)
-        assertEquals("s1", decodedList.shortcuts[0].id)
-        assertEquals("Short 1", decodedList.shortcuts[0].shortLabel)
-        assertEquals("Long Label 1", decodedList.shortcuts[0].longLabel)
-
-        val actionMsg = AppShortcutActionMessage("com.app.test", "s1")
-        val encodedAction = actionMsg.encode()
-        val decodedAction = AppShortcutActionMessage.decode(encodedAction)
-        assertEquals("com.app.test", decodedAction.packageName)
-        assertEquals("s1", decodedAction.shortcutId)
+        val encoded = original.encode()
+        val decoded = AppInfoDataMessage.decode(encoded)
+        assertEquals(original.packageName, decoded.packageName)
+        assertEquals(original.appName, decoded.appName)
+        assertEquals(original.versionName, decoded.versionName)
+        assertEquals(original.versionCode, decoded.versionCode)
+        assertEquals(original.installTime, decoded.installTime)
+        assertEquals(original.targetSdk, decoded.targetSdk)
     }
 }

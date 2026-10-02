@@ -8,14 +8,12 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.content.pm.LauncherApps
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.os.IBinder
 import android.os.PowerManager
-import android.os.UserHandle
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.dilinkauto.client.ClientApp
@@ -264,6 +262,10 @@ class ConnectionService : Service() {
                 val explicitIp = intent?.getStringExtra("car_ip")
                 installCarApp(explicitIp)
             }
+            ACTION_ALLOWLIST_UPDATED -> {
+                // Allowlist screen changed the selection — re-send so the car grid updates live.
+                sendAppList()
+            }
         }
         return START_STICKY
     }
@@ -353,13 +355,7 @@ class ConnectionService : Service() {
                 FileLog.i(TAG, "Handshake from car: ${req.deviceName} ${req.screenWidth}x${req.screenHeight}")
                 handleHandshake(req)
             }
-            // APP_SHORTCUTS still goes through phone — VD has no direct control channel to car
-            ControlMsg.APP_SHORTCUTS -> {
-                val pkg = String(frame.payload, Charsets.UTF_8)
-                FileLog.i(TAG, "Car requested shortcuts for: $pkg")
-                sendAppShortcuts(pkg)
-            }
-            // LAUNCH_APP, GO_BACK, GO_HOME, APP_UNINSTALL, APP_INFO, APP_SHORTCUT_ACTION
+            // LAUNCH_APP, GO_BACK, GO_HOME, APP_UNINSTALL, APP_INFO
             // now go directly Car → VD via port 9639 Channel.CONTROL
         }
     }
@@ -411,12 +407,6 @@ class ConnectionService : Service() {
             val c = controlConnection
             if (c?.isConnected == true) {
                 try { c.sendControl(ControlMsg.VD_STACK_EMPTY) } catch (_: Exception) {}
-            }
-        }
-        lifecycleClient.onFocusedApp = { pkg ->
-            val c = controlConnection
-            if (c?.isConnected == true) {
-                try { c.sendControl(ControlMsg.FOCUSED_APP, pkg.toByteArray(Charsets.UTF_8)) } catch (_: Exception) {}
             }
         }
         lifecycleClient.onDisplayReady = {
@@ -635,13 +625,6 @@ class ConnectionService : Service() {
                 val line = String(frame.payload, Charsets.UTF_8)
                 FileLog.i("CarLog", line)
             }
-            DataMsg.NOTIFICATION_CLEAR -> {
-                val msg = ClearNotificationMessage.decode(frame.payload)
-                NotificationService.instance?.cancelNotification(msg.packageName, msg.id)
-            }
-            DataMsg.NOTIFICATION_CLEAR_ALL -> {
-                NotificationService.instance?.cancelAll()
-            }
         }
     }
 
@@ -735,7 +718,7 @@ class ConnectionService : Service() {
 
         serviceScope.launch(Dispatchers.IO) {
             try {
-                val apps = pm.queryIntentActivities(
+                val allApps = pm.queryIntentActivities(
                     Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0
                 ).filter { info ->
                     // Skip hidden apps (Xiaomi HyperOS, some custom ROMs disable
@@ -769,13 +752,51 @@ class ConnectionService : Service() {
                     )
                 }.sortedBy { it.category.id }
 
+                // Apply the user's car-app allowlist: only selected packages reach the car,
+                // shrinking the wire payload and the car's icon-decode work. On first run
+                // the allowlist is pre-seeded with common map apps that are actually installed.
+                val prefs = getSharedPreferences(ALLOWLIST_PREFS, MODE_PRIVATE)
+                if (!prefs.getBoolean(ALLOWLIST_CONFIGURED_KEY, false)) {
+                    seedDefaultAllowlist(pm, prefs)
+                }
+                val allowed = prefs.getStringSet(ALLOWLIST_PACKAGES_KEY, null)
+                val apps = if (allowed != null) allApps.filter { it.packageName in allowed } else allApps
+
                 conn.sendData(DataMsg.APP_LIST, AppListMessage(apps).encode())
                 val skipped = apps.count { it.iconPng.isEmpty() }
-                FileLog.i(TAG, "App list sent: ${apps.size} apps (${skipped} icons skipped/unchanged)")
+                FileLog.i(TAG, "App list sent: ${apps.size}/${allApps.size} apps allowed (${skipped} icons skipped/unchanged)")
             } catch (e: Exception) {
                 FileLog.e(TAG, "Failed to send app list", e)
             }
         }
+    }
+
+    /** Common map app packageNames used to pre-seed the allowlist on first run. */
+    private val DEFAULT_MAP_PACKAGES = setOf(
+        "com.baidu.BaiduMap",        // Baidu Maps
+        "com.autonavi.minimap",      // AMap (Gaode)
+        "com.google.android.apps.maps", // Google Maps
+        "com.waze",                  // Waze
+        "com.soso.map",              // Sogou Map
+        "com.tencent.map",           // Tencent Map
+        "com.mapabc.mapabc"          // Mapabc
+    )
+
+    /**
+     * First-run seeding: intersect the default map package list with the launcher
+     * apps actually installed. Non-installed defaults are no-ops. Persist the
+     * result and mark the allowlist configured so this only runs once.
+     */
+    private fun seedDefaultAllowlist(pm: android.content.pm.PackageManager, prefs: android.content.SharedPreferences) {
+        val installedLauncher = pm.queryIntentActivities(
+            Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0
+        ).map { it.activityInfo.packageName }.toSet()
+        val seed = DEFAULT_MAP_PACKAGES.intersect(installedLauncher)
+        prefs.edit()
+            .putStringSet(ALLOWLIST_PACKAGES_KEY, seed)
+            .putBoolean(ALLOWLIST_CONFIGURED_KEY, true)
+            .apply()
+        FileLog.i(TAG, "Allowlist seeded with ${seed.size} default map apps: $seed")
     }
 
     // ─── App Shortcuts ───
@@ -804,261 +825,6 @@ class ConnectionService : Service() {
             }
         }
     }
-
-    private fun sendAppShortcuts(packageName: String) {
-        val conn = controlConnection ?: return
-        serviceScope.launch(Dispatchers.IO) {
-            try {
-                val shortcuts = queryShortcuts(packageName)
-                val msg = AppShortcutsListMessage(packageName, shortcuts)
-                conn.sendControl(ControlMsg.APP_SHORTCUTS_LIST, msg.encode())
-                FileLog.i(TAG, "Sent ${shortcuts.size} shortcuts for $packageName")
-            } catch (e: Exception) {
-                FileLog.w(TAG, "Failed to query/send shortcuts for $packageName: ${e.message}")
-                // Send empty list so car doesn't hang waiting
-                try {
-                    val msg = AppShortcutsListMessage(packageName, emptyList())
-                    conn.sendControl(ControlMsg.APP_SHORTCUTS_LIST, msg.encode())
-                } catch (_: Exception) {}
-            }
-        }
-    }
-
-    private suspend fun queryShortcuts(packageName: String): List<AppShortcut> {
-        FileLog.i(TAG, "Querying shortcuts for $packageName: shizuku=${ShizukuManager.isAvailable} vdClient=${vdClient != null} vdConnected=${vdClient?.isConnected}")
-        // True when Shizuku already proved cmd shortcut is unavailable on this device,
-        // so we can skip the redundant VD server attempt (both run the same command).
-        var cmdShortcutUnavailable = false
-        // Try Shizuku shell first — has full access to shortcut data
-        if (ShizukuManager.isAvailable) {
-            try {
-                val output = ShizukuManager.execAndWait("cmd shortcut get-shortcuts --package $packageName")
-                if (!output.isNullOrEmpty()) {
-                    val parsed = parseCmdShortcutOutput(output, packageName)
-                    if (parsed.isNotEmpty()) {
-                        FileLog.i(TAG, "Shizuku: ${parsed.size} shortcuts for $packageName")
-                        return parsed
-                    }
-                    // cmd shortcut unavailable on this device — try dumpsys via Shizuku
-                    cmdShortcutUnavailable = true
-                    FileLog.d(TAG, "Shizuku: cmd shortcut returned ${output.length} chars but parsed empty, trying dumpsys")
-                    val dumpOutput = ShizukuManager.execAndWait("dumpsys shortcut $packageName 2>&1")
-                    if (!dumpOutput.isNullOrBlank()) {
-                        val dumpParsed = parseCmdShortcutOutput(dumpOutput, packageName)
-                        if (dumpParsed.isNotEmpty()) {
-                            FileLog.i(TAG, "Shizuku dumpsys: ${dumpParsed.size} shortcuts for $packageName")
-                            return dumpParsed
-                        }
-                    }
-                    FileLog.i(TAG, "Shizuku: cmd shortcut unavailable, skipping VD server")
-                }
-            } catch (e: Exception) {
-                FileLog.w(TAG, "Shizuku shortcut query failed for $packageName: ${e.message}")
-            }
-        }
-        // Try VD server — skip if Shizuku already proved cmd shortcut is unavailable
-        if (!cmdShortcutUnavailable) {
-            val vd = vdClient
-            if (vd != null && vd.isConnected) {
-                FileLog.i(TAG, "VD server path: querying shortcuts for $packageName")
-                try {
-                    val output = vd.queryShortcuts(packageName)
-                    if (!output.isNullOrBlank()) {
-                        val parsed = parseCmdShortcutOutput(output, packageName)
-                        if (parsed.isNotEmpty()) {
-                            FileLog.i(TAG, "VD server returned ${parsed.size} shortcuts for $packageName")
-                            return parsed
-                        } else {
-                            FileLog.w(TAG, "VD server returned output but parsed empty for $packageName")
-                        }
-                    } else {
-                        FileLog.w(TAG, "VD server returned empty/null output for $packageName")
-                    }
-                } catch (e: Exception) {
-                    FileLog.w(TAG, "VD shortcut query failed for $packageName: ${e.message}")
-                }
-            }
-        }
-        // Fallback: read shortcuts directly from the APK's XML resource.
-        // Necessary when "cmd shortcut" service is unavailable (Samsung, Xiaomi, etc.)
-        val apkShortcuts = queryShortcutsFromApkXml(packageName)
-        if (apkShortcuts.isNotEmpty()) {
-            FileLog.i(TAG, "APK XML: ${apkShortcuts.size} shortcuts for $packageName")
-            return apkShortcuts
-        }
-        // Last resort: LauncherApps API (may fail with "Caller can't access shortcut information")
-        return try {
-            val launcherApps = getSystemService(Context.LAUNCHER_APPS_SERVICE) as? LauncherApps
-                ?: return emptyList()
-            val user = android.os.Process.myUserHandle()
-            val query = LauncherApps.ShortcutQuery().apply {
-                setPackage(packageName)
-                setQueryFlags(
-                    LauncherApps.ShortcutQuery.FLAG_MATCH_DYNAMIC or
-                    LauncherApps.ShortcutQuery.FLAG_MATCH_MANIFEST or
-                    LauncherApps.ShortcutQuery.FLAG_MATCH_PINNED
-                )
-            }
-            (launcherApps.getShortcuts(query, user) ?: emptyList())
-                .map { AppShortcut(it.id, it.shortLabel.toString(), it.longLabel.toString()) }
-        } catch (e: Exception) {
-            FileLog.w(TAG, "Shortcut query failed for $packageName: ${e.message}")
-            emptyList()
-        }
-    }
-
-    /** Parse output from 'cmd shortcut get-shortcuts' shell command. */
-    private fun parseCmdShortcutOutput(output: String, expectedPackage: String): List<AppShortcut> {
-        val shortcuts = mutableListOf<AppShortcut>()
-        var currentId: String? = null
-        var shortLabel = ""
-        var longLabel = ""
-        for (line in output.lines()) {
-            val trimmed = line.trim()
-            if (trimmed.isEmpty()) continue
-
-            val isIndented = line.startsWith(" ") || line.startsWith("\t")
-
-            // Package header line: "com.example.app:" (not indented)
-            if (!isIndented && trimmed.endsWith(":")) {
-                if (currentId != null) {
-                    shortcuts.add(AppShortcut(currentId, shortLabel.ifEmpty { longLabel }, longLabel))
-                }
-                currentId = null; shortLabel = ""; longLabel = ""
-                continue
-            }
-            // Shortcut id line (indented, ends with ":")
-            if (isIndented && trimmed.endsWith(":") && !trimmed.contains(" ")) {
-                if (currentId != null) {
-                    shortcuts.add(AppShortcut(currentId, shortLabel.ifEmpty { longLabel }, longLabel))
-                }
-                currentId = trimmed.removeSuffix(":")
-                shortLabel = ""; longLabel = ""
-                continue
-            }
-            // Label lines
-            if (currentId != null) {
-                if (trimmed.startsWith("ShortLabel:")) {
-                    shortLabel = trimmed.removePrefix("ShortLabel:").trim()
-                } else if (trimmed.startsWith("LongLabel:")) {
-                    longLabel = trimmed.removePrefix("LongLabel:").trim()
-                }
-            }
-        }
-        if (currentId != null) {
-            shortcuts.add(AppShortcut(currentId, shortLabel.ifEmpty { longLabel }, longLabel))
-        }
-        return shortcuts
-    }
-
-    /**
-     * Reads an app's shortcuts.xml resource directly from its APK using AssetManager.
-     * This bypasses the ShortcutService entirely, working on devices where
-     * "cmd shortcut" is unavailable (e.g. Samsung One UI).
-     *
-     * Shortcut labels in XML can be literal strings or resource references
-     * (e.g. @string/wifi_label). We resolve references against the target
-     * app's resources so labels display correctly.
-     */
-    @android.annotation.SuppressLint("BlockedPrivateApi")
-    private fun queryShortcutsFromApkXml(packageName: String): List<AppShortcut> {
-        return try {
-            val ai = packageManager.getApplicationInfo(packageName, 0)
-            val shortcuts = mutableListOf<AppShortcut>()
-
-            // Build an AssetManager pointing at the target APK
-            val am = android.content.res.AssetManager::class.java.newInstance()
-            val addPath = android.content.res.AssetManager::class.java
-                .getDeclaredMethod("addAssetPath", String::class.java).apply { isAccessible = true }
-            val cookie = addPath.invoke(am, ai.publicSourceDir) as Int
-            if (cookie == 0) return emptyList()
-
-            val getResId = android.content.res.AssetManager::class.java
-                .getDeclaredMethod("getResourceIdentifier", String::class.java, String::class.java, String::class.java).apply { isAccessible = true }
-            val resId = getResId.invoke(am, "shortcuts", "xml", ai.packageName) as Int
-            if (resId == 0) return emptyList()
-
-            val res = android.content.res.Resources(am, resources.displayMetrics, resources.configuration)
-
-            // Try to get the target app's context to resolve its string resources
-            val targetContext = try {
-                createPackageContext(packageName, Context.CONTEXT_RESTRICTED)
-            } catch (_: Exception) { null }
-            val targetRes = targetContext?.resources
-
-            val parser = res.getXml(resId)
-
-            var eventType = parser.eventType
-            while (eventType != org.xmlpull.v1.XmlPullParser.END_DOCUMENT) {
-                if (eventType == org.xmlpull.v1.XmlPullParser.START_TAG && parser.name == "shortcut") {
-                    val id = parser.getAttributeValue(null, "shortcutId")
-                        ?: parser.getAttributeValue("http://schemas.android.com/apk/res/android", "shortcutId")
-                    val rawLabel = parser.getAttributeValue(null, "shortcutShortLabel")
-                        ?: parser.getAttributeValue("http://schemas.android.com/apk/res/android", "shortcutShortLabel")
-                    val rawLongLabel = parser.getAttributeValue(null, "shortcutLongLabel")
-                        ?: parser.getAttributeValue("http://schemas.android.com/apk/res/android", "shortcutLongLabel")
-
-                    if (id != null) {
-                        val displayLabel = resolveResourceRef(rawLabel, targetRes, ai) ?: id
-                        val longLabel = resolveResourceRef(rawLongLabel, targetRes, ai) ?: displayLabel
-                        shortcuts.add(AppShortcut(id, displayLabel, longLabel))
-                    }
-                }
-                eventType = parser.nextToken()
-            }
-            parser.close()
-            FileLog.i(TAG, "APK XML: ${shortcuts.size} shortcuts for $packageName")
-            shortcuts
-        } catch (e: Exception) {
-            FileLog.w(TAG, "APK XML shortcut parse failed for $packageName: ${e.message}")
-            emptyList()
-        }
-    }
-
-    /**
-     * Resolves a possibly resource-referenced string value.
-     * e.g. "@string/wifi_label" → "Wi-Fi", "@2131234567" → "Settings", "Wi-Fi" → "Wi-Fi".
-     * Falls back to [targetRes] (the target package's resources), then to null.
-     */
-    private fun resolveResourceRef(value: String?, targetRes: android.content.res.Resources?, appInfo: android.content.pm.ApplicationInfo): String? {
-        if (value.isNullOrEmpty()) return null
-        // Already a literal string, not a reference
-        if (!value.startsWith("@")) return value
-
-        // Try target package resources first
-        if (targetRes != null) {
-            try {
-                val resId = parseResourceRef(value, targetRes, appInfo.packageName)
-                if (resId != 0) {
-                    val resolved = targetRes.getString(resId)
-                    if (resolved.isNotEmpty() && !resolved.startsWith("@")) return resolved
-                }
-            } catch (_: Exception) {}
-        }
-        // Couldn't resolve — return null so caller falls back to shortcutId
-        return null
-    }
-
-    /** Parse a resource reference like "@string/wifi_label" or "@2131234567" to a resource ID. */
-    private fun parseResourceRef(ref: String, res: android.content.res.Resources, pkg: String): Int {
-        // Strip leading @
-        val clean = ref.removePrefix("@")
-        // Format: "type/name" or just numeric ID
-        if (clean.startsWith("string/") || clean.startsWith("0x") || clean.all { it.isDigit() }) {
-            val (type, name) = if (clean.contains("/")) {
-                val parts = clean.split("/", limit = 2)
-                parts[0] to parts[1]
-            } else {
-                // Numeric ID — convert to hex and try direct lookup
-                val id = clean.toIntOrNull() ?: return 0
-                return id
-            }
-            return res.getIdentifier(name, type, pkg)
-        }
-        return 0
-    }
-
-    // launchShortcut removed — shortcut execution now goes Car→VD directly via port 9639
 
     private fun categorizeApp(pkg: String): AppCategory = when {
         pkg.contains("map", true) || pkg.contains("navi", true) ||
@@ -1252,6 +1018,10 @@ class ConnectionService : Service() {
         const val ACTION_START = "com.dilinkauto.client.START"
         const val ACTION_STOP = "com.dilinkauto.client.STOP"
         const val ACTION_INSTALL_CAR = "com.dilinkauto.client.INSTALL_CAR"
+        const val ACTION_ALLOWLIST_UPDATED = "com.dilinkauto.client.ALLOWLIST_UPDATED"
+        const val ALLOWLIST_PREFS = "dilinkauto_allowlist"
+        const val ALLOWLIST_PACKAGES_KEY = "allowed_packages"
+        const val ALLOWLIST_CONFIGURED_KEY = "allowlist_configured"
         const val NOTIFICATION_ID = 1001
 
         /** Propagate log toggle to car. Called from settings UI and onCreate. */

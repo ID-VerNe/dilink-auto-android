@@ -23,8 +23,7 @@ So'nggi yangilanish: 2026-05-01
 
 - **Bildirishnomalarni birma-bir yopish va Barchasini tozalash**: Avtomobil bildirishnoma ekranida endi slide-out animatsiyasi bilan element bo'yicha yopish tugmalari va sarlavhada "Clear All" tugmasi mavjud. Yangi protokol xabarlari: ma'lumot kanalida `NOTIFICATION_CLEAR` (0x04) va `NOTIFICATION_CLEAR_ALL` (0x05). Telefonning `iconPng` yuklamasidan element ikonkalari.
 - **Ilova kontekst amallari**: Ilova plitkalari (ishga tushirgich) va navigatsiya panelidagi so'nggi ilovalarni uzoq bosish O'chirish va Ilova haqida ma'lumot bilan ochiladigan menyuni ko'rsatadi. O'chirish `APP_UNINSTALL` (0x1B) / `APP_UNINSTALLED` (0x06) orqali tarqaladi. Ilova haqida ma'lumot telefondan `APP_INFO_DATA` (0x07) metama'lumotlari bilan avtomobil tomonidagi dialogni ko'rsatadi. Kontekst menyusi amallari shell darajasida kirish uchun VD serveri orqali yo'naltiriladi.
-- **Ilova yorliqlari infratuzilmasi** (UI da o'chirilgan): VD server so'rovi + APK XML zaxirasi bilan `APP_SHORTCUTS` (0x18) / `APP_SHORTCUTS_LIST` (0x19) / `APP_SHORTCUT_ACTION` (0x1A) protokol xabarlari. Belgilarni ajratish aniqlashtirilguncha o'chirilgan (issue #57).
-- **Orqaga tugmasi tuzatish**: GO_BACK endi asosiy menyuga qaytishdan oldin faoliyatlarni birma-bir yopadi, to'g'ri stek kuzatish va `FOCUSED_APP` (0x16) xabarlaridan foydalanadi.
+- **Orqaga tugmasi tuzatish**: GO_BACK endi asosiy menyuga qaytishdan oldin faoliyatlarni birma-bir yopadi, to'g'ri stek kuzatish va `dumpsys activity activities` (0x16) xabarlaridan foydalanadi.
 - **Samsung DeX / Ish stoli rejimi DPI** (bekor qilingan): `UiModeManager.currentModeType` aniqlash va 213dpi dan foydalangan dastlabki amalga oshirish dev-02 da bekor qilindi. VD darajasidagi bayroqni olib tashlash yondashuvi bilan almashtirildi.
 
 ### v0.16.0 (2026-04-29)
@@ -399,7 +398,6 @@ Phone (Xiaomi 17 Pro Max, HyperOS 3, Android 16)
 │   │   ├── acceptConnection() — NIO non-blocking accept
 │   │   ├── NioReader (Selector-based, FRAME_INTERVAL_MS timeout)
 │   │   └── Video relay via videoConnection, stack empty via controlConnection
-│   └── NotificationService (captures phone notifications with progress)
 │
 ├── VD Server (app_process, shell UID 2000)
 │   ├── NIO write queue (ConcurrentLinkedQueue) + Selector-based command reader
