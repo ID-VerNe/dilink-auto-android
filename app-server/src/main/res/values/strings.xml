@@ -39,6 +39,11 @@
     <string name="wifi_adb_setup_title">WiFi ADB Setup</string>
     <string name="wifi_adb_setup_desc">Set up wireless ADB on your phone first — see the DiLink Auto phone app.</string>
 
+    <!-- Startup DPI Override -->
+    <string name="startup_dpi_title">Startup DPI</string>
+    <string name="startup_dpi_desc">0 = auto-calibrate (recommended for most cars)</string>
+    <string name="startup_dpi_hint">Higher DPI = larger UI. Values 120–480. May squeeze portrait-only apps.</string>
+
     <!-- Manual Connect -->
     <string name="manual_connect_label">Or connect manually by IP</string>
     <string name="manual_connect_ip_label">Phone IP address</string>

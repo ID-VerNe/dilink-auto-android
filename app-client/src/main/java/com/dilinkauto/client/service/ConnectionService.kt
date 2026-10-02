@@ -397,8 +397,16 @@ class ConnectionService : Service() {
             vdHeight = (vdHeight * scale).toInt() and 0x7FFFFFFE.toInt()
             FileLog.i(TAG, "Scaled VD to ${vdWidth}x${vdHeight} (scale=$scale) to prevent IME crop")
         }
-        val displayDpi = VideoConfig.calculateOptimalDpi(vdWidth, vdHeight, request.screenDpi)
-        FileLog.i(TAG, "VD: ${vdWidth}x${vdHeight} @${displayDpi}dpi (car reported ${request.screenDpi}dpi, auto-calibrated optimal touch scale)")
+        val displayDpi = if (request.dpiOverride > 0) {
+            // Car-side user override: bypass the portrait-app-safe cap and use the
+            // requested DPI verbatim. Fixes "UI too small" for landscape apps; the
+            // tradeoff (portrait-only apps may squeeze into <360dp) is surfaced in
+            // the car UI hint text. Coerce to the encoder/decoder's sane range.
+            request.dpiOverride.coerceIn(120, 480)
+        } else {
+            VideoConfig.calculateOptimalDpi(vdWidth, vdHeight, request.screenDpi)
+        }
+        FileLog.i(TAG, "VD: ${vdWidth}x${vdHeight} @${displayDpi}dpi (car reported ${request.screenDpi}dpi, override=${request.dpiOverride}, auto-calibrated optimal touch scale)")
 
         // Open lifecycle channel if not already open (survives re-handshakes)
         if (vdClient == null) {

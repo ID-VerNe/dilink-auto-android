@@ -19,7 +19,8 @@ class MessagesTest {
             screenDpi = 440,
             appVersionCode = 100,
             targetFps = 60,
-            appVersionName = "1.0.0"
+            appVersionName = "1.0.0",
+            dpiOverride = 213
         )
         val encoded = original.encode()
         val decoded = HandshakeRequest.decode(encoded)
@@ -34,6 +35,30 @@ class MessagesTest {
         assertEquals(original.appVersionCode, decoded.appVersionCode)
         assertEquals(original.targetFps, decoded.targetFps)
         assertEquals(original.appVersionName, decoded.appVersionName)
+        assertEquals(original.dpiOverride, decoded.dpiOverride)
+    }
+
+    @Test
+    fun testHandshakeRequest_DpiOverrideOmittedByOldPeer_DecodesAsZero() {
+        // An older car that doesn't send the trailing dpiOverride field must
+        // decode as 0 (auto), keeping the wire format backward-compatible.
+        // Layout: ver(4) nameLen(2) name(4) sw(4) sh(4) feat(4) mode(1) dpi(4) verCode(4) fps(4) verNameLen(2)
+        val buf = ByteBuffer.allocate(4 + 2 + 4 + 4 + 4 + 4 + 1 + 4 + 4 + 4 + 2).order(ByteOrder.BIG_ENDIAN)
+        buf.putInt(PROTOCOL_VERSION)
+        buf.putShort(4) // nameLen
+        buf.put("Test".toByteArray(Charsets.UTF_8))
+        buf.putInt(1080) // screenWidth
+        buf.putInt(1920) // screenHeight
+        buf.putInt(7)    // supportedFeatures
+        buf.put(1.toByte()) // displayMode
+        buf.putInt(160)  // screenDpi
+        buf.putInt(100)  // appVersionCode
+        buf.putInt(60)   // targetFps
+        buf.putShort(0)  // verNameLen
+        // No trailing dpiOverride — simulates an old peer.
+
+        val decoded = HandshakeRequest.decode(buf.array())
+        assertEquals(0, decoded.dpiOverride)
     }
 
     @Test

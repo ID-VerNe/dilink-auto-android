@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Startup DPI Override -->
+    <string name="startup_dpi_title">启动 DPI</string>
+    <string name="startup_dpi_desc">0 = 自动校准（适用于大多数车机）</string>
+    <string name="startup_dpi_hint">DPI 越高 UI 越大。范围 120–480。竖屏应用可能被挤压。</string>
+</resources>

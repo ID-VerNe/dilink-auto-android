@@ -3,6 +3,7 @@ package com.dilinkauto.server.ui.screen
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material3.*
@@ -11,6 +12,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
@@ -31,6 +34,7 @@ fun CarLaunchScreen(service: CarConnectionService) {
     val phoneName by service.phoneName.collectAsState()
     val statusMessage by service.statusMessage.collectAsState()
     var devMode by remember { mutableStateOf(service.devMode) }
+    var startupDpi by remember { mutableStateOf(service.startupDpi) }
 
     Box(
         modifier = Modifier
@@ -77,6 +81,11 @@ fun CarLaunchScreen(service: CarConnectionService) {
                             onDevModeChange = { newValue ->
                                 devMode = newValue
                                 service.devMode = newValue
+                            },
+                            startupDpi = startupDpi,
+                            onStartupDpiChange = { newValue ->
+                                startupDpi = newValue
+                                service.startupDpi = newValue
                             }
                         )
 
@@ -109,6 +118,11 @@ fun CarLaunchScreen(service: CarConnectionService) {
                         onDevModeChange = { newValue ->
                             devMode = newValue
                             service.devMode = newValue
+                        },
+                        startupDpi = startupDpi,
+                        onStartupDpiChange = { newValue ->
+                            startupDpi = newValue
+                            service.startupDpi = newValue
                         }
                     )
 
@@ -166,7 +180,9 @@ private fun ConnectionStatusCard(
     phoneName: String,
     statusMessage: String,
     devMode: Boolean,
-    onDevModeChange: (Boolean) -> Unit
+    onDevModeChange: (Boolean) -> Unit,
+    startupDpi: Int,
+    onStartupDpiChange: (Int) -> Unit
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -261,6 +277,59 @@ private fun ConnectionStatusCard(
                         )
                     )
                 }
+
+                Spacer(Modifier.height(12.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            stringResource(R.string.startup_dpi_title),
+                            color = Color.White,
+                            style = MaterialTheme.typography.titleSmall
+                        )
+                        Text(
+                            stringResource(R.string.startup_dpi_desc),
+                            color = if (startupDpi > 0) Color(0xFFFFA726) else MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    // Numeric DPI entry: 0/Auto = use the portrait-app-safe cap;
+                    // 120-480 = override the cap. Effective on the next connect.
+                    var dpiText by remember(startupDpi) {
+                        mutableStateOf(if (startupDpi > 0) startupDpi.toString() else "")
+                    }
+                    OutlinedTextField(
+                        value = dpiText,
+                        onValueChange = { input ->
+                            val digits = input.filter { it.isDigit() }.take(3)
+                            dpiText = digits
+                            val parsed = digits.toIntOrNull() ?: 0
+                            // Coerce to the encoder/decoder's sane range; 0 = Auto.
+                            onStartupDpiChange(parsed.coerceIn(0, 480))
+                        },
+                        singleLine = true,
+                        placeholder = { Text("Auto", color = MaterialTheme.colorScheme.onSurfaceVariant) },
+                        keyboardOptions = KeyboardOptions(
+                            keyboardType = KeyboardType.Number,
+                            imeAction = ImeAction.Done
+                        ),
+                        modifier = Modifier.width(96.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = Color.White,
+                            focusedBorderColor = MaterialTheme.colorScheme.primary,
+                            unfocusedBorderColor = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    )
+                }
+                Text(
+                    stringResource(R.string.startup_dpi_hint),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall,
+                    lineHeight = 18.sp
+                )
             }
         }
     }

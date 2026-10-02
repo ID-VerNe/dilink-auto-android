@@ -54,7 +54,7 @@ class AdversarialDecodingTest {
     fun testHandshakeRequest_MaxUnsignedLengthWithActualPayload() {
         val targetLen = 40000 // exceeds signed short range 32767
         val bigPayload = ByteArray(targetLen) { (it % 26 + 65).toByte() }
-        val buf = ByteBuffer.allocate(4 + 2 + targetLen + 4 + 4 + 4 + 1 + 4 + 4 + 4 + 2).order(ByteOrder.BIG_ENDIAN)
+        val buf = ByteBuffer.allocate(4 + 2 + targetLen + 4 + 4 + 4 + 1 + 4 + 4 + 4 + 2 + 4).order(ByteOrder.BIG_ENDIAN)
         buf.putInt(PROTOCOL_VERSION)
         buf.putShort(targetLen.toShort())
         buf.put(bigPayload)
@@ -66,6 +66,7 @@ class AdversarialDecodingTest {
         buf.putInt(1)
         buf.putInt(60)
         buf.putShort(0.toShort())
+        buf.putInt(0) // dpiOverride
 
         val decoded = HandshakeRequest.decode(buf.array())
         assertEquals(targetLen, decoded.deviceName.length)

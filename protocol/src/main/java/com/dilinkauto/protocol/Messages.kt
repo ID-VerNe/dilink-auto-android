@@ -58,12 +58,20 @@ data class HandshakeRequest(
     val screenDpi: Int = 160,
     val appVersionCode: Int,
     val targetFps: Int = 30,
-    val appVersionName: String = ""
+    val appVersionName: String = "",
+    /**
+     * Car-side user override for the VD DPI. 0 = auto-calibrate via
+     * [VideoConfig.calculateOptimalDpi] (the portrait-app-safe cap). Non-zero
+     * in [120, 480] bypasses the cap and is used verbatim — fixes "UI too
+     * small" for landscape apps at the cost of squeezing portrait-only apps.
+     * Trailing field, so older peers that don't send it decode 0 (auto).
+     */
+    val dpiOverride: Int = 0
 ) {
     fun encode(): ByteArray {
         val nameBytes = deviceName.toByteArray(Charsets.UTF_8)
         val verNameBytes = appVersionName.toByteArray(Charsets.UTF_8)
-        val buf = ByteBuffer.allocate(4 + 2 + nameBytes.size + 4 + 4 + 4 + 1 + 4 + 4 + 4 + 2 + verNameBytes.size)
+        val buf = ByteBuffer.allocate(4 + 2 + nameBytes.size + 4 + 4 + 4 + 1 + 4 + 4 + 4 + 2 + verNameBytes.size + 4)
             .order(ByteOrder.BIG_ENDIAN)
         buf.putInt(protocolVersion)
         buf.putShort(nameBytes.size.toShort())
@@ -77,6 +85,7 @@ data class HandshakeRequest(
         buf.putInt(targetFps)
         buf.putShort(verNameBytes.size.toShort())
         buf.put(verNameBytes)
+        buf.putInt(dpiOverride)
         return buf.array()
     }
 
@@ -95,7 +104,8 @@ data class HandshakeRequest(
                 screenDpi = if (buf.remaining() >= 4) buf.getInt() else 160,
                 appVersionCode = if (buf.remaining() >= 4) buf.getInt() else 0,
                 targetFps = if (buf.remaining() >= 4) buf.getInt() else 30,
-                appVersionName = if (buf.remaining() >= 2) buf.readShortLengthPrefixed() else ""
+                appVersionName = if (buf.remaining() >= 2) buf.readShortLengthPrefixed() else "",
+                dpiOverride = if (buf.remaining() >= 4) buf.getInt() else 0
             )
             return request
         }

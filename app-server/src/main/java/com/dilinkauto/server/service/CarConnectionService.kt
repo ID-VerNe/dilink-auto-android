@@ -67,6 +67,19 @@ class CarConnectionService : Service() {
         set(value) = getSharedPreferences("dilinkauto", MODE_PRIVATE)
             .edit().putBoolean("dev_mode", value).apply()
 
+    /**
+     * Car-side startup DPI override. 0 = auto-calibrate via VideoConfig.calculateOptimalDpi
+     * (the portrait-app-safe cap, default). Non-zero in [120, 480] bypasses the cap and is
+     * sent to the phone as `dpiOverride` in HandshakeRequest; the phone uses it verbatim and
+     * echoes it back as `vdDpi`. Read at handshake construction time, so a change takes effect
+     * on the next connect (or mid-stream rotation re-handshake), not live.
+     */
+    var startupDpi: Int
+        get() = getSharedPreferences("dilinkauto", MODE_PRIVATE)
+                    .getInt("startup_dpi", 0)
+        set(value) = getSharedPreferences("dilinkauto", MODE_PRIVATE)
+            .edit().putInt("startup_dpi", value).apply()
+
     // ─── Handshake ───
     private var handshakeVdDpi = VideoConfig.VIRTUAL_DISPLAY_DPI // DPI from phone (may be adjusted for DeX)
 
@@ -390,7 +403,8 @@ class CarConnectionService : Service() {
                     targetFps = targetFps,
                     appVersionName = packageManager.getPackageInfo(packageName, 0).let {
                         it.versionName ?: ""
-                    }
+                    },
+                    dpiOverride = startupDpi
                 )
                 ctrl.sendControl(ControlMsg.HANDSHAKE_REQUEST, handshake.encode())
                 handshakeDone = true  // Stop gateway/mDNS retry loops immediately
@@ -1027,7 +1041,8 @@ class CarConnectionService : Service() {
                 targetFps = targetFps,
                 appVersionName = packageManager.getPackageInfo(packageName, 0).let {
                     it.versionName ?: ""
-                }
+                },
+                dpiOverride = startupDpi
             )
             try {
                 ctrl.sendControl(ControlMsg.HANDSHAKE_REQUEST, handshake.encode())
