@@ -9,7 +9,7 @@ android {
 
     defaultConfig {
         applicationId = "com.dilinkauto.server"
-        minSdk = 24
+        minSdk = 26
         targetSdk = 34
         versionCode = project.property("app.versionCode").toString().toInt()
         versionName = project.property("app.versionName").toString()

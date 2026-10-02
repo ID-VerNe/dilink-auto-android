@@ -1,8 +1,6 @@
 package com.dilinkauto.server.decoder
 
 import android.media.MediaCodec
-import android.media.MediaCodecInfo
-import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.os.Process
 import android.util.Log
@@ -107,19 +105,6 @@ class VideoDecoder {
         return false
     }
 
-    /** Find the first hardware AVC decoder exposed by the platform, or null if none. */
-    private fun findHardwareAvcDecoder(): MediaCodecInfo? {
-        return try {
-            MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.firstOrNull { info ->
-                info.isHardwareAccelerated &&
-                    info.supportedTypes.any { it.equals(MediaFormat.MIMETYPE_VIDEO_AVC, ignoreCase = true) }
-            }
-        } catch (e: Exception) {
-            logW("Hardware decoder enumeration failed: ${e.message}")
-            null
-        }
-    }
-
     data class FrameData(val isConfig: Boolean, val isKeyFrame: Boolean, val data: ByteArray)
 
     /**
@@ -139,22 +124,12 @@ class VideoDecoder {
             if (fps > 0) setInteger(MediaFormat.KEY_OPERATING_RATE, fps)
         }
 
-        val hwInfo = findHardwareAvcDecoder()
-        codec = try {
-            if (hwInfo != null) {
-                MediaCodec.createByCodecName(hwInfo.name)
-            } else {
-                MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-            }
-        } catch (e: Exception) {
-            logW("Hardware decoder create failed (${hwInfo?.name}): ${e.message}, falling back to createDecoderByType")
-            MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-        }.apply {
+        codec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
             configure(format, surface, null, 0)
             start()
         }
         outputSurfaceValid = true
-        log("MediaCodec created: name=${codec?.name} hw=${hwInfo != null} dims=${width}x${height} operatingRate=$fps")
+        log("MediaCodec created: name=${codec?.name} dims=${width}x${height} operatingRate=$fps")
 
         frameCount = 0
         renderCount = 0
