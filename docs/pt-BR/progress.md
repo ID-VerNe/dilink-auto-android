@@ -346,7 +346,7 @@ Revisao abrangente realizada em 2026-04-23 cobrindo performance, estabilidade e 
 | M3 | Perf | Multi-toque envia N quadros separados por MOVE — deveria agrupar todos os ponteiros | **v0.8.3** |
 | M4 | Perf | MotionEvent PointerProperties/Coords alocados por injecao — usar pool destes | **v0.8.1** |
 | M5 | Perf | Fila do decoder com 6 de profundidade (200ms) — reduzir para 2-3 para menor latencia | **v0.8.1** |
-| M6 | Perf | `execFast("cmd display power-off 0")` na thread de toque — mover para timer | **v0.8.1** |
+| M6 | Perf | ~~`execFast` removido (Phase B6)~~, gerenciamento de energia da tela agora via `execShell` em thread dedicada | **v0.8.1** |
 | M7 | Estabilidade | `cleanup()` duplo no servidor VD — finally do handleClient + run ambos chamam | **v0.7.2** |
 | M8 | Estabilidade | `cleanupSession()` nao reseta `_serviceState` — UI estagnada durante atraso | **v0.7.2** |
 | M9 | Estabilidade | MutableStateFlow estatico no companion sobrevive a reinicios do servico — activeConnection estagnado | **v0.7.2** |
@@ -424,7 +424,7 @@ Carro (BYD DiLink 3.0, Android 10)
 │   │   └── Estado de ejecao persistido em SharedPreferences
 │   ├── VideoDecoder (fila=15, inicio antecipado, logSink, catchup de 4 zonas)
 │   ├── PersistentNavBar (76dp, icones 40dp, texto 14sp, apps recentes podados)
-│   ├── LauncherScreen (icones 64dp, grade 160dp, busca com imePadding)
+│   ├── HomeScreen / HomeContent / AppTile (64dp icons, 160dp grid, pin-to-top, lambda-based actions)
 │   ├── NotificationScreen (barras de progresso, toque-para-iniciar, dedup por ID)
 │   └── MirrorScreen (TextureView + encaminhamento de toque, reinicio do decoder)
 ```

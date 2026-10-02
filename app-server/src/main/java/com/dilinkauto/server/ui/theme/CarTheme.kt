@@ -36,7 +36,7 @@ val CarTypography = Typography(
     bodyLarge = TextStyle(fontSize = 16.sp),
     bodyMedium = TextStyle(fontSize = 14.sp),
     labelLarge = TextStyle(fontSize = 14.sp, fontWeight = FontWeight.Medium),
-    labelSmall = TextStyle(fontSize = 12.sp)
+    labelSmall = TextStyle(fontSize = 14.sp)
 )
 
 @Composable

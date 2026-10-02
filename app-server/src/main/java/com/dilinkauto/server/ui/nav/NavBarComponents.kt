@@ -69,13 +69,13 @@ fun NetworkInfo(isConnected: Boolean) {
         Icon(
             if (isConnected) Icons.Default.Wifi else Icons.Default.WifiOff,
             contentDescription = "Network",
-            tint = if (isConnected) Color(0xFF4CAF50) else Color(0xFF757575),
+            tint = if (isConnected) NavigationColor else MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.size(24.dp)
         )
         Text(
             text = if (isConnected) stringResource(R.string.network_connected) else stringResource(R.string.network_offline),
-            fontSize = 11.sp,
-            color = Color(0xFF888888),
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center
         )
     }
@@ -87,7 +87,8 @@ fun RecentAppIcon(
     app: AppInfo?,
     isActive: Boolean,
     service: CarConnectionService,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
 ) {
     val density = LocalDensity.current
     val iconSizePx = with(density) { 40.dp.toPx().toInt() }
@@ -122,10 +123,13 @@ fun RecentAppIcon(
 
     // Context menu state
     var menuExpanded by remember { mutableStateOf(false) }
+    // Only collect shortcutsCache when the feature is enabled — currently false.
+    // See issue #57. Avoids an idle StateFlow subscription per recent-app tile.
+    val shortcutsEnabled = false
     val shortcutsCache by service.shortcutsCache.collectAsState()
-    val shortcuts = app?.packageName?.let { shortcutsCache[it] }
+    val shortcuts = if (shortcutsEnabled) app?.packageName?.let { shortcutsCache[it] } else null
 
-    Box {
+    Box(modifier = modifier) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -138,7 +142,7 @@ fun RecentAppIcon(
                         if (app != null) {
                             menuExpanded = true
                             // TODO: Re-enable when app shortcuts are revisited.
-                            // See LauncherScreen.AppTile and issue #57.
+                            // See HomeScreen.AppTile and issue #57.
                             // service.requestShortcuts(app.packageName)
                         }
                     }
@@ -171,14 +175,14 @@ fun RecentAppIcon(
                     Icon(
                         categoryIcon,
                         contentDescription = app?.appName,
-                        tint = if (isActive) categoryColor else Color(0xFFBBBBBB),
+                        tint = if (isActive) categoryColor else MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.size(40.dp)
                     )
                 }
                 Text(
                     text = app?.appName ?: stringResource(R.string.recent_app_fallback),
                     fontSize = 14.sp,
-                    color = if (isActive) Color.White else Color(0xFF888888),
+                    color = if (isActive) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
                     textAlign = TextAlign.Center,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
@@ -213,7 +217,7 @@ fun RecentAppIcon(
                     leadingIcon = {
                         Icon(
                             Icons.Default.Delete, null,
-                            tint = Color(0xFFEF5350),
+                            tint = MaterialTheme.colorScheme.error,
                             modifier = Modifier.size(24.dp)
                         )
                     },
@@ -246,7 +250,7 @@ fun RecentAppIcon(
                 // place (VD server query + APK XML fallback, shell execution)
                 // but disabled while label resolution and reliability are
                 // refined. To re-enable, flip the constant and sync with
-                // LauncherScreen.AppTile.
+                // HomeScreen.AppTile.
                 // See: https://github.com/andersonlucasg3/dilink-auto-android/issues/57
                 val shortcutsEnabled = false
                 if (shortcutsEnabled && shortcuts != null && shortcuts.isNotEmpty()) {
@@ -288,7 +292,7 @@ fun NavActionButton(
     icon: ImageVector,
     label: String,
     onClick: () -> Unit,
-    tint: Color = Color(0xFFBBBBBB),
+    tint: Color = MaterialTheme.colorScheme.onSurfaceVariant,
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -304,7 +308,41 @@ fun NavActionButton(
             tint = tint,
             modifier = Modifier.size(40.dp)
         )
+    }
+}
 
+@Composable
+fun NotificationsButton(
+    count: Int,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = modifier
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(onClick = onClick)
+            .padding(vertical = 10.dp)
+    ) {
+        BadgedBox(
+            badge = {
+                if (count > 0) {
+                    Badge {
+                        Text(
+                            if (count > 99) "99+" else "$count",
+                            style = MaterialTheme.typography.labelSmall
+                        )
+                    }
+                }
+            }
+        ) {
+            Icon(
+                Icons.Default.Notifications,
+                contentDescription = "Notifications",
+                tint = if (count > 0) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(40.dp)
+            )
+        }
     }
 }
 

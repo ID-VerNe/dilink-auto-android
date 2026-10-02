@@ -38,8 +38,12 @@ class Connection(
     private val reader = NioReader(channel)
     private val connected = AtomicBoolean(true)
 
-    // Write queue: non-blocking coroutine channel, drained by dedicated writer coroutine.
-    private val writeQueue = kotlinx.coroutines.channels.Channel<FrameCodec.Frame>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+    // Write queue: bounded coroutine channel, drained by dedicated writer coroutine.
+    // Bounded (not UNLIMITED) so a slow TCP consumer applies backpressure to the
+    // reader instead of growing the queue unbounded and OOMing on a slow car link.
+    private val writeQueue = kotlinx.coroutines.channels.Channel<FrameCodec.Frame>(
+        64, kotlinx.coroutines.channels.BufferOverflow.SUSPEND
+    )
 
     private val frameListeners = ConcurrentHashMap<Byte, (FrameCodec.Frame) -> Unit>()
     private var disconnectListener: (() -> Unit)? = null
@@ -84,6 +88,7 @@ class Connection(
                     if (frame.channel == Channel.CONTROL &&
                         frame.messageType == ControlMsg.HEARTBEAT
                     ) {
+                        // Heartbeat ack is a control frame — suspend-enqueue is safe on the reader.
                         enqueueFrame(FrameCodec.Frame(Channel.CONTROL, ControlMsg.HEARTBEAT_ACK, ByteArray(0)))
                         continue
                     }
@@ -213,14 +218,12 @@ class Connection(
     }
 
     /**
-     * Enqueues a frame for writing. Non-blocking, lock-free.
+     * Enqueues a frame for writing. Suspending so backpressure from a full queue
+     * propagates to the caller (reader / heartbeat / watchdog) instead of dropping.
      */
-    private fun enqueueFrame(frame: FrameCodec.Frame) {
+    private suspend fun enqueueFrame(frame: FrameCodec.Frame) {
         if (!connected.get()) throw IOException("Not connected")
-        val result = writeQueue.trySend(frame)
-        if (result.isFailure) {
-            throw IOException("Failed to enqueue frame: channel closed")
-        }
+        writeQueue.send(frame)
     }
 
     fun onFrames(channel: Byte, listener: (FrameCodec.Frame) -> Unit) {
@@ -244,27 +247,33 @@ class Connection(
     }
 
     fun sendFrame(frame: FrameCodec.Frame) {
-        enqueueFrame(frame)
+        // Public senders run on arbitrary threads (UI, NotificationService, etc).
+        // Route through the scope so the suspending enqueueFrame can apply
+        // backpressure without forcing every caller to be a suspend function.
+        if (!connected.get()) throw IOException("Not connected")
+        scope.launch {
+            try { enqueueFrame(frame) } catch (_: IOException) { /* disconnected */ }
+        }
     }
 
     fun sendControl(messageType: Byte, payload: ByteArray = ByteArray(0)) {
-        enqueueFrame(FrameCodec.Frame(Channel.CONTROL, messageType, payload))
+        sendFrame(FrameCodec.Frame(Channel.CONTROL, messageType, payload))
     }
 
     fun sendVideo(messageType: Byte, payload: ByteArray) {
-        enqueueFrame(FrameCodec.Frame(Channel.VIDEO, messageType, payload))
+        sendFrame(FrameCodec.Frame(Channel.VIDEO, messageType, payload))
     }
 
     fun sendAudio(messageType: Byte, payload: ByteArray) {
-        enqueueFrame(FrameCodec.Frame(Channel.AUDIO, messageType, payload))
+        sendFrame(FrameCodec.Frame(Channel.AUDIO, messageType, payload))
     }
 
     fun sendData(messageType: Byte, payload: ByteArray) {
-        enqueueFrame(FrameCodec.Frame(Channel.DATA, messageType, payload))
+        sendFrame(FrameCodec.Frame(Channel.DATA, messageType, payload))
     }
 
     fun sendInput(messageType: Byte, payload: ByteArray) {
-        enqueueFrame(FrameCodec.Frame(Channel.INPUT, messageType, payload))
+        sendFrame(FrameCodec.Frame(Channel.INPUT, messageType, payload))
     }
 
     fun disconnect() {

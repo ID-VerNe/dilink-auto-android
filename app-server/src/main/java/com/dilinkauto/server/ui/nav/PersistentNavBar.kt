@@ -16,17 +16,11 @@ import com.dilinkauto.server.R
 import com.dilinkauto.server.service.CarConnectionService
 
 /**
- * Persistent left-side navigation bar — always visible on all screens.
+ * Persistent navigation bar — always visible during streaming mode.
  *
- * Layout (top to bottom):
- * - Clock (HH:mm)
- * - Network status
- * - Divider
- * - Recent app icons (3-5)
- * - Spacer (fills remaining space)
- * - Divider
- * - Back button
- * - Home button
+ * Landscape: left rail. Portrait: bottom bar. Both render the same action set:
+ * eject (disconnect), recent-apps rail, home, back, notifications (with badge).
+ * The landscape rail additionally shows a clock and network indicator at the top.
  */
 @Composable
 fun PersistentNavBar(
@@ -49,23 +43,41 @@ fun PersistentNavBar(
     }
     val navBarPx = com.dilinkauto.server.service.CarConnectionService.navBarWidthPx(density.density, screenWidthPx)
     val navBarDp = with(density) { navBarPx.toDp() }
+    val recentApps = recentAppsState.recentApps
+    val shortcutsEnabled = false // see NavBarComponents.RecentAppIcon / issue #57
 
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.SpaceEvenly,
+        verticalArrangement = Arrangement.spacedBy(8.dp),
         modifier = Modifier
             .width(navBarDp)
             .fillMaxHeight()
             .background(Color(0xFF0A0E14))
             .padding(vertical = 12.dp, horizontal = 4.dp)
     ) {
-        // Disconnect button
-        NavActionButton(
-            icon = Icons.Default.LinkOff,
-            label = stringResource(R.string.nav_eject),
-            onClick = onDisconnect,
-            tint = Color(0xFFFF5252),
-            modifier = Modifier.weight(1f)
+        ClockDisplay()
+        NetworkInfo(isConnected = isPhoneConnected)
+        Divider(color = Color(0xFF2A2F3A), thickness = 1.dp, modifier = Modifier.fillMaxWidth())
+
+        // Recent-apps rail — one tile per recently launched app that is still installed.
+        for (pkg in recentApps) {
+            val app = appMap[pkg] ?: continue
+            RecentAppIcon(
+                app = app,
+                isActive = pkg == activeAppPackage,
+                service = service,
+                onClick = { onAppClick(pkg) }
+            )
+        }
+
+        Spacer(Modifier.weight(1f))
+
+        Divider(color = Color(0xFF2A2F3A), thickness = 1.dp, modifier = Modifier.fillMaxWidth())
+
+        // Notifications button with badge
+        NotificationsButton(
+            count = notificationCount,
+            onClick = onNotifications
         )
 
         // Home button
@@ -73,7 +85,7 @@ fun PersistentNavBar(
             icon = Icons.Default.Home,
             label = stringResource(R.string.nav_home),
             onClick = onHome,
-            modifier = Modifier.weight(1f)
+            modifier = Modifier.padding(vertical = 4.dp)
         )
 
         // Back button
@@ -81,10 +93,20 @@ fun PersistentNavBar(
             icon = Icons.Default.ArrowBack,
             label = stringResource(R.string.nav_back),
             onClick = onBack,
-            modifier = Modifier.weight(1f)
+            modifier = Modifier.padding(vertical = 4.dp)
+        )
+
+        // Disconnect button
+        NavActionButton(
+            icon = Icons.Default.LinkOff,
+            label = stringResource(R.string.nav_eject),
+            onClick = onDisconnect,
+            tint = MaterialTheme.colorScheme.error,
+            modifier = Modifier.padding(vertical = 4.dp)
         )
     }
 }
+
 @Composable
 fun PersistentBottomNavBar(
     recentAppsState: RecentAppsState,
@@ -106,6 +128,7 @@ fun PersistentBottomNavBar(
     }
     val navBarPx = com.dilinkauto.server.service.CarConnectionService.navBarWidthPx(density.density, screenWidthPx)
     val navBarDp = with(density) { navBarPx.toDp() }
+    val recentApps = recentAppsState.recentApps
 
     Row(
         horizontalArrangement = Arrangement.SpaceEvenly,
@@ -121,7 +144,26 @@ fun PersistentBottomNavBar(
             icon = Icons.Default.LinkOff,
             label = stringResource(R.string.nav_eject),
             onClick = onDisconnect,
-            tint = Color(0xFFFF5252),
+            tint = MaterialTheme.colorScheme.error,
+            modifier = Modifier.weight(1f)
+        )
+
+        // Recent-apps rail — inline along the bottom bar.
+        for (pkg in recentApps) {
+            val app = appMap[pkg] ?: continue
+            RecentAppIcon(
+                app = app,
+                isActive = pkg == activeAppPackage,
+                service = service,
+                onClick = { onAppClick(pkg) },
+                modifier = Modifier.weight(1f)
+            )
+        }
+
+        // Notifications button with badge
+        NotificationsButton(
+            count = notificationCount,
+            onClick = onNotifications,
             modifier = Modifier.weight(1f)
         )
 

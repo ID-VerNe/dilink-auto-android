@@ -21,11 +21,11 @@ class AdversarialDecodingTest {
 
             try {
                 HandshakeRequest.decode(data)
-                fail("Expected BufferUnderflowException for length $l")
+                fail("Expected ProtocolDecodeException for length $l")
             } catch (e: NegativeArraySizeException) {
                 fail("NegativeArraySizeException thrown for length $l: MSB not masked!")
-            } catch (e: java.nio.BufferUnderflowException) {
-                // Pass: length correctly treated as unsigned > 32767
+            } catch (e: ProtocolDecodeException) {
+                // Pass: length correctly treated as unsigned > 32767 and bounds-checked
             }
         }
     }
@@ -81,10 +81,10 @@ class AdversarialDecodingTest {
         buf.putShort(0xFFFF.toShort()) // nameLen = 65535
         try {
             HandshakeResponse.decode(buf.array())
-            fail("Expected BufferUnderflowException")
+            fail("Expected ProtocolDecodeException")
         } catch (e: NegativeArraySizeException) {
             fail("NegativeArraySizeException thrown: MSB not masked!")
-        } catch (e: java.nio.BufferUnderflowException) {
+        } catch (e: ProtocolDecodeException) {
             // Expected
         }
     }
@@ -117,10 +117,10 @@ class AdversarialDecodingTest {
         buf.putShort(0x8000.toShort()) // pkg len = 32768
         try {
             NotificationData.decode(buf.array())
-            fail("Expected BufferUnderflowException")
+            fail("Expected ProtocolDecodeException")
         } catch (e: NegativeArraySizeException) {
             fail("NegativeArraySizeException thrown: MSB not masked!")
-        } catch (e: java.nio.BufferUnderflowException) {
+        } catch (e: ProtocolDecodeException) {
             // Expected
         }
     }
@@ -156,10 +156,10 @@ class AdversarialDecodingTest {
         buf.putShort(0x8001.toShort()) // count = 32769
         try {
             AppListMessage.decode(buf.array())
-            fail("Expected BufferUnderflowException")
+            fail("Expected ProtocolDecodeException")
         } catch (e: NegativeArraySizeException) {
             fail("NegativeArraySizeException thrown: count MSB not masked!")
-        } catch (e: java.nio.BufferUnderflowException) {
+        } catch (e: ProtocolDecodeException) {
             // Expected
         }
     }
@@ -179,10 +179,10 @@ class AdversarialDecodingTest {
         buf.putShort(0x8005.toShort())
         try {
             MediaMetadata.decode(buf.array())
-            fail("Expected BufferUnderflowException")
+            fail("Expected ProtocolDecodeException")
         } catch (e: NegativeArraySizeException) {
             fail("NegativeArraySizeException thrown!")
-        } catch (e: java.nio.BufferUnderflowException) {
+        } catch (e: ProtocolDecodeException) {
             // Expected
         }
     }
@@ -194,10 +194,10 @@ class AdversarialDecodingTest {
         buf.putShort(0xFFFF.toShort())
         try {
             ClearNotificationMessage.decode(buf.array())
-            fail("Expected BufferUnderflowException")
+            fail("Expected ProtocolDecodeException")
         } catch (e: NegativeArraySizeException) {
             fail("NegativeArraySizeException thrown!")
-        } catch (e: java.nio.BufferUnderflowException) {
+        } catch (e: ProtocolDecodeException) {
             // Expected
         }
     }
@@ -210,10 +210,10 @@ class AdversarialDecodingTest {
         buf.putShort(0x8000.toShort()) // pkgLen
         try {
             AppShortcutsListMessage.decode(buf.array())
-            fail("Expected BufferUnderflowException")
+            fail("Expected ProtocolDecodeException")
         } catch (e: NegativeArraySizeException) {
             fail("NegativeArraySizeException thrown!")
-        } catch (e: java.nio.BufferUnderflowException) {
+        } catch (e: ProtocolDecodeException) {
             // Expected
         }
     }
@@ -224,10 +224,10 @@ class AdversarialDecodingTest {
         buf.putShort(0x8000.toShort()) // pkgLen
         try {
             AppShortcutActionMessage.decode(buf.array())
-            fail("Expected BufferUnderflowException")
+            fail("Expected ProtocolDecodeException")
         } catch (e: NegativeArraySizeException) {
             fail("NegativeArraySizeException thrown!")
-        } catch (e: java.nio.BufferUnderflowException) {
+        } catch (e: ProtocolDecodeException) {
             // Expected
         }
     }
@@ -238,10 +238,10 @@ class AdversarialDecodingTest {
         buf.putShort(0x8000.toShort()) // pkgLen
         try {
             AppInfoDataMessage.decode(buf.array())
-            fail("Expected BufferUnderflowException")
+            fail("Expected ProtocolDecodeException")
         } catch (e: NegativeArraySizeException) {
             fail("NegativeArraySizeException thrown!")
-        } catch (e: java.nio.BufferUnderflowException) {
+        } catch (e: ProtocolDecodeException) {
             // Expected
         }
     }

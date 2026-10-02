@@ -121,7 +121,6 @@ WiFi (3 қосылым) және USB тректерімен параллель �
 | CarLaunchScreen | `ui/screen/CarLaunchScreen.kt` | Толық экранды іске қосу/қосылу экраны (навигациясыз), брендинг, нұсқаулықтар, қолмен IP |
 | MirrorScreen | `ui/screen/MirrorScreen.kt` | TextureView + жанасуды жіберу, бет қолжетімді болғанда декодерді қайта іске қосу |
 | HomeContent | `ui/screen/HomeScreen.kt` | Қолданбалар торы (64dp белгішелер, 160dp ұяшықтар) немесе қосылу күйі, ағынды режимде көрсетіледі |
-| LauncherScreen | `ui/screen/LauncherScreen.kt` | SideNavBar, CarStatusBar, AppGrid бар ескі интеграцияланған экран |
 | NotificationScreen | `ui/screen/NotificationScreen.kt` | Прогресс жолақтары бар хабарландырулар тізімі, түрту арқылы іске қосу |
 | PersistentNavBar | `ui/nav/PersistentNavBar.kt` | 76dp навигация панелі (40dp белгішелер, 14sp мәтін), соңғы қолданбалар (тазаланады), тек ағынды режимде |
 | RecentAppsState | `ui/nav/RecentAppsState.kt` | Соңғы қолданбаларды бақылайды, қолжетімсіздерін жояды |

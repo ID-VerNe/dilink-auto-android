@@ -368,7 +368,7 @@ Comprehensive review performed 2026-04-23 covering performance, stability, and f
 | M3 | Perf | Multi-touch sends N separate frames per MOVE — should batch all pointers | **v0.8.3** |
 | M4 | Perf | MotionEvent PointerProperties/Coords allocated per injection — pool these | **v0.8.1** |
 | M5 | Perf | Decoder frame queue 6 deep (200ms) — reduce to 2-3 for lower latency | **v0.8.1** |
-| M6 | Perf | `execFast("cmd display power-off 0")` on touch thread — move to timer | **v0.8.1** |
+| M6 | Perf | ~~`execFast("cmd display power-off 0")` on touch thread — move to timer~~ — `execFast` removed (Phase B6), display power now managed via `execShell` on a dedicated thread | **v0.8.1** |
 | M7 | Stability | Double `cleanup()` in VD server — handleClient finally + run both call it | **v0.7.2** |
 | M8 | Stability | `cleanupSession()` doesn't reset `_serviceState` — stale UI during delay | **v0.7.2** |
 | M9 | Stability | Static MutableStateFlow in companion survives service restarts — stale activeConnection | **v0.7.2** |
@@ -444,9 +444,9 @@ Car (BYD DiLink 3.0, Android 10)
 │   │   ├── Early decoder start: offscreen surface on first CONFIG
 │   │   ├── carLogSend() + logSink callbacks → phone FileLog
 │   │   └── Eject state persisted to SharedPreferences
-│   ├── VideoDecoder (queue=15, early start, logSink, 4-zone catchup)
-│   ├── PersistentNavBar (76dp, 40dp icons, 14sp text, recent apps pruned)
-│   ├── LauncherScreen (64dp icons, 160dp grid, imePadding search)
+│   ├── VideoDecoder (hardware-first decode, 4-frame queue, post-flush IDR resync, logSink, optional debugFrameStats)
+│   ├── PersistentNavBar / PersistentBottomNavBar (40dp icons, 14sp text, recent apps pruned)
+│   ├── HomeScreen / HomeContent / AppTile (64dp icons, 160dp grid, pin-to-top, lambda-based actions)
 │   ├── NotificationScreen (progress bars, tap-to-launch, dedup by ID)
 │   └── MirrorScreen (TextureView + touch forwarding, decoder restart)
 ```

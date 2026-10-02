@@ -129,19 +129,19 @@ Full-screen connection-focused composable shown before the phone connection is e
 - Manual IP entry for direct connection
 - Replaced by streaming mode layout when `appList` becomes non-empty and state reaches CONNECTED/STREAMING
 
-### PersistentNavBar
+### PersistentNavBar / PersistentBottomNavBar
 
-76dp left navigation bar — **only shown in streaming mode** — with:
-- Clock display (HH:mm, updates every 1s)
+Landscape (left rail, `PersistentNavBar`) and portrait (bottom bar, `PersistentBottomNavBar`) navigation bars — **only shown in streaming mode**. Both share the same action set, differing only in placement and orientation:
+- Clock display (HH:mm, updates every 1s, landscape only)
 - Eject button (disconnects and persists user preference)
-- Network status indicator
+- Network status indicator (landscape only)
 - Notifications button with unread badge count
 - Home button
 - Back button
 - Recent app icons (max 5, pruned when apps become unavailable)
-- 40dp icons, 12-14sp text
+- 40dp icons, 14sp text
 
-Width computed to guarantee even viewport for H.264 encoder.
+Width computed to guarantee an even viewport for the H.264 encoder.
 
 ### NotificationScreen
 
@@ -165,9 +165,9 @@ Shown as the main content area when streaming mode is active and current screen 
 - Manual IP entry
 - Connection status
 
-### LauncherScreen (Legacy)
+### HomeContent / AppTile
 
-Full integrated launcher layout with `CarStatusBar`, `SideNavBar` (80dp), and `AppGrid`. Not used in the current `CarShell` routing — the active UI uses `PersistentNavBar` + `HomeContent`/`MirrorContent`/`NotificationContent` composables inline.
+The live composables formerly in `LauncherScreen.kt` now live in `HomeScreen.kt`. `AppTile` takes `onUninstall`/`onAppInfo`/`onTogglePin` lambdas instead of a `CarConnectionService` reference (keeps the tile skippable and testable). Long-press opens a context menu: pin-to-top, uninstall, app info. Pin state persists to SharedPreferences (`dilinkauto_pinned`).
 
 ### RecentAppsState
 
@@ -175,7 +175,7 @@ Tracks recently launched apps (max 5), persisted to SharedPreferences. `pruneUna
 
 ### NavBarComponents
 
-Individual nav bar widget composables: `ClockDisplay` (updates every 1s), `NetworkInfo` (connected/disconnected state), `RecentAppIcon` (40dp, with active state highlight), `NavActionButton` (40dp icons, 12sp labels).
+Individual nav bar widget composables: `ClockDisplay` (updates every 1s), `NetworkInfo` (connected/disconnected state), `RecentAppIcon` (40dp, with active state highlight), `NavActionButton` (40dp icons, 14sp labels), `NotificationsButton` (BadgedBox with unread count). All live — used by both `PersistentNavBar` and `PersistentBottomNavBar`.
 
 ### CarTheme
 

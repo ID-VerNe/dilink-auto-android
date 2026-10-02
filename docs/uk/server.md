@@ -165,10 +165,9 @@ APK автомобіля вбудований в APK телефону. Теле�
 - Ручне введення IP
 - Статус з'єднання
 
-### LauncherScreen (Застарілий)
+### HomeContent / AppTile
 
-Повний інтегрований макет launcher з `CarStatusBar`, `SideNavBar` (80dp) та `AppGrid`. Не використовується в поточній маршрутизації `CarShell` — активний UI використовує `PersistentNavBar` + `HomeContent`/`MirrorContent`/`NotificationContent` вбудовані компонувальні елементи.
-
+Живі composables, раніше у `LauncherScreen.kt`, тепер живуть у `HomeScreen.kt`. `AppTile` приймає лямбди `onUninstall`/`onAppInfo`/`onTogglePin` замість посилання `CarConnectionService` (залишає tile skippable і тестованим). Довгий натиск відкриває контекстне меню: pin-to-top, видалення, інформація про застосунок. Стан піну зберігається у SharedPreferences (`dilinkauto_pinned`).
 ### RecentAppsState
 
 Відстежує нещодавно запущені додатки (макс. 5), зберігається в SharedPreferences. `pruneUnavailable()` видаляє додатки, яких більше немає при оновленні списку додатків.

@@ -126,7 +126,6 @@ DiLink-Auto/
 | CarLaunchScreen | `ui/screen/CarLaunchScreen.kt` | Полноэкранный экран запуска/подключения (без навигации), брендинг, инструкции, ручной IP |
 | MirrorScreen | `ui/screen/MirrorScreen.kt` | TextureView + пересылка касаний, перезапуск декодера при доступности поверхности |
 | HomeContent | `ui/screen/HomeScreen.kt` | Сетка приложений (значки 64dp, ячейки 160dp) или статус соединения, в режиме стриминга |
-| LauncherScreen | `ui/screen/LauncherScreen.kt` | Устаревший интегрированный экран с SideNavBar, CarStatusBar, AppGrid |
 | NotificationScreen | `ui/screen/NotificationScreen.kt` | Список уведомлений с индикаторами прогресса, запуск по нажатию |
 | PersistentNavBar | `ui/nav/PersistentNavBar.kt` | Панель навигации 76dp (значки 40dp, текст 14sp), недавние приложения (с очисткой), только в режиме стриминга |
 | RecentAppsState | `ui/nav/RecentAppsState.kt` | Отслеживает недавние приложения, удаляет недоступные |

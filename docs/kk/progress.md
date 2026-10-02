@@ -346,7 +346,7 @@ VD жасау, self-ADB, төзімді сервер, көп қолданбан�
 | M3 | Perf | Multi-touch MOVE үшін N бөлек кадр жібереді — барлық көрсеткіштерді пакеттеу керек | **v0.8.3** |
 | M4 | Perf | MotionEvent PointerProperties/Coords әр енгізуге бөлінеді — пул пайдалану | **v0.8.1** |
 | M5 | Perf | Декодер кадр кезегі 6 тереңдікте (200ms) — төмен кідіріс үшін 2-3 дейін азайту | **v0.8.1** |
-| M6 | Perf | `execFast("cmd display power-off 0")` жанасу ағынында — таймерге жылжыту | **v0.8.1** |
+| M6 | Perf | ~~`execFast` жойылды (Phase B6)~~, дисплей қуатын басқару енді `execShell` арқылы арнайы ағында | **v0.8.1** |
 | M7 | Stability | VD серверінде қос `cleanup()` — handleClient finally + run екеуі де шақырады | **v0.7.2** |
 | M8 | Stability | `cleanupSession()` `_serviceState` қалпына келтірмейді — кідіріс кезінде ескірген UI | **v0.7.2** |
 | M9 | Stability | Companion-дағы статикалық MutableStateFlow қызмет қайта іске қосылуынан аман қалады — ескірген activeConnection | **v0.7.2** |
@@ -422,9 +422,9 @@ Car (BYD DiLink 3.0, Android 10)
 │   │   ├── Early decoder start: offscreen surface on first CONFIG
 │   │   ├── carLogSend() + logSink callbacks → phone FileLog
 │   │   └── Eject state persisted to SharedPreferences
-│   ├── VideoDecoder (queue=15, early start, logSink, 4-zone catchup)
-│   ├── PersistentNavBar (76dp, 40dp icons, 14sp text, recent apps pruned)
-│   ├── LauncherScreen (64dp icons, 160dp grid, imePadding search)
+│   ├── VideoDecoder (hardware-first decode, 4-frame queue, post-flush IDR resync, logSink, optional debugFrameStats)
+│   ├── PersistentNavBar / PersistentBottomNavBar (40dp icons, 14sp text, recent apps pruned)
+│   ├── HomeScreen / HomeContent / AppTile (64dp icons, 160dp grid, pin-to-top, lambda-based actions)
 │   ├── NotificationScreen (progress bars, tap-to-launch, dedup by ID)
 │   └── MirrorScreen (TextureView + touch forwarding, decoder restart)
 ```

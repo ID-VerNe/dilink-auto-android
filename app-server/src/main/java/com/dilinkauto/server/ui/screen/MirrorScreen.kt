@@ -72,7 +72,6 @@ fun MirrorContent(service: CarConnectionService, visible: Boolean = true) {
                 }
 
                 setOnTouchListener { view, event ->
-                    service.log("[MirrorScreen] TOUCH: action=${event.actionMasked} x=${event.x/view.width} y=${event.y/view.height}")
                     when (event.actionMasked) {
                         MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
                             val idx = event.actionIndex

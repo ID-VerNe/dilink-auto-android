@@ -9,6 +9,43 @@ import java.nio.ByteOrder
  * All multi-byte values are big-endian.
  */
 
+/**
+ * Thrown when a message payload is truncated or declares a length that exceeds the
+ * remaining buffer. Replaces unchecked BufferUnderflowException so callers can catch
+ * malformed frames uniformly without crashing the process.
+ */
+class ProtocolDecodeException(message: String) : Exception(message)
+
+/**
+ * Helpers for length-prefixed, bounds-checked decoding.
+ * Every decoder reads a 2-byte unsigned length then [len] bytes; if the buffer does
+ * not contain the declared bytes, [ProtocolDecodeException] is thrown instead of the
+ * unchecked BufferUnderflowException (which previously escaped the reader coroutine
+ * and crashed the app on a single malformed frame).
+ */
+private fun ByteBuffer.readShortLengthPrefixed(): String {
+    if (remaining() < 2) throw ProtocolDecodeException("Truncated length prefix: need 2, have ${remaining()}")
+    val len = getShort().toInt() and 0xFFFF
+    if (len == 0) return ""
+    if (remaining() < len) throw ProtocolDecodeException("Truncated string: need $len, have ${remaining()}")
+    val bytes = ByteArray(len)
+    get(bytes)
+    return String(bytes, Charsets.UTF_8)
+}
+
+/** Read [len] bytes as a ByteArray, or throw [ProtocolDecodeException] if unavailable. */
+private fun ByteBuffer.readBytes(len: Int): ByteArray {
+    if (len == 0) return ByteArray(0)
+    if (remaining() < len) throw ProtocolDecodeException("Truncated bytes: need $len, have ${remaining()}")
+    val bytes = ByteArray(len)
+    get(bytes)
+    return bytes
+}
+
+private fun ByteBuffer.require(n: Int) {
+    if (remaining() < n) throw ProtocolDecodeException("Need $n bytes, have ${remaining()}")
+}
+
 // ─── Handshake ───
 
 data class HandshakeRequest(
@@ -47,12 +84,10 @@ data class HandshakeRequest(
         fun decode(data: ByteArray): HandshakeRequest {
             val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
             val version = buf.getInt()
-            val nameLen = buf.getShort().toInt() and 0xFFFF
-            val nameBytes = ByteArray(nameLen)
-            buf.get(nameBytes)
+            val deviceName = buf.readShortLengthPrefixed()
             val request = HandshakeRequest(
                 protocolVersion = version,
-                deviceName = String(nameBytes, Charsets.UTF_8),
+                deviceName = deviceName,
                 screenWidth = buf.getInt(),
                 screenHeight = buf.getInt(),
                 supportedFeatures = buf.getInt(),
@@ -60,14 +95,7 @@ data class HandshakeRequest(
                 screenDpi = if (buf.remaining() >= 4) buf.getInt() else 160,
                 appVersionCode = if (buf.remaining() >= 4) buf.getInt() else 0,
                 targetFps = if (buf.remaining() >= 4) buf.getInt() else 30,
-                appVersionName = if (buf.remaining() >= 2) {
-                    val vnLen = (buf.getShort().toInt() and 0xFFFF).coerceAtMost(buf.remaining())
-                    if (vnLen > 0) {
-                        val vnBytes = ByteArray(vnLen)
-                        buf.get(vnBytes)
-                        String(vnBytes, Charsets.UTF_8)
-                    } else ""
-                } else ""
+                appVersionName = if (buf.remaining() >= 2) buf.readShortLengthPrefixed() else ""
             )
             return request
         }
@@ -111,9 +139,7 @@ data class HandshakeResponse(
             val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
             val version = buf.getInt()
             val accepted = buf.get() != 0.toByte()
-            val nameLen = buf.getShort().toInt() and 0xFFFF
-            val nameBytes = ByteArray(nameLen)
-            buf.get(nameBytes)
+            val deviceName = buf.readShortLengthPrefixed()
             val dw = buf.getInt()
             val dh = buf.getInt()
             val vdId = if (buf.hasRemaining()) buf.getInt() else -1
@@ -121,9 +147,7 @@ data class HandshakeResponse(
             val jarPath = if (buf.remaining() >= 2) {
                 val pathLen = buf.getShort().toInt() and 0xFFFF
                 if (pathLen > 0 && buf.remaining() >= pathLen) {
-                    val pathBytes = ByteArray(pathLen)
-                    buf.get(pathBytes)
-                    String(pathBytes, Charsets.UTF_8)
+                    String(buf.readBytes(pathLen), Charsets.UTF_8)
                 } else ""
             } else ""
             val connMethod = if (buf.hasRemaining()) buf.get() else CONNECTION_METHOD_USB_ADB
@@ -131,7 +155,7 @@ data class HandshakeResponse(
             return HandshakeResponse(
                 protocolVersion = version,
                 accepted = accepted,
-                deviceName = String(nameBytes, Charsets.UTF_8),
+                deviceName = deviceName,
                 displayWidth = dw,
                 displayHeight = dh,
                 virtualDisplayId = vdId,
@@ -168,6 +192,7 @@ data class TouchEvent(
     companion object {
         fun decode(data: ByteArray): TouchEvent {
             val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
+            buf.require(1 + 4 + 4 + 4 + 4 + 8)
             return TouchEvent(
                 action = buf.get(),
                 pointerId = buf.getInt(),
@@ -199,8 +224,10 @@ data class TouchMoveBatch(val pointers: List<TouchEvent>) {
     companion object {
         fun decode(data: ByteArray): TouchMoveBatch {
             val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
+            buf.require(1)
             val count = buf.get().toInt() and 0xFF
             val pointers = (0 until count).map {
+                buf.require(4 + 4 + 4 + 4 + 8)
                 TouchEvent(
                     action = InputMsg.TOUCH_MOVE,
                     pointerId = buf.getInt(),
@@ -282,25 +309,17 @@ data class NotificationData(
         fun decode(data: ByteArray): NotificationData {
             val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
             val id = buf.getInt()
-            fun readString(): String {
-                val len = buf.getShort().toInt() and 0xFFFF
-                val bytes = ByteArray(len)
-                buf.get(bytes)
-                return String(bytes, Charsets.UTF_8)
-            }
-            val pkg = readString()
-            val app = readString()
-            val title = readString()
-            val text = readString()
+            val pkg = buf.readShortLengthPrefixed()
+            val app = buf.readShortLengthPrefixed()
+            val title = buf.readShortLengthPrefixed()
+            val text = buf.readShortLengthPrefixed()
             val ts = buf.getLong()
             val indeterminate = if (buf.remaining() >= 1) buf.get() != 0.toByte() else false
             val prog = if (!indeterminate && buf.remaining() >= 4) buf.getInt() else 0
             val progMax = if (!indeterminate && buf.remaining() >= 4) buf.getInt() else 0
             val iconPng = if (buf.remaining() >= 4) {
                 val iconLen = buf.getInt()
-                if (iconLen > 0 && buf.remaining() >= iconLen) {
-                    ByteArray(iconLen).also { buf.get(it) }
-                } else ByteArray(0)
+                if (iconLen > 0 && buf.remaining() >= iconLen) buf.readBytes(iconLen) else ByteArray(0)
             } else ByteArray(0)
             return NotificationData(id, pkg, app, title, text, ts, indeterminate, prog, progMax, iconPng)
         }
@@ -368,25 +387,15 @@ data class AppListMessage(val apps: List<AppInfo>) {
             val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
             val count = buf.getShort().toInt() and 0xFFFF
             val apps = (0 until count).map {
-                fun readStr(): String {
-                    val len = buf.getShort().toInt() and 0xFFFF
-                    val bytes = ByteArray(len)
-                    buf.get(bytes)
-                    return String(bytes, Charsets.UTF_8)
-                }
-                val pkg = readStr()
-                val name = readStr()
+                val pkg = buf.readShortLengthPrefixed()
+                val name = buf.readShortLengthPrefixed()
                 val category = AppCategory.fromId(buf.get())
                 val iconSize = if (buf.remaining() >= 4) buf.getInt() else 0
-                val iconPng = if (iconSize > 0 && buf.remaining() >= iconSize) {
-                    ByteArray(iconSize).also { buf.get(it) }
-                } else ByteArray(0)
+                val iconPng = if (iconSize > 0 && buf.remaining() >= iconSize) buf.readBytes(iconSize) else ByteArray(0)
                 val iconHash = if (buf.remaining() >= 2) {
-                    val hashLen = (buf.getShort().toInt() and 0xFFFF).coerceAtMost(buf.remaining())
-                    if (hashLen > 0) {
-                        val hashBytes = ByteArray(hashLen)
-                        buf.get(hashBytes)
-                        String(hashBytes, Charsets.UTF_8)
+                    val hashLen = buf.getShort().toInt() and 0xFFFF
+                    if (hashLen > 0 && buf.remaining() >= hashLen) {
+                        String(buf.readBytes(hashLen), Charsets.UTF_8)
                     } else ""
                 } else ""
                 AppInfo(
@@ -426,16 +435,10 @@ data class MediaMetadata(
     companion object {
         fun decode(data: ByteArray): MediaMetadata {
             val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
-            fun readStr(): String {
-                val len = buf.getShort().toInt() and 0xFFFF
-                val bytes = ByteArray(len)
-                buf.get(bytes)
-                return String(bytes, Charsets.UTF_8)
-            }
             return MediaMetadata(
-                title = readStr(),
-                artist = readStr(),
-                album = readStr(),
+                title = buf.readShortLengthPrefixed(),
+                artist = buf.readShortLengthPrefixed(),
+                album = buf.readShortLengthPrefixed(),
                 durationMs = buf.getLong()
             )
         }
@@ -460,6 +463,7 @@ data class PlaybackState(
 
         fun decode(data: ByteArray): PlaybackState {
             val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
+            buf.require(1 + 8)
             return PlaybackState(buf.get(), buf.getLong())
         }
     }
@@ -494,10 +498,8 @@ data class ClearNotificationMessage(
         fun decode(data: ByteArray): ClearNotificationMessage {
             val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
             val id = buf.getInt()
-            val pkgLen = buf.getShort().toInt() and 0xFFFF
-            val pkgBytes = ByteArray(pkgLen)
-            buf.get(pkgBytes)
-            return ClearNotificationMessage(id, String(pkgBytes, Charsets.UTF_8))
+            val pkg = buf.readShortLengthPrefixed()
+            return ClearNotificationMessage(id, pkg)
         }
     }
 }
@@ -551,16 +553,10 @@ data class AppInfoDataMessage(
     companion object {
         fun decode(data: ByteArray): AppInfoDataMessage {
             val buf = java.nio.ByteBuffer.wrap(data)
-            fun readStr(): String {
-                val len = buf.short.toInt() and 0xFFFF
-                val bytes = ByteArray(len)
-                buf.get(bytes)
-                return String(bytes, Charsets.UTF_8)
-            }
             return AppInfoDataMessage(
-                packageName = readStr(),
-                appName = readStr(),
-                versionName = readStr(),
+                packageName = buf.readShortLengthPrefixed(),
+                appName = buf.readShortLengthPrefixed(),
+                versionName = buf.readShortLengthPrefixed(),
                 versionCode = buf.long,
                 installTime = buf.long,
                 targetSdk = buf.int
@@ -609,19 +605,14 @@ data class AppShortcutsListMessage(
     companion object {
         fun decode(data: ByteArray): AppShortcutsListMessage {
             val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
-            val pkgLen = buf.getShort().toInt() and 0xFFFF
-            val pkgBytes = ByteArray(pkgLen)
-            buf.get(pkgBytes)
-            val pkg = String(pkgBytes, Charsets.UTF_8)
+            val pkg = buf.readShortLengthPrefixed()
             val count = buf.getShort().toInt() and 0xFFFF
             val shortcuts = (0 until count).map {
-                fun readStr(): String {
-                    val len = buf.getShort().toInt() and 0xFFFF
-                    val bytes = ByteArray(len)
-                    buf.get(bytes)
-                    return String(bytes, Charsets.UTF_8)
-                }
-                AppShortcut(id = readStr(), shortLabel = readStr(), longLabel = readStr())
+                AppShortcut(
+                    id = buf.readShortLengthPrefixed(),
+                    shortLabel = buf.readShortLengthPrefixed(),
+                    longLabel = buf.readShortLengthPrefixed()
+                )
             }
             return AppShortcutsListMessage(pkg, shortcuts)
         }
@@ -648,16 +639,9 @@ data class AppShortcutActionMessage(
     companion object {
         fun decode(data: ByteArray): AppShortcutActionMessage {
             val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
-            val pkgLen = buf.getShort().toInt() and 0xFFFF
-            val pkgBytes = ByteArray(pkgLen)
-            buf.get(pkgBytes)
-            val idLen = buf.getShort().toInt() and 0xFFFF
-            val idBytes = ByteArray(idLen)
-            buf.get(idBytes)
-            return AppShortcutActionMessage(
-                String(pkgBytes, Charsets.UTF_8),
-                String(idBytes, Charsets.UTF_8)
-            )
+            val pkg = buf.readShortLengthPrefixed()
+            val shortcutId = buf.readShortLengthPrefixed()
+            return AppShortcutActionMessage(pkg, shortcutId)
         }
     }
 }

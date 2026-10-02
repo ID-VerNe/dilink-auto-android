@@ -15,6 +15,7 @@ class ServerApp : Application() {
 
         CarCrashHandler.install(this)
         Log.i("ServerApp", CarCrashHandler.buildDeviceInfo(this))
+        CarCrashHandler.logPssAsync()
     }
 
     private fun createNotificationChannels() {

@@ -151,7 +151,7 @@ private fun BrandingSection() {
     Text(
         stringResource(R.string.branding_tagline),
         style = MaterialTheme.typography.bodyMedium,
-        color = Color.Gray
+        color = MaterialTheme.colorScheme.onSurfaceVariant
     )
 }
 
@@ -187,7 +187,7 @@ private fun ConnectionStatusCard(
                                 CarConnectionService.State.STREAMING -> Color(0xFF4CAF50)
                                 CarConnectionService.State.CONNECTED -> Color(0xFFFFA726)
                                 CarConnectionService.State.CONNECTING -> Color(0xFFFFA726)
-                                else -> Color(0xFF757575)
+                                else -> MaterialTheme.colorScheme.onSurfaceVariant
                             },
                             RoundedCornerShape(6.dp)
                         )
@@ -209,7 +209,7 @@ private fun ConnectionStatusCard(
                         Text(
                             if (phoneName.isNotEmpty()) phoneName else statusMessage,
                             style = MaterialTheme.typography.bodySmall,
-                            color = Color.Gray
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 }
@@ -249,7 +249,7 @@ private fun ConnectionStatusCard(
                         Text(
                             if (devMode) stringResource(R.string.dev_mode_desc_on)
                             else stringResource(R.string.dev_mode_desc_off),
-                            color = if (devMode) Color(0xFFFFA726) else Color.Gray,
+                            color = if (devMode) Color(0xFFFFA726) else MaterialTheme.colorScheme.onSurfaceVariant,
                             style = MaterialTheme.typography.bodySmall
                         )
                     }
@@ -282,7 +282,7 @@ private fun WifiAdbSetupCard() {
             Spacer(Modifier.height(8.dp))
             Text(
                 stringResource(R.string.wifi_adb_setup_desc),
-                color = Color(0xFFBBBBBB),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.bodySmall,
                 lineHeight = 20.sp
             )
@@ -338,7 +338,7 @@ private fun ConnectStep(number: String, text: String) {
         Text(
             text,
             style = MaterialTheme.typography.bodyMedium,
-            color = Color(0xFFBBBBBB)
+            color = MaterialTheme.colorScheme.onSurfaceVariant
         )
     }
 }

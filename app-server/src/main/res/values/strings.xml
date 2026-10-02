@@ -33,11 +33,11 @@
     <string name="how_to_connect_title">How to connect</string>
 
     <!-- Connection Mode (WiFi ADB / USB ADB) -->
-    <string name="dev_mode_title">WiFi Direct Mode</string>
+    <string name="dev_mode_title">WiFi ADB Mode</string>
     <string name="dev_mode_desc_on">WiFi ADB (car connects to phone over WiFi — no USB cable needed)</string>
     <string name="dev_mode_desc_off">USB ADB (car connects to phone via USB cable)</string>
     <string name="wifi_adb_setup_title">WiFi ADB Setup</string>
-    <string name="wifi_adb_setup_desc">To use WiFi Direct Mode, you must first enable ADB over WiFi on your phone. Connect your phone to a computer via USB and run:\n\nadb tcpip 5555\n\nThis only needs to be done once. After that, the car can connect to your phone over WiFi without a USB cable.</string>
+    <string name="wifi_adb_setup_desc">Set up wireless ADB on your phone first — see the DiLink Auto phone app.</string>
 
     <!-- Manual Connect -->
     <string name="manual_connect_label">Or connect manually by IP</string>
@@ -74,7 +74,7 @@
     <!-- Notifications -->
     <string name="no_notifications">No notifications</string>
     <string name="notifications_count">Notifications (%d)</string>
-    <string name="clear_all">Clear All</string>
+    <string name="clear_all">Clear all</string>
     <string name="clear_notification">Clear notification</string>
 
     <!-- Connection Status Messages -->
@@ -99,4 +99,14 @@
     <!-- App Context Actions -->
     <string name="action_uninstall">Uninstall</string>
     <string name="action_app_info">App info</string>
+
+    <!-- Home screen copy -->
+    <string name="search_apps">Search apps</string>
+    <string name="clear_search">Clear search</string>
+    <string name="pin_to_top">Pin to top</string>
+    <string name="unpin_from_top">Unpin from top</string>
+    <string name="searching_for_phone">Searching for phone</string>
+    <string name="phone_hint">Make sure DiLink Auto is running on your phone\nand both devices are on the same network</string>
+    <string name="connecting">Connecting</string>
+    <string name="connected_waiting_for_data">Connected - waiting for data</string>
 </resources>

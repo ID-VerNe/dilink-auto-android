@@ -21,6 +21,7 @@ import java.util.Locale
  */
 object CarCrashHandler : Thread.UncaughtExceptionHandler {
 
+    private const val TAG = "CarCrashHandler"
     private val originalHandler = Thread.getDefaultUncaughtExceptionHandler()
     private const val CRASH_FILE = "crash-pending.log"
 
@@ -109,14 +110,30 @@ object CarCrashHandler : Thread.UncaughtExceptionHandler {
             am.getMemoryInfo(miPid)
             sb.appendLine("memThreshold=${mi.threshold}")
 
-            // PSS info for this process
-            try {
-                sb.appendLine("pss=${Debug.getPss()}")
-            } catch (_: Exception) {}
+            // PSS computation is a binder call to activitymanager that can take
+            // 100ms+ on a weak car CPU; defer it so the calling thread (often Main
+            // at startup) doesn't stall. The header still records that PSS exists;
+            // the actual value is filled asynchronously onto the log sink.
+            sb.appendLine("pss=deferred")
             sb.appendLine()
         }
 
         return sb.toString()
+    }
+
+    /** Async PSS capture — offloads Debug.getPss() to a background thread and
+     *  routes the result to the log sink (or logcat). Call from a non-Main scope. */
+    fun logPssAsync() {
+        Thread({
+            try {
+                val pss = Debug.getPss()
+                logToSink("pss=${pss}")
+            } catch (_: Exception) {}
+        }, "PssProbe").apply { isDaemon = true }.start()
+    }
+
+    private fun logToSink(msg: String) {
+        logSink?.invoke(msg) ?: Log.i(TAG, msg)
     }
 
     private fun buildReport(thread: Thread, throwable: Throwable): String {

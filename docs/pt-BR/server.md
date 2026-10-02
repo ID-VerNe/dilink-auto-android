@@ -165,10 +165,9 @@ Exibida como area de conteudo principal quando o modo streaming esta ativo e a t
 - Entrada manual de IP
 - Status da conexao
 
-### LauncherScreen (Legado)
+### HomeContent / AppTile
 
-Layout de launcher integrado completo com `CarStatusBar`, `SideNavBar` (80dp) e `AppGrid`. Nao usado no roteamento atual do `CarShell` — a UI ativa usa composables inline `PersistentNavBar` + `HomeContent`/`MirrorContent`/`NotificationContent`.
-
+Os composables vivos anteriormente em `LauncherScreen.kt` agora vivem em `HomeScreen.kt`. `AppTile` aceita lambdas `onUninstall`/`onAppInfo`/`onTogglePin` em vez de uma referencia `CarConnectionService` (mantem o tile skippable e testavel). Um toque longo abre um menu de contexto: fixar no topo, desinstalar, informacoes do app. O estado de fixacao persiste em SharedPreferences (`dilinkauto_pinned`).
 ### RecentAppsState
 
 Rastreia apps lancados recentemente (max 5), persistidos em SharedPreferences. `pruneUnavailable()` remove apps que nao estao mais presentes quando a lista de apps e atualizada.

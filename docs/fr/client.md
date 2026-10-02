@@ -67,18 +67,13 @@ Accepte la connexion inverse du processus serveur VD sur `localhost:19637`. Pren
 - Les écritures tactiles vers localhost sont synchrones avec `FrameCodec.writeAll()` sous `writeLock`
 - À la déconnexion : restaure l'écran physique (`cmd display power-on 0` + `KEYCODE_WAKEUP`) comme filet de sécurité quand le processus serveur VD est tué avant nettoyage
 
-### AdbBridge
+### CarIpLocator
 
-Assistant de commandes shell de secours. Fournit `execShell()` et `execFast()` utilisant `Runtime.exec()` pour les opérations du serveur VD et la gestion d'alimentation de l'écran quand la réflexion API directe échoue.
+Localise le service ADB-over-WiFi de la voiture (port 5555) pour le flux Installer sur la voiture. Strategies par ordre de latence : IP distante de la connexion de controle, table ARP, cache `ip neigh` (toujours reaping dans `finally`), scan /24 parallele (150ms par sonde), passerelle WiFi. `object` simple — sans dependance `Service` — donc testable isolement.
 
-### VirtualDisplayManager
+### CarAppInstaller
 
-Gère le lancement d'applications sur l'écran physique quand le VD n'est pas utilisé. Fait le pont vers `InputInjectionService` pour l'injection d'entrée basée sur les gestes.
-
-### VideoEncoder
-
-Encodeur H.264 MediaProjection + MediaCodec utilisant un virtual display `AUTO_MIRROR`. Chemin d'encodage alternatif (non utilisé dans le pipeline de streaming principal qui passe par le serveur VD).
-
+Pousse le `app-server.apk` embarque vers la voiture via `dadb` (ADB-over-WiFi). Gere la generation de paire de cles ADB, `Dadb.create()` avec un timeout dur de 15 secondes via `Future.get` (les I/O socket bloquantes ne peuvent pas etre interrompues par l annulation de coroutine), le push `pm install -r`, et le redemarrage `am start`. Les chaines de statut reviennent a l appelant via un callback `onStatus` pour que `_installStatusStatic` reste dans `ConnectionService`.
 ### FileLog
 
 Journalisation basée fichier qui contourne le filtrage logcat Android (HyperOS filtre `Log.i/d` pour les apps non-système).

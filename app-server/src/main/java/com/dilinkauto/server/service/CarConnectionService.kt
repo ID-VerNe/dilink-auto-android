@@ -167,6 +167,7 @@ class CarConnectionService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        startLogWriter()
         videoDecoder.logSink = { msg -> carLogSend(msg) }
 
         // Wire crash handler to TCP log sink for immediate crash delivery
@@ -174,6 +175,9 @@ class CarConnectionService : Service() {
 
         // Log device info for diagnostics
         carLogSend(CarCrashHandler.buildDeviceInfo(this))
+        // PSS is a binder call to activitymanager that stalls the calling thread;
+        // probe it off Main so startup isn't blocked on a slow car CPU.
+        CarCrashHandler.logPssAsync()
 
         // Send any crash report from the previous run
         val crash = CarCrashHandler.consumePendingCrash()
@@ -741,18 +745,11 @@ class CarConnectionService : Service() {
             carLogSend("Video ${if (isConfig) "CONFIG" else "FRAME"} size=${frame.payload.size} total=$videoFrameCount")
         }
 
-        // Start decoder immediately on first CONFIG — don't wait for MirrorScreen's TextureView.
-        // Uses an offscreen SurfaceTexture so the decoder can consume frames right away.
-        // MirrorScreen will restart the decoder with the real surface when it appears.
-        if (isConfig && !videoDecoder.isRunning) {
-            carLogSend("Starting decoder with offscreen surface (pre-MirrorScreen)")
-            val tex = android.graphics.SurfaceTexture(0)
-            tex.setDefaultBufferSize(vdWidth, vdHeight)
-            val surf = android.view.Surface(tex)
-            offscreenTexture = tex
-            offscreenSurface = surf
-            videoDecoder.start(surf, vdWidth, vdHeight, targetFps)
-        }
+        // CONFIG is cached inside VideoDecoder; P-frames before the decoder starts
+        // are dropped there (onFrameReceived checks running). Do NOT start the
+        // decoder on an offscreen SurfaceTexture(0): those decoded frames have no
+        // consumer, wasting hardware-decode bandwidth and a temporary gralloc
+        // allocation. Wait for MirrorScreen's real surface, then start normally.
 
         if (!_videoReady.value && !isConfig) {
             _videoReady.value = true
@@ -766,27 +763,25 @@ class CarConnectionService : Service() {
         when (frame.messageType) {
             DataMsg.APP_LIST -> {
                 val apps = AppListMessage.decode(frame.payload).apps
+                // Set the app list immediately so the grid can render placeholder
+                // (category-icon) tiles while icons are still decoding. The phone's
+                // icon PNGs are persisted on Dispatchers.IO below — never on Main.
                 _appList.value = apps
-                // Store source PNGs and prepare all icons for instant rendering.
-                var newIcons = 0
-                apps.forEach { app ->
-                    if (app.iconPng.isNotEmpty()) {
-                        ServerApp.iconCache.putSource(app.packageName, app.iconPng)
-                        newIcons++
-                    }
-                }
-                // Decode + resize all icons on a background thread BEFORE the grid
-                // renders. After prepareAll() finishes, getPrepared() is an O(1)
-                // ConcurrentHashMap lookup — zero work during scroll.
                 scope.launch(Dispatchers.IO) {
+                    var newIcons = 0
+                    apps.forEach { app ->
+                        if (app.iconPng.isNotEmpty()) {
+                            ServerApp.iconCache.putSource(app.packageName, app.iconPng)
+                            newIcons++
+                        }
+                    }
+                    // Decode + resize all icons on a background thread BEFORE the grid
+                    // renders. After prepareAll() finishes, getPrepared() is an O(1)
+                    // ConcurrentHashMap lookup — zero work during scroll.
                     val density = applicationContext.resources.displayMetrics.density
                     val gridIconPx = (64 * density).toInt()
                     val prepared = ServerApp.iconCache.prepareAll(apps, gridIconPx)
                     carLogSend("App list: ${apps.size} apps, ${prepared} icons prepared @ ${gridIconPx}px")
-                    // Trigger grid recomposition so tiles pick up the prepared icons
-                    if (prepared > 0) {
-                        _appList.value = ArrayList(_appList.value)
-                    }
                 }
             }
             DataMsg.NOTIFICATION_POST -> {
@@ -803,7 +798,8 @@ class CarConnectionService : Service() {
             DataMsg.APP_UNINSTALLED -> {
                 val pkg = String(frame.payload, Charsets.UTF_8)
                 _appList.value = _appList.value.filter { it.packageName != pkg }
-                carLogSend("App uninstalled: $pkg — removed from grid")
+                ServerApp.iconCache.evict(pkg)
+                carLogSend("App uninstalled: $pkg — removed from grid, evicted icon cache")
             }
             DataMsg.APP_INFO_DATA -> {
                 val info = AppInfoDataMessage.decode(frame.payload)
@@ -813,6 +809,10 @@ class CarConnectionService : Service() {
             DataMsg.LOG_TOGGLE -> {
                 val enabled = frame.payload.isNotEmpty() && frame.payload[0].toInt() == 1
                 carLogEnabled = enabled
+                // Frame-stats diagnostics ride on the same toggle — when the user
+                // enables logging from the phone, the per-30-frame decode-time
+                // and queue-depth stats are surfaced too (Phase L1 / perf 9.3).
+                videoDecoder.debugFrameStats = enabled
                 carLogSend("Logging ${if (enabled) "enabled" else "disabled"} by phone")
             }
         }
@@ -1214,6 +1214,7 @@ class CarConnectionService : Service() {
         disconnectAllConnections()
         phoneHost = null
         _state.value = State.IDLE
+        logWriterJob.cancel()
         scope.cancel()
     }
 
@@ -1268,6 +1269,49 @@ class CarConnectionService : Service() {
 
     private val logBuffer = java.util.concurrent.ConcurrentLinkedQueue<String>()
 
+    private data class LogEntry(val msg: String, val level: String)
+
+    /** Off-thread log queue: callers do a non-blocking trySend, a dedicated coroutine formats+encodes+sends. */
+    private val logQueue = kotlinx.coroutines.channels.Channel<LogEntry>(1024)
+    private val logWriterJob = kotlinx.coroutines.Job()
+    private val logWriterScope = CoroutineScope(logWriterJob + Dispatchers.IO)
+    @Volatile private var logWriterStarted = false
+
+    private val logTsFormatter = java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss.SSS")
+
+    private fun startLogWriter() {
+        if (logWriterStarted) return
+        logWriterStarted = true
+        logWriterScope.launch {
+            try {
+                for (entry in logQueue) {
+                    try {
+                        val ts = java.time.LocalTime.now().format(logTsFormatter)
+                        val line = "[$ts][${entry.level}] ${entry.msg}"
+                        val conn = controlConnection
+                        if (conn != null && conn.isConnected) {
+                            // Flush any buffered messages first
+                            while (true) {
+                                val buffered = logBuffer.poll() ?: break
+                                try { conn.sendData(DataMsg.CAR_LOG, buffered.toByteArray(Charsets.UTF_8)) }
+                                catch (_: Exception) { break }
+                            }
+                            try { conn.sendData(DataMsg.CAR_LOG, line.toByteArray(Charsets.UTF_8)) }
+                            catch (_: Exception) {}
+                        } else {
+                            // Buffer for later — cap at 10000 lines
+                            if (logBuffer.size < 10000) logBuffer.add(line)
+                        }
+                    } catch (_: Throwable) {
+                        // Never let the writer die on a single bad entry
+                    }
+                }
+            } catch (_: kotlinx.coroutines.CancellationException) {
+                // shutdown
+            }
+        }
+    }
+
     private fun carLogSend(msg: String, level: String = "I") {
         if (!carLogEnabled) return
         when (level) {
@@ -1276,23 +1320,8 @@ class CarConnectionService : Service() {
             "E" -> Log.e(TAG, msg)
             else -> Log.i(TAG, msg)
         }
-        val ts = java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US)
-            .format(java.util.Date())
-        val line = "[$ts][$level] $msg"
-        val conn = controlConnection
-        if (conn != null && conn.isConnected) {
-            // Flush any buffered messages first
-            while (true) {
-                val buffered = logBuffer.poll() ?: break
-                try { conn.sendData(DataMsg.CAR_LOG, buffered.toByteArray(Charsets.UTF_8)) }
-                catch (_: Exception) { break }
-            }
-            try { conn.sendData(DataMsg.CAR_LOG, line.toByteArray(Charsets.UTF_8)) }
-            catch (_: Exception) {}
-        } else {
-            // Buffer for later — cap at 10000 lines
-            if (logBuffer.size < 10000) logBuffer.add(line)
-        }
+        // Non-blocking: format+encode happens on the dedicated logger coroutine.
+        logQueue.trySend(LogEntry(msg, level))
     }
 
     // ─── System ───

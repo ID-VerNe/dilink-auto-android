@@ -346,7 +346,7 @@ UI аўтамабіля з заўсёды бачнай левай панэллю
 | M3 | Perf | Multi-touch адпраўляе N асобных кадраў за MOVE — трэба пакетаваць усе паказальнікі | **v0.8.3** |
 | M4 | Perf | PointerProperties/Coords MotionEvent вылучаюцца пры кожнай ін'екцыі — выкарыстоўваць пул | **v0.8.1** |
 | M5 | Perf | Чарга кадраў дэкодэра глыбінёй 6 (200ms) — зменшыць да 2-3 для меншай затрымкі | **v0.8.1** |
-| M6 | Perf | `execFast("cmd display power-off 0")` у патоку дотыку — перамясціць на таймер | **v0.8.1** |
+| M6 | Perf | ~~`execFast` выдалены (Phase B6)~~, кіраванне сілкаваннем дысплея цяпер праз `execShell` на асобным патоку | **v0.8.1** |
 | M7 | Stability | Двайная `cleanup()` у VD-серверы — handleClient finally + run выклікаюць абодва | **v0.7.2** |
 | M8 | Stability | `cleanupSession()` не скідае `_serviceState` — састарэлы UI падчас затрымкі | **v0.7.2** |
 | M9 | Stability | Статычны MutableStateFlow у companion перажывае перазапускі сэрвісу — састарэлы activeConnection | **v0.7.2** |
@@ -422,9 +422,9 @@ Car (BYD DiLink 3.0, Android 10)
 │   │   ├── Early decoder start: offscreen surface on first CONFIG
 │   │   ├── carLogSend() + logSink callbacks → phone FileLog
 │   │   └── Eject state persisted to SharedPreferences
-│   ├── VideoDecoder (queue=15, early start, logSink, 4-zone catchup)
-│   ├── PersistentNavBar (76dp, 40dp icons, 14sp text, recent apps pruned)
-│   ├── LauncherScreen (64dp icons, 160dp grid, imePadding search)
+│   ├── VideoDecoder (hardware-first decode, 4-frame queue, post-flush IDR resync, logSink, optional debugFrameStats)
+│   ├── PersistentNavBar / PersistentBottomNavBar (40dp icons, 14sp text, recent apps pruned)
+│   ├── HomeScreen / HomeContent / AppTile (64dp icons, 160dp grid, pin-to-top, lambda-based actions)
 │   ├── NotificationScreen (progress bars, tap-to-launch, dedup by ID)
 │   └── MirrorScreen (TextureView + touch forwarding, decoder restart)
 ```

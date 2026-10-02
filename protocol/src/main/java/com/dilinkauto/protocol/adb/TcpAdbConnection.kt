@@ -74,28 +74,41 @@ class TcpAdbConnection(
         }
     }
 
-    /** Execute a shell command synchronously. Returns exit code (0 = success, -1 = error). */
+    /** Execute a shell command synchronously. Returns exit code (0 = stream closed, -1 = error). */
     fun shell(command: String): Int {
         val sock = socket ?: return -1
-        val localId = nextLocalId
+        val localId = nextLocalId()
+        var peerRemoteId = 0
         return try {
             synchronized(sock) {
                 // OPEN shell stream
                 val openBytes = "shell:$command".toByteArray()
                 sock.getOutputStream().write(
                     AdbProtocol.encode(AdbProtocol.A_OPEN, localId, 0, openBytes))
-                // Read response: OKAY opens stream, then WRTE for data, CLSE when done
+                // Read response: OKAY opens stream, WRTE carries data (ack each), CLSE ends.
                 var exitCode = -1
                 val output = StringBuilder()
                 while (true) {
                     val msg = readMessage()
                     when (msg.command) {
-                        AdbProtocol.A_OKAY -> { /* stream opened, continue reading */ }
+                        AdbProtocol.A_OKAY -> {
+                            // Stream opened — record the peer's remote id so we can
+                            // ack subsequent WRTEs and close cleanly.
+                            peerRemoteId = msg.arg0
+                        }
                         AdbProtocol.A_WRTE -> {
                             msg.data?.let { output.append(String(it)) }
+                            // Acknowledge the write so the device can send more
+                            // (ADB flow control — without this the device stalls).
+                            writeRaw(AdbProtocol.encode(AdbProtocol.A_OKAY, localId, peerRemoteId, null))
                         }
                         AdbProtocol.A_CLSE -> {
-                            // CLSE payload may contain exit code
+                            // Ack the peer's CLSE with our own CLSE to fully close
+                            // the stream on both sides (no half-open leftover).
+                            writeRaw(AdbProtocol.encodeClose(localId, peerRemoteId))
+                            // 0 means "stream closed cleanly" — NOT "command succeeded".
+                            // adb's shell: protocol doesn't surface the real exit code
+                            // over this path.
                             exitCode = 0
                             break
                         }
@@ -113,7 +126,7 @@ class TcpAdbConnection(
      *  Returns the local stream ID if successful, -1 on failure. */
     fun shellBackground(command: String): Int {
         val sock = socket ?: return -1
-        val localId = nextLocalId
+        val localId = nextLocalId()
         return try {
             synchronized(sock) {
                 val openBytes = "shell:$command".toByteArray()
@@ -172,8 +185,8 @@ class TcpAdbConnection(
         }
     }
 
-    private var localIdCounter = 1
-    private val nextLocalId: Int get() = localIdCounter++
+    private val nextLocalId = java.util.concurrent.atomic.AtomicInteger(1)
+    private fun nextLocalId(): Int = nextLocalId.getAndIncrement()
 
     // ── AUTH (same logic as UsbAdbConnection) ──
 

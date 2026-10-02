@@ -125,7 +125,6 @@ Modelo de conexao paralela com trilhas WiFi (3 conexoes) e USB.
 | CarLaunchScreen | `ui/screen/CarLaunchScreen.kt` | Tela de lancamento/conexao em tela cheia (sem nav), branding, instrucoes, IP manual |
 | MirrorScreen | `ui/screen/MirrorScreen.kt` | TextureView + encaminhamento de toque, reinicio do decoder na superficie disponivel |
 | HomeContent | `ui/screen/HomeScreen.kt` | Grade de apps (icones 64dp, celulas 160dp) ou status de conexao, exibido no modo streaming |
-| LauncherScreen | `ui/screen/LauncherScreen.kt` | Tela integrada legada com SideNavBar, CarStatusBar, AppGrid |
 | NotificationScreen | `ui/screen/NotificationScreen.kt` | Lista de notificacoes com barras de progresso, toque-para-iniciar |
 | PersistentNavBar | `ui/nav/PersistentNavBar.kt` | Barra de nav 76dp (icones 40dp, texto 14sp), apps recentes (poda), apenas modo streaming |
 | RecentAppsState | `ui/nav/RecentAppsState.kt` | Rastreia apps recentes, poda indisponiveis |

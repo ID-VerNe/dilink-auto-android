@@ -28,6 +28,9 @@ object FileLog {
 
     private val queue = ConcurrentLinkedQueue<String>()
     @Volatile private var writer: FileWriter? = null
+    // SimpleDateFormat is NOT thread-safe — the writer thread formats all
+    // timestamps, so a single shared instance is safe here. Callers only ever
+    // queue raw message strings (no formatting on the calling thread).
     private val dateFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
     private val logDir = File(Environment.getExternalStorageDirectory(), "DiLinkAuto")
     private val logFile = File(logDir, "client.log")
@@ -47,7 +50,12 @@ object FileLog {
                 try {
                     val line = queue.poll()
                     if (line != null) {
-                        writer?.write(line)
+                        // Format on the writer thread only — SimpleDateFormat is
+                        // not thread-safe, and this is the single consumer.
+                        val ts = dateFormat.format(Date())
+                        val parts = line.split("␞", limit = 3)
+                        val (level, tag, msg) = if (parts.size == 3) Triple(parts[0], parts[1], parts[2]) else Triple("I", "FileLog", line)
+                        writer?.write("[$ts][$level][$tag] $msg")
                         writer?.write("\n")
                         writer?.flush()
                     } else {
@@ -137,7 +145,8 @@ object FileLog {
     fun logDirectory(): File = logDir
 
     private fun write(level: String, tag: String, msg: String) {
-        val ts = dateFormat.format(Date())
-        queue.add("[$ts][$level][$tag] $msg")
+        // No timestamp formatting on the calling thread — queue the raw pieces and
+        // let the single writer thread format with the shared SimpleDateFormat.
+        queue.add("$level␞$tag␞$msg")
     }
 }

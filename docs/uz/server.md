@@ -165,10 +165,9 @@ Oqim rejimi faol va joriy ekran HOME bo'lganda asosiy tarkib maydoni sifatida ko
 - Qo'lda IP kiritish
 - Ulanish holati
 
-### LauncherScreen (Eski)
+### HomeContent / AppTile
 
-`CarStatusBar`, `SideNavBar` (80dp) va `AppGrid` bilan to'liq integratsiyalashgan ishga tushirgich maketi. Joriy `CarShell` marshrutlashda ishlatilmaydi — faol UI `PersistentNavBar` + `HomeContent`/`MirrorContent`/`NotificationContent` composable'larini ishlatadi.
-
+Ilgari `LauncherScreen.kt` ichidagi tirik composables endi `HomeScreen.kt` ichida. `AppTile` `CarConnectionService` havolasi o'rniga `onUninstall`/`onAppInfo`/`onTogglePin` lambdalarini qabul qiladi (tile ni skippable va testlanadigan qiladi). Uzoq bosish kontekst menyusini ochadi: yuqoriga mahkamlash, o'chirish, ilova ma'lumotlari. Mahkamlash holati SharedPreferences (`dilinkauto_pinned`) ichida saqlanadi.
 ### RecentAppsState
 
 So'nggi ishga tushirilgan ilovalarni kuzatadi (ko'pi bilan 5), SharedPreferences'da saqlanadi. `pruneUnavailable()` ilovalar ro'yxati yangilanganda endi mavjud bo'lmagan ilovalarni o'chiradi.

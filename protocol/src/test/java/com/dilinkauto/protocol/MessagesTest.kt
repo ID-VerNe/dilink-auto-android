@@ -48,11 +48,11 @@ class MessagesTest {
 
         try {
             HandshakeRequest.decode(data)
-            fail("Expected BufferUnderflowException due to truncated buffer, but not NegativeArraySizeException")
+            fail("Expected ProtocolDecodeException due to truncated buffer")
         } catch (e: NegativeArraySizeException) {
             fail("NegativeArraySizeException thrown: signed short was not masked to unsigned!")
-        } catch (e: java.nio.BufferUnderflowException) {
-            // Expected: parsed len as positive 32772, tried to read bytes and underflowed
+        } catch (e: ProtocolDecodeException) {
+            // Expected: parsed len as positive 32772, declared length exceeds remaining buffer
         }
     }
 
@@ -95,10 +95,10 @@ class MessagesTest {
 
         try {
             HandshakeResponse.decode(data)
-            fail("Expected BufferUnderflowException")
+            fail("Expected ProtocolDecodeException")
         } catch (e: NegativeArraySizeException) {
             fail("NegativeArraySizeException thrown: signed short was not masked to unsigned!")
-        } catch (e: java.nio.BufferUnderflowException) {
+        } catch (e: ProtocolDecodeException) {
             // Expected
         }
     }
@@ -141,10 +141,10 @@ class MessagesTest {
 
         try {
             NotificationData.decode(data)
-            fail("Expected BufferUnderflowException")
+            fail("Expected ProtocolDecodeException")
         } catch (e: NegativeArraySizeException) {
             fail("NegativeArraySizeException thrown in NotificationData.decode!")
-        } catch (e: java.nio.BufferUnderflowException) {
+        } catch (e: ProtocolDecodeException) {
             // Expected
         }
     }

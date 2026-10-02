@@ -215,7 +215,7 @@ fun CarShell(service: CarConnectionService) {
             },
             containerColor = MaterialTheme.colorScheme.surface,
             titleContentColor = Color.White,
-            textContentColor = Color(0xFFCCCCCC)
+            textContentColor = MaterialTheme.colorScheme.onSurfaceVariant
         )
     }
 
@@ -258,34 +258,14 @@ fun CarShell(service: CarConnectionService) {
                 )
 
                 // Content area
-                Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
-                    MirrorContent(service = service, visible = currentScreen == Screen.APP)
-                    val showVideoWaitOverlay = !videoReady && currentScreen != Screen.NOTIFICATIONS
-                    when {
-                        showVideoWaitOverlay -> {
-                            Box(
-                                modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background),
-                                contentAlignment = androidx.compose.ui.Alignment.Center
-                            ) {
-                                androidx.compose.foundation.layout.Column(
-                                    horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally
-                                ) {
-                                    androidx.compose.material3.CircularProgressIndicator(
-                                        color = MaterialTheme.colorScheme.primary
-                                    )
-                                    androidx.compose.foundation.layout.Spacer(Modifier.height(16.dp))
-                                    androidx.compose.material3.Text(
-                                        statusMessage.ifEmpty { stringResource(R.string.status_starting_vd) },
-                                        color = androidx.compose.ui.graphics.Color.White,
-                                        fontSize = 18.sp
-                                    )
-                                }
-                            }
-                        }
-                        currentScreen == Screen.HOME -> HomeContent(service = service, onAppClick = launchApp)
-                        currentScreen == Screen.NOTIFICATIONS -> NotificationContent(service = service, onAppLaunch = launchApp)
-                    }
-                }
+                CarContentArea(
+                    service = service,
+                    currentScreen = currentScreen,
+                    videoReady = videoReady,
+                    statusMessage = statusMessage,
+                    launchApp = launchApp,
+                    modifier = Modifier.weight(1f).fillMaxHeight()
+                )
             }
         } else {
             Column(
@@ -294,34 +274,14 @@ fun CarShell(service: CarConnectionService) {
                     .background(MaterialTheme.colorScheme.background)
             ) {
                 // Content area
-                Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
-                    MirrorContent(service = service, visible = currentScreen == Screen.APP)
-                    val showVideoWaitOverlay = !videoReady && currentScreen != Screen.NOTIFICATIONS
-                    when {
-                        showVideoWaitOverlay -> {
-                            Box(
-                                modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background),
-                                contentAlignment = androidx.compose.ui.Alignment.Center
-                            ) {
-                                androidx.compose.foundation.layout.Column(
-                                    horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally
-                                ) {
-                                    androidx.compose.material3.CircularProgressIndicator(
-                                        color = MaterialTheme.colorScheme.primary
-                                    )
-                                    androidx.compose.foundation.layout.Spacer(Modifier.height(16.dp))
-                                    androidx.compose.material3.Text(
-                                        statusMessage.ifEmpty { stringResource(R.string.status_starting_vd) },
-                                        color = androidx.compose.ui.graphics.Color.White,
-                                        fontSize = 18.sp
-                                    )
-                                }
-                            }
-                        }
-                        currentScreen == Screen.HOME -> HomeContent(service = service, onAppClick = launchApp)
-                        currentScreen == Screen.NOTIFICATIONS -> NotificationContent(service = service, onAppLaunch = launchApp)
-                    }
-                }
+                CarContentArea(
+                    service = service,
+                    currentScreen = currentScreen,
+                    videoReady = videoReady,
+                    statusMessage = statusMessage,
+                    launchApp = launchApp,
+                    modifier = Modifier.weight(1f).fillMaxWidth()
+                )
 
                 com.dilinkauto.server.ui.nav.PersistentBottomNavBar(
                     recentAppsState = recentAppsState,
@@ -355,6 +315,52 @@ fun CarShell(service: CarConnectionService) {
     }
 }
 
+/**
+ * Shared content area for streaming mode. Renders the mirror surface, the
+ * "waiting for video" overlay when the stream isn't ready, and the
+ * home/notifications screens. Used by both the landscape (Row) and portrait
+ * (Column) layouts in [CarShell] so the two branches differ only in nav-bar
+ * placement.
+ */
+@Composable
+private fun CarContentArea(
+    service: CarConnectionService,
+    currentScreen: Screen,
+    videoReady: Boolean,
+    statusMessage: String,
+    launchApp: (String) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Box(modifier = modifier) {
+        MirrorContent(service = service, visible = currentScreen == Screen.APP)
+        val showVideoWaitOverlay = !videoReady && currentScreen == Screen.APP
+        when {
+            showVideoWaitOverlay -> {
+                Box(
+                    modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background),
+                    contentAlignment = androidx.compose.ui.Alignment.Center
+                ) {
+                    androidx.compose.foundation.layout.Column(
+                        horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally
+                    ) {
+                        androidx.compose.material3.CircularProgressIndicator(
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        androidx.compose.foundation.layout.Spacer(Modifier.height(16.dp))
+                        androidx.compose.material3.Text(
+                            statusMessage.ifEmpty { stringResource(R.string.status_starting_vd) },
+                            color = androidx.compose.ui.graphics.Color.White,
+                            fontSize = 18.sp
+                        )
+                    }
+                }
+            }
+            currentScreen == Screen.HOME -> HomeContent(service = service, onAppClick = launchApp)
+            currentScreen == Screen.NOTIFICATIONS -> NotificationContent(service = service, onAppLaunch = launchApp)
+        }
+    }
+}
+
 @androidx.compose.runtime.Composable
 private fun InfoRow(label: String, value: String) {
     Row(
@@ -363,7 +369,7 @@ private fun InfoRow(label: String, value: String) {
     ) {
         Text(
             "$label:",
-            color = Color(0xFF888888),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
             fontSize = 14.sp
         )
         Text(

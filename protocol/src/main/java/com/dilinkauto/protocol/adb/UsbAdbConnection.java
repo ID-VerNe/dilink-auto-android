@@ -35,9 +35,11 @@ public class UsbAdbConnection {
     private final AtomicInteger nextLocalId = new AtomicInteger(1);
     private final ConcurrentHashMap<Integer, CompletableFuture<Void>> pendingOpens = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Integer, BlockingQueue<byte[]>> streamData = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Integer, BlockingQueue<byte[]>> streamAcks = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Integer, Integer> streamPeerIds = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Integer, Boolean> streamClosed = new ConcurrentHashMap<>();
     private volatile boolean connected = false;
+    private volatile boolean closed = false;
     private Thread readerThread;
     private int maxPayload = AdbProtocol.MAX_PAYLOAD;
 
@@ -181,9 +183,13 @@ public class UsbAdbConnection {
             return null;
         }
 
-        // Read output until stream closes
+        // Read output until the stream closes or the 30s overall deadline expires.
+        // The deadline prevents an indefinite hang when the device disappears
+        // without sending A_CLSE (USB unplugged mid-stream): streamClosed stays
+        // false and the queue poll would otherwise block forever.
+        long deadline = System.currentTimeMillis() + 30_000;
         StringBuilder sb = new StringBuilder();
-        while (!Boolean.TRUE.equals(streamClosed.get(localId))) {
+        while (!Boolean.TRUE.equals(streamClosed.get(localId)) && System.currentTimeMillis() < deadline) {
             try {
                 byte[] data = queue.poll(5, TimeUnit.SECONDS);
                 if (data != null) {
@@ -192,6 +198,9 @@ public class UsbAdbConnection {
                     break;
                 }
             } catch (InterruptedException e) { break; }
+        }
+        if (!Boolean.TRUE.equals(streamClosed.get(localId))) {
+            logW("shell timed out after 30s: " + command);
         }
 
         // Drain remaining
@@ -274,7 +283,9 @@ public class UsbAdbConnection {
             // Open shell stream for cat redirect
             int localId = nextLocalId.getAndIncrement();
             BlockingQueue<byte[]> queue = new LinkedBlockingQueue<>();
+            BlockingQueue<byte[]> ackQueue = new LinkedBlockingQueue<>();
             streamData.put(localId, queue);
+            streamAcks.put(localId, ackQueue);
             streamClosed.put(localId, false);
 
             CompletableFuture<Void> openFuture = new CompletableFuture<>();
@@ -299,9 +310,15 @@ public class UsbAdbConnection {
                 sendRaw(AdbProtocol.encodeWrite(localId, peerId, chunk));
                 offset += chunkSize;
 
-                // Wait for OKAY (flow control)
+                // Wait for OKAY (flow control) on the dedicated ack queue.
+                // A null ack before the timeout means the device stopped
+                // acknowledging — abort instead of continuing to blast data.
                 try {
-                    byte[] ack = queue.poll(5, TimeUnit.SECONDS);
+                    byte[] ack = ackQueue.poll(5, TimeUnit.SECONDS);
+                    if (ack == null) {
+                        logE("push: ack timeout at offset " + offset + ", aborting");
+                        break;
+                    }
                 } catch (InterruptedException e) { break; }
             }
 
@@ -322,16 +339,37 @@ public class UsbAdbConnection {
     }
 
     public void close() {
+        closed = true;
         connected = false;
-        if (readerThread != null) {
-            readerThread.interrupt();
+        // Unblock any shell()/push() polls stuck on streamClosed.get()==null:
+        // mark every stream closed and drop an empty token on each data/ack queue
+        // so poll() returns instead of blocking until the 30s deadline.
+        for (Integer id : streamClosed.keySet()) {
+            streamClosed.put(id, true);
+        }
+        for (BlockingQueue<byte[]> q : streamData.values()) {
+            q.offer(new byte[0]);
+        }
+        for (BlockingQueue<byte[]> q : streamAcks.values()) {
+            q.offer(new byte[0]);
+        }
+        Thread t = readerThread;
+        if (t != null) {
+            t.interrupt();
             readerThread = null;
+        }
+        // Join the reader before closing the USB handle: bulkTransfer can be
+        // mid-flight on the reader thread, and closing connection underneath it
+        // can crash the native USB stack. 2s is well past the 1s header timeout.
+        if (t != null) {
+            try { t.join(2000); } catch (InterruptedException ignored) {}
         }
         if (connection != null) {
             connection.close();
             connection = null;
         }
         streamData.clear();
+        streamAcks.clear();
         streamPeerIds.clear();
         streamClosed.clear();
         pendingOpens.clear();
@@ -363,14 +401,33 @@ public class UsbAdbConnection {
         byte[] headerBuf = new byte[AdbProtocol.HEADER_SIZE];
 
         try {
-        while (!Thread.currentThread().isInterrupted()) {
+        while (!Thread.currentThread().isInterrupted() && !closed) {
+            // Capture the connection once per iteration. close() nulls `connection`
+            // and joins this thread; without a local snapshot, a TOCTOU window
+            // between the null check and the bulkTransfer call can NPE inside
+            // the native USB stack when close() races ahead.
             UsbDeviceConnection conn = connection;
             if (conn == null) break;
 
-            // Read 24-byte header
-            int read = conn.bulkTransfer(endpointIn, headerBuf, headerBuf.length, 1000);
-            if (read < 0) continue; // timeout
-            if (read < AdbProtocol.HEADER_SIZE) continue;
+            // Read 24-byte header — loop to accumulate partial reads.
+            // A single bulkTransfer may return fewer bytes than the header;
+            // without accumulation the stream desynchronizes permanently.
+            int headerRead = 0;
+            while (headerRead < AdbProtocol.HEADER_SIZE && !closed) {
+                UsbDeviceConnection readConn = connection;
+                if (readConn == null) break;
+                int n = readConn.bulkTransfer(endpointIn, headerBuf, headerRead,
+                        AdbProtocol.HEADER_SIZE - headerRead, 1000);
+                if (n < 0) {
+                    if (headerRead > 0) {
+                        logW("Partial header: got " + headerRead + "/" + AdbProtocol.HEADER_SIZE + ", discarding");
+                    }
+                    headerRead = 0;
+                    break;
+                }
+                headerRead += n;
+            }
+            if (headerRead < AdbProtocol.HEADER_SIZE) continue;
 
             int[] header = AdbProtocol.parseHeader(headerBuf);
             if (header == null) {
@@ -437,10 +494,11 @@ public class UsbAdbConnection {
                 if (future != null) {
                     future.complete(null);
                 }
-                // Also signal as "data ready" for write flow control
-                BlockingQueue<byte[]> okQueue = streamData.get(arg1);
-                if (okQueue != null) {
-                    okQueue.offer(new byte[0]); // empty = ack
+                // Route the ack to the dedicated ack queue (flow control for push())
+                // — kept separate from streamData so it can't be mistaken for cat stderr.
+                BlockingQueue<byte[]> ackQueue = streamAcks.get(arg1);
+                if (ackQueue != null) {
+                    ackQueue.offer(new byte[0]);
                 }
                 break;
 
@@ -694,6 +752,7 @@ public class UsbAdbConnection {
 
     private void cleanup(int localId) {
         streamData.remove(localId);
+        streamAcks.remove(localId);
         streamPeerIds.remove(localId);
         streamClosed.remove(localId);
         pendingOpens.remove(localId);

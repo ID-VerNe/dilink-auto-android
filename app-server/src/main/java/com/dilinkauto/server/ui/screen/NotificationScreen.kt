@@ -49,14 +49,14 @@ fun NotificationContent(service: CarConnectionService, onAppLaunch: (String) -> 
                 Icon(
                     Icons.Default.NotificationsOff,
                     contentDescription = null,
-                    tint = Color.Gray,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.size(48.dp)
                 )
                 Spacer(Modifier.height(16.dp))
                 Text(
                     stringResource(R.string.no_notifications),
                     style = MaterialTheme.typography.bodyLarge,
-                    color = Color.Gray
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
         }
@@ -152,7 +152,7 @@ fun NotificationCard(
                         Text(
                             formatRelativeTime(notification.timestamp),
                             style = MaterialTheme.typography.labelSmall,
-                            color = Color.Gray
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                     if (notification.title.isNotEmpty()) {
@@ -168,7 +168,7 @@ fun NotificationCard(
                         Text(
                             notification.text,
                             style = MaterialTheme.typography.bodySmall,
-                            color = Color(0xFFBBBBBB),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 2,
                             overflow = TextOverflow.Ellipsis
                         )
@@ -186,19 +186,19 @@ fun NotificationCard(
                     }
                 }
 
-                // Dismiss button
+                // Dismiss button — 56dp touch target for car use
                 IconButton(
                     onClick = {
                         visible = false
                         onDismiss()
                     },
-                    modifier = Modifier.size(36.dp)
+                    modifier = Modifier.size(56.dp)
                 ) {
                     Icon(
                         Icons.Default.Close,
                         contentDescription = stringResource(R.string.clear_notification),
-                        tint = Color(0xFF888888),
-                        modifier = Modifier.size(18.dp)
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(24.dp)
                     )
                 }
             }

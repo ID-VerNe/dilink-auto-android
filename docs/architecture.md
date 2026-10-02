@@ -118,12 +118,11 @@ Parallel connection model with WiFi (3 connections) and USB tracks.
 |-----------|------|---------|
 | AppIconCache | `AppIconCache.kt` | Car-side icon cache — decodes 192x192 source PNGs once, `prepareAll()` resizes all icons on background thread, `getPrepared()` is O(1) ConcurrentHashMap lookup with zero I/O during scroll |
 | CarConnectionService | `service/CarConnectionService.kt` | Parallel state machine, 3-connection WiFi + USB tracks, UPDATING_CAR handling |
-| VideoDecoder | `decoder/VideoDecoder.kt` | H.264 decode, 30-frame queue, early start on offscreen surface, logSink callback |
+| VideoDecoder | `decoder/VideoDecoder.kt` | H.264 hardware-first decode, 4-frame queue, post-flush IDR resync, logSink callback, optional `debugFrameStats` decode-time/queue-depth log |
 | CarLaunchScreen | `ui/screen/CarLaunchScreen.kt` | Full-screen launch/connection screen (no nav), branding, instructions, manual IP |
 | MirrorScreen | `ui/screen/MirrorScreen.kt` | TextureView + touch forwarding, decoder restart on surface available |
 | HomeContent | `ui/screen/HomeScreen.kt` | App grid (64dp icons, 160dp cells) or connection status, shown in streaming mode |
-| LauncherScreen | `ui/screen/LauncherScreen.kt` | Legacy integrated screen with SideNavBar, CarStatusBar, AppGrid — not used in current routing |
-| HomeScreen | `ui/screen/HomeScreen.kt` | App grid (64dp icons, 160dp cells) with long-press context menu (uninstall, app info, shortcuts) or connection status |
+| HomeScreen | `ui/screen/HomeScreen.kt` | App grid (64dp icons, 160dp cells) with long-press context menu (uninstall, app info, pin-to-top) or connection status |
 | NotificationScreen | `ui/screen/NotificationScreen.kt` | Notification list with progress bars, per-item dismiss, clear-all, tap-to-launch |
 | PersistentNavBar | `ui/nav/PersistentNavBar.kt` | 76dp nav bar (40dp icons, 14sp text), recent apps (pruned), streaming mode only |
 | RecentAppsState | `ui/nav/RecentAppsState.kt` | Tracks recent apps, prunes unavailable |

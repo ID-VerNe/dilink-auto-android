@@ -1,6 +1,8 @@
 package com.dilinkauto.server.decoder
 
 import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.util.Log
 import android.view.Surface
@@ -20,31 +22,40 @@ class VideoDecoder {
     /** Log callback — set by CarConnectionService to route logs to the phone via protocol. */
     var logSink: ((String) -> Unit)? = null
 
+    /**
+     * When true, the per-30-frame stat log includes cumulative decode time and
+     * queue depth. Default off — the volume is noise in release. Toggled by
+     * CarConnectionService when dev diagnostics are enabled (Phase L1 / perf 9.3).
+     */
+    @Volatile
+    var debugFrameStats = false
+
+    // logSink routes through carLogSend, which already calls Log.i (single logcat path).
+    // Avoid double-logging here — the carLogSend side is the one source of truth for logcat.
     private fun log(msg: String) {
-        Log.i(TAG, msg)
-        logSink?.invoke("[VideoDecoder] $msg")
+        logSink?.invoke("[VideoDecoder] $msg") ?: Log.i(TAG, msg)
     }
 
     private fun logW(msg: String) {
-        Log.w(TAG, msg)
-        logSink?.invoke("[VideoDecoder][W] $msg")
+        logSink?.invoke("[VideoDecoder][W] $msg") ?: Log.w(TAG, msg)
     }
 
     private fun logE(msg: String) {
-        Log.e(TAG, msg)
-        logSink?.invoke("[VideoDecoder][E] $msg")
+        logSink?.invoke("[VideoDecoder][E] $msg") ?: Log.e(TAG, msg)
     }
 
     private var codec: MediaCodec? = null
     private var feedThread: Thread? = null
     private val running = AtomicBoolean(false)
     val isRunning: Boolean get() = running.get()
-    private val frameQueue = ArrayBlockingQueue<FrameData>(2) // minimal latency
+    private val frameQueue = ArrayBlockingQueue<FrameData>(4) // small buffer, drop on overflow
 
     // CONFIG data is cached separately so it's never lost, even if it arrives
     // before start() is called or while the queue is full.
     @Volatile
     private var configData: ByteArray? = null
+    @Volatile
+    private var seekingKeyFrame = false
 
     private var frameCount = 0L
     private var receiveCount = 0L
@@ -55,10 +66,17 @@ class VideoDecoder {
     private var keyFramesFed = 0L
     private var keyFramesDropped = 0L
 
-    /** Check if H.264 NAL data contains an IDR frame (NAL type 5) */
+    // Accumulated decode time for the current 30-frame window (Phase L1 / perf 9.3).
+    // Reset at each per-30-frame log so the reported value is per-window, not lifetime.
+    private var windowDecodeNanos = 0L
+
+    /** Check if H.264 NAL data contains an IDR frame (NAL type 5).
+     *  Scans only the first ~1KB: NAL headers near the start determine frame type,
+     *  and a full-buffer scan on every P-frame is wasteful on a weak car CPU. */
     private fun isKeyFrame(data: ByteArray): Boolean {
+        val limit = minOf(data.size - 4, 1024)
         var i = 0
-        while (i < data.size - 4) {
+        while (i < limit) {
             if (data[i] == 0.toByte() && data[i + 1] == 0.toByte()) {
                 val nalStart = if (data[i + 2] == 1.toByte()) i + 3
                     else if (data[i + 2] == 0.toByte() && i + 3 < data.size && data[i + 3] == 1.toByte()) i + 4
@@ -70,6 +88,19 @@ class VideoDecoder {
             i++
         }
         return false
+    }
+
+    /** Find the first hardware AVC decoder exposed by the platform, or null if none. */
+    private fun findHardwareAvcDecoder(): MediaCodecInfo? {
+        return try {
+            MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.firstOrNull { info ->
+                info.isHardwareAccelerated &&
+                    info.supportedTypes.any { it.equals(MediaFormat.MIMETYPE_VIDEO_AVC, ignoreCase = true) }
+            }
+        } catch (e: Exception) {
+            logW("Hardware decoder enumeration failed: ${e.message}")
+            null
+        }
     }
 
     data class FrameData(val isConfig: Boolean, val isKeyFrame: Boolean, val data: ByteArray)
@@ -88,13 +119,24 @@ class VideoDecoder {
         val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
             setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
             setInteger(MediaFormat.KEY_PRIORITY, 0)
+            if (fps > 0) setInteger(MediaFormat.KEY_OPERATING_RATE, fps)
         }
 
-        codec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
+        val hwInfo = findHardwareAvcDecoder()
+        codec = try {
+            if (hwInfo != null) {
+                MediaCodec.createByCodecName(hwInfo.name)
+            } else {
+                MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            }
+        } catch (e: Exception) {
+            logW("Hardware decoder create failed (${hwInfo?.name}): ${e.message}, falling back to createDecoderByType")
+            MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        }.apply {
             configure(format, surface, null, 0)
             start()
         }
-        log("MediaCodec created and started")
+        log("MediaCodec created: name=${codec?.name} hw=${hwInfo != null} operatingRate=$fps")
 
         frameCount = 0
         renderCount = 0
@@ -117,7 +159,7 @@ class VideoDecoder {
                 configFed = true
             }
 
-            // With 2-frame queue, catchup is unnecessary — frames arrive on time or get dropped.
+            // With 4-frame queue, catchup is unnecessary — frames arrive on time or get dropped.
             var skipCount = 0L
 
             while (running.get()) {
@@ -140,14 +182,38 @@ class VideoDecoder {
                     continue
                 } else {
                     val isKey = frame.isKeyFrame
+                    // After a flush, MediaCodec has no reference frame — feeding P-frames
+                    // produces no output and clogs input buffers until the next IDR. Drain
+                    // and discard everything until a keyframe arrives. onFrameReceived gives
+                    // keyframes queue priority, so the next IDR reaches the head quickly.
+                    if (seekingKeyFrame && !isKey) {
+                        skipCount++
+                        if (skipCount <= 5 || skipCount % 30 == 0L) {
+                            logW("Post-flush: skipping P-frame #$skipCount until next IDR")
+                        }
+                        continue
+                    }
+                    if (seekingKeyFrame && isKey) {
+                        seekingKeyFrame = false
+                        log("Post-flush: resynced at IDR keyframe after skipping $skipCount P-frames")
+                        skipCount = 0L
+                    }
                     if (isKey) {
                         keyFramesFed++
                         log("Feeding KEYFRAME #$keyFramesFed size=${frame.data.size} (fed=$frameCount rendered=$renderCount)")
                     }
+                    val decodeStart = if (debugFrameStats) System.nanoTime() else 0L
                     feedBuffer(decoder, frame.data, 0)
+                    if (debugFrameStats) windowDecodeNanos += System.nanoTime() - decodeStart
                     frameCount++
                     if (frameCount % 30 == 0L) {
-                        log("Fed $frameCount rendered=$renderCount drops=$dropCount inputFails=$inputFailCount keys_recv=$keyFramesReceived keys_fed=$keyFramesFed keys_drop=$keyFramesDropped queue=${frameQueue.size} skips=$skipCount")
+                        if (debugFrameStats) {
+                            val decodeMs = windowDecodeNanos / 1_000_000.0
+                            log("Fed $frameCount rendered=$renderCount drops=$dropCount inputFails=$inputFailCount keys_recv=$keyFramesReceived keys_fed=$keyFramesFed keys_drop=$keyFramesDropped queue=${frameQueue.size} skips=$skipCount decodeMs=${"%.1f".format(decodeMs)}")
+                            windowDecodeNanos = 0L
+                        } else {
+                            log("Fed $frameCount rendered=$renderCount drops=$dropCount inputFails=$inputFailCount keys_recv=$keyFramesReceived keys_fed=$keyFramesFed keys_drop=$keyFramesDropped queue=${frameQueue.size} skips=$skipCount")
+                        }
                     }
                 }
 
@@ -182,6 +248,10 @@ class VideoDecoder {
                     logW("Decoder stuck ($consecutiveDrops drops), flushing")
                     decoder.flush()
                     consecutiveDrops = 0
+                    // After flush the decoder has no reference frame; set the
+                    // seek flag so the feed loop drains P-frames until the next
+                    // IDR keyframe before resuming normal feeding.
+                    seekingKeyFrame = true
                     configData?.let { config ->
                         val idx = decoder.dequeueInputBuffer(50_000)
                         if (idx >= 0) {

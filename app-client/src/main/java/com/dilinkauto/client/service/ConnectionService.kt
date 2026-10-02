@@ -24,7 +24,6 @@ import com.dilinkauto.client.R
 import com.dilinkauto.client.ShizukuManager
 import com.dilinkauto.client.display.VirtualDisplayClient
 import com.dilinkauto.protocol.*
-import dadb.AdbKeyPair
 import dadb.Dadb
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -47,6 +46,7 @@ class ConnectionService : Service() {
     private var networkChangeDebounce: Job? = null
     private var autoUpdateAttempted = false
     private var autoUpdateFailedAt = 0L
+    private lateinit var carAppInstaller: CarAppInstaller
 
     enum class State { IDLE, WAITING, CONNECTED, STREAMING }
 
@@ -69,6 +69,11 @@ class ConnectionService : Service() {
         logDeviceInfo()
         cacheDefaultIme()
         UpdateManager.checkForUpdate(force = false)
+        // Wire the extracted locator's WiFi dependency (avoids passing the Service
+        // into CarIpLocator; the locator is a plain object for unit-testability).
+        @Suppress("DEPRECATION")
+        CarIpLocator.wifiManager = applicationContext.getSystemService(WIFI_SERVICE) as? android.net.wifi.WifiManager
+        carAppInstaller = CarAppInstaller(this) { msg -> _installStatusStatic.value = msg }
     }
 
     private fun cacheDefaultIme() {
@@ -521,7 +526,9 @@ class ConnectionService : Service() {
                         }
                         sendAppList()
                     } else {
-                        FileLog.w(TAG, "VD server did not connect within timeout")
+                        FileLog.w(TAG, "VD server did not connect within timeout — tearing down")
+                        withContext(Dispatchers.Main) { cleanupSession() }
+                        return@launch
                     }
                 }
             }
@@ -582,7 +589,7 @@ class ConnectionService : Service() {
 
                 // Get car IP from the active TCP connection (most reliable)
                 val carIp = controlConnection?.remoteAddress
-                    ?: findCarAdb()
+                    ?: CarIpLocator.findCarAdb(null)
                 if (carIp == null) {
                     FileLog.w(TAG, "Auto-update: can't determine car IP")
                     return@launch
@@ -590,29 +597,7 @@ class ConnectionService : Service() {
 
                 FileLog.i(TAG, "Auto-updating car app at $carIp:5555...")
                 _installStatusStatic.value = getString(R.string.car_install_status_connecting_to, carIp)
-                val privKey = java.io.File(filesDir, "adbkey")
-                val pubKey = java.io.File(filesDir, "adbkey.pub")
-                if (!privKey.exists()) {
-                    filesDir.mkdirs()
-                    AdbKeyPair.generate(privKey, pubKey)
-                }
-                val keyPair = AdbKeyPair.read(privKey, pubKey)
-
-                val dadbExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
-                val dadb: Dadb? = try {
-                    val future = dadbExecutor.submit<Dadb> {
-                        Dadb.create(carIp, 5555, keyPair)
-                    }
-                    try {
-                        future.get(15, java.util.concurrent.TimeUnit.SECONDS)
-                    } catch (e: java.util.concurrent.TimeoutException) {
-                        FileLog.w(TAG, "Auto-update Dadb.create() timed out — will retry in 5min")
-                        null
-                    }
-                } finally {
-                    dadbExecutor.shutdownNow()
-                }
-
+                val dadb = carAppInstaller.connect(carIp)
                 if (dadb == null) {
                     _installStatusStatic.value = getString(R.string.car_install_status_auth_needed)
                     autoUpdateFailedAt = System.currentTimeMillis()
@@ -620,17 +605,12 @@ class ConnectionService : Service() {
                 }
 
                 try {
-                    _installStatusStatic.value = "Pushing car APK..."
-                    val remotePath = "/data/local/tmp/app-server.apk"
-                    dadb.push(apkFile, remotePath)
-                    _installStatusStatic.value = "Installing car app..."
-                    val result = dadb.shell("pm install -r $remotePath").allOutput
+                    val result = carAppInstaller.pushAndInstall(dadb, apkFile, /* versionLabel */ "")
                     FileLog.i(TAG, "Auto-update result: ${result.trim()}")
                     if (result.contains("Success")) {
                         _installStatusStatic.value = getString(R.string.status_auto_update_complete)
                         lastSentIconHash.clear() // car's icon cache was wiped by reinstall
                         FileLog.i(TAG, "Car app auto-updated — restarting")
-                        dadb.shell("am start --activity-clear-task -n com.dilinkauto.server/.MainActivity")
                     } else {
                         _installStatusStatic.value = getString(R.string.status_update_failed, result.trim())
                         autoUpdateFailedAt = System.currentTimeMillis()
@@ -684,11 +664,11 @@ class ConnectionService : Service() {
 
                 _installStatus.value = if (explicitIp != null) getString(R.string.car_install_status_connecting_to, explicitIp) else getString(R.string.car_install_status_searching)
                 val carIp = if (!explicitIp.isNullOrBlank()) {
-                    if (probePort(explicitIp, 5555)) explicitIp else {
+                    if (CarIpLocator.probePortSync(explicitIp, 5555)) explicitIp else {
                         _installStatus.value = getString(R.string.car_install_status_not_reachable, explicitIp)
                         null
                     }
-                } else findCarAdb()
+                } else CarIpLocator.findCarAdb(controlConnection?.remoteAddress)
                 if (carIp == null) {
                     _installStatus.value = getString(R.string.car_install_status_car_not_found)
                     FileLog.w(TAG, "Could not find car ADB on USB or network")
@@ -697,32 +677,7 @@ class ConnectionService : Service() {
 
                 _installStatus.value = getString(R.string.car_install_status_connecting_to, carIp)
                 FileLog.i(TAG, "Connecting to car ADB at $carIp:5555")
-                val privKey = java.io.File(filesDir, "adbkey")
-                val pubKey = java.io.File(filesDir, "adbkey.pub")
-                if (!privKey.exists()) {
-                    filesDir.mkdirs()
-                    AdbKeyPair.generate(privKey, pubKey)
-                }
-                val keyPair = AdbKeyPair.read(privKey, pubKey)
-
-                // Dadb.create() does blocking socket I/O that coroutine cancellation
-                // cannot interrupt. Use Future.get(timeout) for reliable timeout.
-                FileLog.d(TAG, "Attempting Dadb.create() (15s timeout)...")
-                val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
-                val dadb: Dadb? = try {
-                    val future = executor.submit<Dadb> {
-                        Dadb.create(carIp, 5555, keyPair)
-                    }
-                    try {
-                        future.get(15, java.util.concurrent.TimeUnit.SECONDS)
-                    } catch (e: java.util.concurrent.TimeoutException) {
-                        FileLog.w(TAG, "Dadb.create() timed out after 15s — likely waiting for car auth dialog")
-                        null
-                    }
-                } finally {
-                    executor.shutdownNow()
-                }
-
+                val dadb = carAppInstaller.connect(carIp)
                 if (dadb == null) {
                     _installStatus.value = getString(R.string.car_install_status_auth_needed)
                     keepStatus = true
@@ -732,11 +687,7 @@ class ConnectionService : Service() {
 
                 try {
                     _installStatus.value = getString(R.string.car_install_status_checking_version)
-                    val versionOutput = dadb.shell(
-                        "dumpsys package com.dilinkauto.server 2>/dev/null | grep versionName"
-                    ).allOutput
-                    val installedVersionName = Regex("""versionName=(\S+)""")
-                        .find(versionOutput)?.groupValues?.get(1) ?: "0"
+                    val installedVersionName = carAppInstaller.readInstalledVersion(dadb)
                     val myVersionName = packageManager.getPackageInfo(packageName, 0).let {
                         it.versionName ?: @Suppress("DEPRECATION") it.versionCode.toString()
                     }
@@ -747,19 +698,11 @@ class ConnectionService : Service() {
                         return@launch
                     }
 
-                    _installStatus.value = getString(R.string.car_install_status_pushing_apk, apkFile.length() / 1024 / 1024)
-                    val remotePath = "/data/local/tmp/app-server.apk"
-                    dadb.push(apkFile, remotePath)
-                    FileLog.i(TAG, "Car APK pushed (${apkFile.length()} bytes)")
-
-                    _installStatus.value = getString(R.string.car_install_status_installing_version, myVersionName)
-                    val result = dadb.shell("pm install -r $remotePath").allOutput
+                    val result = carAppInstaller.pushAndInstall(dadb, apkFile, myVersionName)
                     FileLog.i(TAG, "Install result: ${result.trim()}")
 
                     if (result.contains("Success")) {
-                        _installStatus.value = getString(R.string.car_install_status_launching_car_app)
                         lastSentIconHash.clear() // car's icon cache was wiped by reinstall
-                        dadb.shell("am start --activity-clear-task -n com.dilinkauto.server/.MainActivity")
                         _installStatus.value = getString(R.string.car_install_status_car_installed, myVersionName)
                     } else {
                         _installStatus.value = getString(R.string.car_install_status_failed, result.trim())
@@ -779,156 +722,6 @@ class ConnectionService : Service() {
         }
     }
 
-    private suspend fun findCarAdb(): String? {
-        // 1. Check the control connection's remote address (car is already connected)
-        controlConnection?.remoteAddress?.let { ip ->
-            if (probePort(ip, 5555)) {
-                FileLog.i(TAG, "Found car ADB at $ip (control connection)")
-                return ip
-            }
-        }
-
-        // 2. Scan ALL local subnets (phone may be on both home WiFi + hotspot)
-        val subnetIps = getLocalSubnetIps()
-        val prefixes = subnetIps.map { it.substringBeforeLast(".") }.distinct()
-        FileLog.d(TAG, "Local subnets: $subnetIps (prefixes: $prefixes)")
-
-        // 3. ARP table (may be blocked on Android 14+)
-        try {
-            for (line in java.io.File("/proc/net/arp").readLines().drop(1)) {
-                val ip = line.split("\\s+".toRegex()).firstOrNull() ?: continue
-                if (ip == "0.0.0.0") continue
-                if (subnetIps.contains(ip)) continue
-                if (probePort(ip, 5555)) {
-                    FileLog.i(TAG, "Found car ADB at $ip (ARP)")
-                    return ip
-                }
-            }
-        } catch (e: Exception) {
-            FileLog.d(TAG, "ARP not available: ${e.message}")
-        }
-
-        // 4. Neighbor cache
-        try {
-            for (line in Runtime.getRuntime().exec(arrayOf("ip", "neigh")).inputStream.bufferedReader().readText().lines()) {
-                val ip = line.split("\\s+".toRegex()).firstOrNull() ?: continue
-                if (!ip.matches(Regex("\\d+\\.\\d+\\.\\d+\\.\\d+"))) continue
-                if (subnetIps.contains(ip)) continue
-                if (probePort(ip, 5555)) {
-                    FileLog.i(TAG, "Found car ADB at $ip (neighbor)")
-                    return ip
-                }
-            }
-        } catch (_: Exception) {}
-
-        // 5. Parallel scan on ALL subnets
-        for (prefix in prefixes) {
-            FileLog.i(TAG, "Scanning $prefix.0/24 for ADB...")
-            val startMs = System.currentTimeMillis()
-            val result = probeSubnetConcurrent(prefix, ownIps = subnetIps, maxConcurrent = 32)
-            val elapsed = System.currentTimeMillis() - startMs
-            if (result != null) {
-                FileLog.i(TAG, "Found car ADB at $result ($prefix.0/24, ${elapsed}ms)")
-                return result
-            }
-            FileLog.d(TAG, "$prefix.0/24: no ADB found (${elapsed}ms)")
-        }
-
-        // 6. Gateway
-        try {
-            val wm = applicationContext.getSystemService(WIFI_SERVICE) as android.net.wifi.WifiManager
-            val gw = wm.dhcpInfo.gateway
-            if (gw != 0) {
-                val ip = String.format("%d.%d.%d.%d",
-                    gw and 0xFF, (gw shr 8) and 0xFF,
-                    (gw shr 16) and 0xFF, (gw shr 24) and 0xFF)
-                if (!subnetIps.contains(ip) && probePort(ip, 5555)) {
-                    FileLog.i(TAG, "Found car ADB at $ip (gateway)")
-                    return ip
-                }
-            }
-        } catch (_: Exception) {}
-
-        return null
-    }
-
-    private fun getLocalSubnetIps(): List<String> {
-        return try {
-            java.net.NetworkInterface.getNetworkInterfaces().toList()
-                .filter { !it.isLoopback && it.isUp }
-                .flatMap { iface ->
-                    iface.inetAddresses.toList()
-                        .filter { it is java.net.Inet4Address && !it.isLoopbackAddress }
-                        .map { it.hostAddress!! }
-                }
-                .filter { !it.startsWith("127.") }
-        } catch (_: Exception) {
-            emptyList()
-        }
-    }
-
-    /**
-     * Scans a /24 subnet for port 5555 using parallel concurrent probes.
-     * Probes the full 1-254 range in batches of [maxConcurrent], 150ms timeout each.
-     * This finds the car reliably regardless of its DHCP-assigned IP.
-     */
-    private suspend fun probeSubnetConcurrent(
-        prefix: String, ownIps: List<String>, maxConcurrent: Int = 32
-    ): String? = coroutineScope {
-        // Skip .0 (network) and .255 (broadcast), and own IPs
-        val ownIpSet = ownIps.toSet()
-        val ips = (1..254).map { "$prefix.$it" }.filter { it !in ownIpSet }
-        ips.chunked(maxConcurrent).forEach { batch ->
-            val results = batch.map { ip ->
-                async(Dispatchers.IO) { if (probePortRaw(ip, 5555)) ip else null }
-            }
-            results.forEach { deferred ->
-                val found = deferred.await()
-                if (found != null) {
-                    coroutineContext.cancelChildren() // cancel remaining probes
-                    return@coroutineScope found
-                }
-            }
-        }
-        null
-    }
-
-    /** Non-suspend port probe (150ms timeout) for use in parallel scans */
-    private fun probePortRaw(ip: String, port: Int): Boolean {
-        return try {
-            val ch = java.nio.channels.SocketChannel.open()
-            ch.configureBlocking(false)
-            ch.connect(java.net.InetSocketAddress(ip, port))
-            val deadline = System.currentTimeMillis() + 150
-            try {
-                while (!ch.finishConnect()) {
-                    if (System.currentTimeMillis() > deadline) return false
-                    Thread.sleep(5)
-                }
-                true
-            } finally {
-                ch.close()
-            }
-        } catch (_: Exception) { false }
-    }
-
-    private suspend fun probePort(ip: String, port: Int): Boolean {
-        return try {
-            val ch = java.nio.channels.SocketChannel.open()
-            ch.configureBlocking(false)
-            ch.connect(java.net.InetSocketAddress(ip, port))
-            val deadline = System.currentTimeMillis() + 500
-            try {
-                while (!ch.finishConnect()) {
-                    if (System.currentTimeMillis() > deadline) return false
-                    kotlinx.coroutines.delay(50)
-                }
-                true
-            } finally {
-                ch.close()
-            }
-        } catch (_: Exception) { false }
-    }
 
     // ─── App List ───
 

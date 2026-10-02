@@ -165,10 +165,9 @@ dadb кітапханасын пайдаланатын тікелей ADB кли
 - Қолмен IP енгізу
 - Қосылу күйі
 
-### LauncherScreen (Ескі)
+### HomeContent / AppTile
 
-`CarStatusBar`, `SideNavBar` (80dp) және `AppGrid` бар толық интеграцияланған іске қосу макеті. Ағымдағы `CarShell` бағдарында пайдаланылмайды — белсенді UI `PersistentNavBar` + `HomeContent`/`MirrorContent`/`NotificationContent` composable-дарын пайдаланады.
-
+Бұрын `LauncherScreen.kt` ішіндегі тірі composables енді `HomeScreen.kt` ішінде. `AppTile` `CarConnectionService` сілтемесінің орнына `onUninstall`/`onAppInfo`/`onTogglePin` лямбдаларын қабылдайды (тақтаны skippable әрі тестіленетін етеді). Ұзақ басу мазмұнды мәзірді ашады: жоғарыға бекіту, жою, қолданба ақпараты. Бекіту күйі SharedPreferences (`dilinkauto_pinned`) ішінде сақталады.
 ### RecentAppsState
 
 Соңғы іске қосылған қолданбаларды бақылайды (ең көбі 5), SharedPreferences-те сақталады. `pruneUnavailable()` қолданбалар тізімі жаңартылғанда бұдан былай жоқ қолданбаларды жояды.

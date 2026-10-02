@@ -144,39 +144,42 @@ object UpdateManager {
 
                 val url = URL(release.apkUrl)
                 val conn = url.openConnection() as HttpURLConnection
-                conn.connectTimeout = 15000
-                conn.readTimeout = 60000
-                conn.requestMethod = "GET"
-                conn.connect()
-
-                if (conn.responseCode != HttpURLConnection.HTTP_OK) {
-                    _updateState.value = UpdateState.Error(appContext.getString(R.string.update_download_http_error, conn.responseCode))
-                    return@launch
-                }
-
-                val totalSize = conn.contentLengthLong.takeIf { it > 0 } ?: release.apkSize
-                val input = BufferedInputStream(conn.inputStream)
-                val output = FileOutputStream(tmpFile)
-
-                val buffer = ByteArray(8192)
-                var downloaded = 0L
-                var bytesRead: Int
-
                 try {
-                    while (input.read(buffer).also { bytesRead = it } != -1) {
-                        output.write(buffer, 0, bytesRead)
-                        downloaded += bytesRead
-                        if (totalSize > 0) {
-                            val pct = (downloaded * 100 / totalSize).toInt()
-                            _downloadProgress.value = pct
-                            if (downloaded % (512 * 1024) < 8192) { // update UI ~every 512KB
-                                _updateState.value = UpdateState.Downloading(pct, release.versionName)
+                    conn.connectTimeout = 15000
+                    conn.readTimeout = 60000
+                    conn.requestMethod = "GET"
+                    conn.connect()
+
+                    if (conn.responseCode != HttpURLConnection.HTTP_OK) {
+                        _updateState.value = UpdateState.Error(appContext.getString(R.string.update_download_http_error, conn.responseCode))
+                        return@launch
+                    }
+
+                    val totalSize = conn.contentLengthLong.takeIf { it > 0 } ?: release.apkSize
+                    val input = BufferedInputStream(conn.inputStream)
+                    val output = FileOutputStream(tmpFile)
+
+                    val buffer = ByteArray(8192)
+                    var downloaded = 0L
+                    var bytesRead: Int
+
+                    try {
+                        while (input.read(buffer).also { bytesRead = it } != -1) {
+                            output.write(buffer, 0, bytesRead)
+                            downloaded += bytesRead
+                            if (totalSize > 0) {
+                                val pct = (downloaded * 100 / totalSize).toInt()
+                                _downloadProgress.value = pct
+                                if (downloaded % (512 * 1024) < 8192) { // update UI ~every 512KB
+                                    _updateState.value = UpdateState.Downloading(pct, release.versionName)
+                                }
                             }
                         }
+                    } finally {
+                        output.close()
+                        input.close()
                     }
                 } finally {
-                    output.close()
-                    input.close()
                     conn.disconnect()
                 }
 
@@ -358,30 +361,30 @@ object UpdateManager {
     private fun fetchLatestRelease(): ReleaseInfo? {
         val url = URL(getApiUrl())
         val conn = url.openConnection() as HttpURLConnection
-        conn.connectTimeout = 10000
-        conn.readTimeout = 10000
-        conn.setRequestProperty("Accept", "application/vnd.github.v3+json")
-        conn.setRequestProperty("User-Agent", "DiLink-Auto-Client")
-        conn.connect()
+        try {
+            conn.connectTimeout = 10000
+            conn.readTimeout = 10000
+            conn.setRequestProperty("Accept", "application/vnd.github.v3+json")
+            conn.setRequestProperty("User-Agent", "DiLink-Auto-Client")
+            conn.connect()
 
-        if (conn.responseCode == 403 || conn.responseCode == 429) {
-            FileLog.w(TAG, "GitHub API rate limited (HTTP ${conn.responseCode})")
-            _updateState.value = UpdateState.Error(appContext.getString(R.string.update_rate_limit))
-            return null
-        }
+            if (conn.responseCode == 403 || conn.responseCode == 429) {
+                FileLog.w(TAG, "GitHub API rate limited (HTTP ${conn.responseCode})")
+                _updateState.value = UpdateState.Error(appContext.getString(R.string.update_rate_limit))
+                return null
+            }
 
-        if (conn.responseCode != HttpURLConnection.HTTP_OK) {
-            FileLog.w(TAG, "GitHub API returned HTTP ${conn.responseCode}")
-            return null
-        }
+            if (conn.responseCode != HttpURLConnection.HTTP_OK) {
+                FileLog.w(TAG, "GitHub API returned HTTP ${conn.responseCode}")
+                return null
+            }
 
-        val body = conn.inputStream.bufferedReader().use { it.readText() }
-        conn.disconnect()
+            val body = conn.inputStream.bufferedReader().use { it.readText() }
 
-        // releases/latest returns a single object; releases?per_page=1 returns an array
-        val json = if (body.trimStart().startsWith("[")) {
-            val arr = org.json.JSONArray(body)
-            if (arr.length() == 0) return null
+            // releases/latest returns a single object; releases?per_page=1 returns an array
+            val json = if (body.trimStart().startsWith("[")) {
+                val arr = org.json.JSONArray(body)
+                if (arr.length() == 0) return null
             arr.getJSONObject(0)
         } else {
             JSONObject(body)
@@ -409,6 +412,9 @@ object UpdateManager {
         }
 
         return ReleaseInfo(tagName, versionName, apkUrl, apkSize)
+        } finally {
+            conn.disconnect()
+        }
     }
 
     private fun readCurrentVersion(): String? {

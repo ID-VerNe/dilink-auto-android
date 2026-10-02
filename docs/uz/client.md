@@ -67,18 +67,13 @@ VD server jarayonidan `localhost:19637` da teskari ulanishni qabul qiladi. Ikki 
 - Localhost'ga teginish yozuvlari `writeLock` ostida `FrameCodec.writeAll()` bilan sinxron
 - Uzilganda: fizik displeyni tiklaydi (`cmd display power-on 0` + `KEYCODE_WAKEUP`) VD server jarayoni tozalashdan oldin o'ldirilganda xavfsizlik tarmog'i sifatida
 
-### AdbBridge
+### CarIpLocator
 
-Zaxira shell buyruq yordamchisi. VD server operatsiyalari va to'g'ridan-to'g'ri API reflection muvaffaqiyatsiz bo'lganda displey quvvatini boshqarish uchun `Runtime.exec()` yordamida `execShell()` va `execFast()` ni taqdim etadi.
+«Avtomobilga o'rnatish» oqimi uchun avtomobilning ADB-over-WiFi xizmatini (5555-port) aniqlaydi. Kechikish tartibida strategiyalar: boshqaruv ulanishining masofaviy IP manzili, ARP jadvali, `ip neigh` qo'shni keshi (har doim `finally` ichida tozalanadi), parallel /24 skanerlash (har bir zond uchun 150ms), WiFi shlyuzi. Oddiy `object` — `Service` bog'liqliksiz — izolyatsiya holda testlanadi.
 
-### VirtualDisplayManager
+### CarAppInstaller
 
-VD ishlatilmayotganda fizik displeyda ilovalarni ishga tushirishni boshqaradi. Imo-ishora asosidagi kiritish inyeksiyasi uchun `InputInjectionService` ga ko'prik qiladi.
-
-### VideoEncoder
-
-`AUTO_MIRROR` virtual displeydan foydalanadigan MediaProjection + MediaCodec H.264 kodlovchi. Alternativ kodlash yo'li (VD serveri orqali o'tadigan asosiy oqim konveyerida ishlatilmaydi).
-
+O'rnatilgan `app-server.apk` ni `dadb` (ADB-over-WiFi) orqali avtomobilga suriladi. ADB kalit juftligini generatsiyasini, `Future.get` orqali qatti 15 soniyali taymaut bilan `Dadb.create()` (bloklovchi soket I/O korutin bekor qilinishi bilan to'xtatilmaydi), `pm install -r` push va `am start` qayta ishga tushirishni boshqaradi. Holat qatorlari `onStatus` callback orqali chaqiruvchiga qaytadi, shuning uchun `_installStatusStatic` `ConnectionService` ichida qoladi.
 ### FileLog
 
 Android logcat filtrlashini aylanib o'tadigan fayl asosidagi jurnal yuritish vositasi (HyperOS tizim bo'lmagan ilovalar uchun `Log.i/d` ni filtrlaydi).

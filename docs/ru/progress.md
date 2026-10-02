@@ -346,7 +346,7 @@ UI авто с всегда видимой левой панелью навиг�
 | M3 | Произв | Multi-touch отправляет N отдельных кадров на MOVE — нужно пакетировать все указатели | **v0.8.3** |
 | M4 | Произв | MotionEvent PointerProperties/Coords выделяются на каждую инжекцию — пулить их | **v0.8.1** |
 | M5 | Произв | Очередь кадров декодера глубина 6 (200мс) — уменьшить до 2-3 для меньшей задержки | **v0.8.1** |
-| M6 | Произв | `execFast("cmd display power-off 0")` в потоке касаний — перенести в таймер | **v0.8.1** |
+| M6 | Произв | ~~`execFast` удалён (Phase B6)~~, управление питанием дисплея теперь через `execShell` в отдельном потоке | **v0.8.1** |
 | M7 | Стабильность | Двойная `cleanup()` в сервере VD — handleClient finally + run вызывают оба | **v0.7.2** |
 | M8 | Стабильность | `cleanupSession()` не сбрасывает `_serviceState` — устаревший UI во время задержки | **v0.7.2** |
 | M9 | Стабильность | Статический MutableStateFlow в companion переживает перезапуски службы — устаревший activeConnection | **v0.7.2** |
@@ -424,7 +424,7 @@ UI авто с всегда видимой левой панелью навиг�
 │   │   └── Состояние отключения сохранено в SharedPreferences
 │   ├── VideoDecoder (очередь=15, ранний старт, logSink, catchup 4 зоны)
 │   ├── PersistentNavBar (76dp, иконки 40dp, текст 14sp, недавние приложения с очисткой)
-│   ├── LauncherScreen (иконки 64dp, сетка 160dp, поиск imePadding)
+│   ├── HomeScreen / HomeContent / AppTile (64dp icons, 160dp grid, pin-to-top, lambda-based actions)
 │   ├── NotificationScreen (индикаторы прогресса, запуск по касанию, дедупликация по ID)
 │   └── MirrorScreen (TextureView + пересылка касаний, перезапуск декодера)
 ```

@@ -165,10 +165,9 @@ Affichée comme zone de contenu principale quand le mode streaming est actif et 
 - Saisie manuelle d'IP
 - Statut de connexion
 
-### LauncherScreen (Legacy)
+### HomeContent / AppTile
 
-Disposition de lanceur intégré complet avec `CarStatusBar`, `SideNavBar` (80dp) et `AppGrid`. Non utilisée dans le routage actuel de `CarShell` — l'UI active utilise les composables `PersistentNavBar` + `HomeContent`/`MirrorContent`/`NotificationContent` en ligne.
-
+Les composables vivants autrefois dans `LauncherScreen.kt` vivent maintenant dans `HomeScreen.kt`. `AppTile` prend des lambdas `onUninstall`/`onAppInfo`/`onTogglePin` au lieu d une reference `CarConnectionService` (garde la tuile skippable et testable). Un appui long ouvre un menu contextuel : epingler en haut, desinstaller, infos appl. L etat d epingle persiste dans SharedPreferences (`dilinkauto_pinned`).
 ### RecentAppsState
 
 Suit les applications récemment lancées (max 5), persistées dans SharedPreferences. `pruneUnavailable()` supprime les apps qui ne sont plus présentes lors de la mise à jour de la liste d'applications.

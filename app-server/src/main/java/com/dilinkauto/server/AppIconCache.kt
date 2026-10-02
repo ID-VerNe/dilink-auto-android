@@ -19,6 +19,10 @@ import java.util.concurrent.ConcurrentHashMap
 class AppIconCache(private val cacheDir: File) {
 
     private val sourceCache = ConcurrentHashMap<String, ByteArray>()
+    // Grid-size prepared bitmaps. Sole writer is [prepareAll], keyed by packageName.
+    // [get] no longer mutates this map — it returns its own Bitmap at the requested
+    // size without polluting the grid-size cache (which previously caused navbar/
+    // notification icons rendered at 40dp to overwrite the 64dp grid bitmap).
     private val prepared = ConcurrentHashMap<String, ImageBitmap>()
 
     /** Incremented after each prepareAll() completes — UI observes this to recompose. */
@@ -29,17 +33,14 @@ class AppIconCache(private val cacheDir: File) {
 
     /**
      * Full decode+resize path — used by NotificationScreen and NavBar (few icons).
-     * For the app grid (many icons), use [prepareAll] + [getPrepared] instead.
+     * Returns a Bitmap at the requested size. Does NOT write into [prepared] — the
+     * grid cache is owned by [prepareAll] at the grid size only.
      */
     fun get(packageName: String, sizePx: Int): Bitmap? {
-        val key = "${packageName}_$sizePx"
         val source = sourceCache[packageName] ?: loadSourceFromDisk(packageName) ?: return null
         return try {
             val decoded = BitmapFactory.decodeByteArray(source, 0, source.size) ?: return null
-            val resized = Bitmap.createScaledBitmap(decoded, sizePx, sizePx, true)
-            // Also cache as prepared ImageBitmap for AppTile compatibility
-            prepared[packageName] = resized.asImageBitmap()
-            resized
+            Bitmap.createScaledBitmap(decoded, sizePx, sizePx, true)
         } catch (_: Exception) { null }
     }
 

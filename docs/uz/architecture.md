@@ -121,7 +121,6 @@ WiFi (3 ulanish) va USB treklari bilan parallel ulanish modeli.
 | CarLaunchScreen | `ui/screen/CarLaunchScreen.kt` | To'liq ekranli ishga tushirish/ulanish ekrani (navigatsiyasiz), brendlash, yo'riqnomalar, qo'lda IP |
 | MirrorScreen | `ui/screen/MirrorScreen.kt` | TextureView + teginishlarni yo'naltirish, yuza mavjud bo'lganda dekoderni qayta ishga tushirish |
 | HomeContent | `ui/screen/HomeScreen.kt` | Ilovalar to'ri (64dp ikonkalar, 160dp katakchalar) yoki ulanish holati, oqim rejimida ko'rsatiladi |
-| LauncherScreen | `ui/screen/LauncherScreen.kt` | SideNavBar, CarStatusBar, AppGrid bilan eski integratsiyalashgan ekran |
 | NotificationScreen | `ui/screen/NotificationScreen.kt` | Progress barlar bilan xabarnomalar ro'yxati, tegib ishga tushirish |
 | PersistentNavBar | `ui/nav/PersistentNavBar.kt` | 76dp navigatsiya paneli (40dp ikonkalar, 14sp matn), so'nggi ilovalar (tozalanadi), faqat oqim rejimida |
 | RecentAppsState | `ui/nav/RecentAppsState.kt` | So'nggi ilovalarni kuzatadi, mavjud bo'lmaganlarni o'chiradi |

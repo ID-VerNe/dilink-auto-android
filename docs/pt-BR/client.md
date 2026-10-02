@@ -67,18 +67,13 @@ Aceita conexao reversa do processo servidor VD em `localhost:19637`. Recebe dois
 - Escritas de toque para localhost sao sincronas com `FrameCodec.writeAll()` sob `writeLock`
 - Ao desconectar: restaura a tela fisica (`cmd display power-on 0` + `KEYCODE_WAKEUP`) como rede de seguranca quando o processo servidor VD e finalizado antes da limpeza
 
-### AdbBridge
+### CarIpLocator
 
-Auxiliar de comandos shell de fallback. Fornece `execShell()` e `execFast()` usando `Runtime.exec()` para operacoes do servidor VD e gerenciamento de energia da tela quando a reflexao direta da API falha.
+Localiza o servico ADB-over-WiFi do carro (porta 5555) para o fluxo Instalar no Carro. Estrategias por ordem de latencia: IP remoto da conexao de controle, tabela ARP, cache `ip neigh` (sempre limpo em `finally`), scan /24 paralelo (150ms por sondagem), gateway WiFi. `object` simples — sem dependencia de `Service` — portanto testavel isoladamente.
 
-### VirtualDisplayManager
+### CarAppInstaller
 
-Gerencia o lancamento de apps na tela fisica quando o VD nao esta em uso. Faz ponte com `InputInjectionService` para injecao de entrada baseada em gestos.
-
-### VideoEncoder
-
-Codificador H.264 via MediaProjection + MediaCodec usando virtual display `AUTO_MIRROR`. Caminho de codificacao alternativo (nao usado no pipeline de streaming principal, que flui pelo servidor VD).
-
+Envia o `app-server.apk` embutido para o carro via `dadb` (ADB-over-WiFi). Gerencia a geracao do par de chaves ADB, `Dadb.create()` com timeout fixo de 15 segundos via `Future.get` (I/O de socket bloqueante nao pode ser interrompido por cancelamento de corrotina), o push `pm install -r`, e o reinicio `am start`. As strings de status retornam ao chamador via um callback `onStatus` para que `_installStatusStatic` permaneca em `ConnectionService`.
 ### FileLog
 
 Logger baseado em arquivo que ignora a filtragem do logcat do Android (HyperOS filtra `Log.i/d` para apps nao-sistema).

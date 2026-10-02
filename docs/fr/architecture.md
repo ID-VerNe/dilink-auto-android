@@ -124,7 +124,6 @@ Modèle de connexion parallèle avec pistes WiFi (3 connexions) et USB.
 | CarLaunchScreen | `ui/screen/CarLaunchScreen.kt` | Écran de lancement/connexion plein écran (sans nav), marque, instructions, IP manuelle |
 | MirrorScreen | `ui/screen/MirrorScreen.kt` | TextureView + transfert tactile, redémarrage décodeur quand la surface est disponible |
 | HomeContent | `ui/screen/HomeScreen.kt` | Grille d'apps (icônes 64dp, cellules 160dp) ou statut de connexion, affiché en mode streaming |
-| LauncherScreen | `ui/screen/LauncherScreen.kt` | Écran intégré legacy avec SideNavBar, CarStatusBar, AppGrid |
 | NotificationScreen | `ui/screen/NotificationScreen.kt` | Liste de notifications avec barres de progression, appui pour lancer |
 | PersistentNavBar | `ui/nav/PersistentNavBar.kt` | Barre de navigation 76dp (icônes 40dp, texte 14sp), apps récentes (élaguées), mode streaming uniquement |
 | RecentAppsState | `ui/nav/RecentAppsState.kt` | Suit les apps récentes, élague les indisponibles |

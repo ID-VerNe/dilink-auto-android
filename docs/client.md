@@ -67,17 +67,13 @@ Accepts reverse connection from the VD server process on `localhost:19637`. Take
 - Touch writes to localhost are synchronous with `FrameCodec.writeAll()` under `writeLock`
 - On disconnect: restores physical display (`cmd display power-on 0` + `KEYCODE_WAKEUP`) as safety net when VD server process is killed before cleanup
 
-### AdbBridge
+### CarIpLocator
 
-Fallback shell command helper. Provides `execShell()` and `execFast()` using `Runtime.exec()` for VD server operations and display power management when direct API reflection fails.
+Locates the car's ADB-over-WiFi service (port 5555) for the "Install on Car" flow. Strategies in order of latency: the active control connection's remote IP, ARP table, `ip neigh` neighbor cache (always reaped in `finally`), parallel /24 subnet scan (150ms per-probe timeout), and the WiFi gateway. Plain `object` — no `Service` dependency — so it is unit-testable in isolation.
 
-### VirtualDisplayManager
+### CarAppInstaller
 
-Manages app launching on the physical display when VD is not in use. Bridges to `InputInjectionService` for gesture-based input injection.
-
-### VideoEncoder
-
-MediaProjection + MediaCodec H.264 encoder using `AUTO_MIRROR` virtual display. Alternative encoding path (not used in the primary streaming pipeline which flows through VD server).
+Pushes the embedded `app-server.apk` to the car via `dadb` (ADB-over-WiFi). Owns the ADB key-pair generation, the `Dadb.create()` connect with a hard 15-second `Future.get` timeout (the blocking socket I/O cannot be interrupted by coroutine cancellation), the `pm install -r` push, and the `am start` restart. Status strings flow back to the caller via an `onStatus` callback so the `_installStatusStatic` observable stays in `ConnectionService`. Extracted from the duplicated install logic that previously lived in both `autoUpdateCarApp` and `installCarApp`.
 
 ### FileLog
 

@@ -120,6 +120,7 @@ class PipelineServer(
             val conns = bindAndAccept() ?: run { running = false; return }
             startLifecycleReader(conns.phoneChannel)
             startTouchReader(conns.carInput)
+            lifeWriterThread.start()
             // Signal pipeline to begin rendering with the car video channel
             carVideoChannel = conns.carVideo
             LockSupport.unpark(pipelineThread)
@@ -357,48 +358,53 @@ class PipelineServer(
         var bitrate = BITRATE; var cleanSinceNanos = 0L
         log("Pipeline: ${encodeWidth}x${encodeHeight} ${fps}fps ${bitrate/1_000_000}Mbps")
 
-        while (running) {
-            val waitNs = nextFrameNanos - System.nanoTime()
-            if (waitNs > 0) LockSupport.parkNanos(waitNs)
-            nextFrameNanos += frameIntervalNanos
-            if (nextFrameNanos <= System.nanoTime()) nextFrameNanos = System.nanoTime() + frameIntervalNanos
+        try {
+            while (running) {
+                val waitNs = nextFrameNanos - System.nanoTime()
+                if (waitNs > 0) LockSupport.parkNanos(waitNs)
+                nextFrameNanos += frameIntervalNanos
+                if (nextFrameNanos <= System.nanoTime()) nextFrameNanos = System.nanoTime() + frameIntervalNanos
 
-            val hasNew: Boolean; synchronized(frameLock) { hasNew = frameAvail[0]; frameAvail[0] = false }
-            if (hasNew) st.updateTexImage()
+                val hasNew: Boolean; synchronized(frameLock) { hasNew = frameAvail[0]; frameAvail[0] = false }
+                if (hasNew) st.updateTexImage()
 
-            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, stTexId)
-            val qb = quadBuf!!; qb.position(0)
-            GLES20.glVertexAttribPointer(glPosLoc, 2, GLES20.GL_FLOAT, false, 16, qb); GLES20.glEnableVertexAttribArray(glPosLoc)
-            qb.position(2); GLES20.glVertexAttribPointer(glTexLoc, 2, GLES20.GL_FLOAT, false, 16, qb); GLES20.glEnableVertexAttribArray(glTexLoc)
-            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
-            EGL14.eglSwapBuffers(eglDisplay, eglSurface)
+                GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+                GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, stTexId)
+                val qb = quadBuf!!; qb.position(0)
+                GLES20.glVertexAttribPointer(glPosLoc, 2, GLES20.GL_FLOAT, false, 16, qb); GLES20.glEnableVertexAttribArray(glPosLoc)
+                qb.position(2); GLES20.glVertexAttribPointer(glTexLoc, 2, GLES20.GL_FLOAT, false, 16, qb); GLES20.glEnableVertexAttribArray(glTexLoc)
+                GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+                EGL14.eglSwapBuffers(eglDisplay, eglSurface)
 
-            var drained = 0
-            while (true) {
-                val idx = enc.dequeueOutputBuffer(bufInfo, 0)
-                if (idx < 0) break
-                if (idx >= 0) {
-                    val buf = enc.getOutputBuffer(idx)
-                    if (buf != null && bufInfo.size > 0) {
-                        val payload = ByteArray(bufInfo.size); buf.get(payload)
-                        val isConfig = (bufInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
-                        val msgType = if (isConfig) VideoMsg.CONFIG else VideoMsg.FRAME
-                        if ((bufInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0) keyFrameCount++
-                        val ws = System.nanoTime()
-                        writeFrame(carVideo, msgType, payload)
-                        val wm = (System.nanoTime() - ws) / 1_000_000
-                        if (wm > 15) { cleanSinceNanos = 0L; val nr = maxOf(2_000_000, (bitrate * 0.75f).toInt()); if (nr < bitrate) { bitrate = nr; applyBitrate(enc, bitrate); requestSyncFrame(enc) } }
-                        else if (cleanSinceNanos == 0L) cleanSinceNanos = System.nanoTime()
-                        drained++; frameCount++
+                var drained = 0
+                while (true) {
+                    val idx = enc.dequeueOutputBuffer(bufInfo, 0)
+                    if (idx < 0) break
+                    if (idx >= 0) {
+                        val buf = enc.getOutputBuffer(idx)
+                        if (buf != null && bufInfo.size > 0) {
+                            val payload = ByteArray(bufInfo.size); buf.get(payload)
+                            val isConfig = (bufInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+                            val msgType = if (isConfig) VideoMsg.CONFIG else VideoMsg.FRAME
+                            if ((bufInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0) keyFrameCount++
+                            val ws = System.nanoTime()
+                            writeFrame(carVideo, msgType, payload)
+                            val wm = (System.nanoTime() - ws) / 1_000_000
+                            if (wm > 15) { cleanSinceNanos = 0L; val nr = maxOf(2_000_000, (bitrate * 0.75f).toInt()); if (nr < bitrate) { bitrate = nr; applyBitrate(enc, bitrate); requestSyncFrame(enc) } }
+                            else if (cleanSinceNanos == 0L) cleanSinceNanos = System.nanoTime()
+                            drained++; frameCount++
+                        }
+                        enc.releaseOutputBuffer(idx, false)
                     }
-                    enc.releaseOutputBuffer(idx, false)
                 }
+                if (cleanSinceNanos > 0L && (System.nanoTime() - cleanSinceNanos) / 1_000_000 >= 5000L) { val nr = minOf(BITRATE, bitrate + 1_000_000); if (nr > bitrate) { bitrate = nr; applyBitrate(enc, bitrate) }; cleanSinceNanos = System.nanoTime() }
+                if (frameCount - lastLogAt >= 120) { lastLogAt = frameCount; log("Pipeline: $frameCount frames ${bitrate/1_000_000}Mbps keys=$keyFrameCount") }
             }
-            if (cleanSinceNanos > 0L && (System.nanoTime() - cleanSinceNanos) / 1_000_000 >= 5000L) { val nr = minOf(BITRATE, bitrate + 1_000_000); if (nr > bitrate) { bitrate = nr; applyBitrate(enc, bitrate) }; cleanSinceNanos = System.nanoTime() }
-            if (frameCount - lastLogAt >= 120) { lastLogAt = frameCount; log("Pipeline: $frameCount frames ${bitrate/1_000_000}Mbps keys=$keyFrameCount") }
+        } finally {
+            // cbThread is non-daemon; if writeFrame throws or GL faults, the
+            // parked Looper would prevent a clean JVM exit. quitSafely in finally.
+            cbThread.quitSafely()
         }
-        cbThread.quitSafely()
         log("Pipeline exited: $frameCount frames")
     }
 
@@ -468,7 +474,28 @@ class PipelineServer(
         }, "Watchdog").apply { isDaemon = true }.start()
     }
 
-    private fun readTouchAndCommands(ch: SocketChannel) { val r = NioReader(ch, 65536, frameIntervalNanos/1_000_000); while (running) { val f = try { FrameCodec.readFrameBlocking(r) } catch (e: Exception) { null }; if (f == null) break; when (f.channel) { Channel.INPUT -> handleTouchFrame(f); Channel.CONTROL -> handleCarCommand(f) } }; r.close() }
+    private fun readTouchAndCommands(ch: SocketChannel) {
+        val r = NioReader(ch, 65536, frameIntervalNanos/1_000_000)
+        try {
+            while (running) {
+                val f = try { FrameCodec.readFrameBlocking(r) } catch (e: Exception) { null }
+                if (f == null) break
+                when (f.channel) {
+                    Channel.INPUT -> handleTouchFrame(f)
+                    Channel.CONTROL -> handleCarCommand(f)
+                }
+            }
+        } finally {
+            // Peer of readLifecycleCommands: when the car-input socket dies alone,
+            // tear the whole pipeline down so the physical panel recovers
+            // (setPhysicalDisplayPower(true) runs in cleanup()) instead of
+            // leaving the encoder spinning with no consumer.
+            running = false
+            r.close()
+            try { ch.close() } catch (_: Exception) {}
+            cleanup()
+        }
+    }
 
     private fun handleTouchFrame(f: FrameCodec.Frame) {
         when (f.messageType) {
@@ -477,7 +504,7 @@ class PipelineServer(
         }
     }
     private fun injectTouch(action: Int, ptr: Int, x: Int, y: Int, pressure: Float) {
-        if (inputManager == null || injectInputEventMethod == null) { try { if (action == 0 || action == 2) execFast("input -d $displayId tap $x $y") } catch (_: Exception) {}; return }
+        if (inputManager == null || injectInputEventMethod == null) { try { if (action == 0 || action == 2) execShell("input -d $displayId tap $x $y") } catch (_: Exception) {}; return }
         try {
             activePointers[ptr] = floatArrayOf(x.toFloat(), y.toFloat(), pressure)
             if (activePointers.isEmpty()) return
@@ -533,9 +560,9 @@ class PipelineServer(
     private fun handleCarCommand(f: FrameCodec.Frame) {
         when (f.messageType) {
             ControlMsg.LAUNCH_APP -> launchApp(LaunchAppMessage.decode(f.payload).packageName)
-            ControlMsg.GO_BACK -> { execFast("input -d $displayId keyevent 4"); checkStackEmpty() }
-            ControlMsg.GO_HOME -> { execFast("input -d $displayId keyevent 3"); checkStackEmpty() }
-            ControlMsg.GO_RECENT -> { execFast("input -d $displayId keyevent 187"); checkStackEmpty() }
+            ControlMsg.GO_BACK -> { execShell("input -d $displayId keyevent 4"); checkStackEmpty() }
+            ControlMsg.GO_HOME -> { execShell("input -d $displayId keyevent 3"); checkStackEmpty() }
+            ControlMsg.GO_RECENT -> { execShell("input -d $displayId keyevent 187"); checkStackEmpty() }
             ControlMsg.APP_UNINSTALL -> execShell("pm uninstall ${String(f.payload, Charsets.UTF_8)}")
             ControlMsg.APP_INFO -> { val pkg = String(f.payload, Charsets.UTF_8); val s = execShellOutput("cmd package resolve-activity --brief -a android.settings.APPLICATION_DETAILS_SETTINGS com.android.settings")?.trim(); if (!s.isNullOrEmpty()) execShell("am start --display $displayId -n $s -d \"package:$pkg\"") else execShell("am start --display $displayId -a android.settings.APPLICATION_DETAILS_SETTINGS -d \"package:$pkg\"") }
             ControlMsg.APP_SHORTCUTS -> { val pkg = String(f.payload, Charsets.UTF_8); val o = execShellOutput("cmd shortcut get-shortcuts --package $pkg 2>/dev/null") ?: ""; if (o.isNotBlank()) sendShortcutResult(pkg, o) }
@@ -545,14 +572,55 @@ class PipelineServer(
 
     private fun checkStackEmpty() { Thread({ try { Thread.sleep(300); val d = execShellOutput("dumpsys activity activities 2>/dev/null") ?: ""; val m = "Display #$displayId "; val s = d.indexOf(m); if (s < 0) { enqueueResponse(MSG_STACK_EMPTY, ByteArray(0)) } else { val nd = d.indexOf("Display #", s+m.length); val sec = if (nd >= 0) d.substring(s, nd) else d.substring(s); if (sec.lines().none { it.contains("Task{") }) enqueueResponse(MSG_STACK_EMPTY, ByteArray(0)); else { Regex("topResumedActivity=ActivityRecord\\{[^}]*\\s+(\\S+)/").find(sec)?.let { enqueueResponse(MSG_FOCUSED_APP, it.groupValues[1].toByteArray(Charsets.UTF_8)) } ?: enqueueResponse(MSG_STACK_EMPTY, ByteArray(0)) } } } catch (_: Exception) {} }, "StackCheck").start() }
 
+    private val lifecycleWriteQueue = java.util.concurrent.ArrayBlockingQueue<ByteBuffer>(16)
+    private val lifeWriterThread = Thread({
+        while (running) {
+            val buf = try { lifecycleWriteQueue.take() } catch (_: InterruptedException) { break }
+            val ch = lifecycleChannel
+            if (ch == null || !ch.isOpen) continue
+            try {
+                synchronized(ch) {
+                    while (buf.hasRemaining()) {
+                        val n = ch.write(buf)
+                        if (n == 0) Thread.sleep(1)
+                    }
+                }
+            } catch (_: Exception) {
+                // Swallowed: lifecycle responses are advisory (stack-empty, focused-app).
+                // Dropping one on a transient I/O error is preferable to crashing the
+                // pipeline, which a configureBlocking(true) toggle would do (see below).
+            }
+        }
+    }, "LifeWriter").apply { isDaemon = true }
+
+    /** Enqueue a response on the lifecycle channel through the dedicated LifeWriter
+     *  thread. The lifecycle Channel is registered for OP_READ by NioReader; toggling
+     *  its blocking mode to write synchronously throws IllegalBlockingModeException,
+     *  which the old try/catch silently swallowed — so every MSG_STACK_EMPTY /
+     *  MSG_FOCUSED_APP / MSG_SHORTCUTS_RESULT was dropped. The single-writer thread
+     *  performs a non-blocking spin write without touching blocking mode. */
     private fun enqueueResponse(msgType: Byte, payload: ByteArray) {
-        try { val ch = lifecycleChannel; if (ch != null && ch.isOpen) synchronized(ch) { val len = if (payload.isEmpty()) 1 else 5 + payload.size; val buf = ByteBuffer.allocate(len); buf.put(msgType); if (payload.isNotEmpty()) { buf.putInt(payload.size); buf.put(payload) }; buf.flip(); ch.configureBlocking(true); while (buf.hasRemaining()) ch.write(buf); ch.configureBlocking(false) } } catch (_: Exception) {}
+        try {
+            val len = if (payload.isEmpty()) 1 else 5 + payload.size
+            val buf = ByteBuffer.allocate(len)
+            buf.put(msgType)
+            if (payload.isNotEmpty()) { buf.putInt(payload.size); buf.put(payload) }
+            buf.flip()
+            lifecycleWriteQueue.offer(buf)
+        } catch (_: Exception) {}
     }
-    private fun sendShortcutResult(pkg: String, data: String) { try { val ch = lifecycleChannel; if (ch != null && ch.isOpen) { val pb = pkg.toByteArray(Charsets.UTF_8); val db = data.toByteArray(Charsets.UTF_8); val buf = ByteBuffer.allocate(1+4+pb.size+4+db.size); buf.put(MSG_SHORTCUTS_RESULT); buf.putInt(pb.size); buf.put(pb); buf.putInt(db.size); buf.put(db); buf.flip(); synchronized(ch) { ch.configureBlocking(true); while (buf.hasRemaining()) ch.write(buf); ch.configureBlocking(false) } } } catch (_: Exception) {} }
+    private fun sendShortcutResult(pkg: String, data: String) {
+        try {
+            val pb = pkg.toByteArray(Charsets.UTF_8)
+            val db = data.toByteArray(Charsets.UTF_8)
+            val buf = ByteBuffer.allocate(1+4+pb.size+4+db.size)
+            buf.put(MSG_SHORTCUTS_RESULT); buf.putInt(pb.size); buf.put(pb); buf.putInt(db.size); buf.put(db); buf.flip()
+            lifecycleWriteQueue.offer(buf)
+        } catch (_: Exception) {}
+    }
 
     // ── Helpers ──
 
-    private fun execFast(cmd: String) { try { shellInput?.let { it.write("$cmd\n".toByteArray()); it.flush() } } catch (_: Exception) {} }
     private fun execShell(cmd: String) { try { shellInput?.let { it.write("$cmd\n".toByteArray()); it.flush() } } catch (_: Exception) {} }
     private fun execShellOutput(cmd: String): String? = try { val p = Runtime.getRuntime().exec(arrayOf("sh", "-c", cmd)); val o = p.inputStream.bufferedReader().readText(); p.waitFor(); o } catch (_: Exception) { null }
 
@@ -584,6 +652,8 @@ class PipelineServer(
             }
         }
         try { execShell("cmd window reset-letterbox-style") } catch (_: Exception) {}
+        // Stop the LifeWriter thread before killing the shell — it may be mid-write.
+        lifeWriterThread.interrupt()
         // Now kill the shell
         persistentShell?.let { try { shellInput?.close() } catch (_: Exception) {}; it.destroy() }
         // EGL cleanup
