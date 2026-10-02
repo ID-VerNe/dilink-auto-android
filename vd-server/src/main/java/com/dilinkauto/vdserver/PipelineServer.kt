@@ -78,7 +78,7 @@ class PipelineServer(
         private const val MSG_DISPLAY_READY: Byte = 0x10
         private const val MSG_STACK_EMPTY: Byte = 0x11
         private const val CMD_STOP = 0xFF
-        private const val BITRATE = 8_000_000
+        private const val BITRATE = 4_000_000
         private const val I_FRAME_INTERVAL = 1
         private const val MAX_POINTERS = 10
         private const val VIDEO_PORT = 9638
@@ -254,6 +254,7 @@ class PipelineServer(
         try { sendDisplayReady(phoneChannel); log("Display ready sent") } catch (e: Exception) { err("Display ready: ${e.message}"); try { phoneChannel.close() } catch (_: Exception) {}; try { videoServer.close() } catch (_: Exception) {}; try { inputServer.close() } catch (_: Exception) {}; return null }
         lifecycleChannel = phoneChannel
         execShell("am start --display $displayId -a android.intent.action.MAIN -c android.intent.category.HOME"); log("Home launched")
+        moveTopApp(0, displayId)
         setPhysicalDisplayPower(false); lastPowerOffTime = System.currentTimeMillis()
         val carVideo = acceptCarChannel(videoServer, "video", 30000) ?: run { err("Car video timeout"); try { phoneChannel.close() } catch (_: Exception) {}; return null }
         val carInput = acceptCarChannel(inputServer, "input", 30000) ?: run { err("Car input timeout"); try { phoneChannel.close() } catch (_: Exception) {}; try { carVideo.close() } catch (_: Exception) {}; return null }
@@ -294,6 +295,9 @@ class PipelineServer(
 
     private fun runPipeline() {
         try {
+            // Encoder + GL pipeline thread; mark urgent so background threads
+            // (LifeWriter, watchdog) don't preempt the encode path on A53.
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
             initEglAndSurfaceTexture()
             inputSurfaceReady.countDown()
             // Wait for main thread to create VD, accept connections, and set carVideoChannel
@@ -387,14 +391,14 @@ class PipelineServer(
                             val ws = System.nanoTime()
                             writeFrame(carVideo, msgType, payload)
                             val wm = (System.nanoTime() - ws) / 1_000_000
-                            if (wm > 15) { cleanSinceNanos = 0L; val nr = maxOf(2_000_000, (bitrate * 0.75f).toInt()); if (nr < bitrate) { bitrate = nr; applyBitrate(enc, bitrate); requestSyncFrame(enc) } }
+                            if (wm > 15) { cleanSinceNanos = 0L; val nr = maxOf(1_500_000, (bitrate * 0.75f).toInt()); if (nr < bitrate) { bitrate = nr; applyBitrate(enc, bitrate); requestSyncFrame(enc) } }
                             else if (cleanSinceNanos == 0L) cleanSinceNanos = System.nanoTime()
                             drained++; frameCount++
                         }
                         enc.releaseOutputBuffer(idx, false)
                     }
                 }
-                if (cleanSinceNanos > 0L && (System.nanoTime() - cleanSinceNanos) / 1_000_000 >= 5000L) { val nr = minOf(BITRATE, bitrate + 1_000_000); if (nr > bitrate) { bitrate = nr; applyBitrate(enc, bitrate) }; cleanSinceNanos = System.nanoTime() }
+                if (cleanSinceNanos > 0L && (System.nanoTime() - cleanSinceNanos) / 1_000_000 >= 2000L) { val nr = minOf(BITRATE, bitrate + 500_000); if (nr > bitrate) { bitrate = nr; applyBitrate(enc, bitrate) }; cleanSinceNanos = System.nanoTime() }
                 if (frameCount - lastLogAt >= 120) { lastLogAt = frameCount; log("Pipeline: $frameCount frames ${bitrate/1_000_000}Mbps keys=$keyFrameCount") }
             }
         } finally {
@@ -570,6 +574,7 @@ class PipelineServer(
 
     private val lifecycleWriteQueue = java.util.concurrent.ArrayBlockingQueue<ByteBuffer>(16)
     private val lifeWriterThread = Thread({
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
         while (running) {
             val buf = try { lifecycleWriteQueue.take() } catch (_: InterruptedException) { break }
             val ch = lifecycleChannel
@@ -619,9 +624,32 @@ class PipelineServer(
     }
     private fun setDisplayImePolicy(id: Int) { try { val wm = Class.forName("android.view.IWindowManager\$Stub").getDeclaredMethod("asInterface", android.os.IBinder::class.java).invoke(null, Class.forName("android.os.ServiceManager").getDeclaredMethod("getService", String::class.java).invoke(null, "window")); wm.javaClass.getDeclaredMethod("setDisplayImePolicy", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType).invoke(wm, id, 0) } catch (_: Exception) {} }
 
+    private fun moveTopApp(fromDisplay: Int, toDisplay: Int) {
+        if (fromDisplay < 0 || toDisplay < 0) return
+        try {
+            val d = execShellOutput("dumpsys activity activities 2>/dev/null") ?: return
+            val m = "Display #$fromDisplay "
+            val s = d.indexOf(m)
+            if (s < 0) return
+            val nd = d.indexOf("Display #", s + m.length)
+            val sec = if (nd >= 0) d.substring(s, nd) else d.substring(s)
+            val match = Regex("ActivityRecord\\{[^ ]+ [^ ]+ ([^/ ]+/[^ } ]+) t(\\d+)\\}").find(sec)
+            val topComponent = match?.groupValues?.get(1)
+            val taskId = match?.groupValues?.get(2)
+            if (topComponent != null && taskId != null && !topComponent.contains("launcher", true) && !topComponent.contains("systemui", true)) {
+                log("Moving app $topComponent (Task $taskId) from display $fromDisplay to $toDisplay")
+                execShell("am display move-stack $taskId $toDisplay")
+            }
+        } catch (e: Exception) {
+            err("Failed to move app: ${e.message}")
+        }
+    }
+
     private fun cleanup() {
         if (!cleanedUp.compareAndSet(false, true)) return
         running = false
+        // Resume foreground app from VD to phone display before tearing down VD
+        moveTopApp(displayId, 0)
         // Restore screen BEFORE killing shell (order matters: execShell needs shellInput alive)
         setPhysicalDisplayPower(true)
         try { execShell("input keyevent 224") } catch (_: Exception) {}

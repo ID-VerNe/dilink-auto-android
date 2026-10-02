@@ -1,6 +1,7 @@
 package com.dilinkauto.protocol
 
 import kotlinx.coroutines.*
+import android.os.Process
 import java.io.IOException
 import java.net.InetSocketAddress
 import java.nio.ByteBuffer
@@ -73,6 +74,9 @@ class Connection(
         lastFrameReceivedAt = System.currentTimeMillis()
 
         readerJob = scope.launch(Dispatchers.IO) {
+            // 8x A53 has no big cores; mark the socket-drain thread urgent so
+            // background coroutines on the same pool don't starve frame reads.
+            Process.setThreadPriority(Process.myTid(), Process.THREAD_PRIORITY_URGENT_DISPLAY)
             try {
                 while (isActive && connected.get()) {
                     val frame = FrameCodec.readFrame(reader)

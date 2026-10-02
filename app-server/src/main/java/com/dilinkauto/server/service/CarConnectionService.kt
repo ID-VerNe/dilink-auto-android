@@ -86,7 +86,7 @@ class CarConnectionService : Service() {
     @Volatile private var handshakeDone = false // Stop gateway retry after handshake completes
     @Volatile private var lastAdbHost: String? = null // Track which host TCP ADB connected to
     private var noAdbCount = 0 // Consecutive deploy failures due to no ADB — stops reconnect loop
-    @Volatile private var carLogEnabled = true // Toggled by phone via LOG_TOGGLE data message
+    @Volatile private var carLogEnabled = com.dilinkauto.server.BuildConfig.DEBUG // release: off by default; phone can toggle via LOG_TOGGLE
     @Volatile private var tcpAdbConnecting = false // Prevent duplicate TCP ADB attempts
 
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
@@ -166,9 +166,6 @@ class CarConnectionService : Service() {
 
         // Log device info for diagnostics
         carLogSend(CarCrashHandler.buildDeviceInfo(this))
-        // PSS is a binder call to activitymanager that stalls the calling thread;
-        // probe it off Main so startup isn't blocked on a slow car CPU.
-        CarCrashHandler.logPssAsync()
 
         // Send any crash report from the previous run
         val crash = CarCrashHandler.consumePendingCrash()
@@ -265,7 +262,7 @@ class CarConnectionService : Service() {
             if (usbAdb == null) usbConnecting = false // only reset if no ADB instance (auth may be pending)
         }
 
-        carLogEnabled = true  // Reset to default each session
+        carLogEnabled = com.dilinkauto.server.BuildConfig.DEBUG  // Reset to default each session
         userDisconnected = false
         _state.value = State.CONNECTING
         _statusMessage.value = getString(R.string.status_connecting)
@@ -841,8 +838,13 @@ class CarConnectionService : Service() {
 
             val logFile = "/sdcard/DiLinkAuto/vd-server.log"
             // Args: W H DPI PHONE_HOST EW EH FPS — VD binds 9638/9639 for car, connects to phone on 19647
-            // Use 127.0.0.1: VD server runs on phone (via ADB), same device as ConnectionService
-            val args = "$vdW $vdH $phoneDpi 127.0.0.1 $vdW $vdH $targetFps"
+            // Use 127.0.0.1: VD server runs on phone (via ADB), same device as ConnectionService.
+            // VD (W H) = car-native viewport; encode (EW EH) clamped to 1920x1080 — Snapdragon 439
+            // VPU caps hardware AVC decode at 1080p. Car-native here is already ≤1080p, the clamp
+            // is defensive for higher-res car panels.
+            val encW = minOf(vdW, 1920)
+            val encH = minOf(vdH, 1080)
+            val args = "$vdW $vdH $phoneDpi 127.0.0.1 $encW $encH $targetFps"
 
             // Kill any existing VD server
             _statusMessage.value = getString(R.string.status_preparing_vd)
@@ -1077,6 +1079,9 @@ class CarConnectionService : Service() {
 
         videoDecoder.stop()
         releaseOffscreenSurface()
+        // Release icon cache: ~5-9MB of retained bitmaps + source PNGs on eMMC.
+        // Phone resends icons on next APP_LIST, so retaining across sessions is pure waste.
+        ServerApp.iconCache.clear()
         // Don't disconnect ADB controller on every disconnect — TCP ADB connections
         // survive WiFi flaps. Only null it if the connection is actually broken.
         if (adbController?.isConnected != true) {
@@ -1181,7 +1186,10 @@ class CarConnectionService : Service() {
         val vdW = vp.first
         val vdH = vp.second
         val phoneDpi = if (handshakeVdDpi > 0) handshakeVdDpi else VideoConfig.calculateOptimalDpi(vdW, vdH, displayMetrics.densityDpi)
-        val args = "$vdW $vdH $phoneDpi 127.0.0.1 $vdW $vdH $targetFps"
+        // Encode dims clamped to 1920x1080 (Snapdragon 439 VPU hardware-decode cap).
+        val encW = minOf(vdW, 1920)
+        val encH = minOf(vdH, 1080)
+        val args = "$vdW $vdH $phoneDpi 127.0.0.1 $encW $encH $targetFps"
         _statusMessage.value = getString(R.string.status_preparing_vd)
         carLogSend("VD server: ${vdW}x${vdH}@${phoneDpi}dpi (car-native, no downscale)")
         // Use shell (sync) to capture result. pkill old instance first, then start new one.
@@ -1204,6 +1212,9 @@ class CarConnectionService : Service() {
     // ─── Car Log (sent to phone via protocol, phone writes to file) ───
 
     private val logBuffer = java.util.concurrent.ConcurrentLinkedQueue<String>()
+    // O(1) counter for the cap check below — ConcurrentLinkedQueue.size() is O(n) and
+    // was called per log line on the disconnected path.
+    private val logBufferCount = java.util.concurrent.atomic.AtomicInteger(0)
 
     private data class LogEntry(val msg: String, val level: String)
 
@@ -1229,6 +1240,7 @@ class CarConnectionService : Service() {
                             // Flush any buffered messages first
                             while (true) {
                                 val buffered = logBuffer.poll() ?: break
+                                logBufferCount.decrementAndGet()
                                 try { conn.sendData(DataMsg.CAR_LOG, buffered.toByteArray(Charsets.UTF_8)) }
                                 catch (_: Exception) { break }
                             }
@@ -1236,7 +1248,10 @@ class CarConnectionService : Service() {
                             catch (_: Exception) {}
                         } else {
                             // Buffer for later — cap at 10000 lines
-                            if (logBuffer.size < 10000) logBuffer.add(line)
+                            if (logBufferCount.get() < 10000) {
+                                logBuffer.add(line)
+                                logBufferCount.incrementAndGet()
+                            }
                         }
                     } catch (_: Throwable) {
                         // Never let the writer die on a single bad entry

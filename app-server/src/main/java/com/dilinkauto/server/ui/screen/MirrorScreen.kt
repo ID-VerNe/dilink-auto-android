@@ -3,7 +3,8 @@ package com.dilinkauto.server.ui.screen
 import android.graphics.SurfaceTexture
 import android.view.MotionEvent
 import android.view.Surface
-import android.view.TextureView
+import android.view.SurfaceHolder
+import android.view.SurfaceView
 import android.view.View
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.fillMaxSize
@@ -16,60 +17,72 @@ import com.dilinkauto.protocol.TouchEvent
 import com.dilinkauto.server.service.CarConnectionService
 
 /**
- * Mirror content — TextureView for video + touch forwarding.
- * Uses TextureView instead of SurfaceView to avoid z-ordering issues
- * where SurfaceView would punch through the persistent nav bar.
+ * Mirror content — SurfaceView for video + touch forwarding.
  *
- * The decoder is never stopped during screen navigation. When the TextureView
- * surface is available and the decoder is already running (early start on offscreen
- * surface), we switch the surface with setOutputSurface(). When it's the first
- * time, we start normally. When the surface is destroyed, the decoder stays running
- * — CarConnectionService.handleDisconnect/shutdown handles the final stop.
+ * SurfaceView (not TextureView) so the decoder's output goes through a hardware
+ * overlay instead of an extra per-frame GL composite pass. On the Adreno 505 the
+ * TextureView composite cost (~2-5ms/frame at 1280x800) is a meaningful slice of
+ * the 42ms budget at 24fps; SurfaceView bypasses it entirely.
+ *
+ * Tradeoff: SurfaceView destroys its surface when the view goes INVISIBLE, where
+ * TextureView kept it alive. Navigation HOME<->APP toggles `visible`, so
+ * surfaceCreated/surfaceDestroyed fire on each switch. The decoder is NOT stopped
+ * on surfaceDestroyed — it stays running, and [VideoDecoder.invalidateSurface]
+ * gates the render flag off so frames aren't dropped to a destroyed surface.
+ * surfaceCreated calls switchSurface (setOutputSurface) to re-attach, restoring
+ * rendering with zero keyframe loss. handleDisconnect/shutdown owns the final
+ * decoder stop.
+ *
+ * The persistent nav bar is a sibling (not overlapping) this composable in both
+ * landscape and portrait layouts (MainActivity CarShell), so SurfaceView's
+ * default z-order — surface below the window hierarchy — renders the nav bar
+ * above the video correctly.
  */
 @Composable
 fun MirrorContent(service: CarConnectionService, visible: Boolean = true) {
     AndroidView(
         factory = { context ->
-            TextureView(context).apply {
-                surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-                    override fun onSurfaceTextureAvailable(
-                        surfaceTexture: SurfaceTexture,
-                        width: Int,
-                        height: Int
-                    ) {
-                        service.log("[MirrorScreen] TextureView surface available: ${width}x${height}, decoder.isRunning=${service.videoDecoder.isRunning}")
-                        val surface = Surface(surfaceTexture)
+            SurfaceView(context).apply {
+                holder.addCallback(object : SurfaceHolder.Callback {
+                    override fun surfaceCreated(holder: SurfaceHolder) {
+                        val surface = holder.surface
+                        service.log("[MirrorScreen] SurfaceView surface created, decoder.isRunning=${service.videoDecoder.isRunning}")
                         if (service.videoDecoder.isRunning) {
-                            // Decoder already running (early start on offscreen surface
-                            // or survived a navigation hide/show). Switch surface without
-                            // restarting — zero frame loss, zero keyframe drops.
+                            // Decoder already running (survived a navigation hide/show
+                            // or early start on offscreen surface). Switch surface
+                            // without restarting — zero frame loss, zero keyframe drops.
                             service.videoDecoder.switchSurface(surface)
                             service.releaseOffscreenSurface()
-                            service.log("[MirrorScreen] Decoder surface switched to TextureView (no restart)")
+                            service.log("[MirrorScreen] Decoder surface switched to SurfaceView (no restart)")
                         } else {
                             // First start — decoder hasn't been created yet
                             service.videoDecoder.start(surface, service.vdWidth, service.vdHeight, service.targetFps)
                             service.releaseOffscreenSurface()
-                            service.log("[MirrorScreen] Decoder started on TextureView surface")
+                            service.log("[MirrorScreen] Decoder started on SurfaceView surface")
                         }
                     }
 
-                    override fun onSurfaceTextureSizeChanged(
-                        surfaceTexture: SurfaceTexture,
+                    override fun surfaceChanged(
+                        holder: SurfaceHolder,
+                        format: Int,
                         width: Int,
                         height: Int
-                    ) {}
-
-                    override fun onSurfaceTextureDestroyed(surfaceTexture: SurfaceTexture): Boolean {
-                        // During normal screen navigation the TextureView is kept alive
-                        // (INVISIBLE, not GONE), so this only fires on activity teardown.
-                        // The decoder is stopped by handleDisconnect/shutdown — just log.
-                        service.log("[MirrorScreen] TextureView surface destroyed")
-                        return true
+                    ) {
+                        // No-op — the decoder renders at fixed vdWidth x vdHeight;
+                        // the SurfaceView scales the buffer to the view size.
                     }
 
-                    override fun onSurfaceTextureUpdated(surfaceTexture: SurfaceTexture) {}
-                }
+                    override fun surfaceDestroyed(holder: SurfaceHolder) {
+                        // Surface is gone (view went INVISIBLE or activity teardown).
+                        // Do NOT stop the decoder — navigation between HOME and APP
+                        // toggles visibility, and stopping/restarting the codec would
+                        // drop the keyframe cache and require a fresh IDR. Just gate
+                        // the render flag off; surfaceCreated will re-attach a new
+                        // surface via setOutputSurface.
+                        service.videoDecoder.invalidateSurface()
+                        service.log("[MirrorScreen] SurfaceView surface destroyed — decoder stays running, render gated off")
+                    }
+                })
 
                 setOnTouchListener { view, event ->
                     when (event.actionMasked) {
@@ -85,7 +98,7 @@ fun MirrorContent(service: CarConnectionService, visible: Boolean = true) {
                             ))
                         }
                         MotionEvent.ACTION_MOVE -> {
-                            // Batch ALL active pointers into one message (reduces syscalls for multi-touch)
+                            // BatchALL active pointers into one message (reduces syscalls for multi-touch)
                             val pointers = (0 until event.pointerCount).map { i ->
                                 TouchEvent(
                                     action = InputMsg.TOUCH_MOVE,

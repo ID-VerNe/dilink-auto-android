@@ -14,7 +14,13 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Immutable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -103,6 +109,21 @@ fun HomeContent(
     }
 }
 
+/**
+ * Stable wrapper for [AppTile] inputs. [AppInfo] carries an unstable [ByteArray]
+ * (iconPng), which makes AppTile non-skippable and forces full-grid recomposition
+ * on any appList reassignment. This wrapper excludes the byte array — AppTile
+ * reads the prepared icon from the cache by packageName, so the wrapper's identity
+ * is the only input that matters for recomposition.
+ */
+@Immutable
+data class AppTileData(
+    val packageName: String,
+    val appName: String,
+    val category: AppCategory,
+    val isPinned: Boolean
+)
+
 @Composable
 fun AppGrid(
     apps: List<AppInfo>,
@@ -156,11 +177,15 @@ fun AppGrid(
                 ) {
                     items(filteredApps, key = { it.packageName }, contentType = { "app_tile" }) { app ->
                         AppTile(
-                            app = app,
+                            data = AppTileData(
+                                packageName = app.packageName,
+                                appName = app.appName,
+                                category = app.category,
+                                isPinned = pinnedApps.contains(app.packageName)
+                            ),
                             onClick = { onAppClick(app.packageName) },
                             onUninstall = { onUninstall(app.packageName) },
                             onAppInfo = { onAppInfo(app.packageName) },
-                            isPinned = pinnedApps.contains(app.packageName),
                             onTogglePin = { togglePin(app.packageName) }
                         )
                     }
@@ -210,21 +235,20 @@ fun AppGrid(
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun AppTile(
-    app: AppInfo,
+    data: AppTileData,
     onClick: () -> Unit,
     onUninstall: () -> Unit,
     onAppInfo: () -> Unit,
-    isPinned: Boolean = false,
     onTogglePin: () -> Unit = {}
 ) {
-    val categoryIcon = when (app.category) {
+    val categoryIcon = when (data.category) {
         AppCategory.NAVIGATION -> Icons.Default.Navigation
         AppCategory.MUSIC -> Icons.Default.MusicNote
         AppCategory.COMMUNICATION -> Icons.Default.Chat
         AppCategory.OTHER -> Icons.Default.Apps
     }
 
-    val categoryColor = when (app.category) {
+    val categoryColor = when (data.category) {
         AppCategory.NAVIGATION -> NavigationColor
         AppCategory.MUSIC -> MusicColor
         AppCategory.COMMUNICATION -> CommunicationColor
@@ -235,8 +259,8 @@ fun AppTile(
     // Re-keyed on preparedVersion so a fresh prepareAll() pass (e.g. after icon
     // updates) triggers recomposition and the new bitmap is picked up.
     val preparedVersion = ServerApp.iconCache.preparedVersion
-    val iconBitmap = remember(preparedVersion, app.packageName) {
-        ServerApp.iconCache.getPrepared(app.packageName)
+    val iconBitmap = remember(preparedVersion, data.packageName) {
+        ServerApp.iconCache.getPrepared(data.packageName)
     }
 
     var menuExpanded by remember { mutableStateOf(false) }
@@ -254,7 +278,7 @@ fun AppTile(
         if (iconBitmap != null) {
             Image(
                 bitmap = iconBitmap,
-                contentDescription = app.appName,
+                contentDescription = data.appName,
                 modifier = Modifier
                     .size(64.dp)
             )
@@ -268,7 +292,7 @@ fun AppTile(
         }
         Spacer(Modifier.height(4.dp))
         Text(
-            text = app.appName,
+            text = data.appName,
             style = MaterialTheme.typography.bodyMedium,
             color = Color.White,
             textAlign = TextAlign.Center,
@@ -290,7 +314,7 @@ fun AppTile(
         ) {
             DropdownMenuItem(
                 text = {
-                    Text(if (isPinned) stringResource(R.string.unpin_from_top) else stringResource(R.string.pin_to_top), color = Color.White, fontSize = 18.sp)
+                    Text(if (data.isPinned) stringResource(R.string.unpin_from_top) else stringResource(R.string.pin_to_top), color = Color.White, fontSize = 18.sp)
                 },
                 onClick = {
                     menuExpanded = false
@@ -298,7 +322,7 @@ fun AppTile(
                 },
                 leadingIcon = {
                     Icon(
-                        if (isPinned) Icons.Default.PushPin else Icons.Outlined.PushPin,
+                        if (data.isPinned) Icons.Default.PushPin else Icons.Outlined.PushPin,
                         null,
                         tint = Color(0xFFFFD54F),
                         modifier = Modifier.size(28.dp)

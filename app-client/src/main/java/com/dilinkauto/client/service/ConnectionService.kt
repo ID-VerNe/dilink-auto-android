@@ -546,9 +546,15 @@ class ConnectionService : Service() {
             val logFile = java.io.File(dir, "vd-server.log").absolutePath
             // Args: W H DPI PHONE_HOST EW EH FPS
             // VD binds 9638/9639 on 0.0.0.0, connects lifecycle to phoneHost:19647.
-            // encode dims MUST be even (AVC encoder rejects odd width/height) — use the
-            // already-aligned vdWidth/vdHeight for both VD and encode size.
-            val args = "$vdWidth $vdHeight $dpi 127.0.0.1 $vdWidth $vdHeight $targetFps"
+            // VD dims (W H) are the scaled-up vdWidth/vdHeight (preserves the IME-crop
+            // fix for Chinese ROMs that hardcode IME width to phone physical width).
+            // Encode dims (EW EH) are the car-native viewport clamped to 1920x1080:
+            // the Snapdragon 439 VPU caps hardware AVC decode at 1080p. Encoding
+            // larger forces software decode on the car's 8x A53 (single-digit fps).
+            // Car-native is also 1:1 with the car's pixels, so no downscale on decode.
+            val encW = minOf(carWidth, 1920)
+            val encH = minOf(carHeight, 1080)
+            val args = "$vdWidth $vdHeight $dpi 127.0.0.1 $encW $encH $targetFps"
 
             ShizukuManager.execAndWait("pkill -f PipelineServer 2>/dev/null")
             delay(200)

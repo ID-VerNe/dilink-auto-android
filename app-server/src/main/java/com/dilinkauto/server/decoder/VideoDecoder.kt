@@ -4,6 +4,7 @@ import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaFormat
+import android.os.Process
 import android.util.Log
 import android.view.Surface
 import com.dilinkauto.protocol.VideoConfig
@@ -49,6 +50,16 @@ class VideoDecoder {
     private val running = AtomicBoolean(false)
     val isRunning: Boolean get() = running.get()
     private val frameQueue = ArrayBlockingQueue<FrameData>(4) // small buffer, drop on overflow
+
+    // Surface validity flag. SurfaceView (used since the Adreno 505 TextureView
+    // composite cost was too high) destroys its surface when the view goes INVISIBLE;
+    // TextureView kept it alive. Navigation HOME<->APP toggles visibility, so
+    // surfaceDestroyed fires on each switch. The decoder keeps running across
+    // navigation (handleDisconnect/shutdown owns the final stop); we gate
+    // releaseOutputBuffer's render flag on this so we don't render to a destroyed
+    // surface during the brief window before surfaceCreated re-attaches.
+    @Volatile
+    private var outputSurfaceValid = false
 
     // CONFIG data is cached separately so it's never lost, even if it arrives
     // before start() is called or while the queue is full.
@@ -142,7 +153,8 @@ class VideoDecoder {
             configure(format, surface, null, 0)
             start()
         }
-        log("MediaCodec created: name=${codec?.name} hw=${hwInfo != null} operatingRate=$fps")
+        outputSurfaceValid = true
+        log("MediaCodec created: name=${codec?.name} hw=${hwInfo != null} dims=${width}x${height} operatingRate=$fps")
 
         frameCount = 0
         renderCount = 0
@@ -151,6 +163,9 @@ class VideoDecoder {
         var configFed = false
 
         feedThread = Thread({
+            // 8x A53 has no big cores; tell the scheduler this is latency-critical
+            // so it doesn't get starved by background work (icon decode, log flush).
+            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
             val decoder = codec ?: run {
                 logE("Feed thread: codec is null!")
                 return@Thread
@@ -294,7 +309,7 @@ class VideoDecoder {
             while (true) {
                 val outputIndex = decoder.dequeueOutputBuffer(bufferInfo, 0)
                 if (outputIndex >= 0) {
-                    decoder.releaseOutputBuffer(outputIndex, true) // render to surface
+                    decoder.releaseOutputBuffer(outputIndex, outputSurfaceValid) // render to surface only if valid
                     renderCount++
                     if (renderCount <= 3 || renderCount % 30 == 0L) {
                         log("Rendered frame #$renderCount size=${bufferInfo.size} flags=${bufferInfo.flags}")
@@ -384,14 +399,23 @@ class VideoDecoder {
         }
         try {
             c.setOutputSurface(newSurface)
+            outputSurfaceValid = true
             log("Switched decoder output to new Surface")
         } catch (e: Exception) {
             logE("switchSurface failed: ${e.message}")
         }
     }
 
+    /** Mark the output surface invalid (destroyed). The decoder keeps running;
+     *  releaseOutputBuffer's render flag is gated off until switchSurface/start
+     *  re-attaches a valid surface. */
+    fun invalidateSurface() {
+        outputSurfaceValid = false
+    }
+
     fun stop() {
         if (!running.getAndSet(false)) return
+        outputSurfaceValid = false
         log("Stopping decoder: fed=$frameCount rendered=$renderCount drops=$dropCount inputFails=$inputFailCount")
         frameQueue.clear()
         cachedKeyFrame = null

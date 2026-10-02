@@ -5,8 +5,8 @@ package com.dilinkauto.protocol
  * All waits/polls on the video path should use FRAME_INTERVAL_MS as their max timeout.
  */
 object VideoConfig {
-    const val TARGET_FPS = 30  // phone doesn't overheat at this rate
-    const val FRAME_INTERVAL_MS = 1000L / TARGET_FPS  // 16ms at 60fps
+    const val TARGET_FPS = 24  // 24fps: 42ms/frame budget on weak A53+Adreno 505; cuts WiFi/GPU/allocation 20% vs 30fps
+    const val FRAME_INTERVAL_MS = 1000L / TARGET_FPS  // ~42ms at 24fps
     const val VIRTUAL_DISPLAY_DPI = 480  // legacy fallback constant
     const val TARGET_SW_DP = 600  // smallest-width dp for VD size calculation
     const val DEFAULT_FALLBACK_DPI = 160
