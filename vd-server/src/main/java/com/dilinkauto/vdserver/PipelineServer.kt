@@ -620,12 +620,27 @@ class PipelineServer(
         try {
             if (!displayControlLoaded) { try { displayControlClass = Class.forName("com.android.server.display.DisplayControl"); displayControlLoaded = true } catch (_: Exception) { try { val clf = Class.forName("dalvik.system.DelegateLastClassLoader").getDeclaredConstructor(String::class.java, String::class.java, ClassLoader::class.java); clf.isAccessible = true; displayControlClass = (clf.newInstance("/system/framework/services.jar", null, ClassLoader.getSystemClassLoader()) as ClassLoader).loadClass("com.android.server.display.DisplayControl"); displayControlLoaded = true } catch (_: Exception) { err("DisplayControl load failed") } } }
             val cls = displayControlClass; if (cls != null) { val gid = cls.getDeclaredMethod("getPhysicalDisplayIds").apply { isAccessible = true }; val ids = gid.invoke(null) as LongArray; val sp = cls.getDeclaredMethod("setDisplayPowerMode", android.os.IBinder::class.java, Int::class.javaPrimitiveType).apply { isAccessible = true }; for (id in ids) { sp.invoke(null, cls.getDeclaredMethod("getPhysicalDisplayToken", Long::class.javaPrimitiveType).apply { isAccessible = true }.invoke(null, id), if (on) 2 else 0) } }
-        } catch (_: Exception) { try { execShell("cmd display power-${if (on) "on" else "off"} 0") } catch (_: Exception) {} }
+        } catch (_: Exception) {
+            // Shell fallback `cmd display power-on/off` was added in API 29; on API 26-28 it
+            // is a no-op (subcommand absent) and the panel will not be restored if the
+            // DisplayControl reflection above also fails. Surface this so the failure is
+            // observable rather than silent.
+            if (android.os.Build.VERSION.SDK_INT < 29) err("DisplayControl reflection failed on API < 29; shell fallback (cmd display power) is API 29+ and will NOT restore the panel")
+            try { execShell("cmd display power-${if (on) "on" else "off"} 0") } catch (_: Exception) {}
+        }
     }
     private fun setDisplayImePolicy(id: Int) { try { val wm = Class.forName("android.view.IWindowManager\$Stub").getDeclaredMethod("asInterface", android.os.IBinder::class.java).invoke(null, Class.forName("android.os.ServiceManager").getDeclaredMethod("getService", String::class.java).invoke(null, "window")); wm.javaClass.getDeclaredMethod("setDisplayImePolicy", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType).invoke(wm, id, 0) } catch (_: Exception) {} }
 
     private fun moveTopApp(fromDisplay: Int, toDisplay: Int) {
         if (fromDisplay < 0 || toDisplay < 0) return
+        // `am display move-stack` was added in API 29 (Android 10). On API 26-28 the
+        // subcommand is absent — am prints a usage error and exits non-zero. Skip the
+        // whole feature on older levels so the foreground app is left in place rather
+        // than a silent shell failure masking as success.
+        if (android.os.Build.VERSION.SDK_INT < 29) {
+            log("moveTopApp: skipping, am display move-stack requires API 29 (current ${android.os.Build.VERSION.SDK_INT})")
+            return
+        }
         try {
             val d = execShellOutput("dumpsys activity activities 2>/dev/null") ?: return
             val m = "Display #$fromDisplay "
