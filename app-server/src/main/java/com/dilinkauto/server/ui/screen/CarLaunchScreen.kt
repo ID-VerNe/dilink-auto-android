@@ -295,19 +295,31 @@ private fun ConnectionStatusCard(
                             style = MaterialTheme.typography.bodySmall
                         )
                     }
-                    // Numeric DPI entry: 0/Auto = use the portrait-app-safe cap;
-                    // 120-480 = override the cap. Effective on the next connect.
-                    var dpiText by remember(startupDpi) {
-                        mutableStateOf(if (startupDpi > 0) startupDpi.toString() else "")
-                    }
+                    // Single source of truth: startupDpi (the parent state). The field
+                    // displays it directly; typing calls onStartupDpiChange with the
+                    // coerced value, which updates startupDpi and flows back. No
+                    // separate dpiText state means no drift between what the field
+                    // shows and what is persisted/used.
+                    val displayText = if (startupDpi > 0) startupDpi.toString() else ""
                     OutlinedTextField(
-                        value = dpiText,
+                        value = displayText,
                         onValueChange = { input ->
-                            val digits = input.filter { it.isDigit() }.take(3)
-                            dpiText = digits
+                            // ASCII-only digit filter: Char.isDigit() accepts Unicode Nd
+                            // (Arabic-Indic, Devanagari) which toIntOrNull() rejects,
+                            // causing silent Auto fallback while the field showed a
+                            // non-ASCII char.
+                            val digits = input.filter { it in '0'..'9' }.take(3)
                             val parsed = digits.toIntOrNull() ?: 0
-                            // Coerce to the encoder/decoder's sane range; 0 = Auto.
-                            onStartupDpiChange(parsed.coerceIn(0, 480))
+                            // Match the phone-side range [120, 480]; 0 = Auto. Values
+                            // 1-119 are not valid overrides — the phone would silently
+                            // lift them to 120, making the field lie.
+                            val coerced = when {
+                                parsed == 0 -> 0
+                                parsed < 120 -> 120
+                                parsed > 480 -> 480
+                                else -> parsed
+                            }
+                            onStartupDpiChange(coerced)
                         },
                         singleLine = true,
                         placeholder = { Text("Auto", color = MaterialTheme.colorScheme.onSurfaceVariant) },

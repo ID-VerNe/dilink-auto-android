@@ -1013,6 +1013,17 @@ class CarConnectionService : Service() {
         val ctrl = controlConnection ?: return
         if (!ctrl.isConnected) return
         carLogSend("Car viewport changed -> re-handshake ${newVpW}x${newVpH} (was ${vdWidth}x${vdHeight})")
+        // Cancel discovery retry loops for the duration of the re-handshake. The
+        // control connection is reused (not torn down), but startWifiTrack's
+        // gateway retry loop keys on `!handshakeDone && state == CONNECTING` —
+        // both of which the teardown below sets — and would race to call
+        // connectToPhone, whose handshakeDone guard is now false, disconnecting
+        // the live ctrl mid-re-handshake. Mirrors the cancellation pattern at
+        // the top of startConnection(). Loops restart on the next full
+        // startConnection() if this re-handshake fails and falls back to reconnect.
+        connectionScope?.cancel()
+        connectJob?.cancel()
+        connectJob = null
         scope.launch(Dispatchers.IO) {
             // Tear down video/input — clear disconnect listeners so handleDisconnect()
             // is not invoked for this intentional mid-stream rotation teardown.
