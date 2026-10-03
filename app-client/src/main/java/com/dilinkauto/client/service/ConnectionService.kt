@@ -871,6 +871,7 @@ class ConnectionService : Service() {
         controlConnection?.disconnect()
         controlConnection = null
         activeConnection = null
+        lastSentIconHash.clear() // Force resend icons on reconnect
         _serviceState.value = State.WAITING
         forceWakeScreen()
     }

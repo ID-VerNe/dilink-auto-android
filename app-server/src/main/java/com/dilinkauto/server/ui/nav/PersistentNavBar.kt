@@ -39,15 +39,13 @@ fun PersistentNavBar(
 
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterVertically),
         modifier = modifier
             .width(navBarDp)
             .fillMaxHeight()
             .background(Color(0xFF0A0E14))
             .padding(vertical = 12.dp, horizontal = 4.dp)
     ) {
-        Spacer(Modifier.weight(1f))
-
         NavActionButton(
             icon = Icons.Default.Home,
             label = stringResource(R.string.nav_home),

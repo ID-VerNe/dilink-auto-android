@@ -146,6 +146,5 @@ fun MirrorContent(service: CarConnectionService, visible: Boolean = true) {
         },
         modifier = Modifier
             .fillMaxSize()
-            .background(Color.Black)
     )
 }

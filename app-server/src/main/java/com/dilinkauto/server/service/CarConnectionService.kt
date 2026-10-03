@@ -1024,23 +1024,25 @@ class CarConnectionService : Service() {
         connectionScope?.cancel()
         connectJob?.cancel()
         connectJob = null
+
+        // Tear down video/input synchronously  clear disconnect listeners so handleDisconnect()
+        // is not invoked for this intentional mid-stream rotation teardown.
+        videoConnection?.clearDisconnectListener()
+        inputConnection?.clearDisconnectListener()
+        videoConnection?.disconnect(); videoConnection = null
+        inputConnection?.disconnect(); inputConnection = null
+        videoDecoder.stop()
+        releaseOffscreenSurface()
+        _videoReady.value = false
+        wifiReady = false
+        vdServerStarted = false
+        handshakeDone = false
+        vdWidth = newVpW
+        vdHeight = newVpH
+        _state.value = State.CONNECTING
+        _statusMessage.value = getString(R.string.status_starting_vd)
+
         scope.launch(Dispatchers.IO) {
-            // Tear down video/input — clear disconnect listeners so handleDisconnect()
-            // is not invoked for this intentional mid-stream rotation teardown.
-            videoConnection?.clearDisconnectListener()
-            inputConnection?.clearDisconnectListener()
-            videoConnection?.disconnect(); videoConnection = null
-            inputConnection?.disconnect(); inputConnection = null
-            videoDecoder.stop()
-            releaseOffscreenSurface()
-            _videoReady.value = false
-            wifiReady = false
-            vdServerStarted = false
-            handshakeDone = false
-            vdWidth = newVpW
-            vdHeight = newVpH
-            _state.value = State.CONNECTING
-            _statusMessage.value = getString(R.string.status_starting_vd)
             val handshake = HandshakeRequest(
                 deviceName = "DiLink-${android.os.Build.MODEL}",
                 screenWidth = newVpW,

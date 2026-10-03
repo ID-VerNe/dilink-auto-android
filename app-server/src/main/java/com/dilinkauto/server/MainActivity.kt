@@ -207,7 +207,6 @@ fun CarShell(service: CarConnectionService) {
             Row(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(MaterialTheme.colorScheme.background)
             ) {
                 PersistentNavBar(
                     onBack = { service.goBack() },
