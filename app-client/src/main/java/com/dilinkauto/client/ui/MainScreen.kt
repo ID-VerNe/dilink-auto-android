@@ -1,0 +1,456 @@
+package com.dilinkauto.client.ui
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.BugReport
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.DirectionsCar
+import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.InstallMobile
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.dilinkauto.client.R
+import com.dilinkauto.client.service.ConnectionService
+import com.dilinkauto.client.service.InstallStatus
+import com.dilinkauto.client.service.UpdateManager
+import com.dilinkauto.client.service.UpdateState
+
+/**
+ * Main phone screen: status, update banner, start/stop, car-install card,
+ * donations, share-logs.
+ */
+@Composable
+fun MainScreen(
+    onStartService: () -> Unit,
+    onStopService: () -> Unit,
+    onInstallOnCar: (String?) -> Unit,
+    onOpenSettings: () -> Unit,
+    onShareLogs: () -> Unit,
+    onDownloadUpdate: () -> Unit,
+    onInstallUpdate: () -> Unit
+) {
+    val serviceState by ConnectionService.serviceState.collectAsState()
+    val installStatus by ConnectionService.installStatusFlow.collectAsState()
+    val updateState by UpdateManager.updateState.collectAsState()
+    val downloadProgress by UpdateManager.downloadProgress.collectAsState()
+    val isRunning = serviceState != ConnectionService.State.IDLE
+    var updateDismissed by remember { mutableStateOf(false) }
+    val isSamsung = remember { android.os.Build.MANUFACTURER.equals("samsung", ignoreCase = true) }
+    var samsungWarningDismissed by remember { mutableStateOf(false) }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.background)
+    ) {
+        // Fixed header
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(MaterialTheme.colorScheme.background)
+                .padding(horizontal = 24.dp, vertical = 16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(stringResource(R.string.main_title), fontSize = 28.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                Text(stringResource(R.string.main_subtitle), fontSize = 14.sp, color = Color.Gray)
+            }
+            IconButton(onClick = onOpenSettings) {
+                Icon(Icons.Default.Settings, contentDescription = "Settings", tint = Color.Gray)
+            }
+        }
+
+        // Scrollable content
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Spacer(Modifier.height(16.dp))
+
+            // Samsung device warning
+            if (isSamsung && !samsungWarningDismissed) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF332211))
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.Info, contentDescription = null, tint = Color(0xFFFFA726), modifier = Modifier.size(24.dp))
+                            Spacer(Modifier.width(12.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(stringResource(R.string.samsung_warning_title), fontWeight = FontWeight.Medium, color = Color.White)
+                                Text(stringResource(R.string.samsung_warning_desc), fontSize = 12.sp, color = Color(0xFFB0BEC5))
+                            }
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            TextButton(onClick = onOpenSettings) {
+                                Text(stringResource(R.string.samsung_settings_guide), fontSize = 13.sp, color = MaterialTheme.colorScheme.primary)
+                            }
+                            TextButton(onClick = { samsungWarningDismissed = true }) {
+                                Text(stringResource(R.string.onboarding_skip_btn), fontSize = 13.sp, color = Color.Gray)
+                            }
+                        }
+                    }
+                }
+                Spacer(Modifier.height(12.dp))
+            }
+
+            // Service status
+            StatusCard(serviceState)
+
+            // Update available notification
+            if (updateState is UpdateState.Available && !updateDismissed) {
+                val available = updateState as UpdateState.Available
+                Spacer(Modifier.height(12.dp))
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF1B3A2A))
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.Download, contentDescription = null, tint = Color(0xFF4CAF50), modifier = Modifier.size(24.dp))
+                            Spacer(Modifier.width(12.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(stringResource(R.string.updates_available_title), fontWeight = FontWeight.Medium, color = Color.White)
+                                Text(stringResource(R.string.updates_available, available.version), fontSize = 13.sp, color = Color(0xFFB0BEC5))
+                            }
+                        }
+                        Spacer(Modifier.height(12.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = onDownloadUpdate,
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(12.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))
+                            ) {
+                                Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(8.dp))
+                                Text(stringResource(R.string.updates_update_btn))
+                            }
+                            OutlinedButton(
+                                onClick = { updateDismissed = true },
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Text(stringResource(R.string.updates_dismiss_btn), color = Color.Gray)
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Download progress
+            if (updateState is UpdateState.Downloading) {
+                val downloading = updateState as UpdateState.Downloading
+                Spacer(Modifier.height(12.dp))
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text(stringResource(R.string.updates_downloading_title, downloading.version), fontWeight = FontWeight.Medium, color = Color.White)
+                        Spacer(Modifier.height(8.dp))
+                        LinearProgressIndicator(progress = downloadProgress / 100f, modifier = Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.primary, trackColor = Color(0xFF30363D))
+                        Spacer(Modifier.height(4.dp))
+                        Text(stringResource(R.string.updates_downloading, downloadProgress), fontSize = 13.sp, color = Color.Gray)
+                    }
+                }
+            }
+
+            // Ready to install
+            if (updateState is UpdateState.ReadyToInstall) {
+                val ready = updateState as UpdateState.ReadyToInstall
+                Spacer(Modifier.height(12.dp))
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF1B3A2A))
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.CheckCircle, contentDescription = null, tint = Color(0xFF4CAF50), modifier = Modifier.size(24.dp))
+                            Spacer(Modifier.width(12.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(stringResource(R.string.updates_ready_title), fontWeight = FontWeight.Medium, color = Color.White)
+                                Text(stringResource(R.string.updates_ready, ready.version), fontSize = 13.sp, color = Color(0xFFB0BEC5))
+                            }
+                        }
+                        Spacer(Modifier.height(12.dp))
+                        Button(
+                            onClick = onInstallUpdate,
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))
+                        ) {
+                            Icon(Icons.Default.InstallMobile, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Text(stringResource(R.string.updates_install_btn))
+                        }
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            // Start/Stop
+            Button(
+                onClick = { if (isRunning) onStopService() else onStartService() },
+                modifier = Modifier.fillMaxWidth().height(56.dp),
+                shape = RoundedCornerShape(16.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (isRunning) Color(0xFFD32F2F) else MaterialTheme.colorScheme.primary
+                )
+            ) {
+                Icon(if (isRunning) Icons.Default.Stop else Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(24.dp))
+                Spacer(Modifier.width(8.dp))
+                Text(if (isRunning) stringResource(R.string.stop_service) else stringResource(R.string.start_service), fontSize = 18.sp, fontWeight = FontWeight.Medium)
+            }
+
+            Spacer(Modifier.height(24.dp))
+
+            // Install on Car (unified: button + status)
+            CarInstallCard(
+                installStatus = installStatus,
+                onInstallOnCar = onInstallOnCar
+            )
+
+            Spacer(Modifier.height(24.dp))
+
+            // Support / Donations
+            DonationCard()
+
+            // Share Logs
+            Spacer(Modifier.height(16.dp))
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.Default.BugReport, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(24.dp))
+                    Spacer(Modifier.width(12.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(stringResource(R.string.share_logs_title), fontWeight = FontWeight.Medium, color = Color.White)
+                        Text(stringResource(R.string.share_logs_desc), fontSize = 12.sp, color = Color.Gray)
+                    }
+                    Button(
+                        onClick = onShareLogs,
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF2196F3)
+                        )
+                    ) {
+                        Text(stringResource(R.string.share_logs_button), fontSize = 13.sp)
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(32.dp))
+        }
+    }
+}
+
+@Composable
+fun StatusCard(state: ConnectionService.State) {
+    val ipAddresses = remember { getLocalIpAddresses() }
+
+    val (color, title, subtitle) = when (state) {
+        ConnectionService.State.IDLE -> Triple(
+            Color(0xFF757575), stringResource(R.string.status_stopped), stringResource(R.string.status_stopped_desc)
+        )
+        ConnectionService.State.WAITING -> Triple(
+            Color(0xFFFFA726), stringResource(R.string.status_waiting),
+            if (ipAddresses.isNotEmpty()) stringResource(R.string.status_listening, ipAddresses.joinToString(", "))
+            else stringResource(R.string.status_waiting_desc)
+        )
+        ConnectionService.State.CONNECTED -> Triple(
+            Color(0xFF2196F3), stringResource(R.string.status_connected), stringResource(R.string.status_connected_desc)
+        )
+        ConnectionService.State.STREAMING -> Triple(
+            Color(0xFF4CAF50), stringResource(R.string.status_streaming), stringResource(R.string.status_streaming_desc)
+        )
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(20.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(12.dp)
+                    .background(color, RoundedCornerShape(6.dp))
+            )
+            Spacer(Modifier.width(12.dp))
+            Column {
+                Text(title, fontWeight = FontWeight.Medium, color = Color.White)
+                Text(subtitle, fontSize = 13.sp, color = Color.Gray)
+            }
+        }
+    }
+}
+
+@Composable
+fun CarInstallCard(installStatus: String, onInstallOnCar: (String?) -> Unit) {
+    val status = InstallStatus.parse(installStatus)
+    val isDone = status == InstallStatus.DONE
+    val isError = status == InstallStatus.ERROR
+    val isAuthNeeded = status == InstallStatus.AUTH_NEEDED
+    val isInstalling = status.isInProgress
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Default.DirectionsCar,
+                    contentDescription = null,
+                    tint = if (isDone) Color(0xFF4CAF50) else if (isError || isAuthNeeded) Color(0xFFFFA726) else MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(24.dp)
+                )
+                Spacer(Modifier.width(12.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(stringResource(R.string.car_app_title), fontWeight = FontWeight.Medium, color = Color.White)
+                    Text(
+                        if (installStatus.isEmpty()) stringResource(R.string.car_app_desc) else installStatus,
+                        fontSize = 12.sp,
+                        color = when (status) {
+                            InstallStatus.DONE -> Color(0xFF4CAF50)
+                            InstallStatus.ERROR -> Color(0xFFEF5350)
+                            InstallStatus.AUTH_NEEDED -> Color(0xFFFFA726)
+                            else -> if (isInstalling) Color(0xFFFFA726) else Color.Gray
+                        }
+                    )
+                }
+                if (isInstalling) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(24.dp),
+                        strokeWidth = 2.dp,
+                        color = Color(0xFFFFA726)
+                    )
+                } else if (isDone) {
+                    Icon(Icons.Default.CheckCircle, contentDescription = null, tint = Color(0xFF4CAF50), modifier = Modifier.size(24.dp))
+                } else {
+                    Button(
+                        onClick = { onInstallOnCar(null) },
+                        shape = RoundedCornerShape(8.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 16.dp, vertical = 8.dp)
+                    ) {
+                        Text(if (isError || isAuthNeeded) stringResource(R.string.onboarding_continue) else stringResource(R.string.car_app_install), fontSize = 13.sp)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun DonationCard() {
+    val context = androidx.compose.ui.platform.LocalContext.current
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(stringResource(R.string.donation_title), fontWeight = FontWeight.Medium, color = Color.White)
+            Text(
+                stringResource(R.string.donation_desc),
+                fontSize = 12.sp,
+                color = Color.Gray,
+                modifier = Modifier.padding(top = 4.dp)
+            )
+            Spacer(Modifier.height(12.dp))
+
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = {
+                        val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("https://github.com/sponsors/andersonlucasg3"))
+                        context.startActivity(intent)
+                    },
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6E40C9))
+                ) {
+                    Text(stringResource(R.string.donation_github), fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                }
+
+                Button(
+                    onClick = {
+                        val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("https://nubank.com.br/cobrar/5gf35/69ed4939-b2c0-4071-b75d-3b430ab70a5d"))
+                        context.startActivity(intent)
+                    },
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00C2A0))
+                ) {
+                    Text(stringResource(R.string.donation_pix), fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                }
+            }
+        }
+    }
+}

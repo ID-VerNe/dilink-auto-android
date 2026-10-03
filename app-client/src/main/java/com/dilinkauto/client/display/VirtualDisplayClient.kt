@@ -182,7 +182,8 @@ class VirtualDisplayClient(
 
     companion object {
         private const val TAG = "VirtualDisplayClient"
-        const val SERVER_PORT = 19647
+        // Port the VD server reverse-connects to. Matches Discovery.LIFECYCLE_PORT.
+        const val SERVER_PORT = com.dilinkauto.protocol.Discovery.LIFECYCLE_PORT
 
         // Must match VirtualDisplayServer constants
         private const val MSG_DISPLAY_READY: Byte = 0x10

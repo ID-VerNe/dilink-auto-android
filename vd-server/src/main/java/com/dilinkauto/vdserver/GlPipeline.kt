@@ -1,0 +1,196 @@
+package com.dilinkauto.vdserver
+
+import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaFormat
+import android.opengl.*
+import android.os.Bundle
+import android.os.SystemClock
+import android.view.InputDevice
+import android.view.MotionEvent
+import android.view.Surface
+import com.dilinkauto.protocol.*
+import java.io.IOException
+import java.lang.reflect.Method
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.FloatBuffer
+import java.nio.channels.SocketChannel
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.locks.LockSupport
+
+/**
+ * EGL + GLES2 pipeline that renders the VD's SurfaceTexture into the
+ * MediaCodec encoder's input surface.
+ *
+ * All EGL/GL state lives on the pipeline thread — created in
+ * [initEglAndSurfaceTexture], used in [pipelineLoop], torn down by the
+ * caller. The pipeline samples the SurfaceTexture at [fps] (paced by
+ * [frameIntervalNanos]) and writes each encoded frame to the car video
+ * channel. Adaptive bitrate drops bandwidth when the car's socket backs up
+ * and recovers it after a sustained clean interval.
+ *
+ * Extracted from [PipelineServer] to isolate the GL/encode hot path
+ * (THREAD_PRIORITY_URGENT_DISPLAY) from the connection lifecycle.
+ */
+internal class GlPipeline(
+    private val displayWidth: Int,
+    private val displayHeight: Int,
+    private val encodeWidth: Int,
+    private val encodeHeight: Int,
+    private val fps: Int,
+    private val frameIntervalNanos: Long,
+    private val bitrate: Int
+) {
+    private var stTexId = 0
+    private var eglDisplay: EGLDisplay? = null
+    private var eglContext: EGLContext? = null
+    private var eglSurface: EGLSurface? = null
+    private var glProgram = 0
+    private var glPosLoc = 0
+    private var glTexLoc = 0
+    private var quadBuf: FloatBuffer? = null
+
+    private var vdInputSurface: Surface? = null
+    private var stTexture: android.graphics.SurfaceTexture? = null
+
+    /** The encoder surface, supplied by the caller before [initEglAndSurfaceTexture]. */
+    var encoderSurface: Surface? = null
+
+    /** VD input surface, ready after [initEglAndSurfaceTexture] returns. */
+    fun vdSurface(): Surface? = vdInputSurface
+
+    private fun log(msg: String) = PipeLog.log(msg)
+    private fun err(msg: String) = PipeLog.err(msg)
+
+    /**
+     * Initialize EGL/GLES on the current thread, create the SurfaceTexture
+     * and its GL texture, and the VD input surface. Must be called from the
+     * pipeline thread.
+     */
+    fun initEglAndSurfaceTexture() {
+        val display = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
+        val ver = IntArray(2); EGL14.eglInitialize(display, ver, 0, ver, 1)
+        val cfgA = intArrayOf(EGL14.EGL_RED_SIZE, 8, EGL14.EGL_GREEN_SIZE, 8, EGL14.EGL_BLUE_SIZE, 8, EGL14.EGL_ALPHA_SIZE, 8, EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT, EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT, EGL14.EGL_NONE)
+        val cfgs = arrayOfNulls<EGLConfig>(1); val nc = IntArray(1)
+        EGL14.eglChooseConfig(display, cfgA, 0, cfgs, 0, 1, nc, 0)
+        val ctx = EGL14.eglCreateContext(display, cfgs[0], EGL14.EGL_NO_CONTEXT, intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE), 0)
+        val surf = EGL14.eglCreateWindowSurface(display, cfgs[0], encoderSurface, intArrayOf(EGL14.EGL_NONE), 0)
+        EGL14.eglMakeCurrent(display, surf, surf, ctx)
+        eglDisplay = display; eglContext = ctx; eglSurface = surf
+
+        // GL program
+        glProgram = createProgram(); GLES20.glUseProgram(glProgram)
+        glPosLoc = GLES20.glGetAttribLocation(glProgram, "aPosition")
+        glTexLoc = GLES20.glGetAttribLocation(glProgram, "aTexCoord")
+        GLES20.glViewport(0, 0, encodeWidth, encodeHeight)
+
+        // Create GL texture for SurfaceTexture (VD input)
+        val texIds = IntArray(1); GLES20.glGenTextures(1, texIds, 0); stTexId = texIds[0]
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, stTexId)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        stTexture = android.graphics.SurfaceTexture(stTexId)
+        stTexture!!.setDefaultBufferSize(displayWidth, displayHeight)
+        vdInputSurface = Surface(stTexture)
+
+        // Fullscreen quad
+        val quad = floatArrayOf(-1f, -1f, 0f, 1f, 1f, -1f, 1f, 1f, -1f, 1f, 0f, 0f, 1f, 1f, 1f, 0f)
+        quadBuf = ByteBuffer.allocateDirect(quad.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
+        quadBuf!!.put(quad).position(0)
+
+        log("EGL/GL ready, VD input surface created")
+    }
+
+    /**
+     * Render loop: pace at [frameIntervalNanos], drain the SurfaceTexture,
+     * draw the fullscreen quad, swap, and ship each encoded frame to the car.
+     * Returns when [running] turns false.
+     */
+    fun pipelineLoop(encoder: MediaCodec, carVideo: SocketChannel, running: () -> Boolean) {
+        val st = stTexture ?: return
+        val bufInfo = MediaCodec.BufferInfo()
+
+        // Frame sync
+        val frameLock = Any(); val frameAvail = booleanArrayOf(false)
+        val cbThread = android.os.HandlerThread("PipeCB").apply { start() }
+        st.setOnFrameAvailableListener({
+            synchronized(frameLock) { frameAvail[0] = true; (frameLock as java.lang.Object).notifyAll() }
+        }, android.os.Handler(cbThread.looper))
+
+        var nextFrameNanos = System.nanoTime()
+        var frameCount = 0L; var keyFrameCount = 0L; var lastLogAt = 0L
+        var bitrate = bitrate; var cleanSinceNanos = 0L
+        log("Pipeline: ${encodeWidth}x${encodeHeight} ${fps}fps ${bitrate/1_000_000}Mbps")
+
+        try {
+            while (running()) {
+                val waitNs = nextFrameNanos - System.nanoTime()
+                if (waitNs > 0) LockSupport.parkNanos(waitNs)
+                nextFrameNanos += frameIntervalNanos
+                if (nextFrameNanos <= System.nanoTime()) nextFrameNanos = System.nanoTime() + frameIntervalNanos
+
+                val hasNew: Boolean; synchronized(frameLock) { hasNew = frameAvail[0]; frameAvail[0] = false }
+                if (hasNew) st.updateTexImage()
+
+                GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+                GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, stTexId)
+                val qb = quadBuf!!; qb.position(0)
+                GLES20.glVertexAttribPointer(glPosLoc, 2, GLES20.GL_FLOAT, false, 16, qb); GLES20.glEnableVertexAttribArray(glPosLoc)
+                qb.position(2); GLES20.glVertexAttribPointer(glTexLoc, 2, GLES20.GL_FLOAT, false, 16, qb); GLES20.glEnableVertexAttribArray(glTexLoc)
+                GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+                EGL14.eglSwapBuffers(eglDisplay, eglSurface)
+
+                var drained = 0
+                while (true) {
+                    val idx = encoder.dequeueOutputBuffer(bufInfo, 0)
+                    if (idx < 0) break
+                    if (idx >= 0) {
+                        val buf = encoder.getOutputBuffer(idx)
+                        if (buf != null && bufInfo.size > 0) {
+                            val payload = ByteArray(bufInfo.size); buf.get(payload)
+                            val isConfig = (bufInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+                            val msgType = if (isConfig) VideoMsg.CONFIG else VideoMsg.FRAME
+                            if ((bufInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0) keyFrameCount++
+                            val ws = System.nanoTime()
+                            writeFrame(carVideo, msgType, payload)
+                            val wm = (System.nanoTime() - ws) / 1_000_000
+                            if (wm > 15) { cleanSinceNanos = 0L; val nr = maxOf(1_500_000, (bitrate * 0.75f).toInt()); if (nr < bitrate) { bitrate = nr; applyBitrate(encoder, bitrate); requestSyncFrame(encoder) } }
+                            else if (cleanSinceNanos == 0L) cleanSinceNanos = System.nanoTime()
+                            drained++; frameCount++
+                        }
+                        encoder.releaseOutputBuffer(idx, false)
+                    }
+                }
+                if (cleanSinceNanos > 0L && (System.nanoTime() - cleanSinceNanos) / 1_000_000 >= 2000L) { val nr = minOf(this.bitrate, bitrate + 500_000); if (nr > bitrate) { bitrate = nr; applyBitrate(encoder, bitrate) }; cleanSinceNanos = System.nanoTime() }
+                if (frameCount - lastLogAt >= 120) { lastLogAt = frameCount; log("Pipeline: $frameCount frames ${bitrate/1_000_000}Mbps keys=$keyFrameCount") }
+            }
+        } finally {
+            // cbThread is non-daemon; if writeFrame throws or GL faults, the
+            // parked Looper would prevent a clean JVM exit. quitSafely in finally.
+            cbThread.quitSafely()
+        }
+        log("Pipeline exited: $frameCount frames")
+    }
+
+    private fun writeFrame(ch: SocketChannel, msgType: Byte, payload: ByteArray) {
+        val fl = 2 + payload.size; val hdr = byteArrayOf((fl shr 24).toByte(), (fl shr 16).toByte(), (fl shr 8).toByte(), fl.toByte(), Channel.VIDEO, msgType)
+        writeAll(ch, ByteBuffer.wrap(hdr)); if (payload.isNotEmpty()) writeAll(ch, ByteBuffer.wrap(payload))
+    }
+    private fun writeAll(ch: SocketChannel, buf: ByteBuffer) { var dl = System.nanoTime() + 5_000_000_000L; while (buf.hasRemaining()) { if (ch.write(buf) > 0) dl = System.nanoTime() + 5_000_000_000L; else { if (System.nanoTime() > dl) throw IOException("Write timeout"); LockSupport.parkNanos(100_000) } } }
+    private fun applyBitrate(enc: MediaCodec, br: Int) { try { val p = Bundle(); p.putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, br); enc.setParameters(p) } catch (_: Exception) {} }
+    private fun requestSyncFrame(enc: MediaCodec) { try { val p = Bundle(); p.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0); enc.setParameters(p) } catch (_: Exception) {} }
+
+    private fun createProgram(): Int { val vs = loadShader(GLES20.GL_VERTEX_SHADER, "attribute vec4 aPosition;attribute vec2 aTexCoord;varying vec2 vTexCoord;void main(){gl_Position=aPosition;vTexCoord=aTexCoord;}"); val fs = loadShader(GLES20.GL_FRAGMENT_SHADER, "#extension GL_OES_EGL_image_external:require\nprecision mediump float;varying vec2 vTexCoord;uniform samplerExternalOES sTexture;void main(){gl_FragColor=texture2D(sTexture,vTexCoord);}"); return GLES20.glCreateProgram().also { GLES20.glAttachShader(it, vs); GLES20.glAttachShader(it, fs); GLES20.glLinkProgram(it) } }
+    private fun loadShader(type: Int, src: String): Int = GLES20.glCreateShader(type).also { GLES20.glShaderSource(it, src); GLES20.glCompileShader(it) }
+
+    /** Tear down EGL/GL resources. Idempotent. */
+    fun cleanup() {
+        val d = eglDisplay; val s = eglSurface; val c = eglContext
+        if (d != null) EGL14.eglMakeCurrent(d, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
+        if (d != null && s != null) EGL14.eglDestroySurface(d, s)
+        if (d != null && c != null) EGL14.eglDestroyContext(d, c)
+        vdInputSurface?.release()
+        stTexture?.release()
+    }
+}

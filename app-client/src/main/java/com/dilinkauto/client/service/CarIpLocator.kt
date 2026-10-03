@@ -2,6 +2,7 @@ package com.dilinkauto.client.service
 
 import android.net.wifi.WifiManager
 import com.dilinkauto.client.FileLog
+import com.dilinkauto.protocol.Discovery
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelChildren
@@ -30,7 +31,7 @@ import java.nio.channels.SocketChannel
 object CarIpLocator {
 
     private const val TAG = "CarIpLocator"
-    private const val CAR_ADB_PORT = 5555
+    private const val CAR_ADB_PORT = Discovery.ADB_PORT
 
     /** Returns the car's IPv4 address, or null if no ADB endpoint was found. */
     suspend fun findCarAdb(controlConnectionRemoteIp: String?): String? {
@@ -105,15 +106,10 @@ object CarIpLocator {
         try {
             @Suppress("DEPRECATION")
             val wm = wifiManager ?: return null
-            val gw = wm.dhcpInfo.gateway
-            if (gw != 0) {
-                val ip = String.format("%d.%d.%d.%d",
-                    gw and 0xFF, (gw shr 8) and 0xFF,
-                    (gw shr 16) and 0xFF, (gw shr 24) and 0xFF)
-                if (!subnetIps.contains(ip) && probePort(ip, CAR_ADB_PORT)) {
-                    FileLog.i(TAG, "Found car ADB at $ip (gateway)")
-                    return ip
-                }
+            val ip = com.dilinkauto.protocol.WifiGatewayIp.format(wm.dhcpInfo.gateway)
+            if (ip != null && !subnetIps.contains(ip) && probePort(ip, CAR_ADB_PORT)) {
+                FileLog.i(TAG, "Found car ADB at $ip (gateway)")
+                return ip
             }
         } catch (_: Exception) {}
 

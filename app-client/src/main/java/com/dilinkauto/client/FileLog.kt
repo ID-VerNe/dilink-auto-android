@@ -2,6 +2,7 @@ package com.dilinkauto.client
 
 import android.os.Environment
 import android.util.Log
+import com.dilinkauto.protocol.AppPrefs
 import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileOutputStream
@@ -76,9 +77,9 @@ object FileLog {
      * Once user explicitly toggles, that choice persists regardless of build type.
      */
     fun loadEnabled(prefs: android.content.SharedPreferences) {
-        val userSet = prefs.getBoolean("log_enabled_user_set", false)
+        val userSet = prefs.getBoolean(AppPrefs.LOG_ENABLED_USER_SET, false)
         enabled = if (userSet) {
-            prefs.getBoolean("log_enabled", false)
+            prefs.getBoolean(AppPrefs.LOG_ENABLED, false)
         } else {
             com.dilinkauto.client.BuildConfig.DEBUG  // true for pre-release, false for release
         }

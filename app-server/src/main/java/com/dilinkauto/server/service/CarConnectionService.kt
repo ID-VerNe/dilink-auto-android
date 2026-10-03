@@ -16,7 +16,6 @@ import android.net.NetworkRequest
 import android.os.Binder
 import android.os.IBinder
 import android.os.PowerManager
-import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.dilinkauto.protocol.*
 import com.dilinkauto.server.R
@@ -45,26 +44,26 @@ import kotlinx.coroutines.flow.*
  */
 class CarConnectionService : Service() {
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    internal val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     @Volatile private var controlConnection: Connection? = null
     @Volatile private var videoConnection: Connection? = null
     @Volatile private var inputConnection: Connection? = null
     val videoDecoder = VideoDecoder()
-    @Volatile private var adbController: RemoteAdbController? = null
-    @Volatile private var phoneHost: String? = null
+    @Volatile internal var adbController: RemoteAdbController? = null
+    @Volatile internal var phoneHost: String? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var consecutiveFailures = 0
     private var usbAdb: UsbAdbConnection? = null
     private var userDisconnected: Boolean
-        get() = getSharedPreferences("dilinkauto", MODE_PRIVATE)
+        get() = getSharedPreferences(AppPrefs.FILE_NAME, MODE_PRIVATE)
             .getBoolean("user_disconnected", false)
-        set(value) = getSharedPreferences("dilinkauto", MODE_PRIVATE)
+        set(value) = getSharedPreferences(AppPrefs.FILE_NAME, MODE_PRIVATE)
             .edit().putBoolean("user_disconnected", value).apply()
 
     var devMode: Boolean
-        get() = getSharedPreferences("dilinkauto", MODE_PRIVATE)
+        get() = getSharedPreferences(AppPrefs.FILE_NAME, MODE_PRIVATE)
                     .getBoolean("dev_mode", false)
-        set(value) = getSharedPreferences("dilinkauto", MODE_PRIVATE)
+        set(value) = getSharedPreferences(AppPrefs.FILE_NAME, MODE_PRIVATE)
             .edit().putBoolean("dev_mode", value).apply()
 
     /**
@@ -75,31 +74,36 @@ class CarConnectionService : Service() {
      * on the next connect (or mid-stream rotation re-handshake), not live.
      */
     var startupDpi: Int
-        get() = getSharedPreferences("dilinkauto", MODE_PRIVATE)
+        get() = getSharedPreferences(AppPrefs.FILE_NAME, MODE_PRIVATE)
                     .getInt("startup_dpi", 0)
-        set(value) = getSharedPreferences("dilinkauto", MODE_PRIVATE)
+        set(value) = getSharedPreferences(AppPrefs.FILE_NAME, MODE_PRIVATE)
             .edit().putInt("startup_dpi", value).apply()
 
     // ─── Handshake ───
-    private var handshakeVdDpi = VideoConfig.VIRTUAL_DISPLAY_DPI // DPI from phone (may be adjusted for DeX)
+    internal var handshakeVdDpi = VideoConfig.VIRTUAL_DISPLAY_DPI // DPI from phone (may be adjusted for DeX)
 
-    private var vdServerJarPath = "/sdcard/DiLinkAuto/vd-server.jar"
+    internal var vdServerJarPath = VdDeploy.JAR_PATH
 
-    private val touchExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
-        Thread(r, "touch-sender").apply { isDaemon = true }
-    }
+    internal val vdDeployer = VdServerDeployer(this)
+
+    private val touchSender = CarTouchSender(
+        inputConnectionProvider = { inputConnection },
+        stateProvider = { _state.value },
+        log = { msg, level -> carLogSend(msg, level) }
+    )
+
+    private val logWriter = CarLogWriter(TAG) { controlConnection }
 
     // ─── Parallel prerequisites ───
     @Volatile private var wifiReady = false       // WiFi TCP handshake completed
     @Volatile private var usbReady = false        // USB ADB connected to phone
     private var connectionScope: Job? = null  // Parent job for all discovery/connect coroutines
-    @Volatile private var vdServerStarted = false // VD server process launched
+    @Volatile internal var vdServerStarted = false // VD server process launched
     @Volatile private var updatingFromPhone = false // Phone is pushing an update — don't reconnect
     @Volatile private var shizukuMode = false  // Phone handles VD server via Shizuku
     @Volatile private var handshakeDone = false // Stop gateway retry after handshake completes
     @Volatile private var lastAdbHost: String? = null // Track which host TCP ADB connected to
-    private var noAdbCount = 0 // Consecutive deploy failures due to no ADB — stops reconnect loop
-    @Volatile private var carLogEnabled = com.dilinkauto.server.BuildConfig.DEBUG // release: off by default; phone can toggle via LOG_TOGGLE
+    internal var noAdbCount = 0 // Consecutive deploy failures due to no ADB — stops reconnect loop
     @Volatile private var tcpAdbConnecting = false // Prevent duplicate TCP ADB attempts
 
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
@@ -171,7 +175,8 @@ class CarConnectionService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        startLogWriter()
+        logWriter.setEnabled(com.dilinkauto.server.BuildConfig.DEBUG)
+        logWriter.start()
         videoDecoder.logSink = { msg -> carLogSend(msg) }
 
         // Wire crash handler to TCP log sink for immediate crash delivery
@@ -267,7 +272,7 @@ class CarConnectionService : Service() {
         wifiReady = false
         vdServerStarted = false
         shizukuMode = false
-        vdDeployRetries = 0
+        vdDeployer.reset()
         handshakeDone = false
         _videoReady.value = false
         if (usbAdb?.isConnected != true) {
@@ -275,7 +280,7 @@ class CarConnectionService : Service() {
             if (usbAdb == null) usbConnecting = false // only reset if no ADB instance (auth may be pending)
         }
 
-        carLogEnabled = com.dilinkauto.server.BuildConfig.DEBUG  // Reset to default each session
+        logWriter.setEnabled(com.dilinkauto.server.BuildConfig.DEBUG)  // Reset to default each session
         userDisconnected = false
         _state.value = State.CONNECTING
         _statusMessage.value = getString(R.string.status_connecting)
@@ -392,18 +397,12 @@ class CarConnectionService : Service() {
                 val vp = getViewportSize(displayMetrics.widthPixels, displayMetrics.heightPixels, displayMetrics.density)
                 val viewportWidth = vp.first
                 val viewportHeight = vp.second
-                val handshake = HandshakeRequest(
-                    deviceName = "DiLink-${android.os.Build.MODEL}",
+                val handshake = buildHandshakeRequest(
+                    context = this@CarConnectionService,
                     screenWidth = viewportWidth,
                     screenHeight = viewportHeight,
                     screenDpi = displayMetrics.densityDpi,
-                    appVersionCode = packageManager.getPackageInfo(packageName, 0).let {
-                        @Suppress("DEPRECATION") it.versionCode
-                    },
                     targetFps = targetFps,
-                    appVersionName = packageManager.getPackageInfo(packageName, 0).let {
-                        it.versionName ?: ""
-                    },
                     dpiOverride = startupDpi
                 )
                 ctrl.sendControl(ControlMsg.HANDSHAKE_REQUEST, handshake.encode())
@@ -520,7 +519,7 @@ class CarConnectionService : Service() {
                 while (isActive && !usbReady && _state.value == State.CONNECTING && attempts < 60) {
                     val host = phoneHost
                     if (host != null) {
-                        carLogSend("Dev mode: TCP ADB connecting to $host:5555 (attempt ${attempts + 1})")
+                        carLogSend("Dev mode: TCP ADB connecting to $host:${Discovery.ADB_PORT} (attempt ${attempts + 1})")
                         connectTcpAdb(host)
                         if (adbController?.isConnected == true) {
                             lastAdbHost = host
@@ -539,7 +538,7 @@ class CarConnectionService : Service() {
         }
     }
 
-    private suspend fun connectTcpAdb(host: String) {
+    internal suspend fun connectTcpAdb(host: String) {
         if (usbReady) return
         if (adbController?.isConnected == true) {
             carLogSend("Dev mode: TCP ADB already connected, skipping duplicate")
@@ -550,20 +549,20 @@ class CarConnectionService : Service() {
         val keyDir = java.io.File(filesDir, "adb_keys")
         val controller = RemoteAdbController(
             phoneHost = host,
-            adbPort = 5555,
+            adbPort = Discovery.ADB_PORT,
             virtualDisplayId = -1,
             keyDir = keyDir
         )
 
         if (!controller.connect()) {
             _statusMessage.value = getString(R.string.status_tcp_adb_failed)
-            carLogSend("Dev mode: TCP ADB connection failed to $host:5555")
+            carLogSend("Dev mode: TCP ADB connection failed to $host:${Discovery.ADB_PORT}")
             return
         }
 
         adbController = controller
         _statusMessage.value = getString(R.string.status_tcp_adb_connected)
-        carLogSend("Dev mode: TCP ADB connected to $host:5555")
+        carLogSend("Dev mode: TCP ADB connected to $host:${Discovery.ADB_PORT}")
 
         usbReady = true
         noAdbCount = 0  // Reset — ADB is available now
@@ -573,15 +572,14 @@ class CarConnectionService : Service() {
             carLogSend("TCP ADB ready — deploying VD server immediately")
             deployVdServerDirect(controller)
         }
-
         // Launch phone app after VD server
-        try { controller.shell("am start -n com.dilinkauto.client/.MainActivity") } catch (_: Exception) {}
+        try { controller.shell("am start -n ${AppTargets.PHONE_MAIN_ACTIVITY}") } catch (_: Exception) {}
         carLogSend("Dev mode: phone app launched via TCP ADB")
 
         checkAndAdvance()
     }
 
-    private fun isAdbAvailable(): Boolean {
+    internal fun isAdbAvailable(): Boolean {
         val tcpOk = adbController?.isConnected == true
         val usbOk = usbAdb?.isConnected == true
         if (!tcpOk && !usbOk) {
@@ -590,7 +588,10 @@ class CarConnectionService : Service() {
         return tcpOk || usbOk
     }
 
-    private fun executeAdb(command: String, noWait: Boolean): Boolean {
+    /** Route to the deployer; kept on the service so callers (state machine, USB/TCP tracks) don't change. */
+    internal fun deployVdServer() = vdDeployer.deploy()
+
+    internal fun executeAdb(command: String, noWait: Boolean): Boolean {
         return when {
             adbController?.isConnected == true -> {
                 if (noWait) adbController!!.shellNoWait(command)
@@ -649,7 +650,7 @@ class CarConnectionService : Service() {
             carLogSend("ADB key: $keyInfo")
 
             // Launch phone app (don't clear task — if it's already open, just move on)
-            adb.shell("am start -n com.dilinkauto.client/.MainActivity")
+            adb.shell("am start -n ${AppTargets.PHONE_MAIN_ACTIVITY}")
             carLogSend("Phone app launched via USB ADB")
 
             usbConnecting = false
@@ -790,7 +791,7 @@ class CarConnectionService : Service() {
             }
             DataMsg.LOG_TOGGLE -> {
                 val enabled = frame.payload.isNotEmpty() && frame.payload[0].toInt() == 1
-                carLogEnabled = enabled
+                logWriter.setEnabled(enabled)
                 // Frame-stats diagnostics ride on the same toggle — when the user
                 // enables logging from the phone, the per-30-frame decode-time
                 // and queue-depth stats are surfaced too (Phase L1 / perf 9.3).
@@ -801,89 +802,8 @@ class CarConnectionService : Service() {
     }
 
     // ─── VD Server Deploy ───
-
-    private var vdDeployRetries = 0
-
-    private fun deployVdServer() {
-        if (vdServerStarted) return
-        if (!isAdbAvailable()) {
-            carLogSend("deployVdServer: no ADB connection (retry=${vdDeployRetries})")
-            // Retry once after short delay — ADB connection may be re-establishing
-            if (vdDeployRetries < 2) {
-                vdDeployRetries++
-                scope.launch(Dispatchers.IO) {
-                    delay(500)
-                    deployVdServer()
-                }
-                return
-            }
-            noAdbCount++
-            // Auto-fallback: try TCP ADB if we have the phone IP
-            val host = phoneHost
-            if (host != null && !devMode) {
-                carLogSend("Auto-fallback: trying TCP ADB to $host:5555")
-                _statusMessage.value = getString(R.string.status_connecting_tcp_adb, host)
-                scope.launch(Dispatchers.IO) {
-                    connectTcpAdb(host)
-                    if (adbController?.isConnected == true) {
-                        carLogSend("Auto-fallback TCP ADB connected — deploying VD server")
-                        deployVdServer()
-                    } else {
-                        _statusMessage.value = getString(R.string.status_no_adb)
-                        carLogSend("Auto-fallback TCP ADB failed — connect phone to car USB", "W")
-                    }
-                }
-            } else if (host == null) {
-                _statusMessage.value = getString(R.string.status_no_phone_ip)
-            } else {
-                _statusMessage.value = getString(R.string.status_no_adb)
-            }
-            return
-        }
-        vdServerStarted = true  // Set early to prevent duplicate deploys
-        scope.launch(Dispatchers.IO) {
-            val displayMetrics = resources.displayMetrics
-            val vp = getViewportSize(displayMetrics.widthPixels, displayMetrics.heightPixels, displayMetrics.density)
-            val vdW = vp.first
-            val vdH = vp.second
-            val phoneDpi = if (handshakeVdDpi > 0) handshakeVdDpi else VideoConfig.calculateOptimalDpi(vdW, vdH, displayMetrics.densityDpi)
-
-            val jarPath = vdServerJarPath
-
-            val logFile = "/sdcard/DiLinkAuto/vd-server.log"
-            // Args: W H DPI PHONE_HOST EW EH FPS — VD binds 9638/9639 for car, connects to phone on 19647
-            // Use 127.0.0.1: VD server runs on phone (via ADB), same device as ConnectionService.
-            // VD (W H) = car-native viewport; encode (EW EH) clamped to 1920x1080 — Snapdragon 439
-            // VPU caps hardware AVC decode at 1080p. Car-native here is already ≤1080p, the clamp
-            // is defensive for higher-res car panels.
-            val encW = minOf(vdW, 1920)
-            val encH = minOf(vdH, 1080)
-            val args = "$vdW $vdH $phoneDpi 127.0.0.1 $encW $encH $targetFps"
-
-            // Kill any existing VD server
-            _statusMessage.value = getString(R.string.status_preparing_vd)
-            executeAdb("pkill -f PipelineServer 2>/dev/null", noWait = false)
-            delay(200)
-
-            // Launch VD server. Uses exec to replace shell with app_process — keeps ADB stream open.
-            // VD server will die on disconnect; car re-deploys on reconnect.
-            _statusMessage.value = getString(R.string.status_starting_vd)
-            carLogSend("VD server: ${vdW}x${vdH}@${phoneDpi}dpi (car-native, no downscale)")
-
-            val cmd = "CLASSPATH=$jarPath app_process / " +
-                    "com.dilinkauto.vdserver.PipelineServer $args" +
-                    " >$logFile 2>&1 &"
-            if (!executeAdb(cmd, noWait = true)) {
-                carLogSend("VD server failed to start", "E")
-                _statusMessage.value = getString(R.string.status_vd_failed)
-                return@launch
-            }
-
-            vdServerStarted = true
-            _statusMessage.value = getString(R.string.status_waiting_video)
-            carLogSend("VD server started, waiting for video")
-        }
-    }
+    // (deployVdServer / deployVdServerDirect live in VdServerDeployer; the
+    //  service exposes them via deployVdServer() and the deployer's deployDirect().)
 
     // ─── Actions from car UI ───
 
@@ -904,66 +824,9 @@ class CarConnectionService : Service() {
         offscreenTexture = null
     }
 
-    private var touchDropCount = 0L
-    private var touchSendCount = 0L
+    fun sendTouchEvent(event: TouchEvent) = touchSender.sendTouchEvent(event)
 
-    fun sendTouchEvent(event: TouchEvent) {
-        val conn = inputConnection
-        if (conn == null) {
-            touchDropCount++
-            if (touchDropCount <= 3 || touchDropCount % 100 == 0L) {
-                carLogSend("Touch DROP #$touchDropCount: inputConnection=null state=${_state.value}")
-            }
-            return
-        }
-        if (!conn.isConnected) {
-            touchDropCount++
-            if (touchDropCount <= 3 || touchDropCount % 100 == 0L) {
-                carLogSend("Touch DROP #$touchDropCount: inputConnection not connected")
-            }
-            return
-        }
-        val payload = event.encode()
-        touchExecutor.execute {
-            try {
-                conn.sendInput(event.action, payload)
-                touchSendCount++
-                if (touchSendCount <= 5 || touchSendCount % 100 == 0L) {
-                    carLogSend("Touch #$touchSendCount action=${event.action} ptr=${event.pointerId} x=${"%.2f".format(event.x)} y=${"%.2f".format(event.y)}")
-                }
-            }
-            catch (e: Exception) { carLogSend("Touch send failed: ${e.message}", "W") }
-        }
-    }
-
-    fun sendTouchBatch(pointers: List<TouchEvent>) {
-        val conn = inputConnection
-        if (conn == null) {
-            touchDropCount++
-            if (touchDropCount <= 3 || touchDropCount % 100 == 0L) {
-                carLogSend("Touch batch DROP #$touchDropCount: inputConnection=null state=${_state.value}")
-            }
-            return
-        }
-        if (!conn.isConnected) {
-            touchDropCount++
-            if (touchDropCount <= 3 || touchDropCount % 100 == 0L) {
-                carLogSend("Touch batch DROP #$touchDropCount: inputConnection not connected")
-            }
-            return
-        }
-        val payload = TouchMoveBatch(pointers).encode()
-        touchExecutor.execute {
-            try {
-                conn.sendInput(InputMsg.TOUCH_MOVE_BATCH, payload)
-                touchSendCount++
-                if (touchSendCount <= 5 || touchSendCount % 100 == 0L) {
-                    carLogSend("Touch batch #$touchSendCount (${pointers.size} pointers)")
-                }
-            }
-            catch (e: Exception) { carLogSend("Touch batch send failed: ${e.message}", "W") }
-        }
-    }
+    fun sendTouchBatch(pointers: List<TouchEvent>) = touchSender.sendTouchBatch(pointers)
 
     /** Send a control command to the VD server directly via the input connection (port 9639) */
     private fun sendCommandToVd(msgType: Byte, payload: ByteArray = ByteArray(0)) {
@@ -1043,18 +906,12 @@ class CarConnectionService : Service() {
         _statusMessage.value = getString(R.string.status_starting_vd)
 
         scope.launch(Dispatchers.IO) {
-            val handshake = HandshakeRequest(
-                deviceName = "DiLink-${android.os.Build.MODEL}",
+            val handshake = buildHandshakeRequest(
+                context = this@CarConnectionService,
                 screenWidth = newVpW,
                 screenHeight = newVpH,
                 screenDpi = dpi,
-                appVersionCode = packageManager.getPackageInfo(packageName, 0).let {
-                    @Suppress("DEPRECATION") it.versionCode
-                },
                 targetFps = targetFps,
-                appVersionName = packageManager.getPackageInfo(packageName, 0).let {
-                    it.versionName ?: ""
-                },
                 dpiOverride = startupDpi
             )
             try {
@@ -1122,8 +979,7 @@ class CarConnectionService : Service() {
         _appList.value = emptyList()
         _videoReady.value = false
         videoFrameCount = 0
-        touchSendCount = 0
-        touchDropCount = 0
+        touchSender.resetCounters()
         wifiReady = false
         vdServerStarted = false
         handshakeDone = false
@@ -1183,7 +1039,7 @@ class CarConnectionService : Service() {
         disconnectAllConnections()
         phoneHost = null
         _state.value = State.IDLE
-        logWriterJob.cancel()
+        logWriter.shutdown()
         scope.cancel()
     }
 
@@ -1192,115 +1048,27 @@ class CarConnectionService : Service() {
     private fun getWifiGatewayIp(): String? {
         // Dev mode: check for manual phone IP in SharedPreferences first
         if (devMode) {
-            val devIp = getSharedPreferences("dilinkauto", MODE_PRIVATE)
+            val devIp = getSharedPreferences(AppPrefs.FILE_NAME, MODE_PRIVATE)
                 .getString("dev_phone_ip", null)
             if (!devIp.isNullOrBlank()) return devIp
         }
         return try {
             val wm = applicationContext.getSystemService(WIFI_SERVICE) as android.net.wifi.WifiManager
-            val gw = wm.dhcpInfo.gateway
-            if (gw == 0) null
-            else String.format("%d.%d.%d.%d", gw and 0xFF, (gw shr 8) and 0xFF,
-                (gw shr 16) and 0xFF, (gw shr 24) and 0xFF)
+            WifiGatewayIp.format(wm.dhcpInfo.gateway)
         } catch (e: Exception) { null }
     }
 
     /** Deploy VD server using the Dadb connection directly, bypassing isConnected check */
-    private suspend fun deployVdServerDirect(controller: RemoteAdbController) {
-        if (vdServerStarted) return
-        vdServerStarted = true  // Set early to prevent duplicate deploys
-        val displayMetrics = resources.displayMetrics
-        val vp = getViewportSize(displayMetrics.widthPixels, displayMetrics.heightPixels, displayMetrics.density)
-        val vdW = vp.first
-        val vdH = vp.second
-        val phoneDpi = if (handshakeVdDpi > 0) handshakeVdDpi else VideoConfig.calculateOptimalDpi(vdW, vdH, displayMetrics.densityDpi)
-        // Encode dims clamped to 1920x1080 (Snapdragon 439 VPU hardware-decode cap).
-        val encW = minOf(vdW, 1920)
-        val encH = minOf(vdH, 1080)
-        val args = "$vdW $vdH $phoneDpi 127.0.0.1 $encW $encH $targetFps"
-        _statusMessage.value = getString(R.string.status_preparing_vd)
-        carLogSend("VD server: ${vdW}x${vdH}@${phoneDpi}dpi (car-native, no downscale)")
-        // Use shell (sync) to capture result. pkill old instance first, then start new one.
-        controller.shell("pkill -f PipelineServer 2>/dev/null")
-        val cmd = "CLASSPATH=/sdcard/DiLinkAuto/vd-server.jar app_process / " +
-                "com.dilinkauto.vdserver.PipelineServer $args" +
-                " >/sdcard/DiLinkAuto/vd-server.log 2>&1"
-        // Use shellBackground to keep ADB stream open — prevents shell from killing the process
-        val streamId = controller.shellBackground(cmd)
-        val ok = streamId >= 0
-        _statusMessage.value = getString(R.string.status_starting_vd)
-        if (ok) {
-            carLogSend("VD server started, waiting for video")
-        } else {
-            carLogSend("VD server failed to start", "E")
-            vdServerStarted = false  // Allow retry
-        }
-    }
+    private suspend fun deployVdServerDirect(controller: RemoteAdbController) =
+        vdDeployer.deployDirect(controller)
 
     // ─── Car Log (sent to phone via protocol, phone writes to file) ───
 
-    private val logBuffer = java.util.concurrent.ConcurrentLinkedQueue<String>()
-    // O(1) counter for the cap check below — ConcurrentLinkedQueue.size() is O(n) and
-    // was called per log line on the disconnected path.
-    private val logBufferCount = java.util.concurrent.atomic.AtomicInteger(0)
+    internal fun carLogSend(msg: String, level: String = "I") = logWriter.send(msg, level)
 
-    private data class LogEntry(val msg: String, val level: String)
-
-    /** Off-thread log queue: callers do a non-blocking trySend, a dedicated coroutine formats+encodes+sends. */
-    private val logQueue = kotlinx.coroutines.channels.Channel<LogEntry>(1024)
-    private val logWriterJob = kotlinx.coroutines.Job()
-    private val logWriterScope = CoroutineScope(logWriterJob + Dispatchers.IO)
-    @Volatile private var logWriterStarted = false
-
-    private val logTsFormatter = java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss.SSS")
-
-    private fun startLogWriter() {
-        if (logWriterStarted) return
-        logWriterStarted = true
-        logWriterScope.launch {
-            try {
-                for (entry in logQueue) {
-                    try {
-                        val ts = java.time.LocalTime.now().format(logTsFormatter)
-                        val line = "[$ts][${entry.level}] ${entry.msg}"
-                        val conn = controlConnection
-                        if (conn != null && conn.isConnected) {
-                            // Flush any buffered messages first
-                            while (true) {
-                                val buffered = logBuffer.poll() ?: break
-                                logBufferCount.decrementAndGet()
-                                try { conn.sendData(DataMsg.CAR_LOG, buffered.toByteArray(Charsets.UTF_8)) }
-                                catch (_: Exception) { break }
-                            }
-                            try { conn.sendData(DataMsg.CAR_LOG, line.toByteArray(Charsets.UTF_8)) }
-                            catch (_: Exception) {}
-                        } else {
-                            // Buffer for later — cap at 10000 lines
-                            if (logBufferCount.get() < 10000) {
-                                logBuffer.add(line)
-                                logBufferCount.incrementAndGet()
-                            }
-                        }
-                    } catch (_: Throwable) {
-                        // Never let the writer die on a single bad entry
-                    }
-                }
-            } catch (_: kotlinx.coroutines.CancellationException) {
-                // shutdown
-            }
-        }
-    }
-
-    private fun carLogSend(msg: String, level: String = "I") {
-        if (!carLogEnabled) return
-        when (level) {
-            "D" -> Log.d(TAG, msg)
-            "W" -> Log.w(TAG, msg)
-            "E" -> Log.e(TAG, msg)
-            else -> Log.i(TAG, msg)
-        }
-        // Non-blocking: format+encode happens on the dedicated logger coroutine.
-        logQueue.trySend(LogEntry(msg, level))
+    /** Status sink for the deployer and tracks. */
+    internal fun setStatusMessage(resId: Int, vararg formatArgs: Any) {
+        _statusMessage.value = if (formatArgs.isEmpty()) getString(resId) else getString(resId, *formatArgs)
     }
 
     // ─── System ───
@@ -1327,7 +1095,7 @@ class CarConnectionService : Service() {
 
     override fun onDestroy() {
         shutdown()
-        touchExecutor.shutdownNow()
+        touchSender.shutdown()
         try { unregisterReceiver(usbReceiver) } catch (_: Exception) {}
         networkCallback?.let {
             try { (getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager).unregisterNetworkCallback(it) }

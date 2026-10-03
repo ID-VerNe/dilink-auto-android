@@ -119,7 +119,7 @@ data class HandshakeResponse(
     val displayWidth: Int,
     val displayHeight: Int,
     val virtualDisplayId: Int = -1,
-    val adbPort: Int = 5555,
+    val adbPort: Int = Discovery.ADB_PORT,
     val vdServerJarPath: String = "",
     val connectionMethod: Byte = CONNECTION_METHOD_USB_ADB,
     val vdDpi: Int = VideoConfig.VIRTUAL_DISPLAY_DPI
@@ -153,7 +153,7 @@ data class HandshakeResponse(
             val dw = buf.getInt()
             val dh = buf.getInt()
             val vdId = if (buf.hasRemaining()) buf.getInt() else -1
-            val adbP = if (buf.hasRemaining()) buf.getInt() else 5555
+            val adbP = if (buf.hasRemaining()) buf.getInt() else Discovery.ADB_PORT
             val jarPath = if (buf.remaining() >= 2) {
                 val pathLen = buf.getShort().toInt() and 0xFFFF
                 if (pathLen > 0 && buf.remaining() >= pathLen) {

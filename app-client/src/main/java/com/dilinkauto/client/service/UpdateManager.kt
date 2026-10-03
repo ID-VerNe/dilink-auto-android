@@ -1,16 +1,10 @@
 package com.dilinkauto.client.service
 
 import android.content.Context
-import android.content.Intent
 import android.content.SharedPreferences
-import android.content.pm.PackageManager
-import android.net.Uri
-import androidx.core.content.FileProvider
 import com.dilinkauto.client.FileLog
 import com.dilinkauto.client.R
 import com.dilinkauto.client.ShizukuManager
-import dadb.AdbKeyPair
-import dadb.Dadb
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -37,6 +31,13 @@ sealed class UpdateState {
 
 enum class DistributionChannel { RELEASE, PRE_RELEASE }
 
+/**
+ * Self-update orchestrator: fetch → download → install.
+ *
+ * Version comparison lives in [Versioning.kt]; APK staging and the ADB/system
+ * install mechanics live in [ApkInstaller.kt]. This object owns only the
+ * update state machine, network fetch, and download progress.
+ */
 object UpdateManager {
     private const val TAG = "UpdateManager"
     private const val GITHUB_REPO = "https://api.github.com/repos/andersonlucasg3/dilink-auto-android/releases"
@@ -103,7 +104,7 @@ object UpdateManager {
                 }
 
                 val currentVersion = readCurrentVersion()
-                if (currentVersion == null) {
+                if (currentVersion == "0.0.0") {
                     FileLog.w(TAG, "Could not read current version")
                     _updateState.value = UpdateState.Error(appContext.getString(R.string.update_no_version))
                     return@launch
@@ -234,111 +235,41 @@ object UpdateManager {
                     try { File(tmpPath).delete() } catch (_: Exception) {}
                     if (result != null && result.contains("Success")) {
                         FileLog.i(TAG, "Shizuku install succeeded: $result")
-                        _updateState.value = UpdateState.Installed
-                        downloadedFile?.delete()
-                        downloadedFile = null
-                        latestRelease = null
+                        markInstalled()
                     } else {
                         val msg = result ?: "Shizuku command returned null"
                         FileLog.w(TAG, "Shizuku install failed, trying dadb fallback: $msg")
-                        tryDadbInstall(apkFile, version)
+                        fallbackInstall(apkFile, version)
                     }
                 } catch (e: Exception) {
                     FileLog.e(TAG, "Shizuku install error, trying dadb fallback", e)
-                    tryDadbInstall(apkFile, version)
+                    fallbackInstall(apkFile, version)
                 }
             }
         } else {
             // Fallback to system package installer
-            launchSystemInstaller(context, apkFile)
+            launchSystemInstallerOrError(context, apkFile)
         }
     }
 
-    internal fun stageApkForShizuku(apkFile: File, tmpPath: String = "/data/local/tmp/update.apk"): Boolean {
-        val tmpFile = File(tmpPath)
-        val directCopy = try {
-            apkFile.copyTo(tmpFile, overwrite = true)
-            tmpFile.setReadable(true, false)
-            true
-        } catch (_: Exception) {
-            false
-        }
-        if (directCopy) return true
-        return ShizukuManager.copyToFile(apkFile, tmpPath)
-    }
-
-    private suspend fun tryDadbInstall(apkFile: File, version: String) {
-        try {
-            val filesDir = appContext.filesDir
-            val privKey = File(filesDir, "adbkey")
-            val pubKey = File(filesDir, "adbkey.pub")
-            if (!privKey.exists()) {
-                filesDir.mkdirs()
-                AdbKeyPair.generate(privKey, pubKey)
-            }
-            val keyPair = AdbKeyPair.read(privKey, pubKey)
-
-            val dadbExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
-            val dadb: Dadb? = try {
-                val future = dadbExecutor.submit<Dadb> {
-                    Dadb.create("127.0.0.1", 5555, keyPair)
-                }
-                try {
-                    future.get(10, java.util.concurrent.TimeUnit.SECONDS)
-                } catch (e: java.util.concurrent.TimeoutException) {
-                    FileLog.w(TAG, "Dadb self-connect timed out")
-                    null
-                }
-            } finally {
-                dadbExecutor.shutdownNow()
-            }
-
-            if (dadb == null) {
-                FileLog.w(TAG, "Dadb self-connect failed, falling back to system installer")
-                launchSystemInstaller(appContext, apkFile)
-                return
-            }
-
-            try {
-                FileLog.i(TAG, "Dadb self-install ($version): pushing APK...")
-                val remotePath = "/data/local/tmp/update.apk"
-                dadb.push(apkFile, remotePath)
-                val result = dadb.shell("pm install -r $remotePath").allOutput
-                FileLog.i(TAG, "Dadb self-install result: ${result.trim()}")
-                if (result.contains("Success")) {
-                    FileLog.i(TAG, "Dadb self-install succeeded")
-                    _updateState.value = UpdateState.Installed
-                    downloadedFile?.delete()
-                    downloadedFile = null
-                    latestRelease = null
-                } else {
-                    FileLog.w(TAG, "Dadb self-install failed: ${result.trim()}, falling back to system installer")
-                    launchSystemInstaller(appContext, apkFile)
-                }
-            } finally {
-                dadb.close()
-            }
-        } catch (e: Exception) {
-            FileLog.e(TAG, "Dadb self-install error, falling back to system installer", e)
-            launchSystemInstaller(appContext, apkFile)
+    private suspend fun fallbackInstall(apkFile: File, version: String) {
+        when (tryDadbInstall(appContext, apkFile, version)) {
+            InstallOutcome.Success -> markInstalled()
+            InstallOutcome.NeedsSystemInstaller -> launchSystemInstallerOrError(appContext, apkFile)
         }
     }
 
-    private fun launchSystemInstaller(context: Context, apkFile: File) {
-        try {
-            val uri = FileProvider.getUriForFile(
-                context,
-                "${context.packageName}.fileprovider",
-                apkFile
-            )
-            val intent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(uri, "application/vnd.android.package-archive")
-                flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK
-            }
-            context.startActivity(intent)
-        } catch (e: Exception) {
-            FileLog.e(TAG, "System installer also failed", e)
-            _updateState.value = UpdateState.Error(appContext.getString(R.string.update_installer_error, e.message ?: "unknown"))
+    private fun markInstalled() {
+        _updateState.value = UpdateState.Installed
+        downloadedFile?.delete()
+        downloadedFile = null
+        latestRelease = null
+    }
+
+    private fun launchSystemInstallerOrError(context: Context, apkFile: File) {
+        val err = launchSystemInstaller(context, apkFile)
+        if (err != null) {
+            _updateState.value = UpdateState.Error(appContext.getString(R.string.update_installer_error, err))
         }
     }
 
@@ -385,74 +316,39 @@ object UpdateManager {
             val json = if (body.trimStart().startsWith("[")) {
                 val arr = org.json.JSONArray(body)
                 if (arr.length() == 0) return null
-            arr.getJSONObject(0)
-        } else {
-            JSONObject(body)
-        }
-        val tagName = json.getString("tag_name")
-        val versionName = tagName.removePrefix("v")
-
-        // Find APK asset
-        val assets = json.getJSONArray("assets")
-        var apkUrl: String? = null
-        var apkSize = 0L
-        for (i in 0 until assets.length()) {
-            val asset = assets.getJSONObject(i)
-            val name = asset.getString("name")
-            if (name.endsWith(".apk")) {
-                apkUrl = asset.getString("browser_download_url")
-                apkSize = asset.getLong("size")
-                break
+                arr.getJSONObject(0)
+            } else {
+                JSONObject(body)
             }
-        }
+            val tagName = json.getString("tag_name")
+            val versionName = tagName.removePrefix("v")
 
-        if (apkUrl == null) {
-            FileLog.w(TAG, "No APK asset found in release $tagName")
-            return null
-        }
+            // Find APK asset
+            val assets = json.getJSONArray("assets")
+            var apkUrl: String? = null
+            var apkSize = 0L
+            for (i in 0 until assets.length()) {
+                val asset = assets.getJSONObject(i)
+                val name = asset.getString("name")
+                if (name.endsWith(".apk")) {
+                    apkUrl = asset.getString("browser_download_url")
+                    apkSize = asset.getLong("size")
+                    break
+                }
+            }
 
-        return ReleaseInfo(tagName, versionName, apkUrl, apkSize)
+            if (apkUrl == null) {
+                FileLog.w(TAG, "No APK asset found in release $tagName")
+                return null
+            }
+
+            return ReleaseInfo(tagName, versionName, apkUrl, apkSize)
         } finally {
             conn.disconnect()
         }
     }
 
-    private fun readCurrentVersion(): String? {
-        return try {
-            val info = appContext.packageManager.getPackageInfo(appContext.packageName, 0)
-            info.versionName
-        } catch (e: PackageManager.NameNotFoundException) {
-            null
-        }
-    }
-
-    // "0.17.0-dev-02" → ("0.17.0", true, 2)
-    // "0.17.0-dev"    → ("0.17.0", true, 0)
-    // "0.17.0"        → ("0.17.0", false, 0)
-    internal data class ParsedVersion(val base: String, val isDev: Boolean, val devNum: Int)
-
-    internal fun parseVersion(v: String): ParsedVersion {
-        val m = Regex("^(.*)-dev(?:-(\\d+))?\$").find(v)
-        return if (m != null) {
-            ParsedVersion(m.groupValues[1], true, m.groupValues[2].toIntOrNull() ?: 0)
-        } else {
-            ParsedVersion(v, false, 0)
-        }
-    }
-
-    internal fun compareVersions(a: String, b: String): Int {
-        val (baseA, devA, numA) = parseVersion(a)
-        val (baseB, devB, numB) = parseVersion(b)
-        val aParts = baseA.split(".").map { it.toIntOrNull() ?: 0 }
-        val bParts = baseB.split(".").map { it.toIntOrNull() ?: 0 }
-        val maxLen = maxOf(aParts.size, bParts.size)
-        for (i in 0 until maxLen) {
-            val aVal = aParts.getOrElse(i) { 0 }
-            val bVal = bParts.getOrElse(i) { 0 }
-            if (aVal != bVal) return aVal.compareTo(bVal)
-        }
-        if (!devA && devB) return 1
-        if (devA && !devB) return -1
-        return numA.compareTo(numB)
+    private fun readCurrentVersion(): String {
+        return AppVersion.nameOrEmpty(appContext).ifEmpty { "0.0.0" }
     }
 }

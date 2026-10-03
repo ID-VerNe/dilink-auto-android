@@ -1,6 +1,7 @@
 package com.dilinkauto.server.adb
 
 import android.util.Log
+import com.dilinkauto.protocol.Discovery
 import com.dilinkauto.protocol.adb.TcpAdbConnection
 import java.io.File
 
@@ -10,7 +11,7 @@ import java.io.File
  */
 class RemoteAdbController(
     private val phoneHost: String,
-    private val adbPort: Int = 5555,
+    private val adbPort: Int = Discovery.ADB_PORT,
     private val virtualDisplayId: Int,
     private val keyDir: File
 ) {

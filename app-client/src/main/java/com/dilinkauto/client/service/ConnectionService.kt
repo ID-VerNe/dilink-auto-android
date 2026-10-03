@@ -3,18 +3,17 @@ package com.dilinkauto.client.service
 import android.app.Notification
 import android.app.PendingIntent
 import android.app.Service
-import android.content.pm.PackageManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.os.IBinder
 import android.os.PowerManager
-import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.dilinkauto.client.ClientApp
 import com.dilinkauto.client.FileLog
@@ -22,7 +21,6 @@ import com.dilinkauto.client.R
 import com.dilinkauto.client.ShizukuManager
 import com.dilinkauto.client.display.VirtualDisplayClient
 import com.dilinkauto.protocol.*
-import dadb.Dadb
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -45,6 +43,8 @@ class ConnectionService : Service() {
     private var autoUpdateAttempted = false
     private var autoUpdateFailedAt = 0L
     private lateinit var carAppInstaller: CarAppInstaller
+    private lateinit var appListBuilder: AppListBuilder
+    private lateinit var displayRestorer: PhoneDisplayRestorer
 
     enum class State { IDLE, WAITING, CONNECTED, STREAMING }
 
@@ -55,7 +55,7 @@ class ConnectionService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        FileLog.loadEnabled(getSharedPreferences("dilinkauto", MODE_PRIVATE))
+        FileLog.loadEnabled(getSharedPreferences(AppPrefs.FILE_NAME, MODE_PRIVATE))
         FileLog.rotate() // Archive previous log, start fresh
         // Clear stale static state from previous service instance
         activeConnection = null
@@ -72,6 +72,8 @@ class ConnectionService : Service() {
         @Suppress("DEPRECATION")
         CarIpLocator.wifiManager = applicationContext.getSystemService(WIFI_SERVICE) as? android.net.wifi.WifiManager
         carAppInstaller = CarAppInstaller(this) { msg -> _installStatusStatic.value = msg }
+        appListBuilder = AppListBuilder(applicationContext, serviceScope)
+        displayRestorer = PhoneDisplayRestorer(applicationContext, serviceScope)
     }
 
     private fun cacheDefaultIme() {
@@ -79,7 +81,7 @@ class ConnectionService : Service() {
             val currentIme = android.provider.Settings.Secure.getString(contentResolver, android.provider.Settings.Secure.DEFAULT_INPUT_METHOD)
             if (!currentIme.isNullOrBlank() && currentIme != "null" && !currentIme.contains("linkpc", ignoreCase = true)) {
                 savedDefaultIme = currentIme
-                getSharedPreferences("dilinkauto", MODE_PRIVATE).edit().putString("saved_default_ime", currentIme).apply()
+                getSharedPreferences(AppPrefs.FILE_NAME, MODE_PRIVATE).edit().putString(AppPrefs.SAVED_DEFAULT_IME, currentIme).apply()
                 FileLog.i(TAG, "Cached default IME: $currentIme")
             }
         } catch (e: Exception) {
@@ -123,7 +125,7 @@ class ConnectionService : Service() {
                             FileLog.w(TAG, "Failed to send APP_UNINSTALLED: ${e.message}")
                         }
                         // Resend the full app list so car has accurate state
-                        sendAppList()
+                        appListBuilder.sendAppList(conn)
                     }
                 }
             }
@@ -141,9 +143,9 @@ class ConnectionService : Service() {
 
     private fun deployAssets() {
         serviceScope.launch(Dispatchers.IO) {
-            val dir = java.io.File(android.os.Environment.getExternalStorageDirectory(), "DiLinkAuto")
+            val dir = java.io.File(android.os.Environment.getExternalStorageDirectory(), VdDeploy.DIR_PATH)
             dir.mkdirs()
-            extractAsset("vd-server.jar", java.io.File(dir, "vd-server.jar"))
+            extractAsset(VdDeploy.JAR_NAME, java.io.File(dir, VdDeploy.JAR_NAME))
             extractAsset("app-server.apk", java.io.File(filesDir, "app-server.apk"))
             assetsReady = true
         }
@@ -264,7 +266,7 @@ class ConnectionService : Service() {
             }
             ACTION_ALLOWLIST_UPDATED -> {
                 // Allowlist screen changed the selection — re-send so the car grid updates live.
-                sendAppList()
+                appListBuilder.sendAppList(controlConnection)
             }
         }
         return START_STICKY
@@ -377,35 +379,11 @@ class ConnectionService : Service() {
             vdClient = null
         }
 
-        // Create VD at car viewport size.
-        // Auto-calibrate DPI: ensure portrait apps get at least ~380dp logical width in landscape
-        // (iPad-like phone app display) instead of crushing into an unusable 140dp sliver.
-        var vdWidth = request.screenWidth and 0x7FFFFFFE.toInt()
-        var vdHeight = request.screenHeight and 0x7FFFFFFE.toInt()
-        
-        // Anti-Crop Scale: Ensure Virtual Display width is at least the phone's physical width.
-        // Many Chinese ROMs (like Meizu, Xiaomi) hardcode the IME width to the physical display width.
-        // If the car viewport is narrower than the phone, the keyboard gets horizontally chopped.
-        // Scaling up the VD preserves the car's aspect ratio while satisfying the OS width.
+        // Create VD at car viewport size. The DPI/size computation (anti-crop
+        // scale for Chinese-ROM IME hardcoding + DPI override vs. auto) lives
+        // in VdDimensions; see it for the rationale.
         val dm = resources.displayMetrics
-        val isCarLandscape = vdWidth > vdHeight
-        val isPhoneLandscape = dm.widthPixels > dm.heightPixels
-        val phonePhysicalWidth = if (isPhoneLandscape == isCarLandscape) dm.widthPixels else dm.heightPixels
-        if (vdWidth < phonePhysicalWidth) {
-            val scale = phonePhysicalWidth.toFloat() / vdWidth
-            vdWidth = (vdWidth * scale).toInt() and 0x7FFFFFFE.toInt()
-            vdHeight = (vdHeight * scale).toInt() and 0x7FFFFFFE.toInt()
-            FileLog.i(TAG, "Scaled VD to ${vdWidth}x${vdHeight} (scale=$scale) to prevent IME crop")
-        }
-        val displayDpi = if (request.dpiOverride > 0) {
-            // Car-side user override: bypass the portrait-app-safe cap and use the
-            // requested DPI verbatim. Fixes "UI too small" for landscape apps; the
-            // tradeoff (portrait-only apps may squeeze into <360dp) is surfaced in
-            // the car UI hint text. Coerce to the encoder/decoder's sane range.
-            request.dpiOverride.coerceIn(120, 480)
-        } else {
-            VideoConfig.calculateOptimalDpi(vdWidth, vdHeight, request.screenDpi)
-        }
+        val (vdWidth, vdHeight, displayDpi) = VdDimensions.compute(request, dm)
         FileLog.i(TAG, "VD: ${vdWidth}x${vdHeight} @${displayDpi}dpi (car reported ${request.screenDpi}dpi, override=${request.dpiOverride}, auto-calibrated optimal touch scale)")
 
         // Open lifecycle channel if not already open (survives re-handshakes)
@@ -444,7 +422,7 @@ class ConnectionService : Service() {
             displayWidth = request.screenWidth,
             displayHeight = request.screenHeight,
             virtualDisplayId = -1,
-            adbPort = 5555,
+            adbPort = Discovery.ADB_PORT,
             vdServerJarPath = vdJarPath,
             connectionMethod = connMethod,
             vdDpi = displayDpi
@@ -457,17 +435,10 @@ class ConnectionService : Service() {
             val carHasSemver = request.appVersionName.isNotEmpty()
             val carVersionName = if (carHasSemver) request.appVersionName
                 else request.appVersionCode.toString()
-            val myVersionName = if (carHasSemver) {
-                packageManager.getPackageInfo(packageName, 0).let {
-                    it.versionName ?: @Suppress("DEPRECATION") it.versionCode.toString()
-                }
-            } else {
-                @Suppress("DEPRECATION")
-                packageManager.getPackageInfo(packageName, 0).versionCode.toString()
-            }
+            val myVersionName = AppVersion.label(this@ConnectionService, preferCode = !carHasSemver)
             val updateCooldown = autoUpdateFailedAt > 0L &&
                 System.currentTimeMillis() - autoUpdateFailedAt < 5 * 60 * 1000L
-            val needsUpdate = UpdateManager.compareVersions(myVersionName, carVersionName) > 0
+            val needsUpdate = compareVersions(myVersionName, carVersionName) > 0
                 && !autoUpdateAttempted && !updateCooldown
 
             if (needsUpdate) {
@@ -500,7 +471,7 @@ class ConnectionService : Service() {
                     return@launch
                 }
 
-                if (UpdateManager.compareVersions(myVersionName, carVersionName) > 0) {
+                if (compareVersions(myVersionName, carVersionName) > 0) {
                     FileLog.i(TAG, "Car app outdated — update already attempted, proceeding")
                 } else {
                     FileLog.i(TAG, "Car app up-to-date ($carVersionName)")
@@ -522,7 +493,7 @@ class ConnectionService : Service() {
                             _serviceState.value = State.STREAMING
                             updateNotification(R.string.notification_streaming)
                         }
-                        sendAppList()
+                        appListBuilder.sendAppList(conn)
                     } else {
                         FileLog.w(TAG, "VD server did not connect within timeout — tearing down")
                         withContext(Dispatchers.Main) { cleanupSession() }
@@ -548,28 +519,23 @@ class ConnectionService : Service() {
             return
         }
         try {
-            val dir = java.io.File(android.os.Environment.getExternalStorageDirectory(), "DiLinkAuto")
+            val dir = java.io.File(android.os.Environment.getExternalStorageDirectory(), VdDeploy.DIR_PATH)
             if (!dir.exists()) dir.mkdirs()
-            val jarPath = java.io.File(dir, "vd-server.jar").absolutePath
-            val logFile = java.io.File(dir, "vd-server.log").absolutePath
-            // Args: W H DPI PHONE_HOST EW EH FPS
-            // VD binds 9638/9639 on 0.0.0.0, connects lifecycle to phoneHost:19647.
-            // VD dims (W H) are the scaled-up vdWidth/vdHeight (preserves the IME-crop
-            // fix for Chinese ROMs that hardcode IME width to phone physical width).
-            // Encode dims (EW EH) are the car-native viewport clamped to 1920x1080:
-            // the Snapdragon 439 VPU caps hardware AVC decode at 1080p. Encoding
-            // larger forces software decode on the car's 8x A53 (single-digit fps).
-            // Car-native is also 1:1 with the car's pixels, so no downscale on decode.
-            val encW = minOf(carWidth, 1920)
-            val encH = minOf(carHeight, 1080)
-            val args = "$vdWidth $vdHeight $dpi 127.0.0.1 $encW $encH $targetFps"
+            val jarPath = java.io.File(dir, VdDeploy.JAR_NAME).absolutePath
+            val logPath = java.io.File(dir, VdDeploy.LOG_NAME).absolutePath
+            // VD dims (vdWidth/vdHeight) are the scaled-up values (preserves the
+            // IME-crop fix for Chinese ROMs that hardcode IME width to phone
+            // physical width). Encode dims (carWidth/carHeight) are the car-native
+            // viewport clamped to 1920x1080: the Snapdragon 439 VPU caps hardware
+            // AVC decode at 1080p. Encoding larger forces software decode on the
+            // car's 8x A53 (single-digit fps). Car-native is also 1:1 with the car's
+            // pixels, so no downscale on decode.
+            val args = VdDeployArgs.format(vdWidth, vdHeight, dpi, "127.0.0.1", carWidth, carHeight, targetFps)
 
-            ShizukuManager.execAndWait("pkill -f PipelineServer 2>/dev/null")
+            ShizukuManager.execAndWait(VdDeploy.killCommand)
             delay(200)
 
-            val cmd = "CLASSPATH=$jarPath exec app_process / " +
-                    "com.dilinkauto.vdserver.PipelineServer $args" +
-                    " >$logFile 2>&1"
+            val cmd = VdDeploy.commandLine(jarPath, logPath, args, background = false)
             ShizukuManager.execBackground(cmd)
             FileLog.i(TAG, "VD server started via Shizuku: ${vdWidth}x$vdHeight @${dpi}dpi")
         } catch (e: Exception) {
@@ -599,7 +565,7 @@ class ConnectionService : Service() {
                     return@launch
                 }
 
-                FileLog.i(TAG, "Auto-updating car app at $carIp:5555...")
+                FileLog.i(TAG, "Auto-updating car app at $carIp:${Discovery.ADB_PORT}...")
                 _installStatusStatic.value = getString(R.string.car_install_status_connecting_to, carIp)
                 val dadb = carAppInstaller.connect(carIp)
                 if (dadb == null) {
@@ -613,7 +579,7 @@ class ConnectionService : Service() {
                     FileLog.i(TAG, "Auto-update result: ${result.trim()}")
                     if (result.contains("Success")) {
                         _installStatusStatic.value = getString(R.string.status_auto_update_complete)
-                        lastSentIconHash.clear() // car's icon cache was wiped by reinstall
+                        appListBuilder.resetIconHashes() // car's icon cache was wiped by reinstall
                         FileLog.i(TAG, "Car app auto-updated — restarting")
                     } else {
                         _installStatusStatic.value = getString(R.string.status_update_failed, result.trim())
@@ -661,7 +627,7 @@ class ConnectionService : Service() {
 
                 _installStatus.value = if (explicitIp != null) getString(R.string.car_install_status_connecting_to, explicitIp) else getString(R.string.car_install_status_searching)
                 val carIp = if (!explicitIp.isNullOrBlank()) {
-                    if (CarIpLocator.probePortSync(explicitIp, 5555)) explicitIp else {
+                    if (CarIpLocator.probePortSync(explicitIp, Discovery.ADB_PORT)) explicitIp else {
                         _installStatus.value = getString(R.string.car_install_status_not_reachable, explicitIp)
                         null
                     }
@@ -673,7 +639,7 @@ class ConnectionService : Service() {
                 }
 
                 _installStatus.value = getString(R.string.car_install_status_connecting_to, carIp)
-                FileLog.i(TAG, "Connecting to car ADB at $carIp:5555")
+                FileLog.i(TAG, "Connecting to car ADB at $carIp:${Discovery.ADB_PORT}")
                 val dadb = carAppInstaller.connect(carIp)
                 if (dadb == null) {
                     _installStatus.value = getString(R.string.car_install_status_auth_needed)
@@ -685,12 +651,10 @@ class ConnectionService : Service() {
                 try {
                     _installStatus.value = getString(R.string.car_install_status_checking_version)
                     val installedVersionName = carAppInstaller.readInstalledVersion(dadb)
-                    val myVersionName = packageManager.getPackageInfo(packageName, 0).let {
-                        it.versionName ?: @Suppress("DEPRECATION") it.versionCode.toString()
-                    }
+                    val myVersionName = AppVersion.label(this@ConnectionService)
                     FileLog.i(TAG, "Car app: installed=$installedVersionName, embedded=$myVersionName")
 
-                    if (UpdateManager.compareVersions(myVersionName, installedVersionName) <= 0) {
+                    if (compareVersions(myVersionName, installedVersionName) <= 0) {
                         _installStatus.value = getString(R.string.car_install_status_already_up_to_date, installedVersionName)
                         return@launch
                     }
@@ -699,7 +663,7 @@ class ConnectionService : Service() {
                     FileLog.i(TAG, "Install result: ${result.trim()}")
 
                     if (result.contains("Success")) {
-                        lastSentIconHash.clear() // car's icon cache was wiped by reinstall
+                        appListBuilder.resetIconHashes() // car's icon cache was wiped by reinstall
                         _installStatus.value = getString(R.string.car_install_status_car_installed, myVersionName)
                     } else {
                         _installStatus.value = getString(R.string.car_install_status_failed, result.trim())
@@ -721,97 +685,6 @@ class ConnectionService : Service() {
 
 
     // ─── App List ───
-
-    // Tracks the last icon hash sent per package — survives across reconnections
-    // within the same service lifetime to avoid re-sending unchanged icons.
-    private val lastSentIconHash = mutableMapOf<String, String>()
-
-    private fun sendAppList() {
-        val conn = controlConnection ?: return
-        val pm = packageManager
-
-        serviceScope.launch(Dispatchers.IO) {
-            try {
-                val allApps = pm.queryIntentActivities(
-                    Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0
-                ).filter { info ->
-                    // Skip hidden apps (Xiaomi HyperOS, some custom ROMs disable
-                    // the launcher component without removing the package)
-                    val pkg = info.activityInfo.packageName
-                    val cn = android.content.ComponentName(pkg, info.activityInfo.name)
-                    val state = pm.getComponentEnabledSetting(cn)
-                    state != PackageManager.COMPONENT_ENABLED_STATE_DISABLED
-                }.map { info ->
-                    val pkg = info.activityInfo.packageName
-                    // Use lastUpdateTime as a lightweight change indicator.
-                    // The car-side AppIconCache handles persistence, multi-size
-                    // resizing, and in-memory Bitmap caching.
-                    val hash = try {
-                        pm.getPackageInfo(pkg, 0).lastUpdateTime.toString()
-                    } catch (_: Exception) { "" }
-                    // Only include icon data if the hash differs from last sent
-                    val prevHash = lastSentIconHash[pkg]
-                    val iconPng = if (hash.isNotEmpty() && hash == prevHash) {
-                        ByteArray(0) // car can use its cached icon
-                    } else {
-                        lastSentIconHash[pkg] = hash
-                        ClientApp.loadIconPng(pm, pkg, 192)
-                    }
-                    AppInfo(
-                        pkg,
-                        info.loadLabel(pm).toString(),
-                        categorizeApp(pkg),
-                        iconPng,
-                        hash
-                    )
-                }.sortedBy { it.category.id }
-
-                // Apply the user's car-app allowlist: only selected packages reach the car,
-                // shrinking the wire payload and the car's icon-decode work. On first run
-                // the allowlist is pre-seeded with common map apps that are actually installed.
-                val prefs = getSharedPreferences(ALLOWLIST_PREFS, MODE_PRIVATE)
-                if (!prefs.getBoolean(ALLOWLIST_CONFIGURED_KEY, false)) {
-                    seedDefaultAllowlist(pm, prefs)
-                }
-                val allowed = prefs.getStringSet(ALLOWLIST_PACKAGES_KEY, null)
-                val apps = if (allowed != null) allApps.filter { it.packageName in allowed } else allApps
-
-                conn.sendData(DataMsg.APP_LIST, AppListMessage(apps).encode())
-                val skipped = apps.count { it.iconPng.isEmpty() }
-                FileLog.i(TAG, "App list sent: ${apps.size}/${allApps.size} apps allowed (${skipped} icons skipped/unchanged)")
-            } catch (e: Exception) {
-                FileLog.e(TAG, "Failed to send app list", e)
-            }
-        }
-    }
-
-    /** Common map app packageNames used to pre-seed the allowlist on first run. */
-    private val DEFAULT_MAP_PACKAGES = setOf(
-        "com.baidu.BaiduMap",        // Baidu Maps
-        "com.autonavi.minimap",      // AMap (Gaode)
-        "com.google.android.apps.maps", // Google Maps
-        "com.waze",                  // Waze
-        "com.soso.map",              // Sogou Map
-        "com.tencent.map",           // Tencent Map
-        "com.mapabc.mapabc"          // Mapabc
-    )
-
-    /**
-     * First-run seeding: intersect the default map package list with the launcher
-     * apps actually installed. Non-installed defaults are no-ops. Persist the
-     * result and mark the allowlist configured so this only runs once.
-     */
-    private fun seedDefaultAllowlist(pm: android.content.pm.PackageManager, prefs: android.content.SharedPreferences) {
-        val installedLauncher = pm.queryIntentActivities(
-            Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0
-        ).map { it.activityInfo.packageName }.toSet()
-        val seed = DEFAULT_MAP_PACKAGES.intersect(installedLauncher)
-        prefs.edit()
-            .putStringSet(ALLOWLIST_PACKAGES_KEY, seed)
-            .putBoolean(ALLOWLIST_CONFIGURED_KEY, true)
-            .apply()
-        FileLog.i(TAG, "Allowlist seeded with ${seed.size} default map apps: $seed")
-    }
 
     // ─── App Shortcuts ───
 
@@ -840,23 +713,6 @@ class ConnectionService : Service() {
         }
     }
 
-    private fun categorizeApp(pkg: String): AppCategory = when {
-        pkg.contains("map", true) || pkg.contains("navi", true) ||
-        pkg.contains("waze", true) || pkg.contains("amap", true) ||
-        pkg.contains("gaode", true) -> AppCategory.NAVIGATION
-
-        pkg.contains("music", true) || pkg.contains("spotify", true) ||
-        pkg.contains("podcast", true) || pkg.contains("player", true) ||
-        pkg.contains("qqmusic", true) || pkg.contains("netease", true) -> AppCategory.MUSIC
-
-        pkg.contains("whatsapp", true) || pkg.contains("telegram", true) ||
-        pkg.contains("wechat", true) || pkg.contains("tencent.mm", true) ||
-        pkg.contains("messenger", true) || pkg.contains("sms", true) ||
-        pkg.contains("dialer", true) || pkg.contains("phone", true) -> AppCategory.COMMUNICATION
-
-        else -> AppCategory.OTHER
-    }
-
     // ─── Cleanup ───
 
     private fun cleanupSession() {
@@ -871,107 +727,18 @@ class ConnectionService : Service() {
         controlConnection?.disconnect()
         controlConnection = null
         activeConnection = null
-        lastSentIconHash.clear() // Force resend icons on reconnect
+        appListBuilder.resetIconHashes() // Force resend icons on reconnect
         _serviceState.value = State.WAITING
-        forceWakeScreen()
-    }
-
-    /**
-     * Multi-layered display wake after disconnection. The VD server shuts off the
-     * physical display at the SurfaceControl level (or via cmd display power-off),
-     * which puts it in a deeper off state than normal screen timeout. Regular
-     * WakeLocks can't recover from this — only system-level mechanisms can.
-     *
-     * Layers (tried in order, each is independent):
-     * 1. PowerManager.wakeUp() via reflection — system-level wake
-     * 2. FLAG_TURN_SCREEN_ON activity launch — WindowManager triggers display on
-     * 3. WakeLock with ACQUIRE_CAUSES_WAKEUP — framework-level
-     */
-    @android.annotation.SuppressLint("BlockedPrivateApi")
-    private fun forceWakeScreen() {
-        serviceScope.launch(Dispatchers.IO) {
-            try {
-                FileLog.i(TAG, "Force-waking physical display")
-
-                // Layer 0: Restore SurfaceFlinger-level display power via Shizuku.
-                // The VD server powers off the physical panel directly via
-                // DisplayControl.setDisplayPowerMode(0) — a deeper off than PowerManager
-                // can recover from. Its own cleanup() only runs if the process exits
-                // cleanly (CMD_STOP received). When the lifecycle channel breaks so
-                // CMD_STOP never arrives, or the process hangs in a native futex,
-                // cleanup() never runs and the panel stays off → phone is unusable.
-                // PowerManager wakeUp/wake-locks cannot reverse this; only
-                // setDisplayPowerMode(2) / "cmd display power-on" can, which needs
-                // shell privileges (Shizuku). Kill the VD server first so it stops
-                // re-powering-off the panel every second during touch injection.
-                if (ShizukuManager.isAvailable) {
-                    try {
-                        ShizukuManager.execAndWait("pkill -9 -f PipelineServer 2>/dev/null")
-                        delay(150)
-                        ShizukuManager.execAndWait("cmd display power-on 0 2>/dev/null")
-                        val targetIme = savedDefaultIme
-                            ?: getSharedPreferences("dilinkauto", MODE_PRIVATE).getString("saved_default_ime", null)
-                        if (!targetIme.isNullOrBlank() && targetIme != "null" && !targetIme.contains("linkpc", ignoreCase = true)) {
-                            ShizukuManager.execAndWait("ime enable $targetIme; ime set $targetIme; settings put secure default_input_method $targetIme 2>/dev/null")
-                            FileLog.i(TAG, "Original IME restored via Shizuku: $targetIme")
-                        }
-                        savedDefaultIme = null
-                        FileLog.i(TAG, "Physical display restored via Shizuku (pkill + power-on + IME)")
-                    } catch (e: Exception) {
-                        FileLog.w(TAG, "Shizuku display restore failed: ${e.message}")
-                    }
-                }
-
-                val pm = getSystemService(POWER_SERVICE) as PowerManager
-
-                // Layer 1: PowerManager.wakeUp() — direct system call
-                try {
-                    val wakeUp = PowerManager::class.java.getDeclaredMethod(
-                        "wakeUp", Long::class.javaPrimitiveType,
-                        Int::class.javaPrimitiveType, String::class.java
-                    )
-                    wakeUp.invoke(pm, android.os.SystemClock.uptimeMillis(),
-                        5 /* WAKE_REASON_APPLICATION */, "DiLink:restore")
-                    FileLog.i(TAG, "Display wakeUp() succeeded from cleanupSession")
-                } catch (e: Exception) {
-                    FileLog.d(TAG, "wakeUp() not available from cleanupSession: ${e.message}")
-                }
-
-                // Layer 2: Launch MainActivity with FLAG_TURN_SCREEN_ON.
-                // WindowManager wakes the display as part of bringing the
-                // activity to the foreground, regardless of the display's
-                // current power state.
-                try {
-                    val intent = Intent(this@ConnectionService, Class.forName("com.dilinkauto.client.MainActivity"))
-                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    intent.addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
-                    intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
-                    intent.addFlags(0x10000000) // FLAG_TURN_SCREEN_ON
-                    startActivity(intent)
-                    FileLog.i(TAG, "Launched MainActivity with FLAG_TURN_SCREEN_ON from cleanupSession")
-                } catch (e: Exception) {
-                    FileLog.d(TAG, "Activity launch for wake failed from cleanupSession: ${e.message}")
-                }
-
-                // Layer 3: WakeLock with ACQUIRE_CAUSES_WAKEUP
-                @Suppress("DEPRECATION")
-                val flags = android.os.PowerManager.SCREEN_BRIGHT_WAKE_LOCK or
-                    android.os.PowerManager.ACQUIRE_CAUSES_WAKEUP or
-                    android.os.PowerManager.ON_AFTER_RELEASE
-                val wl = pm.newWakeLock(flags, "DiLink:display:restore2")
-                wl.acquire(3000)
-                wl.release()
-            } catch (e: Exception) {
-                FileLog.w(TAG, "forceWakeScreen error: ${e.message}")
-            }
-        }
+        val ime = savedDefaultIme
+        savedDefaultIme = null
+        displayRestorer.restore(ime)
     }
 
     private fun stopEverything() {
         connectionLoopJob?.cancel()
         connectionLoopJob = null
         cleanupSession()
-        lastSentIconHash.clear()
+        appListBuilder.resetIconHashes()
         serviceRegistration?.unregister()
         serviceRegistration = null
         _serviceState.value = State.IDLE
@@ -1029,7 +796,6 @@ class ConnectionService : Service() {
 
     companion object {
         private const val TAG = "ConnectionService"
-        private const val VD_SERVER_PORT = 19647
         const val ACTION_START = "com.dilinkauto.client.START"
         const val ACTION_STOP = "com.dilinkauto.client.STOP"
         const val ACTION_INSTALL_CAR = "com.dilinkauto.client.INSTALL_CAR"
@@ -1043,9 +809,9 @@ class ConnectionService : Service() {
         fun setLogEnabled(context: android.content.Context, enabled: Boolean) {
             FileLog.enabled = enabled
             // Persist both the value and the fact that user explicitly set it
-            context.getSharedPreferences("dilinkauto", android.content.Context.MODE_PRIVATE)
-                .edit().putBoolean("log_enabled", enabled)
-                .putBoolean("log_enabled_user_set", true).apply()
+            context.getSharedPreferences(AppPrefs.FILE_NAME, android.content.Context.MODE_PRIVATE)
+                .edit().putBoolean(AppPrefs.LOG_ENABLED, enabled)
+                .putBoolean(AppPrefs.LOG_ENABLED_USER_SET, true).apply()
             val conn = activeConnection
             if (conn != null && conn.isConnected) {
                 try { conn.sendData(DataMsg.LOG_TOGGLE, byteArrayOf(if (enabled) 1 else 0)) }

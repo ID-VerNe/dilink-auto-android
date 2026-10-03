@@ -3,6 +3,7 @@ package com.dilinkauto.client.service
 import android.content.Context
 import com.dilinkauto.client.FileLog
 import com.dilinkauto.client.R
+import com.dilinkauto.protocol.Discovery
 import dadb.AdbKeyPair
 import dadb.Dadb
 import java.io.File
@@ -93,7 +94,7 @@ class CarAppInstaller(
 
         if (result.contains("Success")) {
             onStatus.invoke(context.getString(R.string.car_install_status_launching_car_app))
-            dadb.shell("am start --activity-clear-task -n com.dilinkauto.server/.MainActivity")
+            dadb.shell("am start --activity-clear-task -n ${com.dilinkauto.protocol.AppTargets.CAR_MAIN_ACTIVITY}")
         }
         return result
     }
@@ -108,7 +109,7 @@ class CarAppInstaller(
 
     companion object {
         private const val TAG = "CarAppInstaller"
-        private const val CAR_ADB_PORT = 5555
+        private const val CAR_ADB_PORT = Discovery.ADB_PORT
         private const val DADB_TIMEOUT_SECONDS = 15L
     }
 }

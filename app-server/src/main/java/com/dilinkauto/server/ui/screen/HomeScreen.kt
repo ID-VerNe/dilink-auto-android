@@ -1,19 +1,50 @@
 package com.dilinkauto.server.ui.screen
 
-import android.util.Log
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.grid.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.filled.Apps
+import androidx.compose.material.icons.filled.Chat
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.MusicNote
+import androidx.compose.material.icons.filled.Navigation
+import androidx.compose.material.icons.filled.PushPin
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.outlined.PushPin
-import androidx.compose.material3.*
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.collectAsState
@@ -26,27 +57,29 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.dilinkauto.protocol.*
+import com.dilinkauto.protocol.AppCategory
+import com.dilinkauto.protocol.AppInfo
+import com.dilinkauto.protocol.MediaAction
+import com.dilinkauto.protocol.PlaybackState
 import com.dilinkauto.server.R
 import com.dilinkauto.server.ServerApp
 import com.dilinkauto.server.service.CarConnectionService
-import com.dilinkauto.server.ui.theme.*
+import com.dilinkauto.server.ui.theme.CommunicationColor
+import com.dilinkauto.server.ui.theme.MusicColor
+import com.dilinkauto.server.ui.theme.NavigationColor
+import com.dilinkauto.server.ui.theme.OtherColor
 import kotlin.math.max
 
 /**
  * Home screen content: app grid (or connection status) + now playing bar.
  * No navigation controls — those are in the persistent nav bar.
- *
- * Formerly `LauncherScreen.kt` hosted both a dead top-level entry (`LauncherScreen`,
- * `CarStatusBar`, `SideNavBar`, `NavButton`) and these live composables. The dead
- * shell was removed; the live composables moved here so the home screen has a single
- * source of truth.
  */
 @Composable
 fun HomeContent(
@@ -67,13 +100,13 @@ fun HomeContent(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(32.dp),
-                contentAlignment = androidx.compose.ui.Alignment.Center
+                contentAlignment = Alignment.Center
             ) {
                 Text(
                     stringResource(R.string.home_allowlist_empty),
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     fontSize = 16.sp,
-                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                    textAlign = TextAlign.Center
                 )
             }
         } else if (state == CarConnectionService.State.STREAMING && appList.isNotEmpty()) {
@@ -135,7 +168,7 @@ fun AppGrid(
     var searchQuery by remember { mutableStateOf("") }
     val gridState = rememberLazyGridState()
 
-    val context = androidx.compose.ui.platform.LocalContext.current
+    val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("dilinkauto_pinned", android.content.Context.MODE_PRIVATE) }
     var pinnedApps by remember {
         mutableStateOf(prefs.getStringSet("pinned_apps", emptySet())?.toSet() ?: emptySet())
@@ -356,197 +389,6 @@ fun AppTile(
                 },
                 modifier = Modifier.padding(vertical = 4.dp)
             )
-        }
-    }
-}
-
-@Composable
-fun ConnectionStatus(
-    state: CarConnectionService.State,
-    modifier: Modifier,
-    onManualConnect: (String) -> Unit = {}
-) {
-    Box(
-        modifier = modifier.fillMaxSize(),
-        contentAlignment = Alignment.Center
-    ) {
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            modifier = Modifier.widthIn(max = 500.dp)
-        ) {
-            when (state) {
-                CarConnectionService.State.IDLE -> {
-                    CircularProgressIndicator(
-                        color = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(48.dp)
-                    )
-                    Spacer(Modifier.height(24.dp))
-                    Text(
-                        stringResource(R.string.searching_for_phone),
-                        style = MaterialTheme.typography.headlineMedium,
-                        color = Color.White
-                    )
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        stringResource(R.string.phone_hint),
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        textAlign = TextAlign.Center
-                    )
-
-                    // Manual connect option
-                    Spacer(Modifier.height(32.dp))
-                    ManualConnectBox(onConnect = onManualConnect)
-                }
-                CarConnectionService.State.CONNECTING -> {
-                    CircularProgressIndicator(
-                        color = Color(0xFFFFA726),
-                        modifier = Modifier.size(48.dp)
-                    )
-                    Spacer(Modifier.height(24.dp))
-                    Text(
-                        stringResource(R.string.connecting),
-                        style = MaterialTheme.typography.headlineMedium,
-                        color = Color.White
-                    )
-                }
-                CarConnectionService.State.CONNECTED -> {
-                    Icon(
-                        Icons.Default.PhoneAndroid,
-                        contentDescription = null,
-                        tint = Color(0xFF4CAF50),
-                        modifier = Modifier.size(48.dp)
-                    )
-                    Spacer(Modifier.height(24.dp))
-                    Text(
-                        stringResource(R.string.connected_waiting_for_data),
-                        style = MaterialTheme.typography.headlineMedium,
-                        color = Color.White
-                    )
-                }
-                CarConnectionService.State.STREAMING -> {
-                    // Won't reach here since we show AppGrid when streaming
-                }
-            }
-        }
-    }
-}
-
-@Composable
-fun ManualConnectBox(onConnect: (String) -> Unit) {
-    val context = androidx.compose.ui.platform.LocalContext.current
-    val prefs = remember { context.getSharedPreferences("dilinkauto", android.content.Context.MODE_PRIVATE) }
-    val savedIp = remember { prefs.getString("last_manual_ip", null) }
-    val gatewayIp = remember {
-        try {
-            val wm = context.getSystemService(android.content.Context.WIFI_SERVICE) as android.net.wifi.WifiManager
-            val gw = wm.dhcpInfo.gateway
-            if (gw != 0) String.format("%d.%d.%d.%d", gw and 0xFF, (gw shr 8) and 0xFF, (gw shr 16) and 0xFF, (gw shr 24) and 0xFF)
-            else ""
-        } catch (_: Exception) { "" }
-    }
-    var ipAddress by remember {
-        mutableStateOf(savedIp ?: gatewayIp.ifEmpty { "192.168.43.1" })
-    }
-
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
-    ) {
-        Column(modifier = Modifier.padding(20.dp)) {
-            Text(
-                stringResource(R.string.manual_connect_label),
-                style = MaterialTheme.typography.labelLarge,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Spacer(Modifier.height(12.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                OutlinedTextField(
-                    value = ipAddress,
-                    onValueChange = { ipAddress = it },
-                    label = { Text(stringResource(R.string.manual_connect_ip_label)) },
-                    singleLine = true,
-                    modifier = Modifier.weight(1f),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedTextColor = Color.White,
-                        unfocusedTextColor = Color.White,
-                        focusedBorderColor = MaterialTheme.colorScheme.primary,
-                        unfocusedBorderColor = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                )
-                Spacer(Modifier.width(12.dp))
-                Button(
-                    onClick = {
-                        val ip = ipAddress.trim()
-                        if (ip.isNotBlank()) {
-                            prefs.edit().putString("last_manual_ip", ip).apply()
-                            onConnect(ip)
-                        }
-                    },
-                    modifier = Modifier.height(56.dp),
-                    shape = RoundedCornerShape(12.dp)
-                ) {
-                    Text(stringResource(R.string.manual_connect_button))
-                }
-            }
-        }
-    }
-}
-
-@Composable
-fun NowPlayingBar(
-    metadata: MediaMetadata,
-    playbackState: PlaybackState?,
-    onPlayPause: () -> Unit,
-    onNext: () -> Unit,
-    onPrevious: () -> Unit
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(Color(0xFF0A0E14))
-            .padding(horizontal = 24.dp, vertical = 12.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        // Track info
-        Column(modifier = Modifier.weight(1f)) {
-            Text(
-                metadata.title,
-                style = MaterialTheme.typography.titleMedium,
-                color = Color.White,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-            Text(
-                "${metadata.artist} — ${metadata.album}",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-        }
-
-        // Controls — large touch targets for car use
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            IconButton(onClick = onPrevious, modifier = Modifier.size(48.dp)) {
-                Icon(Icons.Default.SkipPrevious, "Previous", tint = Color.White, modifier = Modifier.size(32.dp))
-            }
-            IconButton(onClick = onPlayPause, modifier = Modifier.size(56.dp)) {
-                Icon(
-                    if (playbackState?.state == PlaybackState.PLAYING)
-                        Icons.Default.Pause else Icons.Default.PlayArrow,
-                    "Play/Pause",
-                    tint = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.size(40.dp)
-                )
-            }
-            IconButton(onClick = onNext, modifier = Modifier.size(48.dp)) {
-                Icon(Icons.Default.SkipNext, "Next", tint = Color.White, modifier = Modifier.size(32.dp))
-            }
         }
     }
 }
