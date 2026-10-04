@@ -66,12 +66,17 @@ data class HandshakeRequest(
      * small" for landscape apps at the cost of squeezing portrait-only apps.
      * Trailing field, so older peers that don't send it decode 0 (auto).
      */
-    val dpiOverride: Int = 0
+    val dpiOverride: Int = 0,
+    /**
+     * Car-side requested video bitrate in bps (e.g. 2_000_000, 3_000_000, 4_000_000).
+     * 0 = default (4 Mbps). Trailing field for backward compatibility.
+     */
+    val bitrate: Int = 0
 ) {
     fun encode(): ByteArray {
         val nameBytes = deviceName.toByteArray(Charsets.UTF_8)
         val verNameBytes = appVersionName.toByteArray(Charsets.UTF_8)
-        val buf = ByteBuffer.allocate(4 + 2 + nameBytes.size + 4 + 4 + 4 + 1 + 4 + 4 + 4 + 2 + verNameBytes.size + 4)
+        val buf = ByteBuffer.allocate(4 + 2 + nameBytes.size + 4 + 4 + 4 + 1 + 4 + 4 + 4 + 2 + verNameBytes.size + 4 + 4)
             .order(ByteOrder.BIG_ENDIAN)
         buf.putInt(protocolVersion)
         buf.putShort(nameBytes.size.toShort())
@@ -86,6 +91,7 @@ data class HandshakeRequest(
         buf.putShort(verNameBytes.size.toShort())
         buf.put(verNameBytes)
         buf.putInt(dpiOverride)
+        buf.putInt(bitrate)
         return buf.array()
     }
 
@@ -105,7 +111,8 @@ data class HandshakeRequest(
                 appVersionCode = if (buf.remaining() >= 4) buf.getInt() else 0,
                 targetFps = if (buf.remaining() >= 4) buf.getInt() else 30,
                 appVersionName = if (buf.remaining() >= 2) buf.readShortLengthPrefixed() else "",
-                dpiOverride = if (buf.remaining() >= 4) buf.getInt() else 0
+                dpiOverride = if (buf.remaining() >= 4) buf.getInt() else 0,
+                bitrate = if (buf.remaining() >= 4) buf.getInt() else 0
             )
             return request
         }

@@ -24,6 +24,7 @@ import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -110,7 +111,10 @@ fun CarShell(service: CarConnectionService) {
         val isLandscape = configuration.screenWidthDp > configuration.screenHeightDp
 
         if (isLandscape) {
-            Row(modifier = Modifier.fillMaxSize()) {
+            Row(modifier = Modifier
+                .fillMaxSize()
+                .background(MaterialTheme.colorScheme.background)
+            ) {
                 PersistentNavBar(
                     onBack = { service.goBack() },
                     onHome = {
@@ -120,7 +124,8 @@ fun CarShell(service: CarConnectionService) {
                     onDisconnect = {
                         service.disconnectFromPhone()
                         currentScreen = Screen.HOME
-                    }
+                    },
+                    modifier = Modifier.zIndex(1f)
                 )
                 CarContentArea(
                     service = service,

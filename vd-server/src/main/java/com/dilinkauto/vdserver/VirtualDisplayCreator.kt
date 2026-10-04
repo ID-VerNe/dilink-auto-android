@@ -58,7 +58,6 @@ internal class VirtualDisplayCreator(
             val bld = bldCtor.newInstance("DiLinkAutoVD", displayWidth, displayHeight, dpi)
             bldClass.getDeclaredMethod("setSurface", Surface::class.java).apply { isAccessible = true; invoke(bld, surface) }
             bldClass.getDeclaredMethod("setFlags", Int::class.javaPrimitiveType).apply { isAccessible = true; invoke(bld, 0x6c49) }
-            try { bldClass.getDeclaredMethod("setDisplayIdToMirror", Int::class.javaPrimitiveType).apply { isAccessible = true; invoke(bld, 0) } } catch (_: NoSuchMethodException) {}
             val cfg = bldClass.getDeclaredMethod("build").apply { isAccessible = true }.invoke(bld)
             val cbClass = Class.forName("android.hardware.display.IVirtualDisplayCallback")
             val createVd: Method = try {
@@ -82,7 +81,6 @@ internal class VirtualDisplayCreator(
             log("DisplayManager...")
             val ctor = DisplayManager::class.java.getDeclaredConstructor(android.content.Context::class.java)
             ctor.isAccessible = true; val dm = ctor.newInstance(FakeContext.get())
-            try { DisplayManager::class.java.getDeclaredField("mDisplayIdToMirror").apply { isAccessible = true; setInt(dm, 0) } } catch (_: Exception) {}
             val flags = (DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY or (1 shl 6) or (1 shl 10) or (1 shl 11) or (1 shl 13) or (1 shl 14))
             val vd = dm.createVirtualDisplay("DiLinkAutoVD", displayWidth, displayHeight, dpi, surface, flags)
             displayId = try { vd.display.displayId } catch (_: Exception) { findDisplayId("DiLinkAutoVD") }

@@ -20,7 +20,8 @@ class MessagesTest {
             appVersionCode = 100,
             targetFps = 60,
             appVersionName = "1.0.0",
-            dpiOverride = 213
+            dpiOverride = 213,
+            bitrate = 3_000_000
         )
         val encoded = original.encode()
         val decoded = HandshakeRequest.decode(encoded)
@@ -36,6 +37,7 @@ class MessagesTest {
         assertEquals(original.targetFps, decoded.targetFps)
         assertEquals(original.appVersionName, decoded.appVersionName)
         assertEquals(original.dpiOverride, decoded.dpiOverride)
+        assertEquals(original.bitrate, decoded.bitrate)
     }
 
     @Test

@@ -87,9 +87,10 @@ object VdDeploy {
         encodeHeight: Int,
         phoneHost: String,
         fps: Int,
+        bitrate: Int = VideoConfig.DEFAULT_BITRATE,
         background: Boolean
     ): DeployPlan {
-        val args = VdDeployArgs.format(vdWidth, vdHeight, dpi, phoneHost, encodeWidth, encodeHeight, fps)
+        val args = VdDeployArgs.format(vdWidth, vdHeight, dpi, phoneHost, encodeWidth, encodeHeight, fps, bitrate)
         return DeployPlan(
             args = args,
             killCommand = killCommand,

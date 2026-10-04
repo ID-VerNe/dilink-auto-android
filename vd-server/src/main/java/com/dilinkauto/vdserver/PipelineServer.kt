@@ -35,7 +35,7 @@ import java.util.concurrent.locks.LockSupport
 class PipelineServer(
     private val displayWidth: Int, private val displayHeight: Int, private val dpi: Int,
     private val phoneHost: String, private val encodeWidth: Int, private val encodeHeight: Int,
-    private val fps: Int
+    private val fps: Int, private val bitrate: Int = BITRATE
 ) {
     private val frameIntervalNanos = 1_000_000_000L / fps
     @Volatile private var running = true
@@ -94,8 +94,9 @@ class PipelineServer(
             val d = args.getOrNull(2)?.toInt() ?: 120; val ph = args.getOrNull(3) ?: "127.0.0.1"
             val ew = args.getOrNull(4)?.toInt() ?: w; val eh = args.getOrNull(5)?.toInt() ?: h
             val f = args.getOrNull(6)?.toInt() ?: 30
-            log("Starting: VD=${w}x${h} @${d}dpi, encode=${ew}x${eh}, phoneHost=$ph, fps=$f")
-            PipelineServer(w, h, d, ph, ew, eh, f).run()
+            val br = args.getOrNull(7)?.toInt() ?: BITRATE
+            log("Starting: VD=${w}x${h} @${d}dpi, encode=${ew}x${eh}, phoneHost=$ph, fps=$f, bitrate=${br/1_000_000}M")
+            PipelineServer(w, h, d, ph, ew, eh, f, br).run()
         }
         private fun log(msg: String) = PipeLog.log(msg)
         private fun err(msg: String) = PipeLog.err(msg)
@@ -114,7 +115,7 @@ class PipelineServer(
 
             glPipeline = GlPipeline(
                 displayWidth, displayHeight, encodeWidth, encodeHeight, fps,
-                frameIntervalNanos, BITRATE
+                frameIntervalNanos, bitrate
             ).also { it.encoderSurface = encoderSurface }
 
             // Start pipeline thread — it initializes EGL/GL and signals when VD input surface is ready
@@ -141,7 +142,7 @@ class PipelineServer(
     private fun setupEncoder() {
         val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, encodeWidth, encodeHeight)
         format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-        format.setInteger(MediaFormat.KEY_BIT_RATE, BITRATE)
+        format.setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
         format.setInteger(MediaFormat.KEY_FRAME_RATE, fps)
         format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, I_FRAME_INTERVAL)
         format.setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
@@ -150,7 +151,7 @@ class PipelineServer(
         format.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0); format.setInteger(MediaFormat.KEY_OPERATING_RATE, fps)
         format.setLong("repeat-previous-frame-after", 500_000L)
         encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).also { it.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE) }
-        log("Encoder: ${encodeWidth}x${encodeHeight} CBR@${BITRATE/1_000_000}Mbps Main ${fps}fps")
+        log("Encoder: ${encodeWidth}x${encodeHeight} CBR@${bitrate/1_000_000}Mbps Main ${fps}fps")
     }
 
     // ── VD Creation ──
@@ -180,6 +181,7 @@ class PipelineServer(
         val phoneChannel = connectToPhoneHost() ?: run { try { videoServer.close() } catch (_: Exception) {}; try { inputServer.close() } catch (_: Exception) {}; return null }
         try { sendDisplayReady(phoneChannel); log("Display ready sent") } catch (e: Exception) { err("Display ready: ${e.message}"); try { phoneChannel.close() } catch (_: Exception) {}; try { videoServer.close() } catch (_: Exception) {}; try { inputServer.close() } catch (_: Exception) {}; return null }
         lifecycleChannel = phoneChannel
+        execShell("input keyevent 224"); log("Waking up device to ensure VD activities resume")
         execShell("am start --display $displayId -a android.intent.action.MAIN -c android.intent.category.HOME"); log("Home launched")
         moveTopApp(0, displayId)
         displayController.setPhysicalDisplayPower(false); lastPowerOffTime = System.currentTimeMillis()

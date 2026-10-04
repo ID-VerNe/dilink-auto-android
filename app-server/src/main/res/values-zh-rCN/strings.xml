@@ -44,6 +44,16 @@
     <string name="startup_dpi_desc">0 = 自动校准（适用于大多数车机）</string>
     <string name="startup_dpi_hint">DPI 越高 UI 越大。范围 120–480。竖屏应用可能被挤压。</string>
 
+    <!-- Video Bitrate Settings -->
+    <string name="video_bitrate_title">视频码率</string>
+    <string name="video_bitrate_desc">降低码率可大幅减轻 Wi-Fi 传输延迟与车机硬解码压力</string>
+    <string name="video_bitrate_hint">骁龙 439 建议 2.5–4 Mbps，兼顾文字清晰度与流畅度</string>
+
+    <!-- Video FPS Settings -->
+    <string name="video_fps_title">目标帧率</string>
+    <string name="video_fps_desc">投屏画面帧率。降低帧率可减少 CPU/GPU 渲染负担</string>
+    <string name="video_fps_hint">24 FPS 相比 30 FPS 可节省 20% 的硬解计算与传输负载</string>
+
     <!-- Manual Connect -->
     <string name="manual_connect_label">或通过 IP 手动连接</string>
     <string name="manual_connect_ip_label">手机 IP 地址</string>

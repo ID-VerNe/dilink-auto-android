@@ -44,6 +44,16 @@
     <string name="startup_dpi_desc">0 = auto-calibrate (recommended for most cars)</string>
     <string name="startup_dpi_hint">Higher DPI = larger UI. Values 120–480. May squeeze portrait-only apps.</string>
 
+    <!-- Video Bitrate Settings -->
+    <string name="video_bitrate_title">Video Bitrate</string>
+    <string name="video_bitrate_desc">Lower bitrate reduces Wi-Fi transmission &amp; decoder pressure</string>
+    <string name="video_bitrate_hint">Recommended: 2.5–4 Mbps for weak car chips (Snapdragon 439)</string>
+
+    <!-- Video FPS Settings -->
+    <string name="video_fps_title">Target FPS</string>
+    <string name="video_fps_desc">Frame rate sent to decoder. Lower FPS reduces CPU/GPU load</string>
+    <string name="video_fps_hint">24 FPS cuts 20% CPU/GPU and Wi-Fi load vs 30 FPS</string>
+
     <!-- Manual Connect -->
     <string name="manual_connect_label">Or connect manually by IP</string>
     <string name="manual_connect_ip_label">Phone IP address</string>

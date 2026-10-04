@@ -21,7 +21,8 @@ internal fun buildHandshakeRequest(
     screenHeight: Int,
     screenDpi: Int,
     targetFps: Int,
-    dpiOverride: Int
+    dpiOverride: Int,
+    bitrate: Int = 0
 ): HandshakeRequest {
     val pi = context.packageManager.getPackageInfo(context.packageName, 0)
     return HandshakeRequest(
@@ -32,6 +33,7 @@ internal fun buildHandshakeRequest(
         appVersionCode = @Suppress("DEPRECATION") pi.versionCode,
         targetFps = targetFps,
         appVersionName = pi.versionName ?: "",
-        dpiOverride = dpiOverride
+        dpiOverride = dpiOverride,
+        bitrate = bitrate
     )
 }

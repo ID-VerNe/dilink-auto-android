@@ -62,6 +62,8 @@ fun CarLaunchScreen(service: CarConnectionService) {
     val statusMessage by service.statusMessage.collectAsState()
     var devMode by remember { mutableStateOf(service.devMode) }
     var startupDpi by remember { mutableStateOf(service.startupDpi) }
+    var startupFps by remember { mutableStateOf(service.startupFps) }
+    var startupBitrate by remember { mutableStateOf(service.startupBitrate) }
 
     Box(
         modifier = Modifier
@@ -113,6 +115,16 @@ fun CarLaunchScreen(service: CarConnectionService) {
                             onStartupDpiChange = { newValue ->
                                 startupDpi = newValue
                                 service.startupDpi = newValue
+                            },
+                            startupFps = startupFps,
+                            onStartupFpsChange = { newValue ->
+                                startupFps = newValue
+                                service.startupFps = newValue
+                            },
+                            startupBitrate = startupBitrate,
+                            onStartupBitrateChange = { newValue ->
+                                startupBitrate = newValue
+                                service.startupBitrate = newValue
                             }
                         )
 
@@ -150,6 +162,16 @@ fun CarLaunchScreen(service: CarConnectionService) {
                         onStartupDpiChange = { newValue ->
                             startupDpi = newValue
                             service.startupDpi = newValue
+                        },
+                        startupFps = startupFps,
+                        onStartupFpsChange = { newValue ->
+                            startupFps = newValue
+                            service.startupFps = newValue
+                        },
+                        startupBitrate = startupBitrate,
+                        onStartupBitrateChange = { newValue ->
+                            startupBitrate = newValue
+                            service.startupBitrate = newValue
                         }
                     )
 
@@ -209,7 +231,11 @@ private fun ConnectionStatusCard(
     devMode: Boolean,
     onDevModeChange: (Boolean) -> Unit,
     startupDpi: Int,
-    onStartupDpiChange: (Int) -> Unit
+    onStartupDpiChange: (Int) -> Unit,
+    startupFps: Int,
+    onStartupFpsChange: (Int) -> Unit,
+    startupBitrate: Int,
+    onStartupBitrateChange: (Int) -> Unit
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -306,65 +332,183 @@ private fun ConnectionStatusCard(
                 }
 
                 Spacer(Modifier.height(12.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            stringResource(R.string.startup_dpi_title),
-                            color = Color.White,
-                            style = MaterialTheme.typography.titleSmall
-                        )
-                        Text(
-                            stringResource(R.string.startup_dpi_desc),
-                            color = if (startupDpi > 0) Color(0xFFFFA726) else MaterialTheme.colorScheme.onSurfaceVariant,
-                            style = MaterialTheme.typography.bodySmall
-                        )
+                // DPI Settings & Presets
+                SettingSection(
+                    title = stringResource(R.string.startup_dpi_title),
+                    subtitle = stringResource(R.string.startup_dpi_desc),
+                    hint = stringResource(R.string.startup_dpi_hint),
+                    currentValueText = if (startupDpi > 0) startupDpi.toString() else "Auto",
+                    isCustom = startupDpi !in listOf(0, 140, 160, 180, 200, 240),
+                    presets = listOf(
+                        "Auto" to 0,
+                        "140" to 140,
+                        "160 (标配)" to 160,
+                        "180" to 180,
+                        "200" to 200
+                    ),
+                    selectedPresetValue = startupDpi,
+                    onPresetSelected = { onStartupDpiChange(it) },
+                    onManualValueChange = { input ->
+                        val digits = input.filter { it in '0'..'9' }.take(3)
+                        val parsed = digits.toIntOrNull() ?: 0
+                        val coerced = com.dilinkauto.protocol.VdDeployArgs.coerceDpiOverride(parsed)
+                        onStartupDpiChange(coerced)
                     }
-                    // Single source of truth: startupDpi (the parent state). The field
-                    // displays it directly; typing calls onStartupDpiChange with the
-                    // coerced value, which updates startupDpi and flows back. No
-                    // separate dpiText state means no drift between what the field
-                    // shows and what is persisted/used.
-                    val displayText = if (startupDpi > 0) startupDpi.toString() else ""
-                    OutlinedTextField(
-                        value = displayText,
-                        onValueChange = { input ->
-                            // ASCII-only digit filter: Char.isDigit() accepts Unicode Nd
-                            // (Arabic-Indic, Devanagari) which toIntOrNull() rejects,
-                            // causing silent Auto fallback while the field showed a
-                            // non-ASCII char.
-                            val digits = input.filter { it in '0'..'9' }.take(3)
-                            val parsed = digits.toIntOrNull() ?: 0
-                            // Coerce via the shared range so the car UI and the phone
-                            // apply the same definition of a valid override.
-                            val coerced = com.dilinkauto.protocol.VdDeployArgs.coerceDpiOverride(parsed)
-                            onStartupDpiChange(coerced)
-                        },
-                        singleLine = true,
-                        placeholder = { Text("Auto", color = MaterialTheme.colorScheme.onSurfaceVariant) },
-                        keyboardOptions = KeyboardOptions(
-                            keyboardType = KeyboardType.Number,
-                            imeAction = ImeAction.Done
-                        ),
-                        modifier = Modifier.width(96.dp),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White,
-                            focusedBorderColor = MaterialTheme.colorScheme.primary,
-                            unfocusedBorderColor = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    )
-                }
-                Text(
-                    stringResource(R.string.startup_dpi_hint),
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    style = MaterialTheme.typography.bodySmall,
-                    lineHeight = 18.sp
+                )
+
+                Spacer(Modifier.height(16.dp))
+                // Bitrate Settings & Presets
+                SettingSection(
+                    title = stringResource(R.string.video_bitrate_title),
+                    subtitle = stringResource(R.string.video_bitrate_desc),
+                    hint = stringResource(R.string.video_bitrate_hint),
+                    currentValueText = "${startupBitrate / 1_000_000}M",
+                    isCustom = startupBitrate !in listOf(2_000_000, 2_500_000, 3_000_000, 4_000_000, 6_000_000),
+                    presets = listOf(
+                        "2M (极速)" to 2_000_000,
+                        "2.5M (推荐439)" to 2_500_000,
+                        "3M (均衡)" to 3_000_000,
+                        "4M (默认)" to 4_000_000,
+                        "6M (高清)" to 6_000_000
+                    ),
+                    selectedPresetValue = startupBitrate,
+                    onPresetSelected = { onStartupBitrateChange(it) },
+                    onManualValueChange = { input ->
+                        val digits = input.filter { it in '0'..'9' }.take(2)
+                        val mbps = digits.toIntOrNull() ?: 4
+                        val bps = (mbps.coerceIn(1, 20)) * 1_000_000
+                        onStartupBitrateChange(bps)
+                    },
+                    manualSuffix = "Mbps"
+                )
+
+                Spacer(Modifier.height(16.dp))
+                // FPS Settings & Presets
+                SettingSection(
+                    title = stringResource(R.string.video_fps_title),
+                    subtitle = stringResource(R.string.video_fps_desc),
+                    hint = stringResource(R.string.video_fps_hint),
+                    currentValueText = "${startupFps} FPS",
+                    isCustom = startupFps !in listOf(20, 24, 30, 60),
+                    presets = listOf(
+                        "20 FPS (超节能)" to 20,
+                        "24 FPS (推荐439)" to 24,
+                        "30 FPS (流畅)" to 30,
+                        "60 FPS (高刷)" to 60
+                    ),
+                    selectedPresetValue = startupFps,
+                    onPresetSelected = { onStartupFpsChange(it) },
+                    onManualValueChange = { input ->
+                        val digits = input.filter { it in '0'..'9' }.take(2)
+                        val fps = digits.toIntOrNull() ?: 24
+                        onStartupFpsChange(fps.coerceIn(10, 60))
+                    },
+                    manualSuffix = "FPS"
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun SettingSection(
+    title: String,
+    subtitle: String,
+    hint: String,
+    currentValueText: String,
+    isCustom: Boolean,
+    presets: List<Pair<String, Int>>,
+    selectedPresetValue: Int,
+    onPresetSelected: (Int) -> Unit,
+    onManualValueChange: (String) -> Unit,
+    manualSuffix: String = ""
+) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        title,
+                        color = Color.White,
+                        style = MaterialTheme.typography.titleSmall
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        currentValueText,
+                        color = Color(0xFFFFA726),
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    subtitle,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+
+            // Manual Input field
+            OutlinedTextField(
+                value = if (isCustom) currentValueText.replace(Regex("[^0-9]"), "") else "",
+                onValueChange = onManualValueChange,
+                singleLine = true,
+                placeholder = {
+                    Text(
+                        if (manualSuffix.isNotEmpty()) manualSuffix else "自定义",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontSize = 12.sp
+                    )
+                },
+                keyboardOptions = KeyboardOptions(
+                    keyboardType = KeyboardType.Number,
+                    imeAction = ImeAction.Done
+                ),
+                modifier = Modifier.width(96.dp),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedTextColor = Color.White,
+                    unfocusedTextColor = Color.White,
+                    focusedBorderColor = MaterialTheme.colorScheme.primary,
+                    unfocusedBorderColor = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            )
+        }
+
+        Spacer(Modifier.height(8.dp))
+
+        // Preset Chips Row
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            presets.forEach { (label, value) ->
+                val isSelected = selectedPresetValue == value
+                Button(
+                    onClick = { onPresetSelected(value) },
+                    shape = RoundedCornerShape(8.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (isSelected) MaterialTheme.colorScheme.primary else Color(0xFF21262D),
+                        contentColor = if (isSelected) Color.White else MaterialTheme.colorScheme.onSurfaceVariant
+                    ),
+                    modifier = Modifier.height(30.dp),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                ) {
+                    Text(label, fontSize = 11.sp, fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal)
+                }
+            }
+        }
+
+        Spacer(Modifier.height(4.dp))
+        Text(
+            hint,
+            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+            style = MaterialTheme.typography.bodySmall,
+            fontSize = 11.sp,
+            lineHeight = 15.sp
+        )
     }
 }
 

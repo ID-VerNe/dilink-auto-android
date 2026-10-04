@@ -35,6 +35,7 @@ class ConnectionService : Service() {
     private var vdWaitJob: Job? = null
     private var handshakeJob: Job? = null
     private var targetFps = 30
+    private var targetBitrate = VideoConfig.DEFAULT_BITRATE
     private var serviceRegistration: Discovery.ServiceRegistration? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var connectionLoopJob: Job? = null
@@ -348,8 +349,9 @@ class ConnectionService : Service() {
 
     private fun handleHandshake(request: HandshakeRequest) {
         val conn = controlConnection ?: return
-        FileLog.i(TAG, "Car display: ${request.screenWidth}x${request.screenHeight} @${request.screenDpi}dpi fps=${request.targetFps}")
+        FileLog.i(TAG, "Car display: ${request.screenWidth}x${request.screenHeight} @${request.screenDpi}dpi fps=${request.targetFps} bitrate=${request.bitrate}")
         targetFps = request.targetFps
+        targetBitrate = if (request.bitrate > 0) request.bitrate else VideoConfig.DEFAULT_BITRATE
 
         cacheDefaultIme()
 
@@ -520,6 +522,7 @@ class ConnectionService : Service() {
                 vdWidth = vdWidth, vdHeight = vdHeight, dpi = dpi,
                 encodeWidth = carWidth, encodeHeight = carHeight,
                 phoneHost = "127.0.0.1", fps = targetFps,
+                bitrate = targetBitrate,
                 background = false
             )
 

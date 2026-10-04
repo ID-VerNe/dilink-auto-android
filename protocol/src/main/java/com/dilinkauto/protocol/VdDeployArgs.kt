@@ -31,12 +31,17 @@ object VdDeployArgs {
         phoneHost: String,
         encodeWidth: Int,
         encodeHeight: Int,
-        fps: Int
+        fps: Int,
+        bitrate: Int = VideoConfig.DEFAULT_BITRATE
     ): String {
-        val ew = minOf(encodeWidth, MAX_ENCODE_WIDTH)
-        val eh = minOf(encodeHeight, MAX_ENCODE_HEIGHT)
-        return "$vdWidth $vdHeight $dpi $phoneHost $ew $eh $fps"
+        val ew = minOf(encodeWidth, MAX_ENCODE_WIDTH) and 0x7FFFFFFE
+        val eh = minOf(encodeHeight, MAX_ENCODE_HEIGHT) and 0x7FFFFFFE
+        val br = if (bitrate in MIN_BITRATE..MAX_BITRATE) bitrate else VideoConfig.DEFAULT_BITRATE
+        return "$vdWidth $vdHeight $dpi $phoneHost $ew $eh $fps $br"
     }
+
+    const val MIN_BITRATE = 500_000
+    const val MAX_BITRATE = 20_000_000
 
     /**
      * Coerce a raw DPI override to the valid range, with 0 = Auto (no override).

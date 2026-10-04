@@ -73,6 +73,17 @@ class CarConnectionService : Service() {
         get() = prefs.getInt("startup_dpi", 0)
         set(value) = prefs.edit().putInt("startup_dpi", value).apply()
 
+    var startupFps: Int
+        get() = prefs.getInt("startup_fps", VideoConfig.TARGET_FPS)
+        set(value) {
+            prefs.edit().putInt("startup_fps", value).apply()
+            targetFps = value
+        }
+
+    var startupBitrate: Int
+        get() = prefs.getInt("startup_bitrate", VideoConfig.DEFAULT_BITRATE)
+        set(value) = prefs.edit().putInt("startup_bitrate", value).apply()
+
     // ─── Handshake ───
     internal var handshakeVdDpi = VideoConfig.VIRTUAL_DISPLAY_DPI // DPI from phone (may be adjusted for DeX)
 
@@ -172,6 +183,7 @@ class CarConnectionService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        targetFps = startupFps
         logWriter.setEnabled(com.dilinkauto.server.BuildConfig.DEBUG)
         logWriter.start()
         videoDecoder.logSink = { msg -> carLogSend(msg) }
@@ -400,7 +412,8 @@ class CarConnectionService : Service() {
                     screenHeight = viewportHeight,
                     screenDpi = displayMetrics.densityDpi,
                     targetFps = targetFps,
-                    dpiOverride = startupDpi
+                    dpiOverride = startupDpi,
+                    bitrate = startupBitrate
                 )
                 ctrl.sendControl(ControlMsg.HANDSHAKE_REQUEST, handshake.encode())
                 handshakeDone = true  // Stop gateway/mDNS retry loops immediately
@@ -809,7 +822,7 @@ class CarConnectionService : Service() {
     var vdHeight = 792
         private set
     var targetFps: Int = VideoConfig.TARGET_FPS
-        private set
+        internal set
 
     /** Public log method for UI components (MirrorScreen, etc.) to route logs to phone */
     fun log(msg: String) = carLogSend(msg)
@@ -909,7 +922,8 @@ class CarConnectionService : Service() {
                 screenHeight = newVpH,
                 screenDpi = dpi,
                 targetFps = targetFps,
-                dpiOverride = startupDpi
+                dpiOverride = startupDpi,
+                bitrate = startupBitrate
             )
             try {
                 ctrl.sendControl(ControlMsg.HANDSHAKE_REQUEST, handshake.encode())

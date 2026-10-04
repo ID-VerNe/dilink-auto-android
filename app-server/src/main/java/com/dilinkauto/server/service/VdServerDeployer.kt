@@ -90,6 +90,7 @@ internal class VdServerDeployer(private val host: CarConnectionService) {
                 vdWidth = vdW, vdHeight = vdH, dpi = phoneDpi,
                 encodeWidth = vdW, encodeHeight = vdH,
                 phoneHost = "127.0.0.1", fps = host.targetFps,
+                bitrate = host.startupBitrate,
                 background = true
             )
 
@@ -138,6 +139,7 @@ internal class VdServerDeployer(private val host: CarConnectionService) {
             vdWidth = vdW, vdHeight = vdH, dpi = phoneDpi,
             encodeWidth = vdW, encodeHeight = vdH,
             phoneHost = "127.0.0.1", fps = host.targetFps,
+            bitrate = host.startupBitrate,
             background = true
         )
         host.setStatusMessage(R.string.status_preparing_vd)

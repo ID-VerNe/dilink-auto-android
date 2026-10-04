@@ -6,6 +6,9 @@ package com.dilinkauto.protocol
  */
 object VideoConfig {
     const val TARGET_FPS = 24  // 24fps: 42ms/frame budget on weak A53+Adreno 505; cuts WiFi/GPU/allocation 20% vs 30fps
+    const val DEFAULT_BITRATE = 4_000_000 // 4 Mbps CBR default
+    const val MIN_BITRATE = 1_000_000     // 1 Mbps
+    const val MAX_BITRATE = 12_000_000    // 12 Mbps
     const val FRAME_INTERVAL_MS = 1000L / TARGET_FPS  // ~42ms at 24fps
     const val VIRTUAL_DISPLAY_DPI = 480  // legacy fallback constant
     const val TARGET_SW_DP = 600  // smallest-width dp for VD size calculation

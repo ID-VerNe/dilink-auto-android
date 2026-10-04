@@ -194,8 +194,7 @@ fun AppGrid(
     }
 
     Column(modifier = modifier) {
-        Row(modifier = Modifier.weight(1f)) {
-            BoxWithConstraints(modifier = Modifier.weight(1f)) {
+        BoxWithConstraints(modifier = Modifier.weight(1f).fillMaxWidth()) {
                 // Fixed columns calculated from available width — same density as
                 // Adaptive(100.dp) but without the runtime measurement crash risk
                 val gridColumns = max(3, (maxWidth / 100.dp).toInt().coerceAtMost(12))
@@ -224,8 +223,6 @@ fun AppGrid(
                     }
                 }
             }
-
-        }
 
         // Search bar
         OutlinedTextField(
