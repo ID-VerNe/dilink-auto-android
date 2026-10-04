@@ -1,5 +1,6 @@
 package com.dilinkauto.server.ui.screen
 
+import android.util.Log
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -45,6 +46,9 @@ import com.dilinkauto.server.ui.nav.PersistentNavBar
  */
 enum class Screen { HOME, APP }
 
+/** UI 层日志 TAG：点击应用等交互记入 logcat（dev 模式下由 CarLogWriter 转发到手机） */
+private const val TAG = "CarShell"
+
 @Composable
 fun CarShell(service: CarConnectionService) {
     var currentScreen by remember { mutableStateOf(Screen.HOME) }
@@ -71,6 +75,7 @@ fun CarShell(service: CarConnectionService) {
     }
 
     val launchApp: (String) -> Unit = { pkg ->
+        Log.i(TAG, "launchApp clicked: $pkg -> switch to Screen.APP")
         service.launchApp(pkg)
         currentScreen = Screen.APP
     }

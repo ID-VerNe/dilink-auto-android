@@ -34,8 +34,11 @@ object VdDeployArgs {
         fps: Int,
         bitrate: Int = VideoConfig.DEFAULT_BITRATE
     ): String {
-        val ew = minOf(encodeWidth, MAX_ENCODE_WIDTH) and 0x7FFFFFFE
-        val eh = minOf(encodeHeight, MAX_ENCODE_HEIGHT) and 0x7FFFFFFE
+        // 等比缩放到编码上限内：此前宽高分开 clamp 会把竖屏 1080x2152 压成方形
+        // 1080x1080，导致车机端画面比例失真；等比缩放保持车机 viewport 原始宽高比。
+        val encodeScale = minOf(1f, MAX_ENCODE_WIDTH.toFloat() / encodeWidth, MAX_ENCODE_HEIGHT.toFloat() / encodeHeight)
+        val ew = (encodeWidth * encodeScale).toInt() and 0x7FFFFFFE
+        val eh = (encodeHeight * encodeScale).toInt() and 0x7FFFFFFE
         val br = if (bitrate in MIN_BITRATE..MAX_BITRATE) bitrate else VideoConfig.DEFAULT_BITRATE
         return "$vdWidth $vdHeight $dpi $phoneHost $ew $eh $fps $br"
     }

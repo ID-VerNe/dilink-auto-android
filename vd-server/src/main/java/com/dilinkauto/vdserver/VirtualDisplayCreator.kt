@@ -89,6 +89,54 @@ internal class VirtualDisplayCreator(
         } catch (e: Exception) { err("DisplayManager: ${e.message}"); return null }
     }
 
+    /**
+     * 检查并修复 Flyme(Android 15) 上偶发的 WM↔SF 层树脱同步（车机黑屏根因）。
+     *
+     * 该 ROM 新建 VD 时，把 DefaultTaskDisplayArea(DTA) 挂到 display 层树的
+     * reparent 事务可能丢失：DTA 停留在 SF 根的 Offscreen Hierarchy 下，
+     * display 子树里没有它 → 该 display 合成 0 层 → 输出黑帧。
+     * （WM 侧 dumpsys window 却显示 "(organized)"、任务 visible，极具迷惑性。）
+     *
+     * 检测：解析 dumpsys SurfaceFlinger 层树，DTA 必须出现在
+     * `Display <displayId> name=` 子树内。
+     * 修复：对该 display 做一次 user-rotation 往返 (lock 1 → lock 0)，
+     * 实测可强制 WindowManager 重新提交层树事务、把 DTA 挂回原位。
+     * 健康设备上检测通过即返回，零副作用。
+     */
+    fun ensureDtaAttached() {
+        if (displayId < 0) { err("DTA check skipped: display id unknown"); return }
+        when (isDtaAttachedUnderDisplay()) {
+            true -> { log("DTA attached — no repair needed"); return }
+            false -> log("DTA orphaned in Offscreen Hierarchy — repairing via rotation round-trip")
+            null -> log("DTA check inconclusive — applying preventive rotation round-trip")
+        }
+        repeat(2) { round ->
+            execShell("wm user-rotation -d $displayId lock 1")
+            Thread.sleep(1500)
+            execShell("wm user-rotation -d $displayId lock 0")
+            Thread.sleep(1500)
+            if (isDtaAttachedUnderDisplay() == true) { log("DTA repair OK (round ${round + 1})"); return }
+            err("DTA still orphaned after repair round ${round + 1}")
+        }
+        err("DTA repair failed after 2 rounds — car may show a black screen")
+    }
+
+    /**
+     * true  = DTA 在 display 子树内（健康）；
+     * false = DTA 孤立在 Offscreen Hierarchy（黑屏状态）；
+     * null  = dump 不可用或无法解析（保守起见按需要修复处理）。
+     */
+    private fun isDtaAttachedUnderDisplay(): Boolean? {
+        val dump = execShellOutput("dumpsys SurfaceFlinger") ?: return null
+        val start = dump.indexOf("Display $displayId name=")
+        if (start < 0) return null
+        // 区段终点 = 下一个 display 行 / Offscreen Hierarchy 段，取更早者
+        val nextDisplay = Regex("Display \\d+ name=").find(dump, start + 1)?.range?.first ?: -1
+        val offscreen = dump.indexOf("Offscreen Hierarchy", start)
+        val end = listOf(nextDisplay, offscreen).filter { it > start }.minOrNull() ?: dump.length
+        return dump.substring(start, end).contains("DefaultTaskDisplayArea")
+    }
+
     /** Apply the letterbox style + disable screen-off / wake gestures for the session. */
     private fun configureDisplayEnvironment() {
         try {

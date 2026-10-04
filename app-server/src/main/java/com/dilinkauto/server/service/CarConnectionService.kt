@@ -841,10 +841,17 @@ class CarConnectionService : Service() {
     /** Send a control command to the VD server directly via the input connection (port 9639) */
     private fun sendCommandToVd(msgType: Byte, payload: ByteArray = ByteArray(0)) {
         scope.launch(Dispatchers.IO) {
+            val tag = "sendCommandToVd 0x${Integer.toHexString(msgType.toInt() and 0xFF)}"
             try {
-                inputConnection?.sendControl(msgType, payload)
+                val conn = inputConnection
+                if (conn == null) {
+                    carLogSend("$tag dropped: inputConnection is null (VD server not connected?)", "W")
+                    return@launch
+                }
+                conn.sendControl(msgType, payload)
+                carLogSend("$tag sent (${payload.size}B)")
             } catch (e: Exception) {
-                carLogSend("sendCommandToVd 0x${msgType.toString(16)} failed: ${e.message}", "E")
+                carLogSend("$tag failed: ${e.message}", "E")
             }
         }
     }

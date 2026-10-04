@@ -136,7 +136,13 @@ class PipelineServer(
     }
 
     private fun initPersistentShell() {
-        try { persistentShell = Runtime.getRuntime().exec(arrayOf("sh")); shellInput = persistentShell!!.outputStream } catch (e: Exception) { err("Shell: ${e.message}") }
+        try {
+            persistentShell = Runtime.getRuntime().exec(arrayOf("sh"))
+            shellInput = persistentShell!!.outputStream
+            // 给持久 sh 挂 stdout/stderr 排水线程：防止管道无人读被写满后 sh 卡死（后续命令全部静默失效）
+            ShellExec.startOutputDrain(persistentShell!!)
+            log("Shell: persistent sh started")
+        } catch (e: Exception) { err("Shell: ${e.message}") }
     }
 
     private fun setupEncoder() {
@@ -184,6 +190,8 @@ class PipelineServer(
         execShell("input keyevent 224"); log("Waking up device to ensure VD activities resume")
         execShell("am start --display $displayId -a android.intent.action.MAIN -c android.intent.category.HOME"); log("Home launched")
         moveTopApp(0, displayId)
+        // 校验 DTA 是否挂在 display 层树内（Flyme 偶发 reparent 事务丢失 → 0 层黑屏），必要时旋转往返修复
+        vdCreator.ensureDtaAttached()
         displayController.setPhysicalDisplayPower(false); lastPowerOffTime = System.currentTimeMillis()
         val carVideo = acceptCarChannel(videoServer, "video", 30000) ?: run { err("Car video timeout"); try { phoneChannel.close() } catch (_: Exception) {}; return null }
         val carInput = acceptCarChannel(inputServer, "input", 30000) ?: run { err("Car input timeout"); try { phoneChannel.close() } catch (_: Exception) {}; try { carVideo.close() } catch (_: Exception) {}; return null }
@@ -321,6 +329,7 @@ class PipelineServer(
     }
 
     private fun handleCarCommand(f: FrameCodec.Frame) {
+        log("Car command received: 0x${Integer.toHexString(f.messageType.toInt() and 0xFF)}")
         when (f.messageType) {
             ControlMsg.LAUNCH_APP -> launchApp(LaunchAppMessage.decode(f.payload).packageName)
             ControlMsg.GO_BACK -> { execShell("input -d $displayId keyevent 4"); checkStackEmpty() }
@@ -330,9 +339,42 @@ class PipelineServer(
             ControlMsg.APP_INFO -> { val pkg = String(f.payload, Charsets.UTF_8); val s = execShellOutput("cmd package resolve-activity --brief -a android.settings.APPLICATION_DETAILS_SETTINGS com.android.settings")?.trim(); if (!s.isNullOrEmpty()) execShell("am start --display $displayId -n $s -d \"package:$pkg\"") else execShell("am start --display $displayId -a android.settings.APPLICATION_DETAILS_SETTINGS -d \"package:$pkg\"") }
         }
     }
-    private fun launchApp(pkg: String) { try { val c = execShellOutput("cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.LAUNCHER $pkg 2>/dev/null | tail -1")?.trim(); if (!c.isNullOrEmpty()) execShell("am start --display $displayId -n $c") else execShell("am start --display $displayId -a android.intent.action.MAIN -c android.intent.category.LAUNCHER $pkg") } catch (e: Exception) { err("launch: ${e.message}") } }
+    private fun launchApp(pkg: String) {
+        try {
+            log("launchApp: pkg=$pkg display=$displayId")
+            val raw = execShellOutput("cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.LAUNCHER $pkg 2>/dev/null | tail -1")?.trim()
+            // resolve-activity 失败时会返回 "No activity found" 之类的文本，不是组件名；
+            // 只有形如 "pkg/activity" 且不含空格的输出才可信，否则回退到隐式 intent。
+            val component = raw?.takeIf { it.contains('/') && !it.contains(' ') }
+            val out = if (component != null) {
+                log("launchApp: resolved component=$component")
+                execShellOutput("am start --display $displayId -n $component")
+            } else {
+                log("launchApp: resolve raw='${raw ?: "<null>"}' not a component — fallback to implicit intent")
+                execShellOutput("am start --display $displayId -a android.intent.action.MAIN -c android.intent.category.LAUNCHER $pkg")
+            }
+            // 同步执行并记录 am start 的完整输出（成功是 "Starting: Intent ..."，失败会带 Error/Exception）
+            log("launchApp: am start result='${out?.trim()?.replace(Regex("\\s+"), " ") ?: "<no output>"}'")
+        } catch (e: Exception) { err("launch: ${e.message}") }
+    }
 
-    private fun checkStackEmpty() { Thread({ try { Thread.sleep(300); val d = execShellOutput("dumpsys activity activities 2>/dev/null") ?: ""; val m = "Display #$displayId "; val s = d.indexOf(m); if (s < 0) { enqueueResponse(MSG_STACK_EMPTY, ByteArray(0)) } else { val nd = d.indexOf("Display #", s+m.length); val sec = if (nd >= 0) d.substring(s, nd) else d.substring(s); if (sec.lines().none { it.contains("Task{") }) enqueueResponse(MSG_STACK_EMPTY, ByteArray(0)) } } catch (_: Exception) {} }, "StackCheck").start() }
+    private fun checkStackEmpty() {
+        Thread({
+            try {
+                Thread.sleep(300) // 等 keyevent 生效后再查询
+                val d = execShellOutput("dumpsys activity activities 2>/dev/null") ?: ""
+                val m = "Display #$displayId "
+                val s = d.indexOf(m)
+                val empty = if (s < 0) true else {
+                    val nd = d.indexOf("Display #", s + m.length)
+                    val sec = if (nd >= 0) d.substring(s, nd) else d.substring(s)
+                    sec.lines().none { it.contains("Task{") }
+                }
+                log("checkStackEmpty: display=$displayId empty=$empty")
+                if (empty) enqueueResponse(MSG_STACK_EMPTY, ByteArray(0))
+            } catch (e: Exception) { err("checkStackEmpty: ${e.message}") }
+        }, "StackCheck").start()
+    }
 
     private val lifecycleWriteQueue = java.util.concurrent.ArrayBlockingQueue<ByteBuffer>(16)
     private val lifeWriterThread = Thread({
@@ -392,7 +434,7 @@ class PipelineServer(
             val d = execShellOutput("dumpsys activity activities 2>/dev/null") ?: return
             val m = "Display #$fromDisplay "
             val s = d.indexOf(m)
-            if (s < 0) return
+            if (s < 0) { log("moveTopApp: no 'Display #$fromDisplay' section found, skip"); return }
             val nd = d.indexOf("Display #", s + m.length)
             val sec = if (nd >= 0) d.substring(s, nd) else d.substring(s)
             val match = Regex("ActivityRecord\\{[^ ]+ [^ ]+ ([^/ ]+/[^ } ]+) t(\\d+)\\}").find(sec)
@@ -401,6 +443,8 @@ class PipelineServer(
             if (topComponent != null && taskId != null && !topComponent.contains("launcher", true) && !topComponent.contains("systemui", true)) {
                 log("Moving app $topComponent (Task $taskId) from display $fromDisplay to $toDisplay")
                 execShell("am display move-stack $taskId $toDisplay")
+            } else {
+                log("moveTopApp: nothing to move (top=${topComponent ?: "<none>"}, task=${taskId ?: "-"})")
             }
         } catch (e: Exception) {
             err("Failed to move app: ${e.message}")

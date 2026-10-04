@@ -81,6 +81,13 @@ class VideoDecoder {
     private var keyFramesFed = 0L
     private var keyFramesDropped = 0L
 
+    // 黑屏检测：编码器对近纯色画面输出的 I 帧极小（仅几百字节），正常画面的 I 帧至少几 KB。
+    // 连续多个 I 帧都小于阈值 → 疑似黑屏（VD 内容或应用渲染异常），告警一次；恢复正常后打印清除。
+    private var tinyKeyframeStreak = 0
+    private var blackScreenAlerted = false
+    private val blackScreenKeyframeMaxBytes = 2 * 1024
+    private val blackScreenAlertStreak = 3
+
     // Accumulated decode time for the current 30-frame window (Phase L1 / perf 9.3).
     // Reset at each per-30-frame log so the reported value is per-window, not lifetime.
     private var windowDecodeNanos = 0L
@@ -301,6 +308,20 @@ class VideoDecoder {
         receiveCount++
         val isKey = !isConfig && isKeyFrame(data)
         if (isKey) keyFramesReceived++
+        // 黑屏检测：连续多个 I 帧都极小视为疑似黑屏（去重告警一次），出现正常大小 I 帧则清除。
+        if (isKey) {
+            if (data.size < blackScreenKeyframeMaxBytes) {
+                tinyKeyframeStreak++
+                if (tinyKeyframeStreak >= blackScreenAlertStreak && !blackScreenAlerted) {
+                    blackScreenAlerted = true
+                    logW("Suspected BLACK SCREEN: $tinyKeyframeStreak consecutive tiny keyframes (<${blackScreenKeyframeMaxBytes}B), latest=${data.size}B")
+                }
+            } else {
+                if (blackScreenAlerted) log("Black screen alert cleared — keyframe=${data.size}B")
+                blackScreenAlerted = false
+                tinyKeyframeStreak = 0
+            }
+        }
         if (isConfig || isKey || receiveCount <= 3 || receiveCount % 60 == 0L) {
             log("onFrameReceived #$receiveCount isConfig=$isConfig isKey=$isKey size=${data.size} running=${running.get()} queue=${frameQueue.size}")
         }

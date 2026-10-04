@@ -128,7 +128,10 @@ class ConnectionService : Service() {
 
     private fun deployAssets() {
         serviceScope.launch(Dispatchers.IO) {
-            val dir = java.io.File(android.os.Environment.getExternalStorageDirectory(), VdDeploy.DIR_PATH)
+            // DIR_PATH 已是绝对路径（/sdcard/DiLinkAuto），直接使用。
+            // 不要再与 getExternalStorageDirectory() 拼接，否则 child 的前导斜杠
+            // 不会重置路径，会拼出 /storage/emulated/0/sdcard/DiLinkAuto 影子目录。
+            val dir = java.io.File(VdDeploy.DIR_PATH)
             dir.mkdirs()
             extractAsset(VdDeploy.JAR_NAME, java.io.File(dir, VdDeploy.JAR_NAME))
             extractAsset("app-server.apk", java.io.File(filesDir, "app-server.apk"))
@@ -505,10 +508,11 @@ class ConnectionService : Service() {
             return
         }
         try {
-            val dir = java.io.File(android.os.Environment.getExternalStorageDirectory(), VdDeploy.DIR_PATH)
+            // 同上：使用绝对路径常量，避免拼出影子目录导致引擎加载旧 jar
+            val dir = java.io.File(VdDeploy.DIR_PATH)
             if (!dir.exists()) dir.mkdirs()
-            val jarPath = java.io.File(dir, VdDeploy.JAR_NAME).absolutePath
-            val logPath = java.io.File(dir, VdDeploy.LOG_NAME).absolutePath
+            val jarPath = VdDeploy.JAR_PATH
+            val logPath = VdDeploy.LOG_PATH
             // VD dims (vdWidth/vdHeight) are the scaled-up values (preserves the
             // IME-crop fix for Chinese ROMs that hardcode IME width to phone
             // physical width). Encode dims (carWidth/carHeight) are the car-native
