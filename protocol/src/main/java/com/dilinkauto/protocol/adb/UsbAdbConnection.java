@@ -5,8 +5,6 @@ import android.hardware.usb.*;
 import android.util.Log;
 
 import java.io.*;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.security.*;
 import java.security.spec.*;
 import java.util.concurrent.*;
@@ -532,35 +530,15 @@ public class UsbAdbConnection {
                 // If the phone has "Always allow" checked for this key, CNXN follows immediately.
                 // If not, the phone sends another AUTH_TOKEN, and we fall through to RSA public key.
                 //
-                // CRITICAL: ADB sends a raw 20-byte token that must be treated as a PRE-HASHED
-                // SHA-1 digest. We must NOT hash it again. Use NONEwithRSA and manually prepend
-                // the SHA-1 DigestInfo ASN.1 prefix for PKCS#1 v1.5 padding.
-                // Reference: AOSP adb_auth_host.cpp uses RSA_sign(NID_sha1, token, ...)
-                //            python-adb uses Prehashed(SHA1()) with PKCS1v15
+                // ADB sends a raw 20-byte token that must be treated as a PRE-HASHED
+                // SHA-1 digest (see [AdbCrypto.signAuthToken] for the rationale).
                 try {
                     String fp = keyDiagInfo != null ? keyDiagInfo : "unknown";
                     log("Signing AUTH_TOKEN with stored key (" + fp + ") using prehashed SHA-1");
-
-                    // SHA-1 DigestInfo ASN.1 prefix (from PKCS#1 v1.5 spec)
-                    byte[] SHA1_DIGEST_INFO = {
-                        0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e,
-                        0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14
-                    };
-
-                    // Prepend DigestInfo to the raw token (treated as pre-hashed SHA-1)
-                    byte[] digestInfo = new byte[SHA1_DIGEST_INFO.length + data.length];
-                    System.arraycopy(SHA1_DIGEST_INFO, 0, digestInfo, 0, SHA1_DIGEST_INFO.length);
-                    System.arraycopy(data, 0, digestInfo, SHA1_DIGEST_INFO.length, data.length);
-
-                    // Sign with NONEwithRSA — applies PKCS#1 v1.5 type-1 padding, no hashing
-                    Signature sig = Signature.getInstance("NONEwithRSA");
-                    sig.initSign(keyPair.getPrivate());
-                    sig.update(digestInfo);
-                    byte[] signed = sig.sign();
-
-                    sendRaw(AdbProtocol.encodeAuth(AdbProtocol.AUTH_SIGNATURE, signed));
+                    sendRaw(AdbProtocol.encodeAuth(AdbProtocol.AUTH_SIGNATURE,
+                            AdbCrypto.signAuthToken(keyPair.getPrivate(), data)));
                     authSignatureSent = true;
-                    log("Sent AUTH_SIGNATURE (signatureLen=" + signed.length + ") — waiting for CNXN or second AUTH_TOKEN");
+                    log("Sent AUTH_SIGNATURE — waiting for CNXN or second AUTH_TOKEN");
                 } catch (Exception e) {
                     logE("Failed to sign auth token: " + e.getMessage());
                 }
@@ -569,7 +547,7 @@ public class UsbAdbConnection {
                 // Send our public key for user approval (phone shows "Allow USB debugging?" dialog).
                 logW("AUTH_SIGNATURE rejected — key not recognized by phone. Sending RSA public key for approval.");
                 try {
-                    byte[] pubKey = encodePublicKey(keyPair.getPublic());
+                    byte[] pubKey = AdbCrypto.encodePublicKey(keyPair.getPublic());
                     // Log key details for debugging key mismatch
                     String keyPreview = new String(pubKey, 0, Math.min(40, pubKey.length));
                     log("AUTH_RSAPUBLICKEY preview: [" + keyPreview + "...] len=" + pubKey.length
@@ -649,7 +627,7 @@ public class UsbAdbConnection {
                 KeyFactory kf = KeyFactory.getInstance("RSA");
                 PrivateKey priv = kf.generatePrivate(new PKCS8EncodedKeySpec(privBytes));
                 PublicKey pub = kf.generatePublic(new X509EncodedKeySpec(pubBytes));
-                String fp = fingerprint(pub.getEncoded());
+                String fp = AdbCrypto.fingerprint(pub.getEncoded());
                 keyDiagInfo = "LOADED path=" + privFile.getAbsolutePath() + " fp=" + fp;
                 log("Loaded existing ADB key pair (fingerprint=" + fp + ")");
                 return new KeyPair(pub, priv);
@@ -664,90 +642,13 @@ public class UsbAdbConnection {
             KeyPair kp = kpg.generateKeyPair();
             writeFile(privFile, kp.getPrivate().getEncoded());
             writeFile(pubFile, kp.getPublic().getEncoded());
-            String fp = fingerprint(kp.getPublic().getEncoded());
+            String fp = AdbCrypto.fingerprint(kp.getPublic().getEncoded());
             keyDiagInfo = "GENERATED path=" + privFile.getAbsolutePath() + " fp=" + fp;
             log("Generated NEW ADB key pair (fingerprint=" + fp + ") — phone will ask for auth");
             return kp;
         } catch (Exception e) {
             throw new RuntimeException("Failed to generate ADB key pair", e);
         }
-    }
-
-    /**
-     * Encode RSA public key in Android ADB format (ANDROID_PUBKEY).
-     * Reference: AOSP libcrypto_utils/android_pubkey.cpp, python-adb keygen.py
-     *
-     * Struct layout (little-endian):
-     *   uint32_t modulus_size_words  = ANDROID_PUBKEY_MODULUS_SIZE / 4
-     *   uint32_t n0inv              = r32 - modinv(n % r32, r32)   where r32 = 2^32
-     *   uint8_t  modulus[MODULUS_SIZE]   little-endian, zero-padded to MODULUS_SIZE
-     *   uint8_t  rr[MODULUS_SIZE]       little-endian, zero-padded to MODULUS_SIZE
-     *   uint32_t exponent
-     *
-     * Wire format: base64(struct) + " " + user@host + "\0"
-     */
-    private static final int ANDROID_PUBKEY_MODULUS_SIZE = 256; // 2048 bits / 8
-    private static final int ANDROID_PUBKEY_MODULUS_SIZE_WORDS = ANDROID_PUBKEY_MODULUS_SIZE / 4; // 64
-
-    private byte[] encodePublicKey(PublicKey publicKey) throws Exception {
-        java.security.interfaces.RSAPublicKey rsaKey = (java.security.interfaces.RSAPublicKey) publicKey;
-        java.math.BigInteger n = rsaKey.getModulus();
-        java.math.BigInteger e = rsaKey.getPublicExponent();
-
-        // n0inv = r32 - modinv(n % r32, r32)
-        // This is "-1/n[0] mod 2^32" — a Montgomery reduction parameter
-        java.math.BigInteger r32 = java.math.BigInteger.ONE.shiftLeft(32);
-        java.math.BigInteger n0inv_bi = r32.subtract(n.mod(r32).modInverse(r32));
-
-        // rr = (2^(ANDROID_PUBKEY_MODULUS_SIZE * 8))^2 mod n
-        // = 2^4096 mod n for 2048-bit keys
-        java.math.BigInteger rr = java.math.BigInteger.ONE
-                .shiftLeft(ANDROID_PUBKEY_MODULUS_SIZE * 8)  // 2^2048
-                .modPow(java.math.BigInteger.valueOf(2), n); // squared mod n
-
-        // Convert BigInteger to fixed-size little-endian byte array
-        byte[] modulusLE = bigIntToLEPadded(n, ANDROID_PUBKEY_MODULUS_SIZE);
-        byte[] rrLE = bigIntToLEPadded(rr, ANDROID_PUBKEY_MODULUS_SIZE);
-
-        // Pack struct: '<L L 256s 256s L' (little-endian)
-        int structSize = 4 + 4 + ANDROID_PUBKEY_MODULUS_SIZE + ANDROID_PUBKEY_MODULUS_SIZE + 4;
-        ByteBuffer struct = ByteBuffer.allocate(structSize).order(ByteOrder.LITTLE_ENDIAN);
-        struct.putInt(ANDROID_PUBKEY_MODULUS_SIZE_WORDS);
-        struct.putInt(n0inv_bi.intValue());
-        struct.put(modulusLE);
-        struct.put(rrLE);
-        struct.putInt(e.intValue());
-
-        byte[] structBytes = struct.array();
-        // Log struct header for debugging key mismatch
-        StringBuilder hex = new StringBuilder();
-        for (int i = 0; i < Math.min(12, structBytes.length); i++) {
-            hex.append(String.format("%02x", structBytes[i] & 0xFF));
-        }
-        log("RSAPUBLICKEY struct: words=" + ANDROID_PUBKEY_MODULUS_SIZE_WORDS
-            + " n0inv=0x" + String.format("%08x", n0inv_bi.intValue())
-            + " exp=" + e.intValue()
-            + " header=" + hex
-            + " structSize=" + structSize);
-
-        String base64 = android.util.Base64.encodeToString(structBytes, android.util.Base64.NO_WRAP);
-        String keyString = base64 + " DiLinkAuto@car\0";
-        return keyString.getBytes();
-    }
-
-    /** Convert a BigInteger to a fixed-size little-endian byte array, zero-padded. */
-    private static byte[] bigIntToLEPadded(java.math.BigInteger value, int size) {
-        // BigInteger.toByteArray() is big-endian with possible leading sign byte
-        byte[] be = value.toByteArray();
-        byte[] le = new byte[size]; // zero-filled
-
-        // Copy bytes in reverse order, skipping leading sign byte if present
-        int beStart = (be.length > size && be[0] == 0) ? 1 : 0;
-        int copyLen = Math.min(be.length - beStart, size);
-        for (int i = 0; i < copyLen; i++) {
-            le[i] = be[be.length - 1 - i];
-        }
-        return le;
     }
 
     private void cleanup(int localId) {
@@ -784,15 +685,6 @@ public class UsbAdbConnection {
             int n;
             while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
         }
-    }
-
-    private static String fingerprint(byte[] keyBytes) {
-        try {
-            byte[] hash = java.security.MessageDigest.getInstance("SHA-256").digest(keyBytes);
-            StringBuilder sb = new StringBuilder();
-            for (int i = 0; i < 4; i++) sb.append(String.format("%02x", hash[i]));
-            return sb.toString();
-        } catch (Exception e) { return "?"; }
     }
 
 }

@@ -7,10 +7,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.delay
-import java.net.Inet4Address
+import kotlinx.coroutines.withContext
 import java.net.InetSocketAddress
-import java.net.NetworkInterface
 import java.nio.channels.SocketChannel
 
 /**
@@ -120,20 +118,7 @@ object CarIpLocator {
     @Volatile
     var wifiManager: WifiManager? = null
 
-    private fun getLocalSubnetIps(): List<String> {
-        return try {
-            NetworkInterface.getNetworkInterfaces().toList()
-                .filter { !it.isLoopback && it.isUp }
-                .flatMap { iface ->
-                    iface.inetAddresses.toList()
-                        .filter { it is Inet4Address && !it.isLoopbackAddress }
-                        .map { it.hostAddress!! }
-                }
-                .filter { !it.startsWith("127.") }
-        } catch (_: Exception) {
-            emptyList()
-        }
-    }
+    private fun getLocalSubnetIps(): List<String> = NetUtil.localIpv4Addresses()
 
     /**
      * Scans a /24 subnet for the ADB port using parallel concurrent probes.
@@ -147,7 +132,7 @@ object CarIpLocator {
         val ips = (1..254).map { "$prefix.$it" }.filter { it !in ownIpSet }
         ips.chunked(maxConcurrent).forEach { batch ->
             val results = batch.map { ip ->
-                async(Dispatchers.IO) { if (probePortRaw(ip, CAR_ADB_PORT)) ip else null }
+                async(Dispatchers.IO) { if (probePortBlocking(ip, CAR_ADB_PORT, 150, 5)) ip else null }
             }
             results.forEach { deferred ->
                 val found = deferred.await()
@@ -160,17 +145,26 @@ object CarIpLocator {
         null
     }
 
-    /** Non-suspend port probe (150ms timeout) for use in parallel scans. */
-    private fun probePortRaw(ip: String, port: Int): Boolean {
+    /**
+     * Single port-probe body. Opens a non-blocking SocketChannel, polls
+     * [finishConnect] until it succeeds or [timeoutMs] elapses, sleeping
+     * [sleepMs] between polls. Returns true on successful connect.
+     *
+     * All three former probes ([probePortRaw], [probePortSync], the suspend
+     * [probePort]) were byte-identical except for these two constants and
+     * whether the caller was a suspend function; they now route through
+     * this single body.
+     */
+    private fun probePortBlocking(ip: String, port: Int, timeoutMs: Long, sleepMs: Long): Boolean {
         return try {
             val ch = SocketChannel.open()
             ch.configureBlocking(false)
             ch.connect(InetSocketAddress(ip, port))
-            val deadline = System.currentTimeMillis() + 150
+            val deadline = System.currentTimeMillis() + timeoutMs
             try {
                 while (!ch.finishConnect()) {
                     if (System.currentTimeMillis() > deadline) return false
-                    Thread.sleep(5)
+                    Thread.sleep(sleepMs)
                 }
                 true
             } finally {
@@ -180,39 +174,8 @@ object CarIpLocator {
     }
 
     /** Synchronous port probe with a 500ms timeout — used by the manual install path. */
-    fun probePortSync(ip: String, port: Int): Boolean {
-        return try {
-            val ch = SocketChannel.open()
-            ch.configureBlocking(false)
-            ch.connect(InetSocketAddress(ip, port))
-            val deadline = System.currentTimeMillis() + 500
-            try {
-                while (!ch.finishConnect()) {
-                    if (System.currentTimeMillis() > deadline) return false
-                    Thread.sleep(5)
-                }
-                true
-            } finally {
-                ch.close()
-            }
-        } catch (_: Exception) { false }
-    }
+    fun probePortSync(ip: String, port: Int): Boolean = probePortBlocking(ip, port, 500, 5)
 
-    private suspend fun probePort(ip: String, port: Int): Boolean {
-        return try {
-            val ch = SocketChannel.open()
-            ch.configureBlocking(false)
-            ch.connect(InetSocketAddress(ip, port))
-            val deadline = System.currentTimeMillis() + 500
-            try {
-                while (!ch.finishConnect()) {
-                    if (System.currentTimeMillis() > deadline) return false
-                    delay(50)
-                }
-                true
-            } finally {
-                ch.close()
-            }
-        } catch (_: Exception) { false }
-    }
+    private suspend fun probePort(ip: String, port: Int): Boolean =
+        withContext(Dispatchers.IO) { probePortBlocking(ip, port, 500, 5) }
 }

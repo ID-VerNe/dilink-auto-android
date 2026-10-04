@@ -67,7 +67,7 @@ internal class AppListBuilder(
                     AppInfo(
                         pkg,
                         info.loadLabel(pm).toString(),
-                        categorizeApp(pkg),
+                        AppCategorizer.categorize(pkg),
                         iconPng,
                         hash
                     )
@@ -123,23 +123,6 @@ internal class AppListBuilder(
             .putBoolean(ConnectionService.ALLOWLIST_CONFIGURED_KEY, true)
             .apply()
         FileLog.i(TAG, "Allowlist seeded with ${seed.size} default map apps: $seed")
-    }
-
-    private fun categorizeApp(pkg: String): AppCategory = when {
-        pkg.contains("map", true) || pkg.contains("navi", true) ||
-        pkg.contains("waze", true) || pkg.contains("amap", true) ||
-        pkg.contains("gaode", true) -> AppCategory.NAVIGATION
-
-        pkg.contains("music", true) || pkg.contains("spotify", true) ||
-        pkg.contains("podcast", true) || pkg.contains("player", true) ||
-        pkg.contains("qqmusic", true) || pkg.contains("netease", true) -> AppCategory.MUSIC
-
-        pkg.contains("whatsapp", true) || pkg.contains("telegram", true) ||
-        pkg.contains("wechat", true) || pkg.contains("tencent.mm", true) ||
-        pkg.contains("messenger", true) || pkg.contains("sms", true) ||
-        pkg.contains("dialer", true) || pkg.contains("phone", true) -> AppCategory.COMMUNICATION
-
-        else -> AppCategory.OTHER
     }
 
     companion object {

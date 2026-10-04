@@ -2,7 +2,6 @@ package com.dilinkauto.server.service
 
 import com.dilinkauto.protocol.Discovery
 import com.dilinkauto.protocol.VdDeploy
-import com.dilinkauto.protocol.VdDeployArgs
 import com.dilinkauto.protocol.VideoConfig
 import com.dilinkauto.server.R
 import com.dilinkauto.server.adb.RemoteAdbController
@@ -85,16 +84,18 @@ internal class VdServerDeployer(private val host: CarConnectionService) {
             val phoneDpi = if (host.handshakeVdDpi > 0) host.handshakeVdDpi
                 else VideoConfig.calculateOptimalDpi(vdW, vdH, displayMetrics.densityDpi)
 
-            val jarPath = host.vdServerJarPath
-            val logFile = VdDeploy.LOG_PATH
-            // VD (W H) = car-native viewport; encode (EW EH) clamped to 1920x1080 —
-            // Snapdragon 439 VPU caps hardware AVC decode at 1080p. Car-native here
-            // is already <=1080p, the clamp is defensive for higher-res car panels.
-            val args = VdDeployArgs.format(vdW, vdH, phoneDpi, "127.0.0.1", vdW, vdH, host.targetFps)
+            val plan = VdDeploy.buildDeployPlan(
+                jarPath = host.vdServerJarPath,
+                logPath = VdDeploy.LOG_PATH,
+                vdWidth = vdW, vdHeight = vdH, dpi = phoneDpi,
+                encodeWidth = vdW, encodeHeight = vdH,
+                phoneHost = "127.0.0.1", fps = host.targetFps,
+                background = true
+            )
 
             // Kill any existing VD server
             host.setStatusMessage(R.string.status_preparing_vd)
-            host.executeAdb(VdDeploy.killCommand, noWait = false)
+            host.executeAdb(plan.killCommand, noWait = false)
             delay(200)
 
             // Launch VD server. Uses exec to replace shell with app_process — keeps ADB stream open.
@@ -102,8 +103,7 @@ internal class VdServerDeployer(private val host: CarConnectionService) {
             host.setStatusMessage(R.string.status_starting_vd)
             log("VD server: ${vdW}x${vdH}@${phoneDpi}dpi (car-native, no downscale)")
 
-            val cmd = VdDeploy.commandLine(jarPath, logFile, args, background = true)
-            if (!host.executeAdb(cmd, noWait = true)) {
+            if (!host.executeAdb(plan.launchCommand, noWait = true)) {
                 log("VD server failed to start", "E")
                 host.setStatusMessage(R.string.status_vd_failed)
                 return@launch
@@ -132,14 +132,20 @@ internal class VdServerDeployer(private val host: CarConnectionService) {
         val phoneDpi = if (host.handshakeVdDpi > 0) host.handshakeVdDpi
             else VideoConfig.calculateOptimalDpi(vdW, vdH, displayMetrics.densityDpi)
         // Encode dims clamped to 1920x1080 (Snapdragon 439 VPU hardware-decode cap).
-        val args = VdDeployArgs.format(vdW, vdH, phoneDpi, "127.0.0.1", vdW, vdH, host.targetFps)
+        val plan = VdDeploy.buildDeployPlan(
+            jarPath = VdDeploy.JAR_PATH,
+            logPath = VdDeploy.LOG_PATH,
+            vdWidth = vdW, vdHeight = vdH, dpi = phoneDpi,
+            encodeWidth = vdW, encodeHeight = vdH,
+            phoneHost = "127.0.0.1", fps = host.targetFps,
+            background = true
+        )
         host.setStatusMessage(R.string.status_preparing_vd)
         log("VD server: ${vdW}x${vdH}@${phoneDpi}dpi (car-native, no downscale)")
         // Use shell (sync) to capture result. pkill old instance first, then start new one.
-        controller.shell(VdDeploy.killCommand)
-        val cmd = VdDeploy.commandLine(VdDeploy.JAR_PATH, VdDeploy.LOG_PATH, args, background = true)
+        controller.shell(plan.killCommand)
         // Use shellBackground to keep ADB stream open — prevents shell from killing the process
-        val streamId = controller.shellBackground(cmd)
+        val streamId = controller.shellBackground(plan.launchCommand)
         val ok = streamId >= 0
         host.setStatusMessage(R.string.status_starting_vd)
         if (ok) {

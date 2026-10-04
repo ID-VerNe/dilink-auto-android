@@ -79,7 +79,7 @@ class ConnectionService : Service() {
     private fun cacheDefaultIme() {
         try {
             val currentIme = android.provider.Settings.Secure.getString(contentResolver, android.provider.Settings.Secure.DEFAULT_INPUT_METHOD)
-            if (!currentIme.isNullOrBlank() && currentIme != "null" && !currentIme.contains("linkpc", ignoreCase = true)) {
+            if (com.dilinkauto.protocol.ImeRestore.shouldRestoreIme(currentIme)) {
                 savedDefaultIme = currentIme
                 getSharedPreferences(AppPrefs.FILE_NAME, MODE_PRIVATE).edit().putString(AppPrefs.SAVED_DEFAULT_IME, currentIme).apply()
                 FileLog.i(TAG, "Cached default IME: $currentIme")
@@ -90,23 +90,7 @@ class ConnectionService : Service() {
     }
 
     private fun logDeviceInfo() {
-        val info = buildString {
-            val am = getSystemService(Context.ACTIVITY_SERVICE) as? android.app.ActivityManager
-            val mi = android.app.ActivityManager.MemoryInfo()
-            am?.getMemoryInfo(mi)
-            val dm = resources.displayMetrics
-
-            appendLine("── Device Info ──")
-            appendLine("model=${android.os.Build.MODEL} manufacturer=${android.os.Build.MANUFACTURER}")
-            appendLine("product=${android.os.Build.PRODUCT} device=${android.os.Build.DEVICE}")
-            appendLine("android=${android.os.Build.VERSION.RELEASE} sdk=${android.os.Build.VERSION.SDK_INT}")
-            appendLine("display=${dm.widthPixels}x${dm.heightPixels} @${dm.densityDpi}dpi density=${dm.density}")
-            appendLine("cores=${Runtime.getRuntime().availableProcessors()}")
-            appendLine("abi=${android.os.Build.SUPPORTED_ABIS?.joinToString(",") ?: "?"}")
-            appendLine("heapMax=${Runtime.getRuntime().maxMemory()} heapTotal=${Runtime.getRuntime().totalMemory()} heapFree=${Runtime.getRuntime().freeMemory()}")
-            appendLine("totalMem=${mi.totalMem} availMem=${mi.availMem} lowMemory=${mi.lowMemory}")
-        }
-        FileLog.i(TAG, info)
+        FileLog.i(TAG, DeviceInfo.buildDeviceInfoBlock(this))
     }
 
     private fun registerPackageRemovedReceiver() {
@@ -530,13 +514,19 @@ class ConnectionService : Service() {
             // AVC decode at 1080p. Encoding larger forces software decode on the
             // car's 8x A53 (single-digit fps). Car-native is also 1:1 with the car's
             // pixels, so no downscale on decode.
-            val args = VdDeployArgs.format(vdWidth, vdHeight, dpi, "127.0.0.1", carWidth, carHeight, targetFps)
+            val plan = VdDeploy.buildDeployPlan(
+                jarPath = jarPath,
+                logPath = logPath,
+                vdWidth = vdWidth, vdHeight = vdHeight, dpi = dpi,
+                encodeWidth = carWidth, encodeHeight = carHeight,
+                phoneHost = "127.0.0.1", fps = targetFps,
+                background = false
+            )
 
-            ShizukuManager.execAndWait(VdDeploy.killCommand)
+            ShizukuManager.execAndWait(plan.killCommand)
             delay(200)
 
-            val cmd = VdDeploy.commandLine(jarPath, logPath, args, background = false)
-            ShizukuManager.execBackground(cmd)
+            ShizukuManager.execBackground(plan.launchCommand)
             FileLog.i(TAG, "VD server started via Shizuku: ${vdWidth}x$vdHeight @${dpi}dpi")
         } catch (e: Exception) {
             FileLog.e(TAG, "Shizuku VD server start failed", e)

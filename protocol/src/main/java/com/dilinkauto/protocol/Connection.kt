@@ -28,8 +28,8 @@ class Connection(
     init {
         channel.configureBlocking(false)
         val sock = channel.socket()
-        sock.sendBufferSize = 262144    // request 256KB
-        sock.receiveBufferSize = 262144
+        sock.sendBufferSize = SOCKET_BUF_BYTES    // request 256KB
+        sock.receiveBufferSize = SOCKET_BUF_BYTES
         sock.tcpNoDelay = true
         sock.keepAlive = true
         actualSendBuf = sock.sendBufferSize   // what the kernel actually gave us
@@ -302,6 +302,7 @@ class Connection(
     companion object {
         private const val HEARTBEAT_INTERVAL_MS = 3000L
         private const val HEARTBEAT_TIMEOUT_MS = 10000L
+        private const val SOCKET_BUF_BYTES = 262144 // 256KB — request send/receive buffer
 
         suspend fun connect(host: String, port: Int, scope: CoroutineScope): Connection =
             withContext(Dispatchers.IO) {

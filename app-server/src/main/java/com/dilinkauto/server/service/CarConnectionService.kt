@@ -55,16 +55,12 @@ class CarConnectionService : Service() {
     private var consecutiveFailures = 0
     private var usbAdb: UsbAdbConnection? = null
     private var userDisconnected: Boolean
-        get() = getSharedPreferences(AppPrefs.FILE_NAME, MODE_PRIVATE)
-            .getBoolean("user_disconnected", false)
-        set(value) = getSharedPreferences(AppPrefs.FILE_NAME, MODE_PRIVATE)
-            .edit().putBoolean("user_disconnected", value).apply()
+        get() = prefs.getBoolean("user_disconnected", false)
+        set(value) = prefs.edit().putBoolean("user_disconnected", value).apply()
 
     var devMode: Boolean
-        get() = getSharedPreferences(AppPrefs.FILE_NAME, MODE_PRIVATE)
-                    .getBoolean("dev_mode", false)
-        set(value) = getSharedPreferences(AppPrefs.FILE_NAME, MODE_PRIVATE)
-            .edit().putBoolean("dev_mode", value).apply()
+        get() = prefs.getBoolean("dev_mode", false)
+        set(value) = prefs.edit().putBoolean("dev_mode", value).apply()
 
     /**
      * Car-side startup DPI override. 0 = auto-calibrate via VideoConfig.calculateOptimalDpi
@@ -74,10 +70,8 @@ class CarConnectionService : Service() {
      * on the next connect (or mid-stream rotation re-handshake), not live.
      */
     var startupDpi: Int
-        get() = getSharedPreferences(AppPrefs.FILE_NAME, MODE_PRIVATE)
-                    .getInt("startup_dpi", 0)
-        set(value) = getSharedPreferences(AppPrefs.FILE_NAME, MODE_PRIVATE)
-            .edit().putInt("startup_dpi", value).apply()
+        get() = prefs.getInt("startup_dpi", 0)
+        set(value) = prefs.edit().putInt("startup_dpi", value).apply()
 
     // ─── Handshake ───
     internal var handshakeVdDpi = VideoConfig.VIRTUAL_DISPLAY_DPI // DPI from phone (may be adjusted for DeX)
@@ -108,6 +102,9 @@ class CarConnectionService : Service() {
 
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private val usbPermissionAction = "com.dilinkauto.server.USB_PERMISSION"
+
+    /** Shared prefs accessor — centralizes the file-name + mode so it isn't repeated per field. */
+    private val prefs get() = getSharedPreferences(AppPrefs.FILE_NAME, MODE_PRIVATE)
 
     private val usbReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -1048,8 +1045,7 @@ class CarConnectionService : Service() {
     private fun getWifiGatewayIp(): String? {
         // Dev mode: check for manual phone IP in SharedPreferences first
         if (devMode) {
-            val devIp = getSharedPreferences(AppPrefs.FILE_NAME, MODE_PRIVATE)
-                .getString("dev_phone_ip", null)
+            val devIp = prefs.getString("dev_phone_ip", null)
             if (!devIp.isNullOrBlank()) return devIp
         }
         return try {

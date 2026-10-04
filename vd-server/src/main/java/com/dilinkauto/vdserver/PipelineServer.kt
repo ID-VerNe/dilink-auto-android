@@ -87,6 +87,7 @@ class PipelineServer(
         private const val BITRATE = 4_000_000
         private const val I_FRAME_INTERVAL = 1
         private const val WATCHDOG_GRACE_MS = 3000L
+        private const val SOCKET_BUF_BYTES = 262144 // 256KB — request send/receive buffer
 
         @JvmStatic fun main(args: Array<String>) {
             val w = args.getOrNull(0)?.toInt() ?: 1408; val h = args.getOrNull(1)?.toInt() ?: 792
@@ -213,7 +214,7 @@ class PipelineServer(
 
     private fun acceptCarChannel(server: ServerSocketChannel, name: String, timeoutMs: Int): SocketChannel? {
         val deadline = System.currentTimeMillis() + timeoutMs
-        while (running && System.currentTimeMillis() < deadline) { val a = server.accept(); if (a != null) { a.configureBlocking(false); val s = a.socket(); s.sendBufferSize = 262144; s.receiveBufferSize = 262144; s.tcpNoDelay = true; return a }; Thread.sleep(50) }
+        while (running && System.currentTimeMillis() < deadline) { val a = server.accept(); if (a != null) { a.configureBlocking(false); val s = a.socket(); s.sendBufferSize = SOCKET_BUF_BYTES; s.receiveBufferSize = SOCKET_BUF_BYTES; s.tcpNoDelay = true; return a }; Thread.sleep(50) }
         return null
     }
 

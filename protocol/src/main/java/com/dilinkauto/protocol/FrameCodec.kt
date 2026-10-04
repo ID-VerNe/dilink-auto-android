@@ -54,19 +54,42 @@ object FrameCodec {
     // Reusable header buffer — avoids 6-byte allocation per frame (30x/sec)
     private val headerLocal = ThreadLocal.withInitial { ByteArray(HEADER_SIZE) }
 
+    /**
+     * Encode a frame's 6-byte header into [buf]. Shared by [writeFrame] and
+     * [writeFrameToChannel] so the byte layout lives in one place.
+     */
+    private fun encodeHeaderInto(buf: ByteArray, frame: Frame) {
+        val frameLength = 2 + frame.payload.size
+        buf[0] = (frameLength shr 24).toByte()
+        buf[1] = (frameLength shr 16).toByte()
+        buf[2] = (frameLength shr 8).toByte()
+        buf[3] = frameLength.toByte()
+        buf[4] = frame.channel
+        buf[5] = frame.messageType
+    }
+
+    /**
+     * Validate a frame length and return the payload size, or throw if malformed.
+     * Shared by [readFrame] and [readFrameBlocking].
+     */
+    private fun validatePayloadSize(frameLength: Int): Int {
+        if (frameLength < 2) {
+            throw ProtocolException("Frame too small: $frameLength")
+        }
+        val payloadSize = frameLength - 2
+        if (payloadSize > MAX_PAYLOAD_SIZE) {
+            throw ProtocolException("Frame payload too large: $payloadSize > $MAX_PAYLOAD_SIZE")
+        }
+        return payloadSize
+    }
+
     fun writeFrame(out: OutputStream, frame: Frame) {
         require(frame.payload.size <= MAX_PAYLOAD_SIZE) {
             "Payload too large: ${frame.payload.size} > $MAX_PAYLOAD_SIZE"
         }
 
-        val frameLength = 2 + frame.payload.size
         val header = headerLocal.get()!!
-        header[0] = (frameLength shr 24).toByte()
-        header[1] = (frameLength shr 16).toByte()
-        header[2] = (frameLength shr 8).toByte()
-        header[3] = frameLength.toByte()
-        header[4] = frame.channel
-        header[5] = frame.messageType
+        encodeHeaderInto(header, frame)
 
         out.write(header)
         out.write(frame.payload)
@@ -87,19 +110,13 @@ object FrameCodec {
             .order(ByteOrder.BIG_ENDIAN)
             .getInt()
 
-        if (frameLength < 2) {
-            throw ProtocolException("Frame too small: $frameLength")
-        }
-        if (frameLength - 2 > MAX_PAYLOAD_SIZE) {
-            throw ProtocolException("Frame payload too large: ${frameLength - 2}")
-        }
+        val payloadSize = validatePayloadSize(frameLength)
 
         // Read channel + type (2 bytes)
         val chType = readExact(input, 2)
             ?: throw ProtocolException("Unexpected end of stream: missing channel/type")
 
         // Read payload directly — no intermediate buffer + copyOfRange
-        val payloadSize = frameLength - 2
         val payload = if (payloadSize > 0) {
             readExact(input, payloadSize)
                 ?: throw ProtocolException("Unexpected end of stream: expected $payloadSize bytes")
@@ -139,14 +156,7 @@ object FrameCodec {
      */
     fun readFrameBlocking(reader: NioReader): Frame? {
         val frameLength = reader.readIntOrNullBlocking() ?: return null
-
-        if (frameLength < 2) {
-            throw ProtocolException("Frame too small: $frameLength")
-        }
-        val payloadSize = frameLength - 2
-        if (payloadSize > MAX_PAYLOAD_SIZE) {
-            throw ProtocolException("Frame payload too large: $payloadSize > $MAX_PAYLOAD_SIZE")
-        }
+        val payloadSize = validatePayloadSize(frameLength)
 
         val channelId = reader.readByteBlocking()
         val msgType = reader.readByteBlocking()
@@ -163,14 +173,7 @@ object FrameCodec {
      */
     suspend fun readFrame(reader: NioReader): Frame? {
         val frameLength = reader.readIntOrNull() ?: return null
-
-        if (frameLength < 2) {
-            throw ProtocolException("Frame too small: $frameLength")
-        }
-        val payloadSize = frameLength - 2
-        if (payloadSize > MAX_PAYLOAD_SIZE) {
-            throw ProtocolException("Frame payload too large: $payloadSize > $MAX_PAYLOAD_SIZE")
-        }
+        val payloadSize = validatePayloadSize(frameLength)
 
         val channelId = reader.readByte()
         val msgType = reader.readByte()
@@ -197,14 +200,8 @@ object FrameCodec {
             "Payload too large: ${frame.payload.size} > $MAX_PAYLOAD_SIZE"
         }
 
-        val frameLength = 2 + frame.payload.size
         val header = headerLocal.get()!!
-        header[0] = (frameLength shr 24).toByte()
-        header[1] = (frameLength shr 16).toByte()
-        header[2] = (frameLength shr 8).toByte()
-        header[3] = frameLength.toByte()
-        header[4] = frame.channel
-        header[5] = frame.messageType
+        encodeHeaderInto(header, frame)
 
         writeAll(channel, ByteBuffer.wrap(header))
         if (frame.payload.isNotEmpty()) {
@@ -213,6 +210,7 @@ object FrameCodec {
     }
 
     private const val WRITE_TIMEOUT_NS = 5_000_000_000L // 5 seconds
+    private const val WRITE_BACKOFF_NS = 100_000L // 100us — prevents tight spin on full buffer
 
     /**
      * Writes all remaining bytes from buf to channel.
@@ -229,7 +227,7 @@ object FrameCodec {
                 if (System.nanoTime() > deadline) {
                     throw IOException("Write timed out: ${buf.remaining()} bytes remaining, send buffer full for 5s")
                 }
-                LockSupport.parkNanos(100_000) // 100us — prevents tight spin on full buffer
+                LockSupport.parkNanos(WRITE_BACKOFF_NS)
             }
         }
     }

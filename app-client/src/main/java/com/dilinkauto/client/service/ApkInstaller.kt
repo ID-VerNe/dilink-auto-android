@@ -5,7 +5,6 @@ import android.content.Intent
 import androidx.core.content.FileProvider
 import com.dilinkauto.client.FileLog
 import com.dilinkauto.client.ShizukuManager
-import dadb.AdbKeyPair
 import dadb.Dadb
 import java.io.File
 
@@ -55,29 +54,11 @@ internal fun stageApkForShizuku(apkFile: File, tmpPath: String = "/data/local/tm
 internal suspend fun tryDadbInstall(appContext: Context, apkFile: File, version: String): InstallOutcome {
     val tag = "UpdateManager"
     return try {
-        val filesDir = appContext.filesDir
-        val privKey = File(filesDir, "adbkey")
-        val pubKey = File(filesDir, "adbkey.pub")
-        if (!privKey.exists()) {
-            filesDir.mkdirs()
-            AdbKeyPair.generate(privKey, pubKey)
-        }
-        val keyPair = AdbKeyPair.read(privKey, pubKey)
+        val keyPair = AdbKeyUtil.ensureAdbKeyPair(appContext.filesDir)
 
-        val dadbExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
-        val dadb: Dadb? = try {
-            val future = dadbExecutor.submit<Dadb> {
-                Dadb.create("127.0.0.1", com.dilinkauto.protocol.Discovery.ADB_PORT, keyPair)
-            }
-            try {
-                future.get(10, java.util.concurrent.TimeUnit.SECONDS)
-            } catch (e: java.util.concurrent.TimeoutException) {
-                FileLog.w(tag, "Dadb self-connect timed out")
-                null
-            }
-        } finally {
-            dadbExecutor.shutdownNow()
-        }
+        val dadb: Dadb? = AdbKeyUtil.dadbCreateWithTimeout(
+            tag, "127.0.0.1", com.dilinkauto.protocol.Discovery.ADB_PORT, keyPair, 10L
+        )
 
         if (dadb == null) {
             FileLog.w(tag, "Dadb self-connect failed, falling back to system installer")

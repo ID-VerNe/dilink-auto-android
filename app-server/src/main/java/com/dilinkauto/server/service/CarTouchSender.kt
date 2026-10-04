@@ -29,21 +29,7 @@ internal class CarTouchSender(
     private var sendCount = 0L
 
     fun sendTouchEvent(event: TouchEvent) {
-        val conn = inputConnectionProvider()
-        if (conn == null) {
-            dropCount++
-            if (dropCount <= 3 || dropCount % 100 == 0L) {
-                log("Touch DROP #$dropCount: inputConnection=null state=${stateProvider()}", "I")
-            }
-            return
-        }
-        if (!conn.isConnected) {
-            dropCount++
-            if (dropCount <= 3 || dropCount % 100 == 0L) {
-                log("Touch DROP #$dropCount: inputConnection not connected", "I")
-            }
-            return
-        }
+        val conn = checkConn("Touch") ?: return
         val payload = event.encode()
         executor.execute {
             try {
@@ -57,21 +43,7 @@ internal class CarTouchSender(
     }
 
     fun sendTouchBatch(pointers: List<TouchEvent>) {
-        val conn = inputConnectionProvider()
-        if (conn == null) {
-            dropCount++
-            if (dropCount <= 3 || dropCount % 100 == 0L) {
-                log("Touch batch DROP #$dropCount: inputConnection=null state=${stateProvider()}", "I")
-            }
-            return
-        }
-        if (!conn.isConnected) {
-            dropCount++
-            if (dropCount <= 3 || dropCount % 100 == 0L) {
-                log("Touch batch DROP #$dropCount: inputConnection not connected", "I")
-            }
-            return
-        }
+        val conn = checkConn("Touch batch") ?: return
         val payload = TouchMoveBatch(pointers).encode()
         executor.execute {
             try {
@@ -82,6 +54,31 @@ internal class CarTouchSender(
                 }
             } catch (e: Exception) { log("Touch batch send failed: ${e.message}", "W") }
         }
+    }
+
+    /**
+     * Shared null-conn + not-connected check with the `<= 3 || % 100` drop-gate.
+     * Returns the connection if usable, or null after bumping dropCount and
+     * logging the reason. Both public send methods route through this so the
+     * gating predicate lives in one place.
+     */
+    private fun checkConn(label: String): Connection? {
+        val conn = inputConnectionProvider()
+        if (conn == null) {
+            dropCount++
+            if (dropCount <= 3 || dropCount % 100 == 0L) {
+                log("$label DROP #$dropCount: inputConnection=null state=${stateProvider()}", "I")
+            }
+            return null
+        }
+        if (!conn.isConnected) {
+            dropCount++
+            if (dropCount <= 3 || dropCount % 100 == 0L) {
+                log("$label DROP #$dropCount: inputConnection not connected", "I")
+            }
+            return null
+        }
+        return conn
     }
 
     /** Reset counters on disconnect so the next session's log starts fresh. */

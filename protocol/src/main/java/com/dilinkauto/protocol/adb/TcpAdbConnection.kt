@@ -11,7 +11,6 @@ import java.nio.ByteOrder
 import java.security.KeyFactory
 import java.security.KeyPair
 import java.security.KeyPairGenerator
-import java.security.MessageDigest
 import java.security.PrivateKey
 import java.security.PublicKey
 import java.security.Signature
@@ -24,6 +23,12 @@ import java.security.spec.X509EncodedKeySpec
  * and sends all shell commands through it.
  *
  * Shares ADB protocol constants and encoding with AdbProtocol/UsbAdbConnection.
+ * The AUTH handshake, Android public-key encoding, and fingerprint hash live in
+ * [AdbCrypto] so they cannot silently diverge from [UsbAdbConnection].
+ *
+ * Key *storage* policy is TCP-specific: keys are written as PEM so they remain
+ * readable by Dadb (which the car's dev-mode installer uses). UsbAdbConnection
+ * has its own storage rules; the two intentionally do not share that logic.
  */
 class TcpAdbConnection(
     private val host: String,
@@ -154,7 +159,7 @@ class TcpAdbConnection(
         socket = null
     }
 
-    // ── Message I/O ──
+    // -- Message I/O --
 
     data class AdbMessage(val command: Int, val arg0: Int, val arg1: Int, val data: ByteArray?)
 
@@ -188,27 +193,19 @@ class TcpAdbConnection(
     private val nextLocalId = java.util.concurrent.atomic.AtomicInteger(1)
     private fun nextLocalId(): Int = nextLocalId.getAndIncrement()
 
-    // ── AUTH (same logic as UsbAdbConnection) ──
+    // -- AUTH (delegated to AdbCrypto; shared with UsbAdbConnection) --
 
     private fun handleAuth(type: Int, data: ByteArray, keyPair: KeyPair) {
         if (type == AdbProtocol.AUTH_TOKEN) {
             if (!authSignatureSent) {
                 // Sign token with stored key (SHA-1 DigestInfo + NONEwithRSA)
-                val sha1DigestInfo = byteArrayOf(
-                    0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e,
-                    0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14
-                )
-                val toSign = sha1DigestInfo + data
-                val sig = Signature.getInstance("NONEwithRSA").apply {
-                    initSign(keyPair.private)
-                    update(toSign)
-                }
-                writeRaw(AdbProtocol.encodeAuth(AdbProtocol.AUTH_SIGNATURE, sig.sign()))
+                writeRaw(AdbProtocol.encodeAuth(AdbProtocol.AUTH_SIGNATURE,
+                    AdbCrypto.signAuthToken(keyPair.private, data)))
                 authSignatureSent = true
             } else {
                 // Signature rejected — send public key for user approval
-                val pubKey = encodePublicKey(keyPair.public)
-                writeRaw(AdbProtocol.encodeAuth(AdbProtocol.AUTH_RSAPUBLICKEY, pubKey))
+                writeRaw(AdbProtocol.encodeAuth(AdbProtocol.AUTH_RSAPUBLICKEY,
+                    AdbCrypto.encodePublicKey(keyPair.public)))
             }
         }
     }
@@ -217,60 +214,14 @@ class TcpAdbConnection(
         socket?.getOutputStream()?.write(data)
     }
 
-    // ── Key management (shared logic with UsbAdbConnection) ──
+    // -- Key management (Tcp-specific: PEM storage for Dadb compatibility) --
 
     companion object {
         // Use same key file name as Dadb and UsbAdbConnection for compatibility
         private const val KEY_FILE = "adbkey"
 
-        /** SHA-1 fingerprint of a DER-encoded public key */
-        fun fingerprint(der: ByteArray): String =
-            MessageDigest.getInstance("SHA-1").digest(der)
-                .joinToString("") { "%02x".format(it) }
-
-        // ANDROID_PUBKEY constants matching UsbAdbConnection
-        private const val ANDROID_PUBKEY_MODULUS_SIZE = 256 // 2048 bits / 8
-        private const val ANDROID_PUBKEY_MODULUS_SIZE_WORDS = ANDROID_PUBKEY_MODULUS_SIZE / 4
-
-        /** Encode RSA public key in Android ADB format (ANDROID_PUBKEY).
-         *  Reference: AOSP libcrypto_utils/android_pubkey.cpp */
-        fun encodePublicKey(publicKey: PublicKey): ByteArray {
-            val rsaKey = publicKey as java.security.interfaces.RSAPublicKey
-            val n = rsaKey.modulus
-            val e = rsaKey.publicExponent
-            val r32 = java.math.BigInteger.ONE.shiftLeft(32)
-
-            // n0inv = -1/n[0] mod 2^32 (Montgomery reduction parameter)
-            val n0inv = r32.subtract(n.mod(r32).modInverse(r32)).toInt()
-
-            // rr = (2^2048)^2 mod n = 2^4096 mod n
-            val rr = java.math.BigInteger.ONE
-                .shiftLeft(ANDROID_PUBKEY_MODULUS_SIZE * 8)
-                .modPow(java.math.BigInteger.valueOf(2), n)
-
-            val modulusLE = bigIntToLEPadded(n)
-            val rrLE = bigIntToLEPadded(rr)
-
-            val struct = ByteBuffer.allocate(4 + 4 + ANDROID_PUBKEY_MODULUS_SIZE + ANDROID_PUBKEY_MODULUS_SIZE + 4)
-                .order(ByteOrder.LITTLE_ENDIAN)
-            struct.putInt(ANDROID_PUBKEY_MODULUS_SIZE_WORDS)
-            struct.putInt(n0inv)
-            struct.put(modulusLE)
-            struct.put(rrLE)
-            struct.putInt(e.toInt())
-
-            val base64 = android.util.Base64.encodeToString(struct.array(), android.util.Base64.NO_WRAP)
-            return "$base64 DiLinkAuto@car ".toByteArray()
-        }
-
-        private fun bigIntToLEPadded(bi: java.math.BigInteger): ByteArray {
-            val bytes = ByteArray(ANDROID_PUBKEY_MODULUS_SIZE)
-            val raw = bi.toByteArray() // big-endian, may have leading zero
-            // Skip leading zero byte if present (sign byte for unsigned big integers)
-            val src = if (raw[0] == 0.toByte()) raw.copyOfRange(1, raw.size) else raw
-            for (i in src.indices) bytes[i] = src[src.size - 1 - i] // reverse to little-endian
-            return bytes
-        }
+        /** SHA-1 fingerprint of a DER-encoded public key (delegates to AdbCrypto). */
+        fun fingerprint(der: ByteArray): String = AdbCrypto.fingerprint(der)
     }
 
     private fun getOrCreateKeyPair(): KeyPair {
@@ -308,8 +259,9 @@ class TcpAdbConnection(
     private fun generateAndStore(privFile: File, pubFile: File): KeyPair {
         val kpg = KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }
         val kp = kpg.generateKeyPair()
-        // Save in DER format (compatible with both PEM-aware and direct readers)
-        // Also save in PEM for Dadb compatibility
+        // Save in PEM format (compatible with both PEM-aware and direct readers).
+        // Dadb reads PEM; the AdbCrypto auth path only ever uses the in-memory
+        // KeyPair, so the on-disk format is chosen for Dadb compatibility.
         saveKey(privFile, kp.private)
         saveKey(pubFile, kp.public)
         return kp
@@ -318,9 +270,9 @@ class TcpAdbConnection(
     private fun saveKey(file: File, key: java.security.Key) {
         val encoded = key.encoded
         val b64 = android.util.Base64.encodeToString(encoded, android.util.Base64.DEFAULT)
-        val pem = "-----BEGIN ${if (key is java.security.PrivateKey) "RSA PRIVATE" else "PUBLIC"} KEY-----\n" +
+        val pem = "-----BEGIN ${if (key is PrivateKey) "RSA PRIVATE" else "PUBLIC"} KEY-----\n" +
                 b64 +
-                "-----END ${if (key is java.security.PrivateKey) "RSA PRIVATE" else "PUBLIC"} KEY-----\n"
+                "-----END ${if (key is PrivateKey) "RSA PRIVATE" else "PUBLIC"} KEY-----\n"
         file.writeText(pem)
     }
 }

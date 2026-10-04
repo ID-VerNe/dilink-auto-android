@@ -78,14 +78,7 @@ class NioReader(
      * Returns false on EOF, true when enough data is ready.
      */
     private suspend fun fillOrEof(needed: Int): Boolean {
-        // Grow buffer if a single read unit exceeds capacity
-        if (needed > buf.capacity()) {
-            val newBuf = ByteBuffer.allocate(needed + GROW_PADDING)
-            newBuf.order(ByteOrder.BIG_ENDIAN)
-            newBuf.put(buf) // copy remaining unread data
-            newBuf.flip()
-            buf = newBuf
-        }
+        growIfNeeded(needed)
         // Read from channel until we have enough
         while (buf.remaining() < needed) {
             buf.compact()
@@ -152,13 +145,7 @@ class NioReader(
     }
 
     private fun fillOrEofBlocking(needed: Int): Boolean {
-        if (needed > buf.capacity()) {
-            val newBuf = ByteBuffer.allocate(needed + GROW_PADDING)
-            newBuf.order(ByteOrder.BIG_ENDIAN)
-            newBuf.put(buf)
-            newBuf.flip()
-            buf = newBuf
-        }
+        growIfNeeded(needed)
         while (buf.remaining() < needed) {
             buf.compact()
             val n = channel.read(buf)
@@ -175,6 +162,21 @@ class NioReader(
             }
         }
         return true
+    }
+
+    /**
+     * Grow the internal buffer if a single read unit exceeds capacity.
+     * Shared by [fillOrEof] and [fillOrEofBlocking] so the grow policy lives
+     * in one place — previously the same 5-line block was duplicated.
+     */
+    private fun growIfNeeded(needed: Int) {
+        if (needed > buf.capacity()) {
+            val newBuf = ByteBuffer.allocate(needed + GROW_PADDING)
+            newBuf.order(ByteOrder.BIG_ENDIAN)
+            newBuf.put(buf) // copy remaining unread data
+            newBuf.flip()
+            buf = newBuf
+        }
     }
 
     /**

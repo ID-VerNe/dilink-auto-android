@@ -57,8 +57,8 @@ internal class PhoneDisplayRestorer(
                         val targetIme = savedIme
                             ?: appContext.getSharedPreferences(AppPrefs.FILE_NAME, Context.MODE_PRIVATE)
                                 .getString(AppPrefs.SAVED_DEFAULT_IME, null)
-                        if (!targetIme.isNullOrBlank() && targetIme != "null" && !targetIme.contains("linkpc", ignoreCase = true)) {
-                            ShizukuManager.execAndWait("ime enable $targetIme; ime set $targetIme; settings put secure default_input_method $targetIme 2>/dev/null")
+                        if (com.dilinkauto.protocol.ImeRestore.shouldRestoreIme(targetIme)) {
+                            ShizukuManager.execAndWait(com.dilinkauto.protocol.ImeRestore.imeRestoreCommandLine(targetIme!!))
                             FileLog.i(TAG, "Original IME restored via Shizuku: $targetIme")
                         }
                         FileLog.i(TAG, "Physical display restored via Shizuku (pkill + power-on + IME)")

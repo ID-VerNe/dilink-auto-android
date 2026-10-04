@@ -32,7 +32,7 @@ internal class DisplayPowerController(
     fun saveCurrentIme() {
         try {
             val cur = execShellOutput("settings get secure default_input_method")?.trim()
-            if (!cur.isNullOrBlank() && cur != "null" && !cur.contains("linkpc", ignoreCase = true)) {
+            if (com.dilinkauto.protocol.ImeRestore.shouldRestoreIme(cur)) {
                 savedDefaultIme = cur
                 log("Saved original IME: $savedDefaultIme")
             }
@@ -72,11 +72,9 @@ internal class DisplayPowerController(
     /** Restore the previously-saved IME, physical panel state, and screen settings. */
     fun restoreIme() {
         val ime = savedDefaultIme ?: return
-        if (ime.isNotBlank() && ime != "null" && !ime.contains("linkpc", ignoreCase = true)) {
+        if (com.dilinkauto.protocol.ImeRestore.shouldRestoreIme(ime)) {
             try {
-                execShell("ime enable $ime")
-                execShell("ime set $ime")
-                execShell("settings put secure default_input_method $ime")
+                com.dilinkauto.protocol.ImeRestore.imeRestoreCommands(ime).forEach { execShell(it) }
                 log("Restored original IME: $ime")
             } catch (_: Exception) {}
         }

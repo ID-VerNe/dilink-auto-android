@@ -63,6 +63,11 @@ internal class GlPipeline(
     private fun log(msg: String) = PipeLog.log(msg)
     private fun err(msg: String) = PipeLog.err(msg)
 
+    // Write-loop policy for the car video channel. Mirrors FrameCodec's constants;
+    // see writeAll() below.
+    private val WRITE_TIMEOUT_NS = 5_000_000_000L // 5 seconds
+    private val WRITE_BACKOFF_NS = 100_000L // 100us
+
     /**
      * Initialize EGL/GLES on the current thread, create the SurfaceTexture
      * and its GL texture, and the VD input surface. Must be called from the
@@ -177,7 +182,20 @@ internal class GlPipeline(
         val fl = 2 + payload.size; val hdr = byteArrayOf((fl shr 24).toByte(), (fl shr 16).toByte(), (fl shr 8).toByte(), fl.toByte(), Channel.VIDEO, msgType)
         writeAll(ch, ByteBuffer.wrap(hdr)); if (payload.isNotEmpty()) writeAll(ch, ByteBuffer.wrap(payload))
     }
-    private fun writeAll(ch: SocketChannel, buf: ByteBuffer) { var dl = System.nanoTime() + 5_000_000_000L; while (buf.hasRemaining()) { if (ch.write(buf) > 0) dl = System.nanoTime() + 5_000_000_000L; else { if (System.nanoTime() > dl) throw IOException("Write timeout"); LockSupport.parkNanos(100_000) } } }
+    // Mirrors FrameCodec.writeAll's write-progress deadline and 100us backoff.
+    // vd-server is a shell module that does not depend on the protocol module,
+    // so the loop is duplicated here — but the literals are named so a change to
+    // one file's policy is at least readable in the other.
+    private fun writeAll(ch: SocketChannel, buf: ByteBuffer) {
+        var dl = System.nanoTime() + WRITE_TIMEOUT_NS
+        while (buf.hasRemaining()) {
+            if (ch.write(buf) > 0) dl = System.nanoTime() + WRITE_TIMEOUT_NS
+            else {
+                if (System.nanoTime() > dl) throw IOException("Write timeout")
+                LockSupport.parkNanos(WRITE_BACKOFF_NS)
+            }
+        }
+    }
     private fun applyBitrate(enc: MediaCodec, br: Int) { try { val p = Bundle(); p.putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, br); enc.setParameters(p) } catch (_: Exception) {} }
     private fun requestSyncFrame(enc: MediaCodec) { try { val p = Bundle(); p.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0); enc.setParameters(p) } catch (_: Exception) {} }
 

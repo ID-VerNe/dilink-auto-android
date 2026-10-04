@@ -85,25 +85,9 @@ class VideoDecoder {
     // Reset at each per-30-frame log so the reported value is per-window, not lifetime.
     private var windowDecodeNanos = 0L
 
-    /** Check if H.264 NAL data contains an IDR frame (NAL type 5).
-     *  Scans only the first ~1KB: NAL headers near the start determine frame type,
-     *  and a full-buffer scan on every P-frame is wasteful on a weak car CPU. */
-    private fun isKeyFrame(data: ByteArray): Boolean {
-        val limit = minOf(data.size - 4, 1024)
-        var i = 0
-        while (i < limit) {
-            if (data[i] == 0.toByte() && data[i + 1] == 0.toByte()) {
-                val nalStart = if (data[i + 2] == 1.toByte()) i + 3
-                    else if (data[i + 2] == 0.toByte() && i + 3 < data.size && data[i + 3] == 1.toByte()) i + 4
-                    else { i++; continue }
-                if (nalStart < data.size) {
-                    if ((data[nalStart].toInt() and 0x1F) == 5) return true
-                }
-            }
-            i++
-        }
-        return false
-    }
+    /** True if [data] contains an H.264 IDR frame (NAL type 5). Delegates to
+     *  [H264NalParser]; kept as a thin wrapper so existing call sites stay local. */
+    private fun isKeyFrame(data: ByteArray): Boolean = H264NalParser.isKeyFrame(data)
 
     data class FrameData(val isConfig: Boolean, val isKeyFrame: Boolean, val data: ByteArray)
 

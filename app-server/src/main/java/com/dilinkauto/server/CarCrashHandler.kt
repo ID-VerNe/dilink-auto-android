@@ -3,8 +3,8 @@ package com.dilinkauto.server
 import android.app.ActivityManager
 import android.content.Context
 import android.os.Build
-import android.os.Debug
 import android.util.Log
+import com.dilinkauto.protocol.DeviceInfo
 import java.io.File
 import java.io.PrintWriter
 import java.io.StringWriter
@@ -85,30 +85,15 @@ object CarCrashHandler : Thread.UncaughtExceptionHandler {
     }
 
     fun buildDeviceInfo(context: Context): String {
+        // Device Info block is shared with the phone-side ConnectionService via
+        // [com.dilinkauto.protocol.DeviceInfo]; the car crash report extends it
+        // with the Memory section and the memThreshold line.
         val sb = StringBuilder()
+        sb.appendLine(DeviceInfo.buildDeviceInfoBlock(context, includeMemory = true))
+
         val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
-        val mi = ActivityManager.MemoryInfo()
-        am?.getMemoryInfo(mi)
-        val dm = context.resources.displayMetrics
-
-        sb.appendLine("── Device Info ──")
-        sb.appendLine("model=${Build.MODEL} manufacturer=${Build.MANUFACTURER}")
-        sb.appendLine("product=${Build.PRODUCT} device=${Build.DEVICE}")
-        sb.appendLine("android=${Build.VERSION.RELEASE} sdk=${Build.VERSION.SDK_INT}")
-        sb.appendLine("display=${dm.widthPixels}x${dm.heightPixels} @${dm.densityDpi}dpi density=${dm.density}")
-        sb.appendLine("cores=${Runtime.getRuntime().availableProcessors()}")
-        sb.appendLine("abi=${Build.SUPPORTED_ABIS?.joinToString(",") ?: "?"}")
-        sb.appendLine()
-
-        // Memory
         if (am != null) {
-            sb.appendLine("── Memory ──")
-            sb.appendLine("totalMem=${mi.totalMem} availMem=${mi.availMem} lowMemory=${mi.lowMemory}")
-            sb.appendLine("heapMax=${Runtime.getRuntime().maxMemory()} heapTotal=${Runtime.getRuntime().totalMemory()} heapFree=${Runtime.getRuntime().freeMemory()}")
-            sb.appendLine("nativeHeap=${Debug.getNativeHeapAllocatedSize()} nativeFree=${Debug.getNativeHeapFreeSize()}")
-            val miPid = ActivityManager.MemoryInfo()
-            am.getMemoryInfo(miPid)
-            sb.appendLine("memThreshold=${mi.threshold}")
+            sb.appendLine("memThreshold=${ActivityManager.MemoryInfo().also { am.getMemoryInfo(it) }.threshold}")
             sb.appendLine()
         }
 

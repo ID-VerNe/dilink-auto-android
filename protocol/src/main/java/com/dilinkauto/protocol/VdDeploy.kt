@@ -49,4 +49,51 @@ object VdDeploy {
         val amp = if (background) " &" else ""
         return "CLASSPATH=$jarPath ${exec}app_process / $MAIN_CLASS $args >$logPath 2>&1$amp"
     }
+
+    /**
+     * A fully-assembled VD-server deploy plan: the argv tail, the kill command,
+     * and the launch command line. Built once from viewport + DPI + fps by
+     * [buildDeployPlan] and handed to whichever executor is available
+     * (car USB ADB, car TCP ADB, or phone Shizuku) so the three deploy sites
+     * do not each re-assemble the same sequence.
+     */
+    data class DeployPlan(
+        val args: String,
+        val killCommand: String,
+        val launchCommand: String
+    )
+
+    /**
+     * Build a [DeployPlan] from the viewport dimensions, phone DPI, and fps.
+     *
+     * @param jarPath   vd-server.jar location (caller-selected: VdDeploy.JAR_PATH
+     *                  for the car paths, or a Shizuku-resolved path on the phone).
+     * @param logPath   vd-server.log location.
+     * @param vdWidth    VirtualDisplay width (car-native, even-aligned).
+     * @param vdHeight   VirtualDisplay height (car-native, even-aligned).
+     * @param dpi        DPI to use (caller-resolved: handshake echo or auto-calibrated).
+     * @param encodeWidth encoder width (clamped to 1920 by VdDeployArgs).
+     * @param encodeHeight encoder height (clamped to 1080 by VdDeployArgs).
+     * @param fps        target frame rate.
+     * @param background when true, the launch command backgrounds the server.
+     */
+    fun buildDeployPlan(
+        jarPath: String,
+        logPath: String,
+        vdWidth: Int,
+        vdHeight: Int,
+        dpi: Int,
+        encodeWidth: Int,
+        encodeHeight: Int,
+        phoneHost: String,
+        fps: Int,
+        background: Boolean
+    ): DeployPlan {
+        val args = VdDeployArgs.format(vdWidth, vdHeight, dpi, phoneHost, encodeWidth, encodeHeight, fps)
+        return DeployPlan(
+            args = args,
+            killCommand = killCommand,
+            launchCommand = commandLine(jarPath, logPath, args, background)
+        )
+    }
 }
