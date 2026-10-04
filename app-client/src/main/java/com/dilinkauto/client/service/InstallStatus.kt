@@ -4,7 +4,7 @@ import com.dilinkauto.client.R
 
 /**
  * Classification of the car-app install status string produced by
- * [ConnectionService.installCarApp] and [ConnectionService.autoUpdateCarApp].
+ * [ConnectionService.installCarApp].
  *
  * The status is a free-form string surfaced to the UI; the UI needs to know
  * whether to show a spinner, a success check, an error, or an auth-needed

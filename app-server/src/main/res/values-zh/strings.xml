@@ -23,7 +23,6 @@
     <string name="nav_home">主页</string>
 
     <!-- Mirror -->
-    <string name="status_updating">正在更新车机端应用…</string>
     <string name="status_please_wait">请稍候</string>
 
     <!-- Orientation note -->
@@ -92,12 +91,10 @@
     <string name="status_connecting_usb">正在建立 USB 连接… 请在手机上确认授权弹窗</string>
     <string name="status_usb_failed">USB 连接失败 — 请检查手机上的授权弹窗</string>
     <string name="status_usb_connected">USB 已连接</string>
-    <string name="status_updating_car">正在更新车机端应用…</string>
     <string name="status_preparing_vd">正在准备虚拟显示器…</string>
     <string name="status_starting_vd">正在启动虚拟显示器…</string>
     <string name="status_vd_failed">虚拟显示器服务启动失败</string>
     <string name="status_waiting_video">正在等待视频流…</string>
-    <string name="status_updating_please_wait">正在更新车机端应用… 请稍候</string>
     <string name="status_no_adb">请将手机连接至车机 USB 接口</string>
     <string name="status_no_phone_ip">无法获取手机 IP 地址</string>
 

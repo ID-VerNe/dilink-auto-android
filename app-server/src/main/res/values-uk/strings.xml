@@ -23,7 +23,6 @@
     <string name="nav_home">Додому</string>
 
     <!-- Дзеркалювання -->
-    <string name="status_updating">Оновлення застосунку авто…</string>
     <string name="status_please_wait">Будь ласка, зачекайте</string>
 
     <!-- Орієнтація -->
@@ -86,12 +85,10 @@
     <string name="status_connecting_usb">Підключення USB… Перевірте діалог авторизації на телефоні</string>
     <string name="status_usb_failed">Помилка USB підключення — перевірте діалог авторизації на телефоні</string>
     <string name="status_usb_connected">USB підключено</string>
-    <string name="status_updating_car">Оновлення застосунку авто…</string>
     <string name="status_preparing_vd">Підготовка віртуального дисплея…</string>
     <string name="status_starting_vd">Запуск віртуального дисплея…</string>
     <string name="status_vd_failed">Помилка VD сервера</string>
     <string name="status_waiting_video">Очікування відеопотоку…</string>
-    <string name="status_updating_please_wait">Оновлення застосунку авто… Будь ласка, зачекайте</string>
     <string name="action_uninstall">Видалити</string>
     <string name="action_app_info">Відомості</string>
     <string name="home_allowlist_empty">No apps allowed. Open the phone app and select apps in Settings > Car app allowlist.</string>

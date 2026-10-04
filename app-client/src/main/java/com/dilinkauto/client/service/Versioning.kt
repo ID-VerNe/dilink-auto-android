@@ -1,10 +1,10 @@
 package com.dilinkauto.client.service
 
 /**
- * Semantic-version parsing and comparison for the update pipeline.
+ * Semantic-version parsing and comparison for the car-app install path.
  *
- * Extracted from [UpdateManager] as pure functions so the car-side installer
- * and tests can compare versions without pulling in the update state machine.
+ * Pure functions so the car-side installer and tests can compare versions
+ * without pulling in any state machine.
  *
  * Scheme (matches the project's tag format):
  *  - "0.17.0"        → base "0.17.0", dev=false, devNum=0

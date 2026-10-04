@@ -12,14 +12,10 @@ import java.io.File
  * Installs the embedded `app-server.apk` onto the car via ADB-over-WiFi (dadb),
  * with a hard 15-second connect timeout.
  *
- * Extracted from [ConnectionService] (Phase K3 / code-audit 5.3). The install
- * logic was previously duplicated between `autoUpdateCarApp` and `installCarApp`;
- * a fix in one path had to be hand-mirrored to the other.
+ * Extracted from [ConnectionService] (Phase K3 / code-audit 5.3).
  *
- * Key-pair generation and the Dadb-connect-with-timeout pattern are shared
- * with the self-update installer ([ApkInstaller.tryDadbInstall]) via
- * [AdbKeyUtil]. The 15s timeout here is the user-facing install path; the
- * auto-update fallback uses 10s — both call the same shared helper.
+ * Key-pair generation and the Dadb-connect-with-timeout pattern live in
+ * [AdbKeyUtil].
  *
  * @param context service context — used for `filesDir` (key storage)
  * @param onStatus invoked with user-facing status strings; caller routes them

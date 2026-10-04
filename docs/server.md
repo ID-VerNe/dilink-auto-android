@@ -13,7 +13,7 @@ The car server app runs on the BYD DiLink infotainment system. It uses a **paral
 
 States: IDLE → CONNECTING → CONNECTED → STREAMING
 
-Car APK is embedded in the phone APK. The phone auto-updates the car app via dadb when version mismatch is detected during handshake. Car receives `UPDATING_CAR` message and shows status instead of reconnecting blindly.
+Car APK is embedded in the phone APK. The phone installs the car app via dadb on demand (onboarding "Car setup" step or the main-screen "Install on Car" button).
 
 ### Two-Mode UI
 
@@ -62,11 +62,6 @@ Foreground service managing the full connection lifecycle with a parallel prereq
 - USB ADB connect via `UsbAdbConnection` (in protocol/ module), with `logSink` routing all ADB auth logs to `CarLogWriter`
 - Launches phone app: `am start -n com.dilinkauto.client/.MainActivity`
 - Dev mode: TCP ADB path uses `RemoteAdbController` instead of `UsbAdbConnection`, auto-reconnects on phone IP change
-
-**Update Flow:**
-- If phone sends `UPDATING_CAR`, car sets `updatingFromPhone = true`, shows "Updating car app..." status
-- Skips video/input connection attempts and reconnect loop during update
-- After `pm install -r`, car app restarts fresh
 
 **State Flows:**
 - `_state`, `_phoneName`, `_appList`, `_mediaMetadata`, `_playbackState`: primary state exposed to UI

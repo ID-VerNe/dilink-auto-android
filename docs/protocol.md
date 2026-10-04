@@ -10,7 +10,7 @@ DiLink-Auto uses a custom binary protocol over **3 dedicated TCP connections** b
 | **Video** | 9638 | VD server -> Car | H.264 CONFIG + FRAME only |
 | **Input** | 9639 | Car -> VD server | Touch events only |
 | **Lifecycle** | 19647 | VD server -> Phone (localhost) | Display ready / stack empty / stop signals |
-| **ADB TCP** | 5555 | Car -> Phone (or Phone -> Car for dadb) | Persistent single-socket ADB for shell commands and car APK auto-update |
+| **ADB TCP** | 5555 | Car -> Phone (or Phone -> Car for dadb) | Persistent single-socket ADB for shell commands and car APK install |
 
 The VD server binds the video and input ports directly on `0.0.0.0:9638` and `0.0.0.0:9639`, so video frames and touch events flow directly between the VD server and the car without phone-side relaying. The phone app is not on the video or input data path.
 
@@ -62,7 +62,7 @@ The DATA channel multiplexes on the same TCP socket as CONTROL. Video frames are
 | supportedFeatures    | int32  |  bitmask (FEATURE_VIDEO | FEATURE_AUDIO | ...)
 | displayMode          | byte   |  0=MIRROR, 1=VIRTUAL (default)
 | screenDpi            | int32  |  car display density (e.g. 160)
-| appVersionCode       | int32  |  car app version code (for version-mismatch auto-update)
+| appVersionCode       | int32  |  car app version code (informational)
 | targetFps            | int32  |  car's requested FPS (e.g. 24)
 | appVersionName len   | int16  |  version name string length
 | appVersionName       | UTF-8  |  car app version name
@@ -140,10 +140,6 @@ Empty payload. Triggers the recent-apps view on the virtual display.
 ### VD_SERVER_READY (0x20)
 
 Defined in `MessageType.kt` as a Car -> Phone signal, but unused in the current codebase (no send or receive references). The `VD_PORTS_BOUND` message (0x31) is the active signal for VD readiness. Documented here to avoid confusion when reading the constant table.
-
-### UPDATING_CAR (0x30) -- Phone -> Car
-
-Empty payload. Sent before the phone starts auto-updating the car app via dadb (WiFi ADB on port 5555). The car shows "Updating car app..." status and stops reconnecting. After the update, the car app restarts fresh.
 
 ### VD_PORTS_BOUND (0x31) -- Phone -> Car
 
@@ -298,7 +294,7 @@ The VD server uses `FrameCodec.readFrameBlocking(NioReader)` and `NioReader.read
 
 ## ADB Reference
 
-The car-side RemoteAdbController uses `TcpAdbConnection` -- a persistent single-socket ADB-over-TCP client that keeps one socket open and multiplexes shell commands through it (unlike dadb, which opens a new connection per command). The phone-side CarAppInstaller still uses dadb for car APK auto-update.
+The car-side RemoteAdbController uses `TcpAdbConnection` -- a persistent single-socket ADB-over-TCP client that keeps one socket open and multiplexes shell commands through it (unlike dadb, which opens a new connection per command). The phone-side CarAppInstaller still uses dadb for car APK install.
 
 ADB protocol details (`AdbProtocol.java`):
 - Header: 24 bytes, little-endian (command, arg0, arg1, dataLen, checksum, magic).

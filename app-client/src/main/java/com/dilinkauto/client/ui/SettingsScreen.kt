@@ -21,24 +21,16 @@ import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.BatterySaver
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ChevronRight
-import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Info
-import androidx.compose.material.icons.filled.InstallMobile
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.TouchApp
 import androidx.compose.material.icons.filled.Usb
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.FilterChip
-import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -63,14 +55,9 @@ import androidx.compose.ui.unit.sp
 import com.dilinkauto.client.R
 import com.dilinkauto.client.ShizukuManager
 import com.dilinkauto.client.service.ConnectionService
-import com.dilinkauto.client.service.DistributionChannel
-import com.dilinkauto.client.service.UpdateManager
-import com.dilinkauto.client.service.UpdateState
-import android.content.Intent
-import android.net.Uri
 
 /**
- * Settings screen: permissions, distribution channel, updates, debug, about.
+ * Settings screen: permissions, debug, about.
  */
 @Composable
 fun SettingsScreen(
@@ -79,10 +66,7 @@ fun SettingsScreen(
     onOpenBatteryExemption: () -> Unit,
     onOpenAccessibility: () -> Unit,
     onOpenDeveloperOptions: () -> Unit,
-    onOpenAllowlist: () -> Unit,
-    onCheckForUpdate: () -> Unit,
-    onDownloadUpdate: () -> Unit,
-    onInstallUpdate: () -> Unit
+    onOpenAllowlist: () -> Unit
 ) {
     val context = LocalContext.current
     val pkg = context.packageName
@@ -215,26 +199,6 @@ fun SettingsScreen(
 
             Spacer(Modifier.height(32.dp))
 
-            // Distribution Channel
-            Text(stringResource(R.string.settings_distribution), fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color.Gray,
-                modifier = Modifier.padding(bottom = 12.dp))
-
-            ChannelSelectorCard()
-
-            Spacer(Modifier.height(32.dp))
-
-            // Updates
-            Text(stringResource(R.string.updates_title), fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color.Gray,
-                modifier = Modifier.padding(bottom = 12.dp))
-
-            UpdatesCard(
-                onCheckForUpdate = onCheckForUpdate,
-                onDownloadUpdate = onDownloadUpdate,
-                onInstallUpdate = onInstallUpdate
-            )
-
-            Spacer(Modifier.height(32.dp))
-
             // Debug
             Text(stringResource(R.string.settings_debug), fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color.Gray,
                 modifier = Modifier.padding(bottom = 12.dp))
@@ -279,14 +243,6 @@ fun SettingsScreen(
                     Text(stringResource(R.string.about_version, versionName), fontWeight = FontWeight.Medium, color = Color.White)
                     Spacer(Modifier.height(4.dp))
                     Text(stringResource(R.string.about_tagline), fontSize = 12.sp, color = Color.Gray)
-                    Spacer(Modifier.height(8.dp))
-                    Text(stringResource(R.string.about_dev_credit), fontSize = 12.sp, color = Color(0xFFB0BEC5))
-                    TextButton(onClick = {
-                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/andersonlucasg3"))
-                        context.startActivity(intent)
-                    }) {
-                        Text(stringResource(R.string.about_dev_github), color = MaterialTheme.colorScheme.primary, fontSize = 12.sp)
-                    }
                     Spacer(Modifier.height(12.dp))
                     Text(stringResource(R.string.about_libs_heading), fontSize = 12.sp, fontWeight = FontWeight.Medium, color = Color(0xFFB0BEC5))
                     Text(stringResource(R.string.about_lib_dadb), fontSize = 12.sp, color = Color.Gray)
@@ -327,143 +283,6 @@ fun SetupItem(
                 Text(description, fontSize = 12.sp, color = Color.Gray)
             }
             Icon(Icons.Default.ChevronRight, contentDescription = null, tint = Color.Gray)
-        }
-    }
-}
-
-@Composable
-fun UpdatesCard(
-    onCheckForUpdate: () -> Unit,
-    onDownloadUpdate: () -> Unit,
-    onInstallUpdate: () -> Unit
-) {
-    val updateState by UpdateManager.updateState.collectAsState()
-    val downloadProgress by UpdateManager.downloadProgress.collectAsState()
-
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Text(stringResource(R.string.updates_title), fontWeight = FontWeight.Medium, color = Color.White)
-
-            Spacer(Modifier.height(8.dp))
-            when (val state = updateState) {
-                is UpdateState.Idle -> {
-                    TextButton(onClick = onCheckForUpdate) {
-                        Text(stringResource(R.string.updates_check_phone), color = MaterialTheme.colorScheme.primary)
-                    }
-                }
-                is UpdateState.Checking -> {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp, color = MaterialTheme.colorScheme.primary)
-                        Spacer(Modifier.width(12.dp))
-                        Text(stringResource(R.string.updates_checking), fontSize = 13.sp, color = Color.Gray)
-                    }
-                }
-                is UpdateState.UpToDate -> {
-                    Text(stringResource(R.string.updates_up_to_date, state.version), fontSize = 13.sp, color = Color(0xFF4CAF50))
-                    Spacer(Modifier.height(8.dp))
-                    TextButton(onClick = onCheckForUpdate) {
-                        Text(stringResource(R.string.updates_check_phone), color = MaterialTheme.colorScheme.primary)
-                    }
-                }
-                is UpdateState.Available -> {
-                    Text(stringResource(R.string.updates_available, state.version), fontSize = 13.sp, color = Color(0xFFFFA726))
-                    val sizeMb = state.sizeBytes / (1024.0 * 1024.0)
-                    Text(stringResource(R.string.updates_size_mb, sizeMb), fontSize = 12.sp, color = Color.Gray)
-                    Spacer(Modifier.height(8.dp))
-                    Button(onClick = onDownloadUpdate, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)) {
-                        Icon(androidx.compose.material.icons.Icons.Default.Download, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(8.dp))
-                        Text(stringResource(R.string.updates_download_btn))
-                    }
-                }
-                is UpdateState.Downloading -> {
-                    LinearProgressIndicator(progress = downloadProgress / 100f, modifier = Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.primary, trackColor = Color(0xFF30363D))
-                    Spacer(Modifier.height(8.dp))
-                    Text(stringResource(R.string.updates_downloading, downloadProgress), fontSize = 13.sp, color = Color.Gray)
-                }
-                is UpdateState.ReadyToInstall -> {
-                    Text(stringResource(R.string.updates_ready, state.version), fontSize = 13.sp, color = Color(0xFF4CAF50))
-                    Spacer(Modifier.height(8.dp))
-                    Button(onClick = onInstallUpdate, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))) {
-                        Icon(androidx.compose.material.icons.Icons.Default.InstallMobile, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(8.dp))
-                        Text(stringResource(R.string.updates_install_btn))
-                    }
-                }
-                is UpdateState.Installing -> {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp, color = MaterialTheme.colorScheme.primary)
-                        Spacer(Modifier.width(12.dp))
-                        Text(stringResource(R.string.updates_installing, state.version), fontSize = 13.sp, color = Color.Gray)
-                    }
-                }
-                is UpdateState.Installed -> {
-                    Text(stringResource(R.string.updates_installed), fontSize = 13.sp, color = Color(0xFF4CAF50))
-                    Spacer(Modifier.height(8.dp))
-                    TextButton(onClick = onCheckForUpdate) {
-                        Text(stringResource(R.string.updates_check_phone), color = MaterialTheme.colorScheme.primary)
-                    }
-                }
-                is UpdateState.Error -> {
-                    Text(state.message, fontSize = 12.sp, color = Color(0xFFEF5350))
-                    Spacer(Modifier.height(4.dp))
-                    TextButton(onClick = onCheckForUpdate) { Text(stringResource(R.string.updates_retry), color = MaterialTheme.colorScheme.primary) }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-fun ChannelSelectorCard() {
-    val currentChannel by remember { mutableStateOf(UpdateManager.channel) }
-    var selected by remember { mutableStateOf(currentChannel) }
-
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Text(stringResource(R.string.channel_title), fontWeight = FontWeight.Medium, color = Color.White)
-            Text(
-                when (selected) {
-                    DistributionChannel.RELEASE -> stringResource(R.string.channel_release_desc)
-                    DistributionChannel.PRE_RELEASE -> stringResource(R.string.channel_prerelease_desc)
-                },
-                fontSize = 12.sp,
-                color = Color.Gray,
-                modifier = Modifier.padding(top = 4.dp)
-            )
-            Spacer(Modifier.height(12.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilterChip(
-                    selected = selected == DistributionChannel.RELEASE,
-                    onClick = {
-                        selected = DistributionChannel.RELEASE
-                        UpdateManager.channel = DistributionChannel.RELEASE
-                    },
-                    label = { Text(stringResource(R.string.channel_release)) },
-                    colors = FilterChipDefaults.filterChipColors(
-                        selectedContainerColor = Color(0xFF1A73E8)
-                    )
-                )
-                FilterChip(
-                    selected = selected == DistributionChannel.PRE_RELEASE,
-                    onClick = {
-                        selected = DistributionChannel.PRE_RELEASE
-                        UpdateManager.channel = DistributionChannel.PRE_RELEASE
-                    },
-                    label = { Text(stringResource(R.string.channel_prerelease)) },
-                    colors = FilterChipDefaults.filterChipColors(
-                        selectedContainerColor = Color(0xFFFFA726)
-                    )
-                )
-            }
         }
     }
 }

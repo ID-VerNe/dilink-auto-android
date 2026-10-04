@@ -23,7 +23,6 @@
     <string name="nav_home">Home</string>
 
     <!-- Mirror -->
-    <string name="status_updating">Atualizando app do carro…</string>
     <string name="status_please_wait">Aguarde</string>
 
     <!-- Orientação -->
@@ -86,12 +85,10 @@
     <string name="status_connecting_usb">Conectando USB… Verifique a autorização no telefone</string>
     <string name="status_usb_failed">Falha na conexão USB — verifique autorização no telefone</string>
     <string name="status_usb_connected">USB conectado</string>
-    <string name="status_updating_car">Atualizando app do carro…</string>
     <string name="status_preparing_vd">Preparando tela virtual…</string>
     <string name="status_starting_vd">Iniciando tela virtual…</string>
     <string name="status_vd_failed">Servidor VD falhou</string>
     <string name="status_waiting_video">Aguardando stream de vídeo…</string>
-    <string name="status_updating_please_wait">Atualizando app do carro… Aguarde</string>
     <string name="action_uninstall">Desinstalar</string>
     <string name="action_app_info">Info do app</string>
     <string name="home_allowlist_empty">No apps allowed. Open the phone app and select apps in Settings > Car app allowlist.</string>

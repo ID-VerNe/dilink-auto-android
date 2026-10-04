@@ -7,15 +7,11 @@ import android.content.pm.PackageManager
  * Read an installed app's version label as a string, with a versionCode
  * fallback for pre-semver peers.
  *
- * Extracted from [ConnectionService] (which built this string at three sites:
- * handshake version comparison, car-install version check, and app-info data)
- * and from [com.dilinkauto.client.ui.SettingsScreen]'s about card. The
+ * Extracted from [ConnectionService] (which built this string at multiple
+ * sites: car-install version check and app-info data) and from
+ * [com.dilinkauto.client.ui.SettingsScreen]'s about card. The
  * `versionName ?: versionCode.toString()` shape with the deprecation
  * suppression was duplicated at each site.
- *
- * Also used by the car-side [com.dilinkauto.server.service.HandshakeFactory]
- * and the client [UpdateManager] so the lookup + deprecation-suppression lives
- * in one place across modules.
  *
  * @param preferCode when true, return versionCode as a string (used when the
  *                   peer only speaks versionCode integers — pre-0.17.0 cars).

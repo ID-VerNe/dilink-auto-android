@@ -15,7 +15,6 @@
         tools:ignore="ScopedStorage" />
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
         tools:ignore="QueryAllPackagesPermission" />
-    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <!-- Shizuku: elevated shell access without ADB -->
     <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />

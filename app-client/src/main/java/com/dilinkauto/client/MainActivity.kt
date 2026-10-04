@@ -14,7 +14,6 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import com.dilinkauto.client.service.ConnectionService
-import com.dilinkauto.client.service.UpdateManager
 import com.dilinkauto.client.ui.DiLinkAutoTheme
 import com.dilinkauto.client.ui.MainScreen
 import com.dilinkauto.client.ui.OnboardingScreen
@@ -44,11 +43,6 @@ class MainActivity : ComponentActivity() {
             startConnectionService()
         }
 
-        // Check for updates every time the app is opened
-        if (onboardingCompleted) {
-            UpdateManager.checkForUpdate(force = true)
-        }
-
         setContent {
             DiLinkAutoTheme {
                 val installStatus by ConnectionService.installStatusFlow.collectAsState()
@@ -73,10 +67,7 @@ class MainActivity : ComponentActivity() {
                             onOpenBatteryExemption = { openBatteryExemption() },
                             onOpenAccessibility = { openAccessibilitySettings() },
                             onOpenDeveloperOptions = { openDeveloperOptions() },
-                            onOpenAllowlist = { showAllowlist = true },
-                            onCheckForUpdate = { UpdateManager.checkForUpdate(force = true) },
-                            onDownloadUpdate = { UpdateManager.downloadUpdate() },
-                            onInstallUpdate = { UpdateManager.installUpdate(this) }
+                            onOpenAllowlist = { showAllowlist = true }
                         )
                     } else {
                         MainScreen(
@@ -84,9 +75,7 @@ class MainActivity : ComponentActivity() {
                             onStopService = { stopConnectionService() },
                             onInstallOnCar = { ip -> installOnCar(ip) },
                             onOpenSettings = { showSettings = true },
-                            onShareLogs = { shareLogs() },
-                            onDownloadUpdate = { UpdateManager.downloadUpdate() },
-                            onInstallUpdate = { UpdateManager.installUpdate(this) }
+                            onShareLogs = { shareLogs() }
                         )
                     }
                 }

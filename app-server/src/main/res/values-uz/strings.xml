@@ -23,7 +23,6 @@
     <string name="nav_home">Bosh sahifa</string>
 
     <!-- Aks ettirish -->
-    <string name="status_updating">Avtomobil ilovasi yangilanmoqda…</string>
     <string name="status_please_wait">Iltimos, kuting</string>
 
     <!-- Yo\'nalish -->
@@ -86,12 +85,10 @@
     <string name="status_connecting_usb">USB ulanmoqda… Telefonda avtorizatsiya dialogini tekshiring</string>
     <string name="status_usb_failed">USB ulanishi muvaffaqiyatsiz — telefonda avtorizatsiya dialogini tekshiring</string>
     <string name="status_usb_connected">USB ulandi</string>
-    <string name="status_updating_car">Avtomobil ilovasi yangilanmoqda…</string>
     <string name="status_preparing_vd">Virtual displey tayyorlanmoqda…</string>
     <string name="status_starting_vd">Virtual displey ishga tushirilmoqda…</string>
     <string name="status_vd_failed">VD server muvaffaqiyatsiz tugadi</string>
     <string name="status_waiting_video">Video oqimi kutilmoqda…</string>
-    <string name="status_updating_please_wait">Avtomobil ilovasi yangilanmoqda… Iltimos, kuting</string>
     <string name="action_uninstall">Olib tashlash</string>
     <string name="action_app_info">Ilova ma\'lumoti</string>
     <string name="home_allowlist_empty">No apps allowed. Open the phone app and select apps in Settings > Car app allowlist.</string>

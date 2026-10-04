@@ -41,8 +41,6 @@ class ConnectionService : Service() {
     private var connectionLoopJob: Job? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var networkChangeDebounce: Job? = null
-    private var autoUpdateAttempted = false
-    private var autoUpdateFailedAt = 0L
     private lateinit var carAppInstaller: CarAppInstaller
     private lateinit var appListBuilder: AppListBuilder
     private lateinit var displayRestorer: PhoneDisplayRestorer
@@ -67,7 +65,6 @@ class ConnectionService : Service() {
         deployAssets()
         logDeviceInfo()
         cacheDefaultIme()
-        UpdateManager.checkForUpdate(force = false)
         // Wire the extracted locator's WiFi dependency (avoids passing the Service
         // into CarIpLocator; the locator is a plain object for unit-testability).
         @Suppress("DEPRECATION")
@@ -263,9 +260,6 @@ class ConnectionService : Service() {
     // ─── Connection Loop ───
 
     private fun startConnectionLoop() {
-        // Reset auto-update state on explicit start — gives user a fresh chance
-        autoUpdateAttempted = false
-        autoUpdateFailedAt = 0L
         connectionLoopJob?.cancel()
         connectionLoopJob = serviceScope.launch {
             // Register mDNS in background — don't block the listen loop.
@@ -418,76 +412,35 @@ class ConnectionService : Service() {
         )
         handshakeJob?.cancel()
         handshakeJob = serviceScope.launch(Dispatchers.IO) {
-            // Check version BEFORE sending response — determines the flow.
-            // When car sends empty appVersionName (pre-0.17.0), fall back to
-            // versionCode on BOTH sides so integers are compared correctly.
-            val carHasSemver = request.appVersionName.isNotEmpty()
-            val carVersionName = if (carHasSemver) request.appVersionName
-                else request.appVersionCode.toString()
-            val myVersionName = AppVersion.label(this@ConnectionService, preferCode = !carHasSemver)
-            val updateCooldown = autoUpdateFailedAt > 0L &&
-                System.currentTimeMillis() - autoUpdateFailedAt < 5 * 60 * 1000L
-            val needsUpdate = compareVersions(myVersionName, carVersionName) > 0
-                && !autoUpdateAttempted && !updateCooldown
+            try {
+                conn.sendControl(ControlMsg.HANDSHAKE_RESPONSE, resp.encode())
+                FileLog.i(TAG, "Handshake response sent")
+            } catch (e: Exception) {
+                FileLog.e(TAG, "Failed to send handshake response", e)
+                return@launch
+            }
 
-            if (needsUpdate) {
-                try {
-                    conn.sendControl(ControlMsg.HANDSHAKE_RESPONSE, resp.encode())
-                    FileLog.i(TAG, "Handshake response sent (update needed)")
-                } catch (e: Exception) {
-                    FileLog.e(TAG, "Failed to send handshake response", e)
-                    return@launch
-                }
+            // If Shizuku is available, deploy VD server directly BEFORE waiting for lifecycle connection
+            if (ShizukuManager.isAvailable) {
+                startVdServerViaShizuku(request.screenWidth, request.screenHeight, vdWidth, vdHeight, displayDpi)
+            }
 
-                try {
-                    conn.sendControl(ControlMsg.UPDATING_CAR)
-                    FileLog.i(TAG, "Sent UPDATING_CAR to car")
-                } catch (_: Exception) {}
-
-                autoUpdateAttempted = true
-                FileLog.i(TAG, "Car app outdated — updating, waiting for reconnect")
-                _installStatusStatic.value = getString(R.string.status_auto_update, carVersionName, myVersionName)
-                autoUpdateCarApp(conn)
-                delay(2000)
-                FileLog.i(TAG, "Update initiated — disconnecting to wait for car reconnect")
-                withContext(Dispatchers.Main) { cleanupSession() }
-            } else {
-                try {
-                    conn.sendControl(ControlMsg.HANDSHAKE_RESPONSE, resp.encode())
-                    FileLog.i(TAG, "Handshake response sent")
-                } catch (e: Exception) {
-                    FileLog.e(TAG, "Failed to send handshake response", e)
-                    return@launch
-                }
-
-                if (compareVersions(myVersionName, carVersionName) > 0) {
-                    FileLog.i(TAG, "Car app outdated — update already attempted, proceeding")
-                } else {
-                    FileLog.i(TAG, "Car app up-to-date ($carVersionName)")
-                }
-
-                // If Shizuku is available, deploy VD server directly BEFORE waiting for lifecycle connection
-                if (ShizukuManager.isAvailable) {
-                    startVdServerViaShizuku(request.screenWidth, request.screenHeight, vdWidth, vdHeight, displayDpi)
-                }
-
-                // Wait for VD to connect on the lifecycle channel already opened.
-                // Runs inside handshakeJob — cancelled properly on reconnect.
-                val client = vdClient ?: return@launch
-                if (!client.isConnected) {
-                    if (client.acceptConnection(VirtualDisplayClient.SERVER_PORT)) {
-                        FileLog.i(TAG, "VD server lifecycle connected (displayId=${client.displayId})")
-                        InputInjectionService.instance?.setVirtualDisplay(client.displayId, vdWidth, vdHeight)
-                        withContext(Dispatchers.Main) {
-                            _serviceState.value = State.STREAMING
-                            updateNotification(R.string.notification_streaming)
-                        }
-                        appListBuilder.sendAppList(conn)
-                    } else {
-                        FileLog.w(TAG, "VD server did not connect within timeout — tearing down")
-                        withContext(Dispatchers.Main) { cleanupSession() }
-                        return@launch
+            // Wait for VD to connect on the lifecycle channel already opened.
+            // Runs inside handshakeJob — cancelled properly on reconnect.
+            val client = vdClient ?: return@launch
+            if (!client.isConnected) {
+                if (client.acceptConnection(VirtualDisplayClient.SERVER_PORT)) {
+                    FileLog.i(TAG, "VD server lifecycle connected (displayId=${client.displayId})")
+                    InputInjectionService.instance?.setVirtualDisplay(client.displayId, vdWidth, vdHeight)
+                    withContext(Dispatchers.Main) {
+                        _serviceState.value = State.STREAMING
+                        updateNotification(R.string.notification_streaming)
                     }
+                    appListBuilder.sendAppList(conn)
+                } else {
+                    FileLog.w(TAG, "VD server did not connect within timeout — tearing down")
+                    withContext(Dispatchers.Main) { cleanupSession() }
+                    return@launch
                 }
             }
         }
@@ -537,60 +490,6 @@ class ConnectionService : Service() {
             FileLog.i(TAG, "VD server started via Shizuku: ${vdWidth}x$vdHeight @${dpi}dpi")
         } catch (e: Exception) {
             FileLog.e(TAG, "Shizuku VD server start failed", e)
-        }
-    }
-
-    /**
-     * Auto-update car app via dadb when handshake reveals outdated version.
-     * Gets the car's IP from the WiFi gateway (car connects to phone's hotspot).
-     */
-    private fun autoUpdateCarApp(@Suppress("UNUSED_PARAMETER") conn: Connection) {
-        serviceScope.launch(Dispatchers.IO) {
-            try {
-                ensureAssetsReady()
-                val apkFile = java.io.File(filesDir, "app-server.apk")
-                if (!apkFile.exists()) {
-                    FileLog.w(TAG, "Auto-update: car APK not found")
-                    return@launch
-                }
-
-                // Get car IP from the active TCP connection (most reliable)
-                val carIp = controlConnection?.remoteAddress
-                    ?: CarIpLocator.findCarAdb(null)
-                if (carIp == null) {
-                    FileLog.w(TAG, "Auto-update: can't determine car IP")
-                    return@launch
-                }
-
-                FileLog.i(TAG, "Auto-updating car app at $carIp:${Discovery.ADB_PORT}...")
-                _installStatusStatic.value = getString(R.string.car_install_status_connecting_to, carIp)
-                val dadb = carAppInstaller.connect(carIp)
-                if (dadb == null) {
-                    _installStatusStatic.value = getString(R.string.car_install_status_auth_needed)
-                    autoUpdateFailedAt = System.currentTimeMillis()
-                    return@launch
-                }
-
-                try {
-                    val result = carAppInstaller.pushAndInstall(dadb, apkFile, /* versionLabel */ "")
-                    FileLog.i(TAG, "Auto-update result: ${result.trim()}")
-                    if (result.contains("Success")) {
-                        _installStatusStatic.value = getString(R.string.status_auto_update_complete)
-                        appListBuilder.resetIconHashes() // car's icon cache was wiped by reinstall
-                        FileLog.i(TAG, "Car app auto-updated — restarting")
-                    } else {
-                        _installStatusStatic.value = getString(R.string.status_update_failed, result.trim())
-                        autoUpdateFailedAt = System.currentTimeMillis()
-                        FileLog.w(TAG, "Auto-update failed: ${result.trim()} — will retry in 5min")
-                    }
-                } finally {
-                    dadb.close()
-                }
-            } catch (e: Exception) {
-                _installStatusStatic.value = getString(R.string.status_auto_update_failed, e.message ?: "unknown")
-                autoUpdateFailedAt = System.currentTimeMillis()
-                FileLog.e(TAG, "Auto-update failed: ${e.message} — will retry in 5min")
-            }
         }
     }
 

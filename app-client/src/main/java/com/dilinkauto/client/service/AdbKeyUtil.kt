@@ -8,15 +8,12 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 /**
- * ADB key-pair + Dadb-create helpers shared by the car-APK installer
- * ([CarAppInstaller]) and the self-update installer ([ApkInstaller.tryDadbInstall]).
+ * ADB key-pair + Dadb-create helpers used by the car-APK installer
+ * ([CarAppInstaller]).
  *
- * Both sites previously carried byte-identical key-pair generation blocks and
- * the same `Future.get(timeout, SECONDS)` pattern around `Dadb.create()` (which
- * does blocking socket I/O that coroutine cancellation cannot interrupt). They
- * diverged on the timeout (15s for the user-initiated car install, 10s for the
- * auto-update fallback); the shared helper takes the timeout as a parameter so
- * each call site keeps its own value while the body lives in one place.
+ * The `Future.get(timeout, SECONDS)` pattern around `Dadb.create()` is needed
+ * because the call does blocking socket I/O that coroutine cancellation cannot
+ * interrupt. The timeout is a parameter so call sites can pick their own value.
  */
 internal object AdbKeyUtil {
 

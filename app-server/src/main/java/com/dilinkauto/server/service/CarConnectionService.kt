@@ -104,7 +104,6 @@ class CarConnectionService : Service() {
     @Volatile private var usbReady = false        // USB ADB connected to phone
     private var connectionScope: Job? = null  // Parent job for all discovery/connect coroutines
     @Volatile internal var vdServerStarted = false // VD server process launched
-    @Volatile private var updatingFromPhone = false // Phone is pushing an update — don't reconnect
     @Volatile private var shizukuMode = false  // Phone handles VD server via Shizuku
     @Volatile private var handshakeDone = false // Stop gateway retry after handshake completes
     @Volatile private var lastAdbHost: String? = null // Track which host TCP ADB connected to
@@ -437,16 +436,8 @@ class CarConnectionService : Service() {
      * Called from handleControlFrame when HANDSHAKE_RESPONSE is received.
      */
     private fun connectVideoAndInput(host: String) {
-        if (updatingFromPhone) {
-            carLogSend("Skipping video/input connections — update in progress")
-            return
-        }
         scope.launch(Dispatchers.IO) {
             try {
-                if (updatingFromPhone) {
-                    carLogSend("Skipping video/input connections — update flag set during launch")
-                    return@launch
-                }
                 carLogSend("Connecting video (${Discovery.VIDEO_PORT}) and input (${Discovery.INPUT_PORT})...")
 
                 val videoDef = async { Connection.connect(host, Discovery.VIDEO_PORT, scope) }
@@ -724,11 +715,6 @@ class CarConnectionService : Service() {
                 }
             }
             ControlMsg.APP_STARTED -> {}
-            ControlMsg.UPDATING_CAR -> {
-                carLogSend("Phone is updating car app — waiting for restart")
-                updatingFromPhone = true
-                _statusMessage.value = getString(R.string.status_updating_car)
-            }
             ControlMsg.VD_STACK_EMPTY -> {
                 carLogSend("VD stack empty — switching to home")
                 _vdStackEmpty.tryEmit(Unit)
@@ -1008,14 +994,6 @@ class CarConnectionService : Service() {
         // Preserve TCP ADB readiness if controller is still connected
         if (adbController?.isConnected == true) {
             usbReady = true
-        }
-
-        if (updatingFromPhone) {
-            _state.value = State.IDLE
-            _statusMessage.value = getString(R.string.status_updating_please_wait)
-            carLogSend("Disconnected during update — waiting for app restart")
-            // Don't reconnect — the phone will install the new APK and restart us
-            return
         }
 
         if (userDisconnected) {

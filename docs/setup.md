@@ -35,7 +35,7 @@ No Wireless Debugging pairing codes or special WiFi configuration are needed. Sh
 
 **No internet connection required.** The car APK is embedded inside the phone APK as an asset; the phone pushes it to the car over local WiFi. No manual car installation is needed for the normal flow.
 
-On first connection (or when a version mismatch is detected during handshake), the phone sends an `UPDATING_CAR` control message to the car (which shows an "Updating..." status), then auto-installs via dadb (WiFi ADB on port 5555). The phone's onboarding "Car setup" step and the main-screen "Install on Car" button both trigger this same path.
+Install the car app from the phone's onboarding "Car setup" step or the main-screen "Install on Car" button; both trigger the same path (dadb over WiFi ADB on port 5555).
 
 Manual install (only if you have ADB access to the car and want to bypass the auto-push): `adb install app-server-debug.apk`.
 
@@ -78,11 +78,10 @@ When the phone connects to the car:
 2. **Track A (WiFi):** gateway IP + mDNS discovery → NIO connect to phone control port `9637`.
 3. **Track B (USB):** scan devices → USB ADB connect → launch phone app via `am start`.
 4. **Handshake:** car sends viewport dimensions + DPI override + appVersionCode + targetFps; phone responds with device info and `vdServerJarPath`.
-5. **Version check:** phone compares `appVersionCode` — on mismatch it sends `UPDATING_CAR` and auto-updates the car APK via dadb before continuing.
-6. **Three-connection setup:** after handshake the car opens video (`9638`) and input (`9639`) connections; the VD server reverse-connects to the phone on localhost:`19647` for the lifecycle channel.
-7. **Phone deploys VD server** — extracts `vd-server.jar` to `/sdcard/DiLinkAuto/`, starts `app_process` as shell UID with the VD dimensions, DPI, encode dims, and FPS as args.
-8. **VD server creates the VirtualDisplay** at the negotiated DPI (Auto or override) and runs the GL pipeline: frame clock → GL render → encoder drain → TCP write, all on a single thread with `System.nanoTime()` / `LockSupport.parkNanos()` timing.
-9. **Video streams** over WiFi TCP on port `9638` — H.264 Main profile, 4 Mbps CBR, 24 fps, encode dimensions capped at 1920x1080. Adaptive bitrate falls back in 0.5 Mbps steps down to a 1.5 Mbps floor with a 2s recovery window.
+5. **Three-connection setup:** after handshake the car opens video (`9638`) and input (`9639`) connections; the VD server reverse-connects to the phone on localhost:`19647` for the lifecycle channel.
+6. **Phone deploys VD server** — extracts `vd-server.jar` to `/sdcard/DiLinkAuto/`, starts `app_process` as shell UID with the VD dimensions, DPI, encode dims, and FPS as args.
+7. **VD server creates the VirtualDisplay** at the negotiated DPI (Auto or override) and runs the GL pipeline: frame clock → GL render → encoder drain → TCP write, all on a single thread with `System.nanoTime()` / `LockSupport.parkNanos()` timing.
+8. **Video streams** over WiFi TCP on port `9638` — H.264 Main profile, 4 Mbps CBR, 24 fps, encode dimensions capped at 1920x1080. Adaptive bitrate falls back in 0.5 Mbps steps down to a 1.5 Mbps floor with a 2s recovery window.
 
 Port reference: `9637` control+data, `9638` video, `9639` touch input, `19647` lifecycle (VD server → phone localhost), `5555` ADB TCP.
 
@@ -122,10 +121,8 @@ A race used to leave the decoder unable to restart after rotation: `onCarViewpor
 - Reconnect attempts no longer kill an active session — the WiFi gateway retry loop stops after 3 consecutive ADB failures, and TCP ADB reconnects on phone IP change rather than tearing down the running stream.
 - If persistent, check `/sdcard/DiLinkAuto/client.log` for "Network lost" entries.
 
-### Car app not updating
+### Car app not installing
 
-- The phone auto-updates the car app when a version mismatch is detected during handshake
-- The car shows an "Updating car app..." status during the update
 - Manual trigger: "Install on Car" button in the phone app
 - Ensure dadb can reach the car over WiFi ADB (port 5555)
 

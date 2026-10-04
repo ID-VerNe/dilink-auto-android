@@ -36,7 +36,7 @@ A separate lifecycle channel on `localhost:19647` carries `MSG_DISPLAY_READY` / 
 |  |  9637: control+data  | 19647| Reverse-connects lifecycle     |  |
 |  |  Handshake           |  NIO | VirtualDisplay (car viewport)  |  |
 |  |  VD lifecycle        |      | GL render -> H.264 encoder     |  |
-|  |  Car auto-update     |      | TCP write 9638 (video)         |  |
+|  |  Car-app install     |      | TCP write 9638 (video)         |  |
 |  |  Car log routing     |      | Touch read 9639 (input)        |  |
 |  |  Allowlist filter    |      | Display power + IME restore    |  |
 |  +----------+-----------+      | App launcher (am start)        |  |
@@ -98,12 +98,12 @@ Shared by all three apps. Zero UI dependencies. Owns the wire format, the ADB cl
 | Discovery | `Discovery.kt` | mDNS service registration/discovery. Port constants: `DEFAULT_PORT=9637`, `VIDEO_PORT=9638`, `INPUT_PORT=9639`, `LIFECYCLE_PORT=19647`, `ADB_PORT=5555` |
 | UsbAdbConnection | `adb/UsbAdbConnection.java` | ADB protocol over USB (CNXN, AUTH, OPEN, WRTE), `logSink` callback |
 | AdbProtocol | `adb/AdbProtocol.java` | ADB message constants and serialization |
-| TcpAdbConnection | `adb/TcpAdbConnection.kt` | Persistent ADB over TCP — single socket reused for all shell commands. Used by the car-side `RemoteAdbController`. (`dadb` is still used by the phone-side `CarAppInstaller` for the car APK auto-update.) |
+| TcpAdbConnection | `adb/TcpAdbConnection.kt` | Persistent ADB over TCP — single socket reused for all shell commands. Used by the car-side `RemoteAdbController`. (`dadb` is still used by the phone-side `CarAppInstaller` for the car APK install.) |
 | Cross-module constants | `AppPrefs.kt`, `AppTargets.kt`, `VdDeploy.kt`, `VdDeployArgs.kt`, `WifiGatewayIp.kt`, `ImeRestore.kt` | Shared SharedPreferences keys, `am start` component strings, `app_process` kill/launch command builders, DPI override range (120..480), WiFi gateway formatter, IME restore commands + `linkpc` exclusion predicate |
 
 ### app-client (Phone Application, minSdk 29)
 
-Manages handshake, VD lifecycle, car auto-update, allowlist filtering, and `FileLog`.
+Manages handshake, VD lifecycle, car-app install, allowlist filtering, and `FileLog`.
 
 | Component | File | Purpose |
 |-----------|------|---------|
@@ -116,7 +116,6 @@ Manages handshake, VD lifecycle, car auto-update, allowlist filtering, and `File
 | CarIpLocator | `service/CarIpLocator.kt` | Locates the car's ADB-over-WiFi service (port 5555): control-connection remote IP, subnet enumeration, ARP, neighbor cache, parallel /24 scan, gateway |
 | PhoneDisplayRestorer | `service/PhoneDisplayRestorer.kt` | Restores the phone's physical display and IME after the VD server tears down. Layered: Shizuku (`pkill PipelineServer` + `cmd display power-on` + IME restore), then `PowerManager.wakeUp` reflection, then `FLAG_TURN_SCREEN_ON`, then a wake lock |
 | FileLog | `FileLog.kt` | File-based logging to `/sdcard/DiLinkAuto/client.log`, rotation (10 files max), bypasses HyperOS logcat filtering. Defaults to ON for debug/pre-release, OFF for release; user choice persists via `AppPrefs.LOG_ENABLED` |
-| UpdateManager | `service/UpdateManager.kt` | Self-update orchestrator: GitHub Releases fetch, download, install. `Versioning.kt` does semver comparison |
 | MainActivity | `MainActivity.kt` | UI — start/stop, onboarding, settings, allowlist, install-on-car |
 
 ### app-server (Car Application, minSdk 26)
@@ -170,17 +169,15 @@ Android library module (`com.android.library`), compiled via `bundleLibRuntimeTo
    b. NIO connect to phone control port (9637)
    c. Handshake: car sends viewport + DPI + appVersionCode + targetFps + dpiOverride
    d. Phone responds with device info + vdServerJarPath + connectionMethod + vdDpi
-   e. Phone checks appVersionCode/appVersionName -- if mismatch, sends UPDATING_CAR,
-      auto-updates car APK via dadb, then disconnects to wait for car restart
-   f. Phone opens lifecycle ServerSocket on 0.0.0.0:19647
-   g. If Shizuku available: phone deploys VD server directly.
+   e. Phone opens lifecycle ServerSocket on 0.0.0.0:19647
+   f. If Shizuku available: phone deploys VD server directly.
       Else car deploys via ADB (USB or TCP).
-   h. VD server starts: CLASSPATH=jar app_process / PipelineServer W H DPI PHONE_HOST EW EH FPS
-   i. VD server reverse-connects to phone localhost:19647 (NIO non-blocking)
-   j. Phone accepts, reads MSG_DISPLAY_READY (displayId + direct-injection flag)
-   k. Phone sends VD_PORTS_BOUND to car on the control connection
-   l. Car connects video (9638) + input (9639) directly to the VD server in parallel
-   m. VD server accepts both -- session fully established
+   g. VD server starts: CLASSPATH=jar app_process / PipelineServer W H DPI PHONE_HOST EW EH FPS
+   h. VD server reverse-connects to phone localhost:19647 (NIO non-blocking)
+   i. Phone accepts, reads MSG_DISPLAY_READY (displayId + direct-injection flag)
+   j. Phone sends VD_PORTS_BOUND to car on the control connection
+   k. Car connects video (9638) + input (9639) directly to the VD server in parallel
+   l. VD server accepts both -- session fully established
 
    Track B (USB ADB / TCP ADB):
    a. USB: scan USB devices for ADB interface -> CNXN -> AUTH -> connected

@@ -23,7 +23,6 @@
     <string name="nav_home">Басты бет</string>
 
     <!-- Айна -->
-    <string name="status_updating">Автокөлік қолданбасы жаңартылуда…</string>
     <string name="status_please_wait">Күте тұрыңыз</string>
 
     <!-- Бағдар -->
@@ -86,12 +85,10 @@
     <string name="status_connecting_usb">USB қосылуда… Телефондағы авторизация диалогын тексеріңіз</string>
     <string name="status_usb_failed">USB қосылымы сәтсіз — телефондағы авторизация диалогын тексеріңіз</string>
     <string name="status_usb_connected">USB қосылды</string>
-    <string name="status_updating_car">Автокөлік қолданбасы жаңартылуда…</string>
     <string name="status_preparing_vd">Виртуалды дисплей дайындалуда…</string>
     <string name="status_starting_vd">Виртуалды дисплей іске қосылуда…</string>
     <string name="status_vd_failed">VD сервері сәтсіз аяқталды</string>
     <string name="status_waiting_video">Бейне ағынын күту…</string>
-    <string name="status_updating_please_wait">Автокөлік қолданбасы жаңартылуда… Күте тұрыңыз</string>
     <string name="action_uninstall">Жою</string>
     <string name="action_app_info">Қолданба туралы ақпарат</string>
     <string name="home_allowlist_empty">No apps allowed. Open the phone app and select apps in Settings > Car app allowlist.</string>
