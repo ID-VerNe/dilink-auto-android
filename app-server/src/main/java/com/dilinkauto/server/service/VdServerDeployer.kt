@@ -91,7 +91,11 @@ internal class VdServerDeployer(private val host: CarConnectionService) {
                 encodeWidth = vdW, encodeHeight = vdH,
                 phoneHost = "127.0.0.1", fps = host.targetFps,
                 bitrate = host.startupBitrate,
-                background = true
+                // background=false → exec app_process，shell 流保持附着：
+                // 带 & 后台化会让 shell 立即退出、ADB 流立刻关闭，而车机端
+                // TcpAdbConnection 没有按流分发的读线程，残留消息会连带
+                // 干掉刚启动的引擎（表现为日志 0 字节、进程秒死）。
+                background = false
             )
 
             // Kill any existing VD server
@@ -140,13 +144,15 @@ internal class VdServerDeployer(private val host: CarConnectionService) {
             encodeWidth = vdW, encodeHeight = vdH,
             phoneHost = "127.0.0.1", fps = host.targetFps,
             bitrate = host.startupBitrate,
-            background = true
+            // 同 deploy()：必须 exec 保持流附着，不能用 & 后台化
+            background = false
         )
         host.setStatusMessage(R.string.status_preparing_vd)
         log("VD server: ${vdW}x${vdH}@${phoneDpi}dpi (car-native, no downscale)")
         // Use shell (sync) to capture result. pkill old instance first, then start new one.
         controller.shell(plan.killCommand)
-        // Use shellBackground to keep ADB stream open — prevents shell from killing the process
+        // shellBackground 打开流后不关闭：exec app_process 接管 shell，
+        // 流在引擎存活期间一直附着，进程不会被 adbd 回收
         val streamId = controller.shellBackground(plan.launchCommand)
         val ok = streamId >= 0
         host.setStatusMessage(R.string.status_starting_vd)

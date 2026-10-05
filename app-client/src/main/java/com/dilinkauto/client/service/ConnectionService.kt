@@ -145,6 +145,28 @@ class ConnectionService : Service() {
         }
     }
 
+    /**
+     * 把 assets 里的字节原子地写入 [target]。
+     *
+     * 先写同目录下的 `.tmp` 再 rename，避免两种线上事故：
+     *  1. `app_process` 正在 mmap 旧 jar 时被截断覆写 → SIGBUS 让进程崩溃，
+     *     实测还会连带 adbd 重启（无线调试端口被重置）。
+     *  2. 写入中途失败留下半截文件 → 下次 `app_process` 加载时 exit_code=134
+     *     (SIGABRT) 且不打印任何日志，属于无法排查的静默失败。
+     *
+     * rename 只替换目录项，老进程的 mmap仍指向旧 inode，因此运行中的
+     * vd-server 不受影响（已在真机实测：PID 存活、设备稳定）。
+     */
+    private fun writeAtomically(target: java.io.File, bytes: ByteArray) {
+        val tmp = java.io.File("${target.absolutePath}.tmp")
+        tmp.writeBytes(bytes)
+        if (!tmp.renameTo(target)) {
+            // FUSE 上某些场景 rename 可能失败，退化为直接写（仍优于整体丢失）
+            target.writeBytes(bytes)
+            tmp.delete()
+        }
+    }
+
     private fun extractAsset(assetName: String, target: java.io.File) {
         try {
             val assetBytes = assets.open(assetName).use { it.readBytes() }
@@ -158,13 +180,49 @@ class ConnectionService : Service() {
                 }
             }
 
-            val tmp = java.io.File("${target.absolutePath}.tmp")
-            tmp.writeBytes(assetBytes)
-            tmp.renameTo(target)
+            writeAtomically(target, assetBytes)
             FileLog.i(TAG, "$assetName deployed to ${target.absolutePath} (${assetBytes.size} bytes, crc=$assetCrc)")
         } catch (e: Exception) {
             FileLog.w(TAG, "Failed to extract $assetName: ${e.message}")
         }
+    }
+
+    /**
+     * 确保磁盘上的 vd-server.jar 与当前 APK 内嵌的版本一致，返回该 jar 的 CRC。
+     *
+     * 为什么必须在每次握手前调用：磁盘上的 jar 会跨进程存活，而
+     * [deployAssets] 只在 [onCreate] 跑一次。若这里不校验，Service 未被系统
+     * 回收、只是重连车机或强杀重启 vd-server 时，`CLASSPATH=... app_process`
+     * 会静默加载上一次的旧引擎 —— 应用能跑、日志正常，但跑的是旧代码。
+     *
+     * CRC 相同则直接返回，代价仅一次内存读，不写盘、不需要 Shizuku；
+     * 因此 Shizuku 与车机 ADB 两条部署路径都可以无条件调用。
+     */
+    private fun ensureVdServerJarCurrent(): Long {
+        val target = java.io.File(VdDeploy.JAR_PATH)
+        var crc = -1L
+        try {
+            val assetBytes = assets.open(VdDeploy.JAR_NAME).use { it.readBytes() }
+            val assetCrc = java.util.zip.CRC32().apply { update(assetBytes) }.value
+            crc = assetCrc
+
+            target.parentFile?.mkdirs()
+            if (target.exists()) {
+                val fileCrc = java.util.zip.CRC32().apply { update(target.readBytes()) }.value
+                if (fileCrc == assetCrc) {
+                    FileLog.i(TAG, "VD jar up-to-date (crc=$assetCrc)")
+                    return assetCrc
+                }
+            }
+
+            writeAtomically(target, assetBytes)
+            FileLog.i(TAG, "VD jar refreshed: ${target.absolutePath} (${assetBytes.size} bytes, crc=$assetCrc)")
+        } catch (e: Exception) {
+            FileLog.e(TAG, "VD jar refresh failed: ${e.message}")
+            // 磁盘上已有可用 jar 时继续启动，否则让调用方决定是否放弃
+            if (!target.exists() || target.length() == 0L) crc = -1L
+        }
+        return crc
     }
 
     private fun registerNetworkCallback() {
@@ -394,10 +452,14 @@ class ConnectionService : Service() {
             FileLog.i(TAG, "VD lifecycle channel open on localhost:${VirtualDisplayClient.SERVER_PORT}")
         }
 
-        val vdJarPath = java.io.File(
-            java.io.File(android.os.Environment.getExternalStorageDirectory(), "DiLinkAuto"),
-            "vd-server.jar"
-        ).absolutePath
+        // 握手响应里告知车机端 jar 路径前，先确保磁盘上的 jar 就是当前 APK
+        // 内嵌的那一份。放在此处可覆盖 Shizuku 与车机 ADB 两条部署路径，
+        // 且早于响应发送 —— 车机端拿到路径后不会启动到旧 jar。
+        val vdJarCrc = ensureVdServerJarCurrent()
+        // 直接用 VdDeploy.JAR_PATH，不再与 getExternalStorageDirectory() 拼接：
+        // child 的前导斜杠不重置父路径，拼接会得到 /storage/emulated/0/sdcard/DiLinkAuto
+        // 这类影子目录，与实际写入位置不一致。
+        val vdJarPath = VdDeploy.JAR_PATH
         val connMethod = if (ShizukuManager.checkPermission()) CONNECTION_METHOD_SHIZUKU else CONNECTION_METHOD_USB_ADB
         val resp = HandshakeResponse(
             accepted = true,
@@ -422,7 +484,7 @@ class ConnectionService : Service() {
 
             // If Shizuku is available, deploy VD server directly BEFORE waiting for lifecycle connection
             if (ShizukuManager.isAvailable) {
-                startVdServerViaShizuku(request.screenWidth, request.screenHeight, vdWidth, vdHeight, displayDpi)
+                startVdServerViaShizuku(request.screenWidth, request.screenHeight, vdWidth, vdHeight, displayDpi, vdJarCrc)
             }
 
             // Wait for VD to connect on the lifecycle channel already opened.
@@ -455,7 +517,7 @@ class ConnectionService : Service() {
      * without waiting for the car's USB ADB connection. The VD server will
      * reverse-connect to localhost:19647 as usual.
      */
-    private suspend fun startVdServerViaShizuku(carWidth: Int, carHeight: Int, vdWidth: Int, vdHeight: Int, dpi: Int = VideoConfig.DEFAULT_FALLBACK_DPI) {
+    private suspend fun startVdServerViaShizuku(carWidth: Int, carHeight: Int, vdWidth: Int, vdHeight: Int, dpi: Int = VideoConfig.DEFAULT_FALLBACK_DPI, jarCrc: Long = -1L) {
         if (!ShizukuManager.isAvailable) {
             FileLog.w(TAG, "Shizuku not available — cannot start VD server")
             return
@@ -487,7 +549,9 @@ class ConnectionService : Service() {
             delay(200)
 
             ShizukuManager.execBackground(plan.launchCommand)
-            FileLog.i(TAG, "VD server started via Shizuku: ${vdWidth}x$vdHeight @${dpi}dpi")
+            // 打出 jar CRC：测试时可直接从日志确认这次跑的是哪一版引擎，
+            // 避免"装了新 APK 却跑旧代码"无从查证。
+            FileLog.i(TAG, "VD server started via Shizuku: ${vdWidth}x$vdHeight @${dpi}dpi jarCrc=$jarCrc")
         } catch (e: Exception) {
             FileLog.e(TAG, "Shizuku VD server start failed", e)
         }

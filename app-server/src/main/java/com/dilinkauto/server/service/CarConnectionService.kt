@@ -506,7 +506,18 @@ class CarConnectionService : Service() {
     private fun startTcpAdbTrack() {
         if (tcpAdbConnecting) return
         // Reconnect if phone IP changed since last ADB connection
-        if (adbController?.isConnected == true && lastAdbHost == phoneHost) return
+        if (adbController?.isConnected == true && lastAdbHost == phoneHost) {
+            // 控制器跨会话存活（dev 模式下 TCP ADB 连的是手机 adbd，不受 App 重启影响）
+            // 时直接复用，但 usbReady 可能已被上一轮重连（startConnection 重置）或
+            // 用户断开清掉；这里必须就地恢复，否则本函数因「已连接」提前返回，
+            // usbReady 再也无法置真，状态机卡死在 CONNECTING（UI 永远显示"连接中"）。
+            if (!usbReady) {
+                usbReady = true
+                carLogSend("Dev mode: TCP ADB still connected — usbReady restored")
+                checkAndAdvance()
+            }
+            return
+        }
         if (adbController?.isConnected == true && lastAdbHost != phoneHost && phoneHost != null) {
             carLogSend("Dev mode: phone IP changed $lastAdbHost -> $phoneHost, reconnecting TCP ADB")
             adbController?.disconnect()

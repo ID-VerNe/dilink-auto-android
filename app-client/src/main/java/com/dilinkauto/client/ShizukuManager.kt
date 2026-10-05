@@ -8,9 +8,7 @@ import android.util.Log
 import moe.shizuku.server.IRemoteProcess
 import moe.shizuku.server.IShizukuService
 import rikka.shizuku.Shizuku
-import java.io.File
 import java.io.FileInputStream
-import java.io.FileOutputStream
 
 /**
  * Manages Shizuku lifecycle and provides shell-level command execution.
@@ -185,31 +183,6 @@ object ShizukuManager {
         return try {
             process.waitForTimeout(deadlineMs, java.util.concurrent.TimeUnit.MILLISECONDS.name)
         } catch (_: Exception) { false }
-    }
-
-    /**
-     * Copy a local file to a destination path using Shizuku shell STDIN pipe.
-     * Useful when direct file copy fails due to SELinux/permission restrictions.
-     */
-    fun copyToFile(source: File, destinationPath: String): Boolean {
-        if (!isAvailable) return false
-        return try {
-            val service = getService() ?: return false
-            val process = service.newProcess(arrayOf("sh", "-c", "cat > '$destinationPath'"), null, null)
-            val stdinFd = process.outputStream
-            try {
-                FileOutputStream(stdinFd.fileDescriptor).use { out ->
-                    source.inputStream().use { it.copyTo(out) }
-                }
-                // Cap waitFor so a stalled cat can't block the caller forever.
-                waitForWithDeadline(process, 30_000L)
-            } finally {
-                stdinFd.close()
-            }
-        } catch (e: Exception) {
-            FileLog.w(TAG, "copyToFile via Shizuku failed: ${e.message}")
-            false
-        }
     }
 
     /**
