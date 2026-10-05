@@ -304,6 +304,20 @@ ADB protocol details (`AdbProtocol.java`):
 - AUTH: `AUTH_TOKEN` (1) = device sends 20-byte token, `AUTH_SIGNATURE` (2) = host signs with SHA-1 DigestInfo + NONEwithRSA (prehashed, matching AOSP `RSA_sign(NID_sha1)`), `AUTH_RSAPUBLICKEY` (3) = host sends public key for user approval.
 - Key storage: `TcpAdbConnection` writes PEM-format keys (`adbkey` / `adbkey.pub`) in its `keyDir` so dadb can read the same keys.
 
+### VD Server Shell Commands (`VdDeploy`)
+
+All VD server lifecycle commands are defined in `VdDeploy.kt` (protocol module) and shared across phone and car:
+
+| Command | Description |
+|---------|-------------|
+| `killCommand` | Graceful kill: `pkill -f [P]ipelineServer 2>/dev/null` (SIGTERM, lets JVM shutdown hook run) |
+| `killCommandForce` | Force kill: `pkill -9 -f [P]ipelineServer 2>/dev/null` (SIGKILL, skips shutdown hook) |
+| `stopCommand` | Two-stage stop: `pkill -f [P]ipelineServer; sleep 1; pkill -9 -f [P]ipelineServer; exit 0` — SIGTERM → wait → SIGKILL in one shell line so a coroutine cancellation cannot land between signals |
+| `probeCommand` | Liveness probe (output form): prints `Y` if alive, `N` if gone. Uses `pkill -0` (signal 0 = existence check only) |
+| `probeExitCodeCommand` | Liveness probe (exit code form): exit 0 = alive, exit 1 = gone. For callers that only see exit status (car's ADB `shell()` path) |
+
+**Process pattern**: All patterns use the `[P]ipelineServer` bracket trick. A plain `PipelineServer` pattern makes `pkill -f` match the wrapper shell itself (`sh -c "pkill -f PipelineServer ..."` has that string in its own cmdline), so the shell gets SIGTERM'd mid-script and any subsequent command silently never runs.
+
 ## Constants
 
 ```

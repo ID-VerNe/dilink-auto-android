@@ -76,6 +76,10 @@ Foreground service managing the full connection lifecycle with a parallel prereq
 **Rotation Re-Handshake:**
 - `onCarViewportChanged(widthPx, heightPx, dpi)` is called by `MainActivity.onConfigurationChanged` when the car panel rotates. If the viewport dims changed and the state is STREAMING or CONNECTED, the service cancels discovery loops, tears down video/input (clearing their disconnect listeners so `handleDisconnect` is not invoked for the intentional teardown), stops the decoder, clears `wifiReady`/`vdServerStarted`/`handshakeDone`, sets state to CONNECTING, and re-sends `HANDSHAKE_REQUEST` on the existing control connection with the new dims + current `startupDpi`. The phone tears down the old VD server, deploys a fresh one at the new dims, re-binds 9638/9639, and sends `VD_PORTS_BOUND` again — same flow as the initial connect, just without re-establishing the control TCP connection.
 
+**Black Screen Re-Handshake:**
+- `videoDecoder.onSustainedBlackScreen` is wired in `onCreate` to call `rehandshakeForBlackScreen()`, which rebuilds the phone-side VD at the *current* dimensions (no viewport change — the engine is wedged, not the display). Latched by `vdServerStarted && !blackScreenRecoveryInFlight` so at most one rebuild fires per session, preventing the reconnect storm that originally caused VD leaks.
+- `rehandshakeOnExistingControl(ctrl, newVpW, newVpH, dpi)` — shared by the rotation and black-screen paths. Tears down video/input + stops the decoder, then sends `HANDSHAKE_REQUEST` on the existing control connection.
+
 **Car Log Routing:**
 - `CarLogWriter` routes all car-side logs through the DATA channel (`DataMsg.CAR_LOG`) to the phone. Callers do a non-blocking `send` (logcat + queue); a dedicated coroutine on `Dispatchers.IO` formats, encodes, and ships each line. When the control connection is down, lines are buffered in a bounded `ConcurrentLinkedQueue` (10k cap, `AtomicInteger` counter for O(1) cap check) and flushed on reconnect. `videoDecoder.logSink`, `CarCrashHandler.logSink`, and `adb.setLogSink()` all wire through `carLogSend` so every log path reaches the phone. All logs visible in phone's `/sdcard/DiLinkAuto/client.log`. Logging defaults to `BuildConfig.DEBUG` (off in release); the phone toggles it via `LOG_TOGGLE`.
 
@@ -91,6 +95,8 @@ Owns deployment of the vd-server (`PipelineServer`) onto the phone from the car,
 - `deployDirect(controller)` — for the dev-mode TCP-ADB path, which already has a fresh `RemoteAdbController` in hand and bypasses the availability probe.
 
 Reads viewport dims + DPI from the host (which owns the display) and reports status through the host's message sink. `vdWidth`/`vdHeight` come from `getViewportSize`; DPI comes from `handshakeVdDpi` (if the phone adjusted it) or `VideoConfig.calculateOptimalDpi` otherwise. Uses `VdDeploy.buildDeployPlan` for the kill + launch commands. Extracted from `CarConnectionService` (which went 1237 → 1137 lines).
+
+**VD exit wait**: Before launching a replacement engine, `waitForVdServerExit()` polls the phone over ADB using `VdDeploy.probeExitCodeCommand` (exit 0 = alive, exit 1 = gone). If the old engine doesn't exit within 3s, a force kill (`VdDeploy.stopCommand`) is issued. Two live engines race for the same VirtualDisplay / DTA / 9638-9639 binds and the loser never runs `cleanup()` — one leaked VD per reconnect, which is what turns the car screen black after a few cycles.
 
 ### CarLogWriter
 
@@ -119,6 +125,13 @@ H.264 decoder using `MediaCodec` with Surface output (GPU-direct rendering).
 - `logSink` callback routes all decoder logs to phone via `carLogSend`
 - `debugFrameStats` flag (toggled by `LOG_TOGGLE`): per-30-frame log includes cumulative decode time and queue depth
 - Feed thread runs at `Process.THREAD_PRIORITY_URGENT_DISPLAY` (8x A53 has no big cores; tell the scheduler this is latency-critical)
+
+**Black screen self-heal:**
+
+- `onSustainedBlackScreen: (() -> Unit)?` — callback fired when the stream has been persistently black for `BLACK_SCREEN_SUSTAIN_MS` (5000ms). A handful of tiny I-frames right after start is normal (the VD can briefly composite nothing before the first app frame lands), and re-handshaking on that would cause reconnect loops — the very thing that leaked VDs. Requiring a sustained window means we only escalate on a genuinely stuck stream.
+- `tinyKeyframeStreak` / `blackScreenAlerted` — existing detection: after 3 consecutive tiny keyframes (<2048 bytes), logs "Suspected BLACK SCREEN".
+- `blackScreenSinceMs` / `blackScreenRecoveryFired` — tracks how long the stream has been black. Fires `onSustainedBlackScreen` only after 5s of continuous tiny keyframes, and at most once per session.
+- `resetBlackScreenState()` — re-arms the detector at each `start()` and `stop()`.
 
 ### AppIconCache
 

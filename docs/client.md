@@ -44,12 +44,14 @@ Foreground service (`foregroundServiceType="connectedDevice"`) that orchestrates
 - **`deployAssets()`**: extracts `vd-server.jar` to `/sdcard/DiLinkAuto/` and `app-server.apk` to `filesDir`. CRC-checked; skips re-extraction when the asset matches the on-disk file.
 - **`handleHandshake()`**: computes VD dims via `VdDimensions`, opens the lifecycle ServerSocket (or reuses it across a mid-stream re-handshake), sends `HANDSHAKE_RESPONSE`, then deploys the VD server via Shizuku and waits for `MSG_DISPLAY_READY`. On `MSG_DISPLAY_READY` it sends `VD_PORTS_BOUND`, hands the `displayId` to `InputInjectionService`, flips state to `STREAMING`, and calls `AppListBuilder.sendAppList`.
 - **Mid-stream re-handshake**: when the car rotates, it reuses the control TCP connection. `handleHandshake` tears down the old VD (`stopVdServer` + `disconnect`) and deploys a fresh one at the new orientation, leaving the lifecycle ServerSocket open across the swap.
+- **VD exit wait before relaunch**: After killing the old VD server, `ShizukuManager.waitForVdServerExit(VD_EXIT_WAIT_MS)` polls until the process exits before launching the replacement. Two live engines race for the same VirtualDisplay / DTA / 9638-9639 ports; the loser skips `cleanup()` entirely — one leaked VD per reconnect.
+- **Cleanup idempotency guard**: `cleanupGuard` `AtomicBoolean` prevents `cleanupSession()` from running multiple times for a single session. `cleanupSession()` was callable from 7 places (two network callbacks, the listen-loop `finally`, the handshake-failure path, `stopEverything`, and `onDestroy`) with no guard — observed 1 disconnect → 9 "Force-waking physical display" lines. `resetCleanupGuard()` is called before establishing a new session so the next teardown is allowed to run.
 - **Smart network callback**: `NetworkRequest.Builder().addTransportType(TRANSPORT_WIFI)` — only reacts to WiFi changes, ignores mobile data fluctuations. `onLost` is debounced 3s (4G hotspot resets can recover immediately); `onAvailable` restarts the listen loop only when `WAITING`. Proactive disconnect on `CONNECTED`/`STREAMING` so the heartbeat timeout does not have to expire.
 - **`ACTION_ALLOWLIST_UPDATED`**: re-sends the app list so the car grid updates live while a session is active.
 - **`ACTION_INSTALL_CAR`**: manual install path; uses `CarIpLocator` to find the car and `CarAppInstaller` to push the APK.
 - **Package-removed receiver**: on `ACTION_PACKAGE_REMOVED` (with `EXTRA_REPLACING` filtered out), sends `APP_UNINSTALLED` and re-sends the full app list.
 - **`setLogEnabled(context, enabled)`**: companion entry point called from `SettingsScreen`. Persists to `AppPrefs.LOG_ENABLED` + `LOG_ENABLED_USER_SET`, sets `FileLog.enabled`, and propagates to the car over the live control connection via `DataMsg.LOG_TOGGLE` (1-byte payload).
-- **`cleanupSession()`**: cancels `handshakeJob`, stops/disconnects the VD client, clears `InputInjectionService`'s VD binding, disconnects the control connection, resets icon hashes, and hands the cached IME to `PhoneDisplayRestorer`.
+- **`cleanupSession()`**: cancels `handshakeJob`, stops/disconnects the VD client, clears `InputInjectionService`'s VD binding, disconnects the control connection, resets icon hashes, and hands the cached IME to `PhoneDisplayRestorer`. Runs on `PhoneDisplayRestorer`'s own process-lifetime scope so it cannot be cancelled by `onDestroy()`.
 - **mDNS registration** runs in a background `launch` with a 5s `withTimeoutOrNull` so `NsdManager` cannot hang the listen loop when there is no network.
 - **`FileLog.rotate()`** on `onCreate` — archives the previous session log.
 
@@ -62,7 +64,7 @@ Lifecycle-only. Accepts the VD server's reverse connection on `localhost:19647` 
 - `startListening(port = SERVER_PORT)`: synchronous `ServerSocketChannel` bind on `0.0.0.0:19647`. Called **before** `HANDSHAKE_RESPONSE` so the socket is open when the VD server connects back.
 - `acceptConnection(port, timeoutMs = 60000)`: non-blocking accept loop. First byte must be `MSG_DISPLAY_READY` (carries `displayId: Int` + `directInjection: Byte` flag). On success, sets `isConnected`, fires `onDisplayReady` (which `ConnectionService` uses to send `VD_PORTS_BOUND`), and starts the command relay.
 - **Command relay** (`Dispatchers.IO`): reads `MSG_STACK_EMPTY` and forwards it via the `onStackEmpty` callback → `ConnectionService` sends `ControlMsg.VD_STACK_EMPTY` to the car.
-- `stopVdServer()`: writes `CMD_STOP` (`0xFF`) to the VD server under `writeLock` for graceful shutdown.
+- `stopVdServer()`: writes `CMD_STOP` (`0xFF`) to the VD server under `writeLock` for graceful shutdown. **Returns `Boolean`** — `true` when the byte was handed to the socket, `false` when the lifecycle channel is already gone. A `false` return is expected whenever the channel is already closed — the engine's `readLifecycleCommands()` treats the resulting EOF/IOException exactly like `CMD_STOP` (sets `running=false` → `finally cleanup()`), so the teardown still happens; the caller just must not assume it was graceful.
 - `disconnect()`: closes reader, server socket, and channel; resets `displayId = -1`.
 - On disconnect the VD server's own cleanup runs only if it received `CMD_STOP`. If the lifecycle channel breaks first, `PhoneDisplayRestorer` is the safety net (see below).
 
@@ -105,10 +107,15 @@ Enum classifying the free-form status string produced by `installCarApp`. Centra
 
 Restores the phone's physical display and IME after the VD server tears down. The VD server powers off the physical panel directly via `DisplayControl.setDisplayPowerMode(0)` — a deeper off than `PowerManager` can recover from. Its cleanup runs only if it received `CMD_STOP`; when the lifecycle channel breaks first (or the process hangs in a native futex), `PhoneDisplayRestorer` is the safety net. Four layers, tried in order, each independent:
 
-1. **Shizuku**: `pkill -9 -f PipelineServer` (`VdDeploy.killCommandForce`) → `cmd display power-on 0` → IME restore via `ImeRestore.imeRestoreCommandLine`. Kills the VD server first so it stops re-powering-off the panel during touch injection.
+1. **Shizuku**: `VdDeploy.stopCommand` (SIGTERM → wait 1s → SIGKILL) → `cmd display power-on 0` → IME restore via `ImeRestore.imeRestoreCommandLine`. The two-stage stop lets the JVM shutdown hook run `cleanup()` (releases VD, restores IME/letterbox/screen settings, re-powers panel) before the force kill.
 2. `PowerManager.wakeUp()` via reflection (system-level wake).
 3. Launch `MainActivity` with `FLAG_TURN_SCREEN_ON` (WindowManager triggers display on).
 4. `SCREEN_BRIGHT_WAKE_LOCK | ACQUIRE_CAUSES_WAKEUP | ON_AFTER_RELEASE` wake lock.
+
+**Owns its own `CoroutineScope`** — deliberately NOT the Service's scope:
+
+- **Problem**: The previous version ran on the Service's `serviceScope`, which `ConnectionService.onDestroy()` cancels. When the user hit "stop" (or the system reclaimed the Service) the restore coroutine was cancelled *between* the `pkill` and the `cmd display power-on`, leaving the physical panel off with nothing left to turn it back on. Observed in logs: 3× "Force-waking physical display" followed by 3× "Shizuku display restore failed: Job was cancelled".
+- **Fix**: `restoreScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)` — a process-lifetime scope that no Service lifecycle can cancel. `withContext(NonCancellable)` wraps the restore so once we start killing the engine we must run the power-on too. `inFlight` `AtomicBoolean` collapses concurrent restore requests into one.
 
 ### AppVersion
 
@@ -121,6 +128,13 @@ Semantic-version parsing and comparison for the car-install version check (skip 
 ### ShizukuManager
 
 Manages the Shizuku lifecycle and provides shell-level command execution via `IShizukuService.newProcess` (UID 2000). `init(context)` registers binder-received / binder-dead / permission-result listeners. `checkPermission()` caches `isAvailable`. `execAndWait(command)` runs `sh -c` with a 30s deadline (drains stdout + stderr concurrently so a >64KB stderr write cannot deadlock the pipe), returns combined output. `execBackground(command)` is fire-and-forget (used for `app_process` so the server outlives the shell stream). `copyToFile(source, destinationPath)` streams bytes via `cat > 'path'` for paths only shell can reach.
+
+**`waitForVdServerExit(timeoutMs)`** — polls until no vd-server process remains, or `timeoutMs` elapses. Uses `VdDeploy.probeCommand` (`pkill -0` existence check) so it needs no `ps`/`pidof`. Used at two points where "the old engine is gone" must be true before proceeding:
+
+- Before launching a new engine, so two instances never race for the same VirtualDisplay / DTA / 9638-9639 ports.
+- After the graceful stop, to confirm `cleanup()` actually ran before we declare the session torn down.
+
+Returns `true` if no vd-server is running (or Shizuku is unavailable, in which case we cannot verify and report `true` to avoid hanging).
 
 ### FileLog
 

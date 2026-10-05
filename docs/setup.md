@@ -111,6 +111,7 @@ If the dialog appears on the first connection after updating, check "Always allo
 - The VD server may need a moment to start — wait 5-10 seconds after connecting
 - On API 26-28 cars, `cmd display power-on/off` shell fallback is unavailable (API 29+ only); a DisplayControl reflection failure means the physical panel is not restored and the failure is now logged rather than silently masked. Check the log for `DisplayControl` errors.
 - Check `/sdcard/DiLinkAuto/client.log` for diagnostic information
+- **Sustained black screen (>5s)**: The car app now detects this automatically and requests a VD rebuild from the phone via re-handshake. Look for `[BLACK] requesting VD rebuild via re-handshake` in the logs. This should self-heal without manual intervention.
 
 ### Rotation causes a black screen mid-session
 
@@ -120,6 +121,7 @@ A race used to leave the decoder unable to restart after rotation: `onCarViewpor
 
 - Reconnect attempts no longer kill an active session — the WiFi gateway retry loop stops after 3 consecutive ADB failures, and TCP ADB reconnects on phone IP change rather than tearing down the running stream.
 - If persistent, check `/sdcard/DiLinkAuto/client.log` for "Network lost" entries.
+- **VD leak on reconnect**: Fixed in v0.18.0-dev-13. The old `pkill -9` skipped the JVM shutdown hook, so `PipelineServer.cleanup()` never ran — leaking a VirtualDisplay per reconnect and keeping the physical panel powered off. Now uses a two-stage stop (SIGTERM → wait → SIGKILL), waits for the old engine to exit before launching a replacement, and a cleanup idempotency guard prevents duplicate teardown. To verify the fix, use `scripts/verify-blackscreen-fix.sh` on a share-logs zip.
 
 ### Car app not installing
 
@@ -142,6 +144,23 @@ This is normal. DiLink-Auto mirrors apps onto a landscape virtual display that m
 - Car logs: routed to the phone's `client.log` via the protocol DATA channel (tag: `CarLog`)
 - Pull logs: `adb shell "cat /sdcard/DiLinkAuto/client.log"`
 - A debug diagnostic log toggle lives in Settings; when off, zero disk writes occur. It propagates to the car via the `LOG_TOGGLE` data message. Defaults: ON for debug/pre-release builds, OFF for release; the user choice persists.
+
+## Verifying VD Leak Fix
+
+After updating, share logs from the phone (Settings → Share Logs) and run the verification script:
+
+```bash
+unzip dilinkauto-logs.zip -d /tmp/vdcheck
+bash scripts/verify-blackscreen-fix.sh /tmp/vdcheck
+```
+
+The script checks:
+- **VD leak**: VD start count vs cleanup complete count (should be equal)
+- **Cleanup idempotency**: disconnect count vs "Force-waking physical display" count (should be ~1:1)
+- **Black screen self-heal**: sustained black detection vs VD rebuild trigger
+- **Stop path audit**: CMD_STOP success/failure counts, VD exit probe results
+
+Exit code 0 = all checks passed; 1 = one or more checks failed.
 
 ## HyperOS (Xiaomi) Tips
 

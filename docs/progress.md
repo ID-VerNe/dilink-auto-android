@@ -331,6 +331,26 @@ Project created. Screen mirroring on emulators.
 
 The upstream repo went quiet after `v0.18.0-dev` (2026-05-09). This fork (`ID-VerNe/dilink-auto-android`) then landed a directed set of changes targeting Chinese ROM phones (Xiaomi HyperOS, Meizu, etc.) paired with BYD DiLink car head units. The reference car is a BYD Qin PLUS DM-i 2023 Champion 55KM Leading trim — DiLink 4.0 low-spec (Snapdragon 439, 8x Cortex-A53, Adreno 505, 4GB RAM, 16GB eMMC, 1280x800, 2.4GHz-only WiFi, Android 9 / API 28, H.264 hardware decode capped at 1080p). All work is on `main` (git-flow develop model dropped).
 
+### v0.18.0-dev-13 — VD leak fix, cleanup idempotency, black screen self-heal
+
+A leaked VirtualDisplay per reconnect cycle turned the car screen black after a few cycles. Root cause: `pkill -9` skipped the JVM shutdown hook, so `PipelineServer.cleanup()` never ran — leaking the VD, keeping the physical panel powered off, and losing the `screen_off_timeout` setting (snapshot captured its own `2147483647` sentinel). Fixed across 12 files:
+
+1. **Two-stage VD stop** (`VdDeploy.stopCommand`). SIGTERM → wait 1s → SIGKILL, as a single shell line. A coroutine cancellation cannot land between the two signals.
+2. **Bracket process pattern** (`VdDeploy.PROCESS_PATTERN`). `[P]ipelineServer` prevents `pkill -f` from matching the wrapper shell's own cmdline.
+3. **Liveness probes** (`VdDeploy.probeCommand` / `probeExitCodeCommand`). `pkill -0` existence check — no signal delivered.
+4. **VD exit wait** (`ShizukuManager.waitForVdServerExit()` / `VdServerDeployer.waitForVdServerExit()`). Polls until the old engine exits before launching the replacement. Two live engines race for the same VirtualDisplay / DTA / 9638-9639 binds and the loser skips `cleanup()` entirely.
+5. **Cleanup idempotency** (`ConnectionService.cleanupGuard`). `AtomicBoolean` guard prevents 7 `cleanupSession()` call sites from firing repeatedly (observed: 1 disconnect → 9 "Force-waking physical display" lines). `resetCleanupGuard()` before each new session.
+6. **Process-lifetime PhoneDisplayRestorer scope**. Owns a `CoroutineScope(SupervisorJob() + Dispatchers.IO)` — deliberately not the Service scope, which `onDestroy()` cancels. `NonCancellable` context ensures `cmd display power-on` cannot be skipped. `inFlight` `AtomicBoolean` collapses concurrent restore requests into one.
+7. **`stopVdServer()` returns Boolean**. Was void — callers had no way to know if CMD_STOP succeeded or fell back to shell kill.
+8. **`PipelineServer.cleanup()` reorder**. Global window/rotation state reset FIRST (device-wide, not per-display), then move foreground app, then restore panel + IME, then release threads/GL/encoder/VD. Previous order had `virtualDisplay.release()` dead last with nothing after it.
+9. **`saveCurrentIme()` before `VirtualDisplayCreator.create()`**. The snapshot used to run after `create()` had already written `screen_off_timeout=2147483647`, so the restore path treated the sentinel as "already the sentinel, nothing to do" and the user's real timeout was lost forever.
+10. **`VirtualDisplayCreator` split**. `create()` no longer calls `configureDisplayEnvironment()`. New `configureEnvironment()` must be called after the snapshot.
+11. **`DisplayPowerController.restoreSetting()`**. Validates before writing: non-blank, not `null`/`undefined`, numeric > 0. A failed snapshot yields a marker; writing it back would make things worse.
+12. **`VideoDecoder.onSustainedBlackScreen`**. Fires only after `BLACK_SCREEN_SUSTAIN_MS` (5000ms) of continuous tiny keyframes. A 3-frame burst during app/VD warm-up is normal and must not trigger a re-handshake — that is the reconnect storm that leaked VDs in the first place. `resetBlackScreenState()` re-arms per session.
+13. **`CarConnectionService.rehandshakeForBlackScreen()`**. Rebuilds the phone-side VD when the stream is persistently black. `blackScreenRecoveryInFlight` latch ensures at most one rebuild per session.
+14. **`rehandshakeOnExistingControl()` extracted**. Shared by rotation and black-screen paths — tears down video/input on the existing control connection without re-establishing TCP.
+15. **`scripts/verify-blackscreen-fix.sh`**. Automated log verification: VD leak check (start count vs cleanup count), cleanup idempotency (disconnect count vs wake count), black-screen self-heal (sustained detection vs rebuild trigger), stop path audit.
+
 ### Architecture — direct VD streaming (no phone relay)
 
 VD Server binds `9638` (video) and `9639` (input) directly on `0.0.0.0`; the car talks to the VD without the phone app as middleman. Was 4 socket ops + 2 process context switches per frame; now 2 socket ops + 0 context switches. The phone is a pure orchestrator: handshake, VD lifecycle (`VD_PORTS_BOUND` control message), car log routing. `VirtualDisplayClient` simplified to lifecycle-only. The lifecycle channel is on `localhost:19647` (the upstream docs said `19637` — that was wrong; `Discovery.LIFECYCLE_PORT = 19647`). Approximately -356 lines across 7 files.
@@ -500,8 +520,10 @@ Comprehensive review performed 2026-04-23 covering performance, stability, and f
 | Issue | Impact | Status |
 |-------|--------|--------|
 | USB ADB auth dialog on replug | Phone asked "Allow USB debugging?" each time | **FIXED v0.13.1** — was double-hashing AUTH_TOKEN with SHA1withRSA. Now uses NONEwithRSA + prehashed SHA-1 DigestInfo. "Always allow" persists. |
-| VD server dies on USB disconnect | Stream stops if USB unplugged | Accepted — `setsid`/`nohup` detachment broke localhost connectivity. Car re-deploys on reconnect. |
-| Touch injection wakes physical display | Screen turns on briefly during interaction | Mitigated with throttled re-power-off (1s, on background thread) |
+| VD leak on reconnect | Each reconnect leaked one VirtualDisplay; panel stayed off | **FIXED v0.18.0-dev-13** — two-stage stop (SIGTERM→SIGKILL), `cleanupGuard` idempotency, VD exit wait before relaunch, `PhoneDisplayRestorer` on process-lifetime scope |
+| Cleanup non-idempotent | 1 disconnect triggered 9 duplicate restore calls | **FIXED v0.18.0-dev-13** — `cleanupGuard` `AtomicBoolean` |
+| Screen timeout lost on teardown | `screen_off_timeout=2147483647` persisted after session | **FIXED v0.18.0-dev-13** — `saveCurrentIme()` now runs before `configureEnvironment()`; `restoreSetting()` validates values |
+| Black screen after reconnect | Car stuck on black screen, no recovery | **FIXED v0.18.0-dev-13** — `onSustainedBlackScreen` callback triggers VD rebuild after 5s |
 | Portrait apps letterboxed on landscape VD | Petal Maps home screen narrow | Mitigated — `VideoConfig.calculateOptimalDpi` caps DPI so portrait apps get >=360dp; user can override via `startup_dpi`. |
 | Hotspot must be enabled manually | User enables before plugging in | Android 16 limitation |
 | Audio streaming / media controls / navigation widgets | Not implemented | `NowPlayingBar` exists in the source tree but is only composed when `MediaMetadata` is present, which the phone never sends. |

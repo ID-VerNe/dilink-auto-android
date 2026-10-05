@@ -38,4 +38,4 @@
 
 ## 下载
 
-不提供具体版本号(代码版本与 Release tag 不一致,以 [Releases](https://github.com/ID-VerNe/dilink-auto-android/releases/latest) 为准)。
+不提供具体版本号(代码版本与 Release tag 不一致,以 [Releases](https://github.com/ID-VerNe/dilink-auto-android/releases/latest) 为准)。当前版本: **0.18.0-dev-13** (VD 泄漏修复 + 清理幂等 + 黑屏自愈)。

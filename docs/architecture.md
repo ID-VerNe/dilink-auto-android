@@ -107,14 +107,14 @@ Manages handshake, VD lifecycle, car-app install, allowlist filtering, and `File
 
 | Component | File | Purpose |
 |-----------|------|---------|
-| ConnectionService | `service/ConnectionService.kt` | Accepts 9637, runs the handshake, opens the lifecycle ServerSocket on `0.0.0.0:19647`, deploys the VD server (Shizuku when available), sends `VD_PORTS_BOUND` on `MSG_DISPLAY_READY`, routes car logs to `FileLog`, applies the allowlist before sending the app list |
+| ConnectionService | `service/ConnectionService.kt` | Accepts 9637, runs the handshake, opens the lifecycle ServerSocket on `0.0.0.0:19647`, deploys the VD server (Shizuku when available), sends `VD_PORTS_BOUND` on `MSG_DISPLAY_READY`, routes car logs to `FileLog`, applies the allowlist before sending the app list. `cleanupGuard` `AtomicBoolean` prevents 7 `cleanupSession()` call sites from firing repeatedly; `resetCleanupGuard()` before each new session. `VD_EXIT_WAIT_MS` (3000ms) before launching a replacement engine to avoid two live instances racing for the same VD/DTA/ports |
 | VirtualDisplayClient | `display/VirtualDisplayClient.kt` | Lifecycle-only. `startListening()` opens the ServerSocket synchronously; `acceptConnection()` waits for the VD server's reverse connection on `localhost:19647`, reads `MSG_DISPLAY_READY` (displayId + direct-injection flag), relays `MSG_STACK_EMPTY`, sends `CMD_STOP` |
 | VdDimensions | `service/VdDimensions.kt` | Pure viewport math: car viewport (even-aligned) + anti-crop scale for Chinese-ROM IME hardcoding + DPI override vs. auto-calibrate |
 | AppListBuilder | `service/AppListBuilder.kt` | Builds the car-visible app list, filtered by the user's allowlist. Icon PNGs sent once per package per session (hash-suppressed) |
 | AllowlistScreen | `AllowlistScreen.kt` | Phone-side picker for which launcher apps reach the car. Toggling a row fires `ACTION_ALLOWLIST_UPDATED` so the running service re-sends the list live |
 | CarAppInstaller | `service/CarAppInstaller.kt` | Installs the embedded `app-server.apk` onto the car via `dadb` over WiFi (15s connect timeout) |
 | CarIpLocator | `service/CarIpLocator.kt` | Locates the car's ADB-over-WiFi service (port 5555): control-connection remote IP, subnet enumeration, ARP, neighbor cache, parallel /24 scan, gateway |
-| PhoneDisplayRestorer | `service/PhoneDisplayRestorer.kt` | Restores the phone's physical display and IME after the VD server tears down. Layered: Shizuku (`pkill PipelineServer` + `cmd display power-on` + IME restore), then `PowerManager.wakeUp` reflection, then `FLAG_TURN_SCREEN_ON`, then a wake lock |
+| PhoneDisplayRestorer | `service/PhoneDisplayRestorer.kt` | Restores the phone's physical display and IME after the VD server tears down. **Owns a process-lifetime `CoroutineScope(SupervisorJob() + Dispatchers.IO)`** — deliberately not the Service's scope, which `onDestroy()` cancels. `NonCancellable` context ensures `cmd display power-on` cannot be skipped mid-restore. `inFlight` `AtomicBoolean` collapses concurrent restore requests into one. Layered: Shizuku (`VdDeploy.stopCommand` + `cmd display power-on` + IME restore), then `PowerManager.wakeUp`, then `FLAG_TURN_SCREEN_ON`, then a wake lock |
 | FileLog | `FileLog.kt` | File-based logging to `/sdcard/DiLinkAuto/client.log`, rotation (10 files max), bypasses HyperOS logcat filtering. Defaults to ON for debug/pre-release, OFF for release; user choice persists via `AppPrefs.LOG_ENABLED` |
 | MainActivity | `MainActivity.kt` | UI — start/stop, onboarding, settings, allowlist, install-on-car |
 
@@ -148,15 +148,26 @@ Android library module (`com.android.library`), compiled via `bundleLibRuntimeTo
 
 | Component | File | Purpose |
 |-----------|------|---------|
-| PipelineServer | `PipelineServer.kt` | Process entry point and lifecycle owner. Creates the encoder (`createEncoderByType`, CBR 4Mbps Main profile, I-frame interval 1s), binds `9638` (video) and `9639` (input) on `0.0.0.0`, accepts the car's connections, owns the persistent shell, the LifeWriter, the watchdog (forces `cleanup()` if the pipeline thread hangs in a native MediaCodec call), and cleanup ordering (resume foreground app via `am display move-stack` -> restore panel -> restore IME -> kill shell -> tear down GL/encoder/VD) |
+| PipelineServer | `PipelineServer.kt` | Process entry point and lifecycle owner. Creates the encoder (`createEncoderByType`, CBR 4Mbps Main profile, I-frame interval 1s), binds `9638` (video) and `9639` (input) on `0.0.0.0`, accepts the car's connections, owns the persistent shell, the LifeWriter, the watchdog (forces `cleanup()` if the pipeline thread hangs in a native MediaCodec call), and cleanup ordering (reset global window/rotation state → move foreground app → restore panel + IME → release threads/GL/encoder/VD). Physical panel power-off happens AFTER the car connects, not before |
 | GlPipeline | `GlPipeline.kt` | EGL14 + GLES20 render loop on the pipeline thread. Single-threaded: `parkNanos` pace -> `updateTexImage` -> fullscreen quad -> `eglSwapBuffers` -> encoder drain -> TCP write. Natural flow control: a TCP stall blocks the next swap, slowing encoder input. Adaptive bitrate: floor 1.5Mbps, 2s clean recovery window, 0.5Mbps steps (down-shifts at >15ms write time) |
 | TouchInjector | `TouchInjector.kt` | `InputManager` reflection (`injectInputEvent`), `MotionEvent.setDisplayId` reflection, multi-touch state. Falls back to `input -d` shell taps when reflection is unavailable |
 | DisplayPowerController | `DisplayPowerController.kt` | `DisplayControl.setDisplayPowerMode` reflection (loaded from `services.jar` via `DelegateLastClassLoader`); shell fallback `cmd display power-on/off` is API 29+. On API 26-28 the fallback is a no-op — a `DisplayControl` reflection failure means the physical panel is not restored (now logged, was silent). Persists and restores the original IME (gated by `ImeRestore.shouldRestoreIme` — excludes the linkpc IME) |
-| VirtualDisplayCreator | `VirtualDisplayCreator.kt` | Shell-UID VirtualDisplay via `DisplayManagerGlobal` reflection (trust flag `0x6c49`, `OWN_DISPLAY_GROUP` + `OWN_FOCUS` + `TRUSTED`), `DisplayManager` fallback with `mDisplayIdToMirror` forced to 0. Applies the Android 12L+ letterbox style so portrait apps render at a sensible aspect ratio |
+| VirtualDisplayCreator | `VirtualDisplayCreator.kt` | Shell-UID VirtualDisplay via `DisplayManagerGlobal` reflection (trust flag `0x6c49`, `OWN_DISPLAY_GROUP` + `OWN_FOCUS` + `TRUSTED`), `DisplayManager` fallback with `mDisplayIdToMirror` forced to 0. Applies the Android 12L+ letterbox style so portrait apps render at a sensible aspect ratio. `create()` only creates the VD — `configureEnvironment()` (which applies letterbox style + disables screen-off/wake gestures) must be called separately AFTER the caller has snapshotted the original settings via `DisplayPowerController.saveCurrentIme()` |
 | FakeContext | `FakeContext.kt` | Spoofs `com.android.shell` for DisplayManager access. Uses `ActivityThread.getSystemContext()` for a real system Context |
 | PipeLog | `PipeLog.kt` | `println`-based logging (no `android.util.Log` in `app_process`); `ShellExec` runs commands against the persistent `sh` process |
 
 **PipelineServer architecture.** Single pipeline thread processes each frame sequentially — `clock.wait()` -> `updateTexImage()` -> GL render -> `eglSwapBuffers` -> encoder drain -> TCP write. No queues between stages. Flow control is natural: if TCP stalls, the pipeline blocks, delaying the next swap. Uses `System.nanoTime()` + `LockSupport.parkNanos()` for drift-free 24fps timing. Three threads total: Pipeline (urgent priority), TouchReader, Lifecycle/LifeWriter (background priority).
+
+**VD teardown (`cleanup()`).** Idempotent (guarded by `cleanedUp` `AtomicBoolean`). Order is deliberate:
+
+1. **Global state first** — `cmd window reset-letterbox-style` + `wm user-rotation -d <id> free`. These are device-wide (not per-display), so a leaked value corrupts every later session. Doing them first means even a process killed midway has already returned the device to normal.
+2. **Move foreground app** back to the physical display (`am display move-stack`).
+3. **Restore panel + IME** — while `shellInput` is still usable. `setDisplayPower(true)` + `input keyevent 224` + `restoreIme()`.
+4. **Release resources** — LifeWriter thread interrupted, shell destroyed, GL/encoder/VD released.
+
+The previous order had `virtualDisplay.release()` dead last with nothing after it to fail, so a mid-way exception or a SIGKILL from the phone side left the panel off and the VD alive — one leaked display per reconnect.
+
+**Two-stage VD stop.** `VdDeploy.stopCommand` is a single shell line: `pkill -f [P]ipelineServer; sleep 1; pkill -9 -f [P]ipelineServer; exit 0`. SIGTERM lets the JVM run the shutdown hook (which triggers `cleanup()`); SIGKILL after 1s catches processes that got wedged. The `[P]ipelineServer` bracket trick prevents `pkill -f` from matching the wrapper shell's own cmdline. The old `pkill -9` skipped the shutdown hook entirely, so `cleanup()` never ran.
 
 ## Connection Flow
 
@@ -198,6 +209,8 @@ States: `IDLE -> CONNECTING -> CONNECTED -> STREAMING`
 
 A mid-stream car-panel rotation reuses the control TCP connection. `MainActivity.onConfigurationChanged` calls `CarConnectionService.onCarViewportChanged`, which tears down video/input + the old VD server and re-sends a `HandshakeRequest` at the new dims. The phone deploys a fresh VD server and re-sends `VD_PORTS_BOUND`. The streaming-layout gate accepts `state == CONNECTING && appList.isNotEmpty()` so the video-wait overlay covers the ~2s redeploy gap instead of flashing `CarLaunchScreen` (which would destroy the SurfaceView and lose the decoder state).
 
+A sustained black stream (no visible content for >5s) triggers the same re-handshake path via `rehandshakeForBlackScreen()` — the phone tears down and redeploys the VD server, which is the recovery a wedged compositor needs.
+
 ## DiLink 4.0 Low-Spec Performance (Snapdragon 439)
 
 The reference car is a low-spec DiLink 4.0 head unit: 8x Cortex-A53 (no big cores), Adreno 505, 4GB RAM, 1280x800, 2.4GHz-only WiFi, API 28, H.264 hardware decode capped at 1080p. The streaming pipeline was retuned for this hardware. The nine fixes:
@@ -233,6 +246,8 @@ The BYD head unit runs Android 9 (API 28). Several framework APIs the project us
 - **TCP ADB reconnects on phone IP change.** Dev mode tracks `lastAdbHost` and reconnects when the phone's IP changes.
 - **Auto-fallback to TCP ADB when USB unavailable.** `VdServerDeployer.deploy` falls back to TCP ADB using the phone-host IP if known.
 - **User disconnect stays IDLE**, no auto-reconnect. Persisted to SharedPreferences (`user_disconnected`).
+- **VD leak prevention.** `ConnectionService.cleanupGuard` prevents duplicate `cleanupSession()` from 7 call sites (was: 1 disconnect → 9 wake calls). VD exit wait (`VD_EXIT_WAIT_MS = 3000ms`) before launching a replacement engine prevents two live instances racing for the same VD/DTA/9638-9639 ports.
+- **Black screen self-heal.** `VideoDecoder.onSustainedBlackScreen` fires after 5s of continuous tiny keyframes (not on transient 3-frame bursts during app warm-up). `CarConnectionService.rehandshakeForBlackScreen()` rebuilds the phone-side VD via a re-handshake at the current dimensions. `blackScreenRecoveryInFlight` latch ensures at most one rebuild per session, preventing the reconnect storm that originally caused the VD leak.
 
 ## Key Design Decisions
 
@@ -256,6 +271,13 @@ The BYD head unit runs Android 9 (API 28). Several framework APIs the project us
 | **Watchdog forces `cleanup()`** | If the pipeline thread hangs in a native MediaCodec call after `CMD_STOP`, the lifecycle reader's `finally` never runs. The watchdog polls `running` + `cleanedUp` and forces `cleanup()` + `System.exit(1)` after a 3s grace. |
 | **Mid-stream rotation re-handshake** | Control connection is reused; only video/input + VD server are recycled. The streaming-layout gate accepts `CONNECTING && appList.isNotEmpty()` so the SurfaceView is not destroyed during the redeploy gap. |
 | **Reconnect stops after 3 ADB failures** | `noAdbCount >= 3` stops the reconnect loop instead of looping indefinitely. User is told to plug the phone into car USB. |
+| **Two-stage VD stop (`stopCommand`)** | SIGTERM → wait 1s → SIGKILL in one shell line. The old `pkill -9` skipped the JVM shutdown hook, so `cleanup()` never ran — leaking VD, keeping panel off, losing screen timeout. The bracket pattern `[P]ipelineServer` prevents self-matching the wrapper shell. |
+| **Cleanup idempotency (`cleanupGuard`)** | `AtomicBoolean` guard on `cleanupSession()`. Was 7 call sites with no guard — 1 disconnect fired the whole teardown 9 times, each racing a `pkill` against the previous restore. `resetCleanupGuard()` before each new session. |
+| **VD exit wait before relaunch** | `ShizukuManager.waitForVdServerExit()` / `VdServerDeployer.waitForVdServerExit()` poll until the old engine exits. Two live instances race for the same VirtualDisplay / DTA / 9638-9639 ports; the loser skips `cleanup()` entirely. |
+| **`saveCurrentIme()` before `create()`** | The snapshot must run before `configureEnvironment()` writes `screen_off_timeout=2147483647`, or the restore path sees the sentinel and does nothing. Old code snapshotted after `create()` — the user's real timeout was lost forever. |
+| **Process-lifetime PhoneDisplayRestorer scope** | Owns `CoroutineScope(SupervisorJob() + Dispatchers.IO)` — not the Service scope, which `onDestroy()` cancels. `NonCancellable` ensures `cmd display power-on` cannot be skipped. `inFlight` collapses concurrent requests. |
+| **Black screen self-heal** | `onSustainedBlackScreen` fires after 5s of continuous tiny keyframes (not on 3-frame bursts). `rehandshakeForBlackScreen()` rebuilds the VD. `blackScreenRecoveryInFlight` latch prevents storms. |
+| **`stopVdServer()` returns Boolean** | Callers can now check if CMD_STOP succeeded or fell back to shell kill. Was void — callers assumed graceful stop always worked. |
 | **Allowlist filters the wire payload** | Phone-side `AllowlistScreen` selects which launcher apps reach the car. `AppListBuilder.sendAppList` filters before building the wire payload; `ACTION_ALLOWLIST_UPDATED` triggers a live re-send. Pre-seeded with common map apps on first run. |
 | **Car APK embedded in phone APK** | `embedServerApk` bundles `app-server.apk` into `app-client` assets; `CarAppInstaller` pushes it to the car via `dadb`. Enables "Install on Car" from the phone. |
 | **`buildVdServer` task** | `bundleLibRuntimeToJarDebug` -> D8 -> `vd-server.dex` -> `vd-server.jar` -> copied to `app-client/src/main/assets/`. Bundles Kotlin stdlib + coroutines (needed at `app_process` runtime). |

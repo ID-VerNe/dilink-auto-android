@@ -6,6 +6,8 @@
 
 实测车型:**比亚迪 秦PLUS DM-i 2023款 冠军版 55KM 领先型**。该款车机是 DiLink 4.0 低配方案 —— 骁龙 439(8x Cortex-A53 全小核、Adreno 505)、4GB RAM、16GB eMMC、1280x800 屏、仅 2.4GHz WiFi、Android 9 / API 28、H.264 硬件解码上限 1080p。本 fork 的性能调优全部围绕这套硬件展开。
 
+当前版本:**0.18.0-dev-13**。
+
 原本要解决的矛盾是:手机(小米 HyperOS 国行版等)装不了 Android Auto,而车机只支持 Android Auto —— 中间没有桥。DiLink-Auto 对任何 Android 10+ 手机都通用,有没有 Google 服务都行。
 
 ---
@@ -66,6 +68,26 @@ client 和 server 都加了 `values-zh-rCN` / `values-zh`。这是面向中国�
 
 最近一轮 4-agent 并行审计后的 DRY/SRP pass:跨模块共享常量(`AppPrefs`、`AppTargets`、`VdDeploy`、`VdDeployArgs`、`WifiGatewayIp`)、协作者提取(`ApkInstaller`、`AppListBuilder`、`AppVersion`、`CarLogWriter`、`CarTouchSender`、`HandshakeFactory`、`VdServerDeployer`、`PhoneDisplayRestorer`、`VdDimensions` 等)、大文件拆分(`CarConnectionService` 1237 → 1137 行)。DPI 范围 `120..480` 和 `app_process` argv tail 在 phone 和 car 之间共享同一份 `VdDeployArgs`。
 
+### 10. VD 泄漏修复 + 清理幂等 + 黑屏自愈(v0.18.0-dev-13)
+
+**根因**:每次重连都泄漏一个 VirtualDisplay。旧代码用 `pkill -9` 杀 VD 进程,跳过了 JVM shutdown hook,`PipelineServer.cleanup()` 从未执行 —— 导致 VD 不释放、物理面板保持关屏、`screen_off_timeout` 设置丢失(快照捕获的是自己写入的 `2147483647` 哨兵值)。连续几次重连后车机变黑屏。
+
+**修复(跨 12 个文件)**:
+
+- **`VdDeploy.stopCommand`**:两阶段停止(SIGTERM → 等 1 秒 → SIGKILL),合并成**一条 shell 命令**,确保协程取消不会落在两个信号之间导致进程半死。
+- **`VdDeploy.PROCESS_PATTERN`**:`[P]ipelineServer` 括号技巧,避免 `pkill -f` 匹配到 wrapper shell 自身的 cmdline。
+- **`VdDeploy.probeCommand` / `probeExitCodeCommand`**:`pkill -0` 存活探测(信号 0 = 仅检查,不发送信号)。
+- **`ConnectionService.cleanupGuard`**:`AtomicBoolean` 幂等 guard,防止 7 个调用点重复执行 `cleanupSession()`(实测 1 次断连 → 9 次 "Force-waking physical display")。新会话开始时 `resetCleanupGuard()`。
+- **`ShizukuManager.waitForVdServerExit()`**:轮询直到 VD 进程真正退出,再启动新引擎,防止两个实例争抢同一个 VirtualDisplay / DTA / 9638-9639 端口。
+- **`VdServerDeployer.waitForVdServerExit()`**:车机端同样等待旧实例退出后再部署。
+- **`PhoneDisplayRestorer`**:自建 process-lifetime `CoroutineScope`(不再是 Service scope,`onDestroy` 不会取消它)。`NonCancellable` 上下文,确保 `pkill` 后 `cmd display power-on` 不会被中断。`inFlight` 单飞 guard 合并并发请求。
+- **`PipelineServer.cleanup()` 重排序**:先重置全局 window/rotation 状态,再移回前台 app,再恢复面板/IME,最后释放线程/GL/编码器/VD。
+- **`VirtualDisplayCreator.create()` 拆分**:`create()` 不再调用 `configureDisplayEnvironment()`,新增 `configureEnvironment()` 方法 —— 必须在 `saveCurrentIme()` 快照**之后**调用,否则快照捕获的是自己的写入值。
+- **`DisplayPowerController.restoreSetting()`**:写入前验证值合理性(非空、非 null/undefined、数字 > 0),防止写入哨兵值。
+- **`VideoDecoder.onSustainedBlackScreen`**:持续黑屏检测 —— 仅在连续 5 秒以上微小关键帧后才触发,3 帧的短暂黑帧(启动/重建时的正常瞬态)不会触发重连风暴。
+- **`CarConnectionService.rehandshakeForBlackScreen()`**:检测到持续黑屏后,通过重新握手让手机重建 VD。`blackScreenRecoveryInFlight` 闩锁确保每次会话最多触发一次。
+- **`scripts/verify-blackscreen-fix.sh`**:自动化日志验证脚本,检查 VD 泄漏、cleanup 幂等、黑屏自愈、停机路径。
+
 ---
 
 ## 当前功能状态
@@ -83,6 +105,8 @@ client 和 server 都加了 `values-zh-rCN` / `values-zh`。这是面向中国�
 - 引导式权限授权
 - 简体中文 + 8 种其他语言(英、葡、俄、白俄、法、哈、乌、乌兹)
 - 直连 VD 架构:手机不做中继,视频/触摸直通
+- VD 泄漏修复:两阶段优雅停机、清理幂等 guard、VD 退出等待 —— 每次重连不再泄漏 VirtualDisplay
+- 黑屏自愈:车机端检测到持续 5 秒以上黑屏后自动重建 VD(重握手)
 
 **已移除(相对 upstream):**
 - 通知转发(手机通知 → 车机)—— 导航栏通知按钮、通知列表、相关协议消息全部删除
@@ -97,7 +121,6 @@ client 和 server 都加了 `values-zh-rCN` / `values-zh`。这是面向中国�
 - Samsung Auto Blocker 必须关掉才能用 USB ADB(设置 → 安全 → Auto Blocker → 关)。
 - Samsung 电池管理需要显式豁免。
 - Samsung Knox 首次访问虚拟显示器时可能弹安全提示。
-- VD server 进程在 USB 断开时会重启(自动重连)。
 - 手机热点需手动开启(Android 16 限制)。
 - 偶发花屏 —— 解码器重启竞争,下一个关键帧(~1s)恢复。
 - 流式延迟在负载下约 100-200ms。
