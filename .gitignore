@@ -37,3 +37,4 @@ keystore.properties
 *.zip
 .plan/
 app-client/DiLinkAuto/
+/debug-logs/

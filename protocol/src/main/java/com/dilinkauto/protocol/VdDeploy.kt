@@ -39,15 +39,28 @@ object VdDeploy {
      * @param jarPath  CLASSPATH argument (location of vd-server.jar).
      * @param logPath  where stdout+stderr are redirected.
      * @param args     argv tail from [VdDeployArgs.format].
-     * @param background when true, the line ends with ` &` so the caller's
-     *   shell returns immediately while the server keeps running; when false,
-     *   `exec` replaces the shell with app_process so the caller's stream
-     *   stays attached (used by Shizuku, which keeps the session open via exec).
+     * @param background when false, the line uses `exec` so app_process replaces
+     *   the caller's shell — used by the car USB/TCP-ADB paths, where the ADB
+     *   stream must stay attached to the engine process (the car's
+     *   TcpAdbConnection has no stream-demux reader; a closing stream kills the
+     *   just-started engine). When true, the line uses `setsid ... &` so
+     *   app_process detaches into its own session — used by the phone Shizuku
+     *   path, where `execBackground` is fire-and-forget and the engine must
+     *   survive the parent sh's exit (and Shizuku's process tracking, which is
+     *   tied to the parent sh PID). `setsid` is what actually detaches: with
+     *   plain `exec app_process ... &`, the engine remained in Shizuku's
+     *   process group and could be reaped when the parent sh exited, leaving
+     *   vd-server.log at 0 bytes.
      */
     fun commandLine(jarPath: String, logPath: String, args: String, background: Boolean): String {
-        val exec = if (background) "" else "exec "
+        val prefix = if (background) "setsid " else "exec "
         val amp = if (background) " &" else ""
-        return "CLASSPATH=$jarPath ${exec}app_process / $MAIN_CLASS $args >$logPath 2>&1$amp"
+        // Append (>>), not truncate (>): a reconnect storm runs pkill + restart
+        // several times in quick succession, and each restart reopens the log.
+        // With truncation the LAST restart's process — which often dies before its
+        // first stdout flush — erases the FIRST failure's diagnostic output,
+        // leaving a 0-byte log. Append preserves every run's output in order.
+        return "CLASSPATH=$jarPath ${prefix}app_process / $MAIN_CLASS $args >>$logPath 2>&1$amp"
     }
 
     /**

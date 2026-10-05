@@ -535,6 +535,17 @@ class ConnectionService : Service() {
             // AVC decode at 1080p. Encoding larger forces software decode on the
             // car's 8x A53 (single-digit fps). Car-native is also 1:1 with the car's
             // pixels, so no downscale on decode.
+            //
+            // background=true → `setsid app_process ... >>log 2>&1 &`. The car
+            // ADB path uses background=false (`exec app_process`) because the ADB
+            // shell stream must stay attached to the engine (the car's
+            // TcpAdbConnection has no stream-demux reader). Shizuku is different:
+            // execBackground is fire-and-forget and Shizuku tracks the parent sh
+            // PID. With `exec app_process ... &`, the parent sh exits immediately
+            // after backgrounding and Shizuku reaps the process group, killing the
+            // engine before its first stdout flush — vd-server.log stays at 0
+            // bytes. `setsid` detaches the engine into its own session so it
+            // survives the parent sh's exit.
             val plan = VdDeploy.buildDeployPlan(
                 jarPath = jarPath,
                 logPath = logPath,
@@ -542,7 +553,7 @@ class ConnectionService : Service() {
                 encodeWidth = carWidth, encodeHeight = carHeight,
                 phoneHost = "127.0.0.1", fps = targetFps,
                 bitrate = targetBitrate,
-                background = false
+                background = true
             )
 
             ShizukuManager.execAndWait(plan.killCommand)

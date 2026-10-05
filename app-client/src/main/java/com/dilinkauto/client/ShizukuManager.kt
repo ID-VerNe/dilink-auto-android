@@ -187,13 +187,21 @@ object ShizukuManager {
 
     /**
      * Execute a shell command in the background (fire and forget).
+     *
+     * The command is wrapped as `sh -c "<cmd>"` and the caller is expected to
+     * include its own `&` (the vd-server deploy path builds `setsid ...
+     * >>log 2>&1 &` via [com.dilinkauto.protocol.VdDeploy.commandLine] with
+     * background=true). We do NOT strip a trailing `&` and re-add one: that
+     * earlier form turned `setsid app_process ... &` into `setsid app_process
+     * ... & &`, a syntax error in some shells, and stripped a `&` the
+     * caller deliberately placed. Passing the command through verbatim lets
+     * the caller control backgrounding semantics (setsid, nohup, etc.).
      */
     fun execBackground(command: String) {
         if (!isAvailable) return
         try {
             val service = getService() ?: return
-            val sanitized = command.trim().removeSuffix("&").trim()
-            service.newProcess(arrayOf("sh", "-c", "$sanitized &"), null, null)
+            service.newProcess(arrayOf("sh", "-c", command.trim()), null, null)
         } catch (e: Exception) {
             FileLog.w(TAG, "Shizuku execBackground failed: ${e.message}")
         }
