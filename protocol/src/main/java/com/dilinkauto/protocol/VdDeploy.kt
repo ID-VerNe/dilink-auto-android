@@ -9,15 +9,34 @@ package com.dilinkauto.protocol
  * kill flag lands in one place. The argv tail is built by [VdDeployArgs].
  *
  * The kill command comes in two flavors:
- *  - [killCommand] — graceful `pkill -f PipelineServer` (lets the process
- *    clean up via its shutdown hook).
- *  - [killCommandForce] — `pkill -9 -f PipelineServer` for cases where the
- *    process is wedged and must be shot immediately (used by the phone-side
- *    display restorer before a power-on, where a slow shutdown would delay
- *    screen restore).
+ *  - [killCommand] — graceful `pkill -f` (SIGTERM, lets the process clean up
+ *    via its shutdown hook).
+ *  - [killCommandForce] — `pkill -9 -f` for cases where the process is wedged
+ *    and must be shot immediately.
+ *
+ *  - [stopCommand] — the two-stage "SIGTERM, wait, then SIGKILL" sequence used
+ *    when tearing a session down. It exists as ONE shell line on purpose: the
+ *    caller gets it back from a single [com.dilinkauto.client.ShizukuManager.execAndWait],
+ *    so a coroutine cancellation (Service.onDestroy cancels serviceScope) can
+ *    never land between the two signals and leave the process half-killed with
+ *    cleanup() unrun.
+ *
+ * All patterns use the `[P]ipelineServer` bracket trick. A plain
+ * `PipelineServer` pattern makes `pkill -f` match the *wrapper shell itself*
+ * (`sh -c "pkill -f PipelineServer ..."` has that string in its own cmdline),
+ * so the shell gets SIGTERM'd mid-script and any command after it in the same
+ * line silently never runs. The bracket form matches the engine but not the
+ * literal `[P]ipelineServer` text in the shell's cmdline.
  */
 object VdDeploy {
     const val MAIN_CLASS = "com.dilinkauto.vdserver.PipelineServer"
+
+    /**
+     * Regex that matches the vd-server process but NOT the literal
+     * `[P]ipelineServer` text inside the wrapper shell's own cmdline.
+     * See the class doc for why the plain name is unsafe.
+     */
+    const val PROCESS_PATTERN = "[P]ipelineServer"
 
     /** Directory on shared storage where the JAR and log live. */
     const val DIR_PATH = "/sdcard/DiLinkAuto"
@@ -27,11 +46,42 @@ object VdDeploy {
     val JAR_PATH get() = "$DIR_PATH/$JAR_NAME"
     val LOG_PATH get() = "$DIR_PATH/$LOG_NAME"
 
-    /** Graceful kill. Stderr suppressed because pkill returns non-zero when no match. */
-    const val killCommand = "pkill -f PipelineServer 2>/dev/null"
+    /** Graceful kill (SIGTERM). Stderr suppressed because pkill returns non-zero when no match. */
+    const val killCommand = "pkill -f $PROCESS_PATTERN 2>/dev/null"
 
     /** Force kill (-9). Use only when the process cannot shut down on its own. */
-    const val killCommandForce = "pkill -9 -f PipelineServer 2>/dev/null"
+    const val killCommandForce = "pkill -9 -f $PROCESS_PATTERN 2>/dev/null"
+
+    /**
+     * Two-stage stop: SIGTERM → wait 1s → SIGKILL, as a single shell line.
+     *
+     * This is the only stop path the display restorer uses. The previous
+     * `pkill -9` skipped the JVM shutdown hook entirely, so `PipelineServer.cleanup()`
+     * (which releases the VirtualDisplay, restores IME, resets letterbox and
+     * re-powers the physical panel) never ran on most teardowns — each
+     * exit/reconnect cycle leaked one VirtualDisplay plus a permanently
+     * power-off physical panel, which is what turns the car screen black after
+     * a few reconnects.
+     */
+    const val stopCommand =
+        "pkill -f $PROCESS_PATTERN 2>/dev/null; sleep 1; pkill -9 -f $PROCESS_PATTERN 2>/dev/null; exit 0"
+
+    /**
+     * Liveness probe, output form: prints `Y` when a vd-server process exists,
+     * `N` otherwise. Uses `pkill -0` (signal 0 = existence check only, no
+     * signal sent) so it needs no `ps`/`pidof` (whose name matching breaks on
+     * app_process, where the comm name is truncated). For callers that can read
+     * stdout (the phone's Shizuku path).
+     */
+    const val probeCommand =
+        "if pkill -0 -f $PROCESS_PATTERN >/dev/null 2>&1; then echo Y; else echo N; fi"
+
+    /**
+     * Liveness probe, exit-code form: exit 0 = alive, exit 1 = gone.
+     * For callers that only see an exit status (the car's ADB `shell()` path).
+     */
+    const val probeExitCodeCommand =
+        "if pkill -0 -f $PROCESS_PATTERN >/dev/null 2>&1; then exit 0; else exit 1; fi"
 
     /**
      * Build the full app_process command line.

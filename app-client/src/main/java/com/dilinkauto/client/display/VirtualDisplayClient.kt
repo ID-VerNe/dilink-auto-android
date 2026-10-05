@@ -151,10 +151,22 @@ class VirtualDisplayClient(
         }
     }
 
-    /** Send CMD_STOP to the VD server to trigger graceful shutdown */
-    fun stopVdServer() {
-        val ch = channel ?: return
-        try {
+    /**
+     * Send CMD_STOP to the VD server to trigger graceful shutdown.
+     *
+     * Returns true when the byte was handed to the socket. A false return is
+     * expected whenever the lifecycle channel is already gone — the engine's
+     * `readLifecycleCommands()` treats the resulting EOF/IOException exactly
+     * like CMD_STOP (sets running=false → finally cleanup()), so the teardown
+     * still happens; the caller just must not assume it was graceful.
+     */
+    fun stopVdServer(): Boolean {
+        val ch = channel
+        if (ch == null || !ch.isOpen) {
+            FileLog.d(TAG, "stopVdServer: no lifecycle channel (displayId=$displayId) — engine will be stopped by the shell kill instead")
+            return false
+        }
+        return try {
             synchronized(writeLock) {
                 writeBuf.clear()
                 writeBuf.put(CMD_STOP.toByte())
@@ -162,8 +174,14 @@ class VirtualDisplayClient(
                 FrameCodec.writeAll(ch, writeBuf)
             }
             FileLog.i(TAG, "Sent CMD_STOP to VD server")
+            true
         } catch (e: Exception) {
-            FileLog.w(TAG, "Failed to send CMD_STOP: ${e.message}")
+            // Was `Failed to send CMD_STOP: null` in every teardown: writeAll's
+            // exception message is null on a closed socket, so the log looked
+            // like a no-op even though the graceful stop had already failed and
+            // the caller was about to escalate to pkill.
+            FileLog.w(TAG, "Failed to send CMD_STOP (${ch.isOpen}), falling back to shell kill: ${e.javaClass.simpleName}: ${e.message}")
+            false
         }
     }
 

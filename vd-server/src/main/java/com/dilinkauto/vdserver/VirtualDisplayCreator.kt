@@ -38,13 +38,34 @@ internal class VirtualDisplayCreator(
     var displayId: Int = -1
         private set
 
+    /**
+     * Create the VirtualDisplay. Does **not** touch system settings — see
+     * [configureEnvironment], which the caller must invoke separately *after*
+     * snapshotting the originals.
+     *
+     * Ordering matters and used to be inverted: this method used to call
+     * `configureDisplayEnvironment()` itself, but [PipelineServer.createVirtualDisplay]
+     * snapshotted the originals *afterwards*, so `settings get system
+     * screen_off_timeout` read back the `2147483647` this class had just written
+     * (visible in vd-server.log as `get ... -> out='2147483647'`). The restore
+     * path then treated that as "already the sentinel, nothing to do" and the
+     * setting was never put back.
+     */
     fun create(surface: Surface): VirtualDisplay? {
         var vd: VirtualDisplay? = createViaDisplayManagerGlobal(surface)
         if (vd == null) vd = createViaDisplayManager(surface)
         if (vd == null) return null
-        configureDisplayEnvironment()
         return vd
     }
+
+    /**
+     * Apply the letterbox style + disable screen-off / wake gestures.
+     *
+     * MUST be called only after `DisplayPowerController.saveCurrentIme()` has
+     * snapshotted the current values, otherwise the snapshot captures our own
+     * writes and the originals are lost forever.
+     */
+    fun configureEnvironment() = configureDisplayEnvironment()
 
     private fun createViaDisplayManagerGlobal(surface: Surface): VirtualDisplay? {
         try {

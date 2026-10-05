@@ -69,18 +69,44 @@ internal class DisplayPowerController(
         }
     }
 
-    /** Restore the previously-saved IME, physical panel state, and screen settings. */
+    /**
+     * Restore the previously-saved IME and screen settings.
+     *
+     * Runs unconditionally on teardown (the caller re-powers the panel
+     * separately) and is idempotent. Each setting is restored from the snapshot
+     * taken in [saveCurrentIme]. The old code skipped `screen_off_timeout`
+     * whenever the snapshot equalled `2147483647` — but because the snapshot was
+     * taken *after* [VirtualDisplayCreator] had already written that sentinel,
+     * the skip fired on every session and the user's real timeout was lost
+     * forever. Validity, not equality-with-our-own-sentinel, is the right test.
+     */
     fun restoreIme() {
-        val ime = savedDefaultIme ?: return
-        if (com.dilinkauto.protocol.ImeRestore.shouldRestoreIme(ime)) {
+        val ime = savedDefaultIme
+        if (ime != null && com.dilinkauto.protocol.ImeRestore.shouldRestoreIme(ime)) {
             try {
                 com.dilinkauto.protocol.ImeRestore.imeRestoreCommands(ime).forEach { execShell(it) }
                 log("Restored original IME: $ime")
             } catch (_: Exception) {}
         }
-        savedScreenOffTimeout?.let { if (it != "2147483647") execShell("settings put system screen_off_timeout $it") }
-        savedLiftWakeup?.let { execShell("settings put system lift_wakeup_enabled $it") }
-        savedProximityWakeup?.let { execShell("settings put system proximity_wakeup_enabled $it") }
+        restoreSetting("screen_off_timeout", savedScreenOffTimeout)
+        restoreSetting("lift_wakeup_enabled", savedLiftWakeup)
+        restoreSetting("proximity_wakeup_enabled", savedProximityWakeup)
+    }
+
+    /**
+     * Write [value] back to `system.[key]` when it is a plausible snapshot.
+     *
+     * "Plausible" = non-blank and not a `settings get` miss marker (`null` /
+     * `undefined`), and numeric keys must hold a positive number. A failed
+     * snapshot yields one of those markers; writing them back would leave the
+     * device in a worse state than leaving the current value alone.
+     */
+    private fun restoreSetting(key: String, value: String?) {
+        val v = value?.trim()
+        if (v.isNullOrEmpty() || v.equals("null", true) || v.equals("undefined", true)) return
+        val numeric = v.toLongOrNull()
+        if (numeric != null && numeric <= 0L) return
+        try { execShell("settings put system $key $v") } catch (_: Exception) {}
     }
 
     private fun log(msg: String) = PipeLog.log(msg)

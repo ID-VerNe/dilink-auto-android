@@ -164,10 +164,17 @@ class PipelineServer(
 
     private fun createVirtualDisplay(): Boolean {
         val vdSurf = vdInputSurface ?: return false
+        // Snapshot the system state we are about to change — BEFORE changing it.
+        // This used to run after VirtualDisplayCreator.create(), which itself
+        // wrote screen_off_timeout=2147483647 / lift_wakeup=0 / proximity=0, so
+        // the "original" snapshot captured our own writes and restoreIme() could
+        // never put the user's real values back.
+        displayController.saveCurrentIme()
         virtualDisplay = vdCreator.create(vdSurf)
         if (virtualDisplay == null) return false
         displayId = vdCreator.displayId
-        displayController.saveCurrentIme()
+        // Now that the originals are safely stored, apply the session overrides.
+        vdCreator.configureEnvironment()
         try { displayController.setDisplayImePolicy(displayId) } catch (_: Exception) {}
         return true
     }
@@ -192,11 +199,23 @@ class PipelineServer(
         moveTopApp(0, displayId)
         // 校验 DTA 是否挂在 display 层树内（Flyme 偶发 reparent 事务丢失 → 0 层黑屏），必要时旋转往返修复
         vdCreator.ensureDtaAttached()
-        displayController.setPhysicalDisplayPower(false); lastPowerOffTime = System.currentTimeMillis()
+        // Physical panel power-off happens *after* the car connects — see below.
         val carVideo = acceptCarChannel(videoServer, "video", 30000) ?: run { err("Car video timeout"); try { phoneChannel.close() } catch (_: Exception) {}; return null }
         val carInput = acceptCarChannel(inputServer, "input", 30000) ?: run { err("Car input timeout"); try { phoneChannel.close() } catch (_: Exception) {}; try { carVideo.close() } catch (_: Exception) {}; return null }
         try { videoServer.close() } catch (_: Exception) {}; try { inputServer.close() } catch (_: Exception) {}
         log("Car connected: video=${carVideo.remoteAddress} input=${carInput.remoteAddress}")
+        // Power the physical panel off only now — after the car holds both channels.
+        //
+        // This used to run *before* the accepts, i.e. possibly facing a 30s
+        // accept timeout, which produced two failure modes:
+        //  - a slow car found the phone already dark, so the user stared at a
+        //    black phone before anything was actually broken;
+        //  - being killed during that window meant cleanup() had to re-power a
+        //    panel we had switched off for a session that never started, and any
+        //    interruption of cleanup left it off permanently.
+        // Now the panel only goes dark once a live stream exists to replace it,
+        // and a car that fails to connect never costs the user their screen.
+        displayController.setPhysicalDisplayPower(false); lastPowerOffTime = System.currentTimeMillis()
         return ConnectionSet(carVideo, carInput, phoneChannel)
     }
 
@@ -451,17 +470,38 @@ class PipelineServer(
         }
     }
 
+    /**
+     * Idempotent teardown. Order is deliberate:
+     *
+     *  1. Global window/rotation state is reset FIRST, while the shell is
+     *  guaranteed alive and before anything that can block. These two are
+     *  device-wide (not per-display), so a leaked value corrupts every later
+     *  session, and they are cheap enough that doing them up front means even a
+     *  process killed midway has already returned the device to normal.
+     *  2. The foreground app is moved back to the physical display.
+     *  3. The physical panel is re-powered and the IME restored — while
+     *  `shellInput` is still usable (`setPhysicalDisplayPower` needs it).
+     *  4. Threads, GL, encoder, and finally the VirtualDisplay are released.
+     *
+     * The previous order had `virtualDisplay.release()` dead last with nothing
+     * after it to fail, so a mid-way exception or a SIGKILL from the phone side
+     * left the panel off and the VD alive — one leaked display per reconnect.
+     */
     private fun cleanup() {
         if (!cleanedUp.compareAndSet(false, true)) return
         running = false
-        // Resume foreground app from VD to phone display before tearing down VD
+        // 1. Global state first — these outlive this process if we die.
+        try { execShell("cmd window reset-letterbox-style") } catch (_: Exception) {}
+        if (displayId >= 0) {
+            try { execShell("wm user-rotation -d $displayId free") } catch (_: Exception) {}
+        }
+        // 2. Resume foreground app from VD to phone display before tearing down VD
         moveTopApp(displayId, 0)
-        // Restore screen BEFORE killing shell (order matters: execShell needs shellInput alive)
+        // 3. Restore screen BEFORE killing shell (order matters: execShell needs shellInput alive)
         displayController.setPhysicalDisplayPower(true)
         try { execShell("input keyevent 224") } catch (_: Exception) {}
         displayController.restoreIme()
-        try { execShell("cmd window reset-letterbox-style") } catch (_: Exception) {}
-        // Stop the LifeWriter thread before killing the shell — it may be mid-write.
+        // 4. Stop the LifeWriter thread before killing the shell — it may be mid-write.
         lifeWriterThread.interrupt()
         // Now kill the shell
         persistentShell?.let { try { shellInput?.close() } catch (_: Exception) {}; it.destroy() }

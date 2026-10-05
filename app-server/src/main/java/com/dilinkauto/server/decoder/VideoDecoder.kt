@@ -3,6 +3,7 @@ package com.dilinkauto.server.decoder
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.os.Process
+import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
 import com.dilinkauto.protocol.VideoConfig
@@ -88,6 +89,32 @@ class VideoDecoder {
     private val blackScreenKeyframeMaxBytes = 2 * 1024
     private val blackScreenAlertStreak = 3
 
+    /**
+     * Called once per session when the stream is *persistently* black — not on
+     * the third tiny keyframe, but only after [BLACK_SCREEN_SUSTAIN_MS] of
+     * continuous tiny keyframes.
+     *
+     * Rationale: a handful of tiny I-frames right after start is normal (the
+     * VD can briefly composite nothing before the first app frame lands), and
+     * re-handshaking on that would cause reconnect loops — the very thing that
+     * leaked VDs in the first place. Requiring a sustained window means we only
+     * escalate on a genuinely stuck stream. Fires at most once per session;
+     * [resetBlackScreenState] re-arms it.
+     */
+    @Volatile
+    var onSustainedBlackScreen: (() -> Unit)? = null
+
+    private var blackScreenSinceMs = 0L
+    private var blackScreenRecoveryFired = false
+
+    /** Reset the black-screen detector so a fresh session starts clean. */
+    fun resetBlackScreenState() {
+        tinyKeyframeStreak = 0
+        blackScreenAlerted = false
+        blackScreenSinceMs = 0L
+        blackScreenRecoveryFired = false
+    }
+
     // Accumulated decode time for the current 30-frame window (Phase L1 / perf 9.3).
     // Reset at each per-30-frame log so the reported value is per-window, not lifetime.
     private var windowDecodeNanos = 0L
@@ -108,6 +135,10 @@ class VideoDecoder {
         }
 
         log("Starting decoder: ${width}x${height} @${fps}fps, cached config=${configData != null}, queued=${frameQueue.size}")
+
+    // Re-arm the black-screen detector: a fresh stream gets a fresh chance, and
+     // the "escalate once" latch must not survive into the new session.
+        resetBlackScreenState()
 
         val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
             setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
@@ -312,14 +343,28 @@ class VideoDecoder {
         if (isKey) {
             if (data.size < blackScreenKeyframeMaxBytes) {
                 tinyKeyframeStreak++
+                if (tinyKeyframeStreak == 1) blackScreenSinceMs = SystemClock.elapsedRealtime()
                 if (tinyKeyframeStreak >= blackScreenAlertStreak && !blackScreenAlerted) {
                     blackScreenAlerted = true
                     logW("Suspected BLACK SCREEN: $tinyKeyframeStreak consecutive tiny keyframes (<${blackScreenKeyframeMaxBytes}B), latest=${data.size}B")
+                }
+                // Escalate only after the black frames persist. A 3-frame burst during
+                // app/VD warm-up is normal and must not trigger a re-handshake —
+                // that is exactly the reconnect storm that leaked VDs to begin with.
+                if (!blackScreenRecoveryFired) {
+                    val since = blackScreenSinceMs
+                    if (since > 0 && SystemClock.elapsedRealtime() - since >= BLACK_SCREEN_SUSTAIN_MS) {
+                        blackScreenRecoveryFired = true
+                        logW("BLACK SCREEN sustained for ${BLACK_SCREEN_SUSTAIN_MS}ms — requesting VD rebuild")
+                        onSustainedBlackScreen?.invoke()
+                    }
                 }
             } else {
                 if (blackScreenAlerted) log("Black screen alert cleared — keyframe=${data.size}B")
                 blackScreenAlerted = false
                 tinyKeyframeStreak = 0
+                blackScreenSinceMs = 0L
+                blackScreenRecoveryFired = false
             }
         }
         if (isConfig || isKey || receiveCount <= 3 || receiveCount % 60 == 0L) {
@@ -397,6 +442,7 @@ class VideoDecoder {
         if (!running.getAndSet(false)) return
         outputSurfaceValid = false
         log("Stopping decoder: fed=$frameCount rendered=$renderCount drops=$dropCount inputFails=$inputFailCount")
+        resetBlackScreenState()
         frameQueue.clear()
         cachedKeyFrame = null
         feedThread?.interrupt()
@@ -411,7 +457,15 @@ class VideoDecoder {
         codec = null
     }
 
-    companion object {
+companion object {
         private const val TAG = "VideoDecoder"
+
+        /**
+         * How long the stream must stay black before [onSustainedBlackScreen]
+         * fires. Long enough to ride out app-launch and VD warm-up transients,
+         * short enough that a real stuck stream is recovered while the user is
+         * still looking at it.
+         */
+        private const val BLACK_SCREEN_SUSTAIN_MS = 5_000L
     }
 }

@@ -101,7 +101,15 @@ internal class VdServerDeployer(private val host: CarConnectionService) {
             // Kill any existing VD server
             host.setStatusMessage(R.string.status_preparing_vd)
             host.executeAdb(plan.killCommand, noWait = false)
-            delay(200)
+            // Wait for a real exit before launching the replacement. Two live
+            // engines race for the same VirtualDisplay / DTA / 9638-9639 binds
+            // and the loser never runs cleanup() → one leaked VD per reconnect,
+            // which is what turns the car screen black after a few cycles.
+            if (!waitForVdServerExit()) {
+                log("Previous VD server did not exit in time — forcing kill", "W")
+                host.executeAdb(VdDeploy.stopCommand, noWait = false)
+                waitForVdServerExit()
+            }
 
             // Launch VD server. Uses exec to replace shell with app_process — keeps ADB stream open.
             // VD server will die on disconnect; car re-deploys on reconnect.
@@ -151,6 +159,13 @@ internal class VdServerDeployer(private val host: CarConnectionService) {
         log("VD server: ${vdW}x${vdH}@${phoneDpi}dpi (car-native, no downscale)")
         // Use shell (sync) to capture result. pkill old instance first, then start new one.
         controller.shell(plan.killCommand)
+        // Wait for a real exit — two live engines race for the same
+        // VirtualDisplay / DTA / 9638-9639 binds and the loser never cleans up.
+        if (!waitForVdServerExit()) {
+            log("Previous VD server did not exit in time — forcing kill", "W")
+            controller.shell(VdDeploy.stopCommand)
+            waitForVdServerExit()
+        }
         // shellBackground 打开流后不关闭：exec app_process 接管 shell，
         // 流在引擎存活期间一直附着，进程不会被 adbd 回收
         val streamId = controller.shellBackground(plan.launchCommand)
@@ -162,6 +177,39 @@ internal class VdServerDeployer(private val host: CarConnectionService) {
             log("VD server failed to start", "E")
             host.vdServerStarted = false  // Allow retry
         }
+    }
+
+    /**
+     * Poll the phone over ADB until no vd-server process remains.
+     *
+     * Uses `pkill -0` (existence check, no signal delivered) because `ps`/
+     * `pidof` name matching is unreliable for `app_process`-launched engines
+     * (the comm name is truncated). The probe encodes the result in its exit
+     * code, which is all the ADB `shell()` path exposes. Returns true when the
+     * engine is gone or we cannot probe (no ADB) — in the latter case we proceed
+     * rather than stall the deploy.
+     */
+    private suspend fun waitForVdServerExit(timeoutMs: Long = 3000, pollMs: Long = 150): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        var probeFailed = false
+        while (System.currentTimeMillis() < deadline) {
+            if (!host.executeAdb(VdDeploy.probeExitCodeCommand, noWait = false)) {
+                // shell() reports the command's exit status; false here means
+                // "no process matched" (exit 1) — engine is gone. A transport
+                // failure also returns false, so distinguish by retrying once:
+                // if the next probe also reports gone, accept it.
+                if (!host.isAdbAvailable()) return true
+                if (!probeFailed) {
+                    probeFailed = true
+                    delay(pollMs)
+                    continue
+                }
+                return true
+            }
+            delay(pollMs) // exit 0 = still alive
+        }
+        log("vd-server still alive after ${timeoutMs}ms wait", "W")
+        return false
     }
 
     /** Reset retry/state on a fresh connect cycle. */

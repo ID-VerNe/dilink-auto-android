@@ -71,7 +71,9 @@ class ConnectionService : Service() {
         CarIpLocator.wifiManager = applicationContext.getSystemService(WIFI_SERVICE) as? android.net.wifi.WifiManager
         carAppInstaller = CarAppInstaller(this) { msg -> _installStatusStatic.value = msg }
         appListBuilder = AppListBuilder(applicationContext, serviceScope)
-        displayRestorer = PhoneDisplayRestorer(applicationContext, serviceScope)
+        // No scope passed: the restorer owns a process-lifetime scope so a
+        // Service.onDestroy() mid-restore cannot skip `cmd display power-on`.
+        displayRestorer = PhoneDisplayRestorer(applicationContext)
     }
 
     private fun cacheDefaultIme() {
@@ -239,6 +241,7 @@ class ConnectionService : Service() {
                     FileLog.i(TAG, "New network while WAITING — restarting listen loop")
                     cleanupSession()
                     connectionLoopJob?.cancel()
+                    resetCleanupGuard()
                     startConnectionLoop()
                 }
             }
@@ -279,6 +282,7 @@ class ConnectionService : Service() {
                 FileLog.i(TAG, "Network changed while WAITING — restarting listen loop")
                 cleanupSession()
                 connectionLoopJob?.cancel()
+                resetCleanupGuard()
                 startConnectionLoop()
             }
             State.CONNECTED, State.STREAMING -> {
@@ -358,6 +362,8 @@ class ConnectionService : Service() {
         try {
             // ─── Accept control connection (port 9637) ───
             val ctrl = Connection.accept(Discovery.DEFAULT_PORT, serviceScope)
+            // A brand-new session begins: allow the next teardown to run again.
+            resetCleanupGuard()
             controlConnection = ctrl
             activeConnection = ctrl
             _serviceState.value = State.CONNECTED
@@ -407,6 +413,11 @@ class ConnectionService : Service() {
         FileLog.i(TAG, "Car display: ${request.screenWidth}x${request.screenHeight} @${request.screenDpi}dpi fps=${request.targetFps} bitrate=${request.bitrate}")
         targetFps = request.targetFps
         targetBitrate = if (request.bitrate > 0) request.bitrate else VideoConfig.DEFAULT_BITRATE
+
+        // A handshake always leads to a fresh VD, so the teardown of whatever
+        // came before must be allowed to run again (rotation re-handshake case:
+        // the guard was consumed by the mid-stream VD swap below).
+        resetCleanupGuard()
 
         cacheDefaultIme()
 
@@ -557,7 +568,15 @@ class ConnectionService : Service() {
             )
 
             ShizukuManager.execAndWait(plan.killCommand)
-            delay(200)
+            // Do NOT launch a second engine while the old one may still be alive.
+            // Two instances race for the same VirtualDisplay / DTA / 9638-9639
+            // binds, and the loser skips cleanup() entirely — a leaked VD per
+            // reconnect. Wait for a real exit before starting the new one.
+            if (!ShizukuManager.waitForVdServerExit(VD_EXIT_WAIT_MS)) {
+                FileLog.w(TAG, "Previous VD server did not exit within ${VD_EXIT_WAIT_MS}ms — forcing kill")
+                ShizukuManager.execAndWait(VdDeploy.stopCommand)
+                ShizukuManager.waitForVdServerExit(VD_EXIT_WAIT_MS)
+            }
 
             ShizukuManager.execBackground(plan.launchCommand)
             // 打出 jar CRC：测试时可直接从日志确认这次跑的是哪一版引擎，
@@ -686,13 +705,49 @@ class ConnectionService : Service() {
 
     // ─── Cleanup ───
 
+    /**
+     * Idempotency guard for [cleanupSession].
+     *
+     * `cleanupSession()` used to be callable from 7 places (two network
+     * callbacks, the listen-loop `finally`, the handshake-failure path,
+     * `stopEverything`, and `onDestroy`) with no guard, so a single disconnect
+     * could run the whole teardown — including the vd-server kill and the
+     * physical-panel restore — several times over. Observed in
+     * `client-20261005-164828.log`: **1** `Car disconnected` produced **9**
+     * `Force-waking physical display` lines. Each repeat raced the previous
+     * one's `pkill`, which is how VDs leaked.
+     *
+     * Set on entry, cleared by [resetCleanupGuard] which the call sites invoke
+     * when they are about to establish a *new* session (so the next teardown is
+     * allowed to run again).
+     */
+    private val cleanupGuard = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** Allow the next [cleanupSession] to execute. Call before starting a new session. */
+    private fun resetCleanupGuard() {
+        cleanupGuard.set(false)
+    }
+
     private fun cleanupSession() {
+        if (!cleanupGuard.compareAndSet(false, true)) {
+            FileLog.d(TAG, "cleanupSession: already cleaned up this session — skipping")
+            return
+        }
+        FileLog.i(TAG, "cleanupSession: tearing down session")
         handshakeJob?.cancel()
         handshakeJob = null
         vdWaitJob?.cancel()
         vdWaitJob = null
-        vdClient?.stopVdServer()
-        vdClient?.disconnect()
+        // Graceful stop: CMD_STOP first so the engine's readLifecycleCommands()
+        // sets running=false and its finally block runs cleanup() (releases the
+        // VD, restores IME + letterbox + screen settings, re-powers the panel).
+        // Only if that does not take effect do we fall through to the shell kill
+        // inside PhoneDisplayRestorer.
+        val client = vdClient
+        if (client != null) {
+            client.stopVdServer()
+            client.disconnect()
+        }
         vdClient = null
         InputInjectionService.instance?.clearVirtualDisplay()
         controlConnection?.disconnect()
@@ -702,12 +757,17 @@ class ConnectionService : Service() {
         _serviceState.value = State.WAITING
         val ime = savedDefaultIme
         savedDefaultIme = null
+        // Runs on PhoneDisplayRestorer's own process-lifetime scope: the two-stage
+        // stop + `cmd display power-on` cannot be cancelled by onDestroy().
         displayRestorer.restore(ime)
     }
 
     private fun stopEverything() {
         connectionLoopJob?.cancel()
         connectionLoopJob = null
+        // Explicit user stop / Service teardown must always run the teardown,
+        // even if a network callback already cleaned up this session.
+        resetCleanupGuard()
         cleanupSession()
         appListBuilder.resetIconHashes()
         serviceRegistration?.unregister()
@@ -775,6 +835,9 @@ class ConnectionService : Service() {
         const val ALLOWLIST_PACKAGES_KEY = "allowed_packages"
         const val ALLOWLIST_CONFIGURED_KEY = "allowlist_configured"
         const val NOTIFICATION_ID = 1001
+
+        /** How long to wait for the previous vd-server process to actually exit. */
+        private const val VD_EXIT_WAIT_MS = 3000L
 
         /** Propagate log toggle to car. Called from settings UI and onCreate. */
         fun setLogEnabled(context: android.content.Context, enabled: Boolean) {

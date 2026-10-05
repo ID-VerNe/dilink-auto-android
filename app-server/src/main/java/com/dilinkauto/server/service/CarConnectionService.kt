@@ -186,7 +186,27 @@ class CarConnectionService : Service() {
         logWriter.setEnabled(com.dilinkauto.server.BuildConfig.DEBUG)
         logWriter.start()
         videoDecoder.logSink = { msg -> carLogSend(msg) }
-
+        // Self-heal: a stream that stays black for seconds means the phone's
+        // VirtualDisplay is producing nothing (stuck DTA, leaked display,
+        // compositor wedged). Nothing on the car side can fix that — only a
+        // fresh VD on the phone. Re-handshake makes the phone tear down and
+        // redeploy the engine, which is exactly the recovery path.
+        //
+        // Latched by vdServerStarted so we ask for at most one rebuild per
+        // session: without that, a phone that keeps serving black frames would
+        // drive an endless re-handshake loop — the same reconnect storm that
+        // leaked displays in the first place.
+        videoDecoder.onSustainedBlackScreen = {
+            if (vdServerStarted && !blackScreenRecoveryInFlight) {
+                blackScreenRecoveryInFlight = true
+                carLogSend("[BLACK] requesting VD rebuild via re-handshake", "W")
+                scope.launch(Dispatchers.IO) {
+                    try { rehandshakeForBlackScreen() } catch (e: Exception) {
+                        carLogSend("[BLACK] rebuild failed: ${e.message}", "E")
+                    } finally { blackScreenRecoveryInFlight = false }
+                }
+            }
+        }
         // Wire crash handler to TCP log sink for immediate crash delivery
         CarCrashHandler.logSink = { msg -> carLogSend(msg) }
 
@@ -734,6 +754,8 @@ class CarConnectionService : Service() {
     }
 
     private var videoFrameCount = 0L
+    /** One-shot latch: at most one VD rebuild in flight for a sustained black screen. */
+    @Volatile private var blackScreenRecoveryInFlight = false
     private var offscreenTexture: android.graphics.SurfaceTexture? = null
     private var offscreenSurface: android.view.Surface? = null
 
@@ -887,9 +909,46 @@ class CarConnectionService : Service() {
         val newVpH = vp.second
         if (newVpW == vdWidth && newVpH == vdHeight) return
         if (_state.value != State.STREAMING && _state.value != State.CONNECTED) return
-        val ctrl = controlConnection ?: return
+val ctrl = controlConnection ?: return
         if (!ctrl.isConnected) return
         carLogSend("Car viewport changed -> re-handshake ${newVpW}x${newVpH} (was ${vdWidth}x${vdHeight})")
+        // rehandshakeOnExistingControl is suspend; this entry point is not.
+        scope.launch(Dispatchers.IO) { rehandshakeOnExistingControl(ctrl, newVpW, newVpH, dpi) }
+    }
+
+    /**
+     * Rebuild the phone-side VirtualDisplay after a sustained black stream.
+     *
+     * Same teardown as a rotation re-handshake, but at the *current* dimensions
+     * — there is no viewport change here, only a wedged engine. The phone's
+     * `handleHandshake` treats any HANDSHAKE_REQUEST as "drop the old VD and
+     * build a new one", which is exactly the recovery a stuck compositor needs.
+     */
+    private suspend fun rehandshakeForBlackScreen() {
+        val ctrl = controlConnection
+        if (ctrl == null || !ctrl.isConnected) {
+            carLogSend("[BLACK] control link gone, cannot re-handshake", "W")
+            return
+        }
+        if (_state.value != State.STREAMING && _state.value != State.CONNECTED) return
+        carLogSend("[BLACK] re-handshake at current viewport ${vdWidth}x$vdHeight")
+        rehandshakeOnExistingControl(ctrl, vdWidth, vdHeight, startupDpi)
+    }
+
+    /**
+     * Tear down video/input + the current engine, then send a fresh
+     * HANDSHAKE_REQUEST on the *existing* control connection so the phone
+     * redeploys the vd-server and rebinds 9638/9639.
+     *
+     * Shared by the rotation and black-screen paths. The control channel stays
+     * alive throughout; only the streams are recycled.
+     */
+    private suspend fun rehandshakeOnExistingControl(
+        ctrl: Connection,
+        newVpW: Int,
+        newVpH: Int,
+        dpi: Int
+    ) {
         // Cancel discovery retry loops for the duration of the re-handshake. The
         // control connection is reused (not torn down), but startWifiTrack's
         // gateway retry loop keys on `!handshakeDone && state == CONNECTING` —
@@ -902,8 +961,8 @@ class CarConnectionService : Service() {
         connectJob?.cancel()
         connectJob = null
 
-        // Tear down video/input synchronously  clear disconnect listeners so handleDisconnect()
-        // is not invoked for this intentional mid-stream rotation teardown.
+        // Tear down video/input synchronously — clear disconnect listeners so
+        // handleDisconnect() is not invoked for this intentional mid-stream teardown.
         videoConnection?.clearDisconnectListener()
         inputConnection?.clearDisconnectListener()
         videoConnection?.disconnect(); videoConnection = null
@@ -919,24 +978,23 @@ class CarConnectionService : Service() {
         _state.value = State.CONNECTING
         _statusMessage.value = getString(R.string.status_starting_vd)
 
-        scope.launch(Dispatchers.IO) {
-            val handshake = buildHandshakeRequest(
-                context = this@CarConnectionService,
-                screenWidth = newVpW,
-                screenHeight = newVpH,
-                screenDpi = dpi,
-                targetFps = targetFps,
-                dpiOverride = startupDpi,
-                bitrate = startupBitrate
-            )
-            try {
-                ctrl.sendControl(ControlMsg.HANDSHAKE_REQUEST, handshake.encode())
-            } catch (e: Exception) {
-                carLogSend("Re-handshake send failed: ${e.message}")
-                handleDisconnect()
-            }
+        val handshake = buildHandshakeRequest(
+            context = this@CarConnectionService,
+            screenWidth = newVpW,
+            screenHeight = newVpH,
+            screenDpi = dpi,
+            targetFps = targetFps,
+            dpiOverride = startupDpi,
+            bitrate = startupBitrate
+        )
+        try {
+            ctrl.sendControl(ControlMsg.HANDSHAKE_REQUEST, handshake.encode())
+        } catch (e: Exception) {
+            carLogSend("Re-handshake send failed: ${e.message}")
+            handleDisconnect()
         }
     }
+
 
     fun requestUninstall(packageName: String) {
         sendCommandToVd(ControlMsg.APP_UNINSTALL, packageName.toByteArray(Charsets.UTF_8))

@@ -206,4 +206,36 @@ object ShizukuManager {
             FileLog.w(TAG, "Shizuku execBackground failed: ${e.message}")
         }
     }
+
+    /**
+     * Block until no vd-server process remains, or [timeoutMs] elapses.
+     *
+     * Used at two points where "the old engine is gone" must be true before
+     * proceeding:
+     *  - before launching a new engine, so two instances never race for the same
+     *    VirtualDisplay / DTA / 9638-9639 ports;
+     *  - after the graceful stop, to confirm cleanup() actually ran before we
+     *    declare the session torn down.
+     *
+     * `pkill -0` performs an existence check without delivering a signal, so this
+     * is safe to poll.
+     *
+     * @return true if no vd-server is running (or Shizuku is unavailable, in
+     *         which case we cannot verify and report true to avoid hanging).
+     */
+    fun waitForVdServerExit(timeoutMs: Long, pollMs: Long = 100): Boolean {
+        if (!isAvailable) return true
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            val out = try { execAndWait(com.dilinkauto.protocol.VdDeploy.probeCommand) } catch (_: Exception) { null }
+            val alive = out?.trim()?.endsWith("Y") == true
+            if (!alive) return true
+            try { Thread.sleep(pollMs) } catch (_: InterruptedException) { return false }
+        }
+        val stillAlive = try {
+            execAndWait(com.dilinkauto.protocol.VdDeploy.probeCommand)?.trim()?.endsWith("Y") == true
+        } catch (_: Exception) { false }
+        if (stillAlive) FileLog.w(TAG, "vd-server still alive after ${timeoutMs}ms wait")
+        return !stillAlive
+    }
 }
