@@ -111,10 +111,16 @@ dependencies {
 // This task just runs d8 + jar packaging.
 tasks.register("buildVdServer") {
     dependsOn(":vd-server:bundleLibRuntimeToJarDebug")
+    // :protocol-core 是纯 JVM 模块（PlatformLog 等协议基元都在这里）。Phase 0 把它
+    // 从 :protocol 拆出后，下面那份 inputs 曾漏掉它 —— 编译期正常、d8 也正常，直到
+    // app_process 启动 vd-server 时才以 NoClassDefFoundError: PlatformLog 崩掉，
+    // 且因为崩在最早一行日志之前，vd-server.log 完全空白，极难定位。
+    dependsOn(":protocol-core:jar")
 
     val vdBuildDir = file("${rootDir}/vd-server/build/tmp/vds-d8")
     val vdClassesJar = file("${rootDir}/vd-server/build/intermediates/runtime_library_classes_jar/debug/classes.jar")
     val protocolJar = file("${rootDir}/protocol/build/intermediates/runtime_library_classes_jar/debug/classes.jar")
+    val protocolCoreJar = file("${rootDir}/protocol-core/build/libs/protocol-core.jar")
     val d8Jar = file("${android.sdkDirectory}/build-tools/${android.buildToolsVersion}/lib/d8.jar")
     val assetsDir = file("src/main/assets")
 
@@ -133,8 +139,8 @@ tasks.register("buildVdServer") {
         // Clean stale artifacts from assets
         file("${assetsDir}/vd-server.dex").delete()
 
-        // DEX vd-server + protocol + kotlin stdlib (needed for app_process runtime)
-        val inputs = listOf(vdClassesJar.absolutePath, protocolJar.absolutePath) +
+        // DEX vd-server + protocol + protocol-core + kotlin stdlib (needed for app_process runtime)
+        val inputs = listOf(vdClassesJar.absolutePath, protocolJar.absolutePath, protocolCoreJar.absolutePath) +
             kotlinLibs.map { it.absolutePath }
         val d8Args = (listOf("--output", vdBuildDir.absolutePath) + inputs).toTypedArray()
 

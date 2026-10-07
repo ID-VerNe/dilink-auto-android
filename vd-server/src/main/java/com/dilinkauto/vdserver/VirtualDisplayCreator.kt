@@ -11,11 +11,11 @@ import java.lang.reflect.Method
  * Two strategies, in order:
  *  1. [DisplayManagerGlobal] — the hidden singleton that accepts a
  *     [VirtualDisplayConfig] built via its Builder. This is the path that
- *     lets us set the surface, the trust flag (0x6c49), and the
- *     display-id-to-mirror; it works on the AOSP shell runtime.
+ *     lets us set the surface and the full flag set (see [VD_FLAGS]); it
+ *     works on the AOSP shell runtime.
  *  2. [DisplayManager] fallback — construct the (also hidden) constructor
- *     via [FakeContext], force `mDisplayIdToMirror` to 0, and use the public
- *     [DisplayManager.createVirtualDisplay] with the same trust-flag bits.
+ *     via [FakeContext] and use the public [DisplayManager.createVirtualDisplay]
+ *     with the same flag set.
  *
  * After creation, applies the iPad-like letterbox style (Android 12L+) so
  * portrait apps render at a sensible 16:10 aspect ratio inside the car's
@@ -35,6 +35,21 @@ internal class VirtualDisplayCreator(
     private val log: (String) -> Unit,
     private val err: (String) -> Unit
 ) {
+    private companion object {
+        /**
+         * VirtualDisplay flags（位值与 AOSP DisplayManager.java 一致）：
+         * PUBLIC(1<<0) | OWN_CONTENT_ONLY(1<<3) | SUPPORTS_TOUCH(1<<6) | TRUSTED(1<<10) |
+         * OWN_DISPLAY_GROUP(1<<11) | ALWAYS_UNLOCKED(1<<12) | TOUCH_FEEDBACK_DISABLED(1<<13) |
+         * OWN_FOCUS(1<<14)
+         *
+         * ALWAYS_UNLOCKED 是「手机锁屏 → VD 上出现 KEYGUARD_DIALOG(ty=2009) 全屏黑窗 → 投屏
+         * 恒黑」的修复：此前误用 0x40(SUPPORTS_TOUCH) 充当 ALWAYS_UNLOCKED(=1<<12)，该位
+         * 实际从未设置。AOSP 语义要求该 flag 仅对非默认 display group 的 VD 有效，
+         * 前置条件已由 OWN_DISPLAY_GROUP 满足。
+         */
+        const val VD_FLAGS = 0x1 or 0x8 or (1 shl 6) or (1 shl 10) or (1 shl 11) or (1 shl 12) or (1 shl 13) or (1 shl 14)
+    }
+
     var displayId: Int = -1
         private set
 
@@ -78,7 +93,7 @@ internal class VirtualDisplayCreator(
             bldCtor.isAccessible = true
             val bld = bldCtor.newInstance("DiLinkAutoVD", displayWidth, displayHeight, dpi)
             bldClass.getDeclaredMethod("setSurface", Surface::class.java).apply { isAccessible = true; invoke(bld, surface) }
-            bldClass.getDeclaredMethod("setFlags", Int::class.javaPrimitiveType).apply { isAccessible = true; invoke(bld, 0x6c49) }
+            bldClass.getDeclaredMethod("setFlags", Int::class.javaPrimitiveType).apply { isAccessible = true; invoke(bld, VD_FLAGS) }
             val cfg = bldClass.getDeclaredMethod("build").apply { isAccessible = true }.invoke(bld)
             val cbClass = Class.forName("android.hardware.display.IVirtualDisplayCallback")
             val createVd: Method = try {
@@ -102,8 +117,7 @@ internal class VirtualDisplayCreator(
             log("DisplayManager...")
             val ctor = DisplayManager::class.java.getDeclaredConstructor(android.content.Context::class.java)
             ctor.isAccessible = true; val dm = ctor.newInstance(FakeContext.get())
-            val flags = (DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY or (1 shl 6) or (1 shl 10) or (1 shl 11) or (1 shl 13) or (1 shl 14))
-            val vd = dm.createVirtualDisplay("DiLinkAutoVD", displayWidth, displayHeight, dpi, surface, flags)
+            val vd = dm.createVirtualDisplay("DiLinkAutoVD", displayWidth, displayHeight, dpi, surface, VD_FLAGS)
             displayId = try { vd.display.displayId } catch (_: Exception) { findDisplayId("DiLinkAutoVD") }
             log("VD via DisplayManager: id=$displayId")
             return vd

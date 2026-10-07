@@ -7,12 +7,14 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.Canvas
+import com.dilinkauto.protocol.AndroidPlatformHooks
 import java.io.ByteArrayOutputStream
 
 class ClientApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        AndroidPlatformHooks.install()
         createNotificationChannels()
         ShizukuManager.init(this)
     }

@@ -6,6 +6,7 @@ import android.os.Process
 import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
+import com.dilinkauto.protocol.H264NalParser
 import com.dilinkauto.protocol.VideoConfig
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
@@ -120,7 +121,7 @@ class VideoDecoder {
     private var windowDecodeNanos = 0L
 
     /** True if [data] contains an H.264 IDR frame (NAL type 5). Delegates to
-     *  [H264NalParser]; kept as a thin wrapper so existing call sites stay local. */
+     *  [H264NalParser]（已迁至 :protocol-core，桌面端共用同一判定）；薄包装让调用点保持本地命名。 */
     private fun isKeyFrame(data: ByteArray): Boolean = H264NalParser.isKeyFrame(data)
 
     data class FrameData(val isConfig: Boolean, val isKeyFrame: Boolean, val data: ByteArray)

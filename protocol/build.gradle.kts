@@ -19,16 +19,11 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
-
-    testOptions {
-        unitTests.isReturnDefaultValues = true
-    }
 }
 
 dependencies {
-    implementation("androidx.annotation:annotation:1.7.1")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+    // 平台无关的协议核心（api：上游模块可直接使用 FrameCodec / Messages / Connection 等）
+    api(project(":protocol-core"))
 
-    testImplementation("junit:junit:4.13.2")
-    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 }

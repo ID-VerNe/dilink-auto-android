@@ -4,12 +4,14 @@ import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.util.Log
+import com.dilinkauto.protocol.AndroidPlatformHooks
 import java.io.File
 
 class ServerApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        AndroidPlatformHooks.install()
         createNotificationChannels()
         iconCache = AppIconCache(File(filesDir, "icons"))
 

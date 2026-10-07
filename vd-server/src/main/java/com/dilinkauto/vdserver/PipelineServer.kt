@@ -90,6 +90,7 @@ class PipelineServer(
         private const val SOCKET_BUF_BYTES = 262144 // 256KB — request send/receive buffer
 
         @JvmStatic fun main(args: Array<String>) {
+            AndroidPlatformHooks.install()
             val w = args.getOrNull(0)?.toInt() ?: 1408; val h = args.getOrNull(1)?.toInt() ?: 792
             val d = args.getOrNull(2)?.toInt() ?: 120; val ph = args.getOrNull(3) ?: "127.0.0.1"
             val ew = args.getOrNull(4)?.toInt() ?: w; val eh = args.getOrNull(5)?.toInt() ?: h
@@ -356,6 +357,14 @@ class PipelineServer(
             ControlMsg.GO_RECENT -> { execShell("input -d $displayId keyevent 187"); checkStackEmpty() }
             ControlMsg.APP_UNINSTALL -> execShell("pm uninstall ${String(f.payload, Charsets.UTF_8)}")
             ControlMsg.APP_INFO -> { val pkg = String(f.payload, Charsets.UTF_8); val s = execShellOutput("cmd package resolve-activity --brief -a android.settings.APPLICATION_DETAILS_SETTINGS com.android.settings")?.trim(); if (!s.isNullOrEmpty()) execShell("am start --display $displayId -n $s -d \"package:$pkg\"") else execShell("am start --display $displayId -a android.settings.APPLICATION_DETAILS_SETTINGS -d \"package:$pkg\"") }
+            // 手动开关手机物理屏（payload: 1 字节，0=熄屏 1=亮屏）。
+            // 默认连上即自动熄屏（bindAndAccept），这条只用于中途手动干预；
+            // 空 payload 按"熄屏"处理，避免对端漏填载荷时误把屏幕点亮。
+            ControlMsg.SET_DISPLAY_POWER -> {
+                val on = f.payload.isNotEmpty() && f.payload[0].toInt() != 0
+                displayController.setPhysicalDisplayPower(on)
+                log("Physical display power -> ${if (on) "ON" else "OFF"}")
+            }
         }
     }
     private fun launchApp(pkg: String) {

@@ -24,14 +24,13 @@ object Discovery {
     const val SERVICE_TYPE = "_dilinkauto._tcp."
     const val SERVICE_NAME = "DiLink-Auto"
 
-    // Protocol-wide TCP port constants. These are contracts between modules
-    // (phone / car / VD server) and must agree across all three. Collected
-    // here so a change lands in one place.
-    const val DEFAULT_PORT = 9637     // Control + Data (phone listens, car connects)
-    const val VIDEO_PORT = 9638       // Video only (phone -> car)
-    const val INPUT_PORT = 9639      // Input only (car -> phone)
-    const val LIFECYCLE_PORT = 19647 // VD server reverse-connects to phone (localhost)
-    const val ADB_PORT = 5555        // Standard ADB TCP port (car dev-mode + self-install)
+    // 协议端口常量的唯一来源已移到平台无关的 :protocol-core（见 [Ports]），
+    // 这里保留同名别名以免改动三端的大量历史调用点，取值不重复定义。
+    const val DEFAULT_PORT = Ports.DEFAULT_PORT
+    const val VIDEO_PORT = Ports.VIDEO_PORT
+    const val INPUT_PORT = Ports.INPUT_PORT
+    const val LIFECYCLE_PORT = Ports.LIFECYCLE_PORT
+    const val ADB_PORT = Ports.ADB_PORT
 
     /**
      * Registers the DiLink-Auto service on the local network.
