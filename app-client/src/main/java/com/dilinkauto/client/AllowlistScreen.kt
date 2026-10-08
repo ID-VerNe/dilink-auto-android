@@ -21,8 +21,8 @@ import androidx.compose.ui.graphics.painter.BitmapPainter
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import com.dilinkauto.client.service.ConnectionService
 import com.dilinkauto.client.service.LauncherApps
 import kotlinx.coroutines.Dispatchers
@@ -89,13 +89,13 @@ fun AllowlistScreen(onBack: () -> Unit) {
             verticalAlignment = Alignment.CenterVertically
         ) {
             IconButton(onClick = onBack) {
-                Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = Color.White)
+                Icon(Icons.Default.ArrowBack, contentDescription = stringResource(R.string.action_back), tint = Color.White)
             }
-            Text(stringResource(R.string.allowlist_title), fontSize = 22.sp, fontWeight = FontWeight.Bold, color = Color.White)
+            Text(stringResource(R.string.allowlist_title), style = MaterialTheme.typography.titleLarge, color = Color.White)
         }
 
         Column(modifier = Modifier.padding(horizontal = 16.dp)) {
-            Text(stringResource(R.string.allowlist_desc), fontSize = 13.sp, color = Color.Gray)
+            Text(stringResource(R.string.allowlist_desc), style = MaterialTheme.typography.bodySmall, color = Color.Gray)
             Spacer(Modifier.height(12.dp))
 
             OutlinedTextField(
@@ -108,7 +108,13 @@ fun AllowlistScreen(onBack: () -> Unit) {
                 trailingIcon = {
                     if (query.isNotEmpty()) {
                         IconButton(onClick = { query = "" }) {
-                            Icon(Icons.Default.Close, contentDescription = null, tint = Color.Gray)
+                            // Without a name TalkBack announces only "button", leaving
+                            // the purpose unreachable for screen-reader users (UX-04).
+                            Icon(
+                                Icons.Default.Close,
+                                contentDescription = stringResource(R.string.clear_search),
+                                tint = Color.Gray
+                            )
                         }
                     }
                 },
@@ -129,10 +135,10 @@ fun AllowlistScreen(onBack: () -> Unit) {
             }
 
             Spacer(Modifier.height(8.dp))
-            Text("${allowed.size} / ${apps.size}", fontSize = 12.sp, color = Color.Gray)
+            Text("${allowed.size} / ${apps.size}", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
             if (allowed.isEmpty()) {
                 Spacer(Modifier.height(4.dp))
-                Text(stringResource(R.string.allowlist_empty), fontSize = 12.sp, color = Color(0xFFFFA726))
+                Text(stringResource(R.string.allowlist_empty), style = MaterialTheme.typography.bodySmall, color = Color(0xFFFFA726))
             }
         }
 
@@ -144,6 +150,27 @@ fun AllowlistScreen(onBack: () -> Unit) {
                 .padding(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp)
         ) {
+            if (filtered.isEmpty() && query.isNotBlank()) {
+                // Say why the list is empty and offer the way out (audit UX-09):
+                // a blank list reads as "still loading".
+                item(key = "no_match") {
+                    Column(
+                        modifier = Modifier.fillMaxWidth().padding(top = 32.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Text(
+                            stringResource(R.string.allowlist_no_match, query),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = Color.Gray,
+                            textAlign = TextAlign.Center
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        TextButton(onClick = { query = "" }) {
+                            Text(stringResource(R.string.clear_search))
+                        }
+                    }
+                }
+            }
             items(filtered, key = { it.pkg }) { row ->
                 val checked = row.pkg in allowed
                 Card(
@@ -175,7 +202,7 @@ fun AllowlistScreen(onBack: () -> Unit) {
                         Spacer(Modifier.width(12.dp))
                         Column(modifier = Modifier.weight(1f)) {
                             Text(row.label, fontWeight = FontWeight.Medium, color = Color.White, maxLines = 1)
-                            Text(row.pkg, fontSize = 11.sp, color = Color.Gray, maxLines = 1)
+                            Text(row.pkg, style = MaterialTheme.typography.bodySmall, color = Color.Gray, maxLines = 1)
                         }
                         Switch(
                             checked = checked,

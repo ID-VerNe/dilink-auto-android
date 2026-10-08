@@ -44,7 +44,6 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -224,8 +223,7 @@ fun OnboardingScreen(onComplete: () -> Unit, onInstallOnCar: () -> Unit, install
         AnimatedContent(targetState = step.title, label = "title") { title ->
             Text(
                 title,
-                fontSize = 24.sp,
-                fontWeight = FontWeight.Bold,
+                style = MaterialTheme.typography.headlineSmall,
                 color = Color.White,
                 textAlign = TextAlign.Center
             )
@@ -237,7 +235,7 @@ fun OnboardingScreen(onComplete: () -> Unit, onInstallOnCar: () -> Unit, install
         AnimatedContent(targetState = step.description, label = "desc") { desc ->
             Text(
                 desc,
-                fontSize = 15.sp,
+                style = MaterialTheme.typography.bodyLarge,
                 color = Color.Gray,
                 textAlign = TextAlign.Center,
                 lineHeight = 22.sp
@@ -246,7 +244,7 @@ fun OnboardingScreen(onComplete: () -> Unit, onInstallOnCar: () -> Unit, install
 
         if (currentStep > 0 && currentStep != 4 && step.isGranted()) {
             Spacer(Modifier.height(8.dp))
-            Text(stringResource(R.string.onboarding_granted_label), fontSize = 14.sp, color = InstallStatusVisuals.DoneColor, fontWeight = FontWeight.Medium)
+            Text(stringResource(R.string.onboarding_granted_label), style = MaterialTheme.typography.labelLarge, color = InstallStatusVisuals.DoneColor)
         }
 
         // Car setup step: prerequisites + install button + skip
@@ -279,7 +277,7 @@ fun OnboardingScreen(onComplete: () -> Unit, onInstallOnCar: () -> Unit, install
                         Spacer(Modifier.width(10.dp))
                         Text(
                             prereq,
-                            fontSize = 14.sp,
+                            style = MaterialTheme.typography.bodyMedium,
                             color = Color(0xFFB0BEC5)
                         )
                     }
@@ -328,8 +326,7 @@ fun OnboardingScreen(onComplete: () -> Unit, onInstallOnCar: () -> Unit, install
                 Spacer(Modifier.width(8.dp))
                 Text(
                     if (step.isGranted()) stringResource(R.string.onboarding_continue) else step.actionLabel,
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.Medium
+                    style = MaterialTheme.typography.titleSmall
                 )
             }
 
@@ -352,7 +349,7 @@ fun OnboardingScreen(onComplete: () -> Unit, onInstallOnCar: () -> Unit, install
                     containerColor = InstallStatusVisuals.DoneColor
                 )
             ) {
-                Text(step.actionLabel, fontSize = 16.sp, fontWeight = FontWeight.Medium)
+                Text(step.actionLabel, style = MaterialTheme.typography.titleSmall)
             }
         }
     }

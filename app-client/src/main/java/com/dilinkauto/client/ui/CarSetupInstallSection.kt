@@ -32,7 +32,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import com.dilinkauto.client.R
 import com.dilinkauto.client.service.InstallStatus
 
@@ -65,7 +64,7 @@ internal fun CarSetupInstallSection(
             ) {
                 Icon(Icons.Default.CheckCircle, contentDescription = null, tint = InstallStatusVisuals.DoneColor, modifier = Modifier.size(20.dp))
                 Spacer(Modifier.width(8.dp))
-                Text(installStatus, fontSize = 14.sp, color = InstallStatusVisuals.DoneColor, fontWeight = FontWeight.Medium)
+                Text(installStatus, style = MaterialTheme.typography.labelLarge, color = InstallStatusVisuals.DoneColor)
             }
             Spacer(Modifier.height(8.dp))
         }
@@ -76,10 +75,10 @@ internal fun CarSetupInstallSection(
             ) {
                 Icon(Icons.Default.Warning, contentDescription = null, tint = InstallStatusVisuals.AttentionColor, modifier = Modifier.size(20.dp))
                 Spacer(Modifier.width(8.dp))
-                Text(installStatus, fontSize = 13.sp, color = InstallStatusVisuals.AttentionColor)
+                Text(installStatus, style = MaterialTheme.typography.bodySmall, color = InstallStatusVisuals.AttentionColor)
             }
             Spacer(Modifier.height(8.dp))
-            InstallRetryButton(onInstallOnCar, stringResource(R.string.onboarding_continue))
+            InstallRetryButton(onInstallOnCar, stringResource(R.string.car_app_retry))
         }
         InstallStatus.ERROR -> {
             Row(
@@ -88,7 +87,7 @@ internal fun CarSetupInstallSection(
             ) {
                 Icon(Icons.Default.Warning, contentDescription = null, tint = InstallStatusVisuals.ErrorColor, modifier = Modifier.size(20.dp))
                 Spacer(Modifier.width(8.dp))
-                Text(installStatus, fontSize = 14.sp, color = InstallStatusVisuals.ErrorColor)
+                Text(installStatus, style = MaterialTheme.typography.bodyMedium, color = InstallStatusVisuals.ErrorColor)
             }
             Spacer(Modifier.height(8.dp))
             InstallRetryButton(onInstallOnCar, stringResource(R.string.car_app_retry))
@@ -104,7 +103,7 @@ internal fun CarSetupInstallSection(
                     InstallStageProgress(installStatus, stageIndex)
                 }
                 Spacer(Modifier.height(8.dp))
-                Text(carSkipBtn, fontSize = 13.sp, color = Color.Gray)
+                Text(carSkipBtn, style = MaterialTheme.typography.bodySmall, color = Color.Gray)
             } else {
                 // Idle — offer the initial install button.
                 Button(
@@ -115,7 +114,7 @@ internal fun CarSetupInstallSection(
                 ) {
                     Icon(Icons.Default.DirectionsCar, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
-                    Text(carInstallBtn, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                    Text(carInstallBtn, style = MaterialTheme.typography.labelLarge)
                 }
             }
         }
@@ -139,7 +138,7 @@ private fun InstallRetryButton(onInstallOnCar: () -> Unit, label: String) {
     ) {
         Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
         Spacer(Modifier.width(8.dp))
-        Text(label, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+        Text(label, style = MaterialTheme.typography.labelLarge)
     }
 }
 
@@ -156,7 +155,7 @@ fun InstallStageProgress(status: String, stageIndex: Int = InstallStatus.stageIn
                 modifier = Modifier.size(16.dp), strokeWidth = 2.dp,
                 color = MaterialTheme.colorScheme.primary)
             Spacer(Modifier.width(10.dp))
-            Text(status, fontSize = 13.sp, color = Color.White, fontWeight = FontWeight.Medium)
+            Text(status, style = MaterialTheme.typography.bodySmall, color = Color.White, fontWeight = FontWeight.Medium)
         }
         if (stageIndex >= 0) {
             Spacer(Modifier.height(10.dp))
@@ -185,11 +184,13 @@ fun InstallStageProgress(status: String, stageIndex: Int = InstallStatus.stageIn
                     Spacer(Modifier.width(8.dp))
                     Text(
                         stringResource(labelRes),
-                        fontSize = 12.sp,
+                        style = MaterialTheme.typography.bodySmall,
                         color = when (stageState) {
                             "done" -> InstallStatusVisuals.DoneColor
                             "active" -> Color.White
-                            else -> Color(0xFF757575)
+                            // #757575 on the #1A2332 stage card measured 3.43:1 at
+                            // 12sp; onSurfaceVariant measures 7.45:1 (audit UX-05).
+                            else -> MaterialTheme.colorScheme.onSurfaceVariant
                         }
                     )
                 }

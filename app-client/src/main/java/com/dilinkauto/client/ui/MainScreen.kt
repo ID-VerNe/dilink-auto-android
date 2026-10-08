@@ -45,7 +45,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import com.dilinkauto.client.R
 import com.dilinkauto.client.service.ConnectionService
 import com.dilinkauto.client.service.InstallStatus
@@ -81,11 +80,11 @@ fun MainScreen(
             verticalAlignment = Alignment.CenterVertically
         ) {
             Column(modifier = Modifier.weight(1f)) {
-                Text(stringResource(R.string.main_title), fontSize = 28.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
-                Text(stringResource(R.string.main_subtitle), fontSize = 14.sp, color = Color.Gray)
+                Text(stringResource(R.string.main_title), style = MaterialTheme.typography.headlineMedium, color = MaterialTheme.colorScheme.primary)
+                Text(stringResource(R.string.main_subtitle), style = MaterialTheme.typography.bodyMedium, color = Color.Gray)
             }
             IconButton(onClick = onOpenSettings) {
-                Icon(Icons.Default.Settings, contentDescription = "Settings", tint = Color.Gray)
+                Icon(Icons.Default.Settings, contentDescription = stringResource(R.string.action_settings), tint = Color.Gray)
             }
         }
 
@@ -112,27 +111,29 @@ fun MainScreen(
                             Spacer(Modifier.width(12.dp))
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(stringResource(R.string.samsung_warning_title), fontWeight = FontWeight.Medium, color = Color.White)
-                                Text(stringResource(R.string.samsung_warning_desc), fontSize = 12.sp, color = Color(0xFFB0BEC5))
+                                Text(stringResource(R.string.samsung_warning_desc), style = MaterialTheme.typography.bodySmall, color = Color(0xFFB0BEC5))
                             }
                         }
                         Spacer(Modifier.height(8.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             TextButton(onClick = onOpenSettings) {
-                                Text(stringResource(R.string.samsung_settings_guide), fontSize = 13.sp, color = MaterialTheme.colorScheme.primary)
+                                Text(stringResource(R.string.samsung_settings_guide), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
                             }
                             TextButton(onClick = { samsungWarningDismissed = true }) {
-                                Text(stringResource(R.string.onboarding_skip_btn), fontSize = 13.sp, color = Color.Gray)
+                                Text(stringResource(R.string.onboarding_skip_btn), style = MaterialTheme.typography.bodySmall, color = Color.Gray)
                             }
                         }
                     }
                 }
-                Spacer(Modifier.height(12.dp))
+                Spacer(Modifier.height(24.dp))
             }
 
             // Service status
             StatusCard(serviceState)
 
-            Spacer(Modifier.height(12.dp))
+            // Card-to-card gap is 24dp: larger than the 16–20dp inside each card,
+            // so adjacent cards read as separate groups (audit UX-14).
+            Spacer(Modifier.height(24.dp))
 
             // Start/Stop
             Button(
@@ -140,12 +141,15 @@ fun MainScreen(
                 modifier = Modifier.fillMaxWidth().height(56.dp),
                 shape = RoundedCornerShape(16.dp),
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = if (isRunning) Color(0xFFD32F2F) else MaterialTheme.colorScheme.primary
+                    containerColor = if (isRunning) Color(0xFFD32F2F) else MaterialTheme.colorScheme.primary,
+                    // The default content colour is onPrimary — black here, which on
+                    // #D32F2F measures 4.22:1. White measures 4.98:1 (audit UX-05).
+                    contentColor = if (isRunning) Color.White else MaterialTheme.colorScheme.onPrimary
                 )
             ) {
                 Icon(if (isRunning) Icons.Default.Stop else Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(24.dp))
                 Spacer(Modifier.width(8.dp))
-                Text(if (isRunning) stringResource(R.string.stop_service) else stringResource(R.string.start_service), fontSize = 18.sp, fontWeight = FontWeight.Medium)
+                Text(if (isRunning) stringResource(R.string.stop_service) else stringResource(R.string.start_service), style = MaterialTheme.typography.titleMedium)
             }
 
             Spacer(Modifier.height(24.dp))
@@ -159,7 +163,6 @@ fun MainScreen(
             Spacer(Modifier.height(24.dp))
 
             // Share Logs
-            Spacer(Modifier.height(16.dp))
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(16.dp),
@@ -175,16 +178,21 @@ fun MainScreen(
                     Spacer(Modifier.width(12.dp))
                     Column(modifier = Modifier.weight(1f)) {
                         Text(stringResource(R.string.share_logs_title), fontWeight = FontWeight.Medium, color = Color.White)
-                        Text(stringResource(R.string.share_logs_desc), fontSize = 12.sp, color = Color.Gray)
+                        Text(stringResource(R.string.share_logs_desc), style = MaterialTheme.typography.bodySmall, color = Color.Gray)
                     }
                     Button(
                         onClick = onShareLogs,
                         shape = RoundedCornerShape(12.dp),
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = Color(0xFF2196F3)
+                            containerColor = Color(0xFF2196F3),
+                            // ButtonDefaults keeps onPrimary (black here) as the default
+                            // content colour, which measures 6.72:1 on this blue and is
+                            // left as-is — stated explicitly so it is not mistaken for
+                            // an oversight next time this colour is touched.
+                            contentColor = MaterialTheme.colorScheme.onPrimary
                         )
                     ) {
-                        Text(stringResource(R.string.share_logs_button), fontSize = 13.sp)
+                        Text(stringResource(R.string.share_logs_button), style = MaterialTheme.typography.bodySmall)
                     }
                 }
             }
@@ -234,7 +242,7 @@ fun StatusCard(state: ConnectionService.State) {
             Spacer(Modifier.width(12.dp))
             Column {
                 Text(title, fontWeight = FontWeight.Medium, color = Color.White)
-                Text(subtitle, fontSize = 13.sp, color = Color.Gray)
+                Text(subtitle, style = MaterialTheme.typography.bodySmall, color = Color.Gray)
             }
         }
     }
@@ -266,7 +274,7 @@ fun CarInstallCard(installStatus: String, onInstallOnCar: (String?) -> Unit) {
                     Text(stringResource(R.string.car_app_title), fontWeight = FontWeight.Medium, color = Color.White)
                     Text(
                         if (installStatus.isEmpty()) stringResource(R.string.car_app_desc) else installStatus,
-                        fontSize = 12.sp,
+                        style = MaterialTheme.typography.bodySmall,
                         color = InstallStatusVisuals.statusColor(status) ?: Color.Gray
                     )
                 }
@@ -285,7 +293,14 @@ fun CarInstallCard(installStatus: String, onInstallOnCar: (String?) -> Unit) {
                         colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
                         contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 16.dp, vertical = 8.dp)
                     ) {
-                        Text(if (isError || isAuthNeeded) stringResource(R.string.onboarding_continue) else stringResource(R.string.car_app_install), fontSize = 13.sp)
+                        // One word for one action: the retry label is the same here
+                        // and in the onboarding car-setup step, and the install label
+                        // matches the onboarding button (audit UX-15).
+                        Text(
+                            if (isError || isAuthNeeded) stringResource(R.string.car_app_retry)
+                            else stringResource(R.string.install_on_car),
+                            style = MaterialTheme.typography.bodySmall
+                        )
                     }
                 }
             }

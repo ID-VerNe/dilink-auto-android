@@ -51,7 +51,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import com.dilinkauto.client.R
 import com.dilinkauto.client.ShizukuManager
 import com.dilinkauto.client.service.ConnectionService
@@ -103,9 +102,9 @@ fun SettingsScreen(
             verticalAlignment = Alignment.CenterVertically
         ) {
             IconButton(onClick = onBack) {
-                Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = Color.White)
+                Icon(Icons.Default.ArrowBack, contentDescription = stringResource(R.string.action_back), tint = Color.White)
             }
-            Text(stringResource(R.string.settings_title), fontSize = 24.sp, fontWeight = FontWeight.Bold, color = Color.White)
+            Text(stringResource(R.string.settings_title), style = MaterialTheme.typography.headlineSmall, color = Color.White)
         }
 
         // Scrollable content
@@ -118,7 +117,7 @@ fun SettingsScreen(
             Spacer(Modifier.height(16.dp))
 
             // Permissions
-            Text(stringResource(R.string.settings_permissions), fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color.Gray,
+            Text(stringResource(R.string.settings_permissions), style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold, color = Color.Gray,
                 modifier = Modifier.padding(bottom = 12.dp))
 
             SetupItem(
@@ -185,14 +184,18 @@ fun SettingsScreen(
                 icon = shizukuIcon,
                 title = shizukuTitle,
                 description = shizukuDesc,
+                // Every branch must do something: the row is drawn with a chevron
+                // and a ripple, so a branch that falls through is a control that
+                // lies about being interactive (audit UX-13).
                 onClick = {
                     when {
-                        shizukuAvailable -> { /* already authorized */ }
+                        shizukuAvailable -> ShizukuManager.openShizukuApp(context)
                         shizukuInstalled -> {
                             ShizukuManager.requestPermission()
                             ShizukuManager.openShizukuApp(context)
                             permissionsKey++
                         }
+                        else -> ShizukuManager.openShizukuStorePage(context)
                     }
                 }
             )
@@ -200,7 +203,7 @@ fun SettingsScreen(
             Spacer(Modifier.height(32.dp))
 
             // Debug
-            Text(stringResource(R.string.settings_debug), fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color.Gray,
+            Text(stringResource(R.string.settings_debug), style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold, color = Color.Gray,
                 modifier = Modifier.padding(bottom = 12.dp))
 
             Card(
@@ -215,7 +218,7 @@ fun SettingsScreen(
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(stringResource(R.string.log_enabled), fontWeight = FontWeight.Medium)
-                        Text(stringResource(R.string.log_enabled_desc), fontSize = 12.sp, color = Color.Gray)
+                        Text(stringResource(R.string.log_enabled_desc), style = MaterialTheme.typography.bodySmall, color = Color.Gray)
                     }
                     Switch(
                         checked = logEnabled,
@@ -230,7 +233,7 @@ fun SettingsScreen(
             Spacer(Modifier.height(32.dp))
 
             // About
-            Text(stringResource(R.string.about_title), fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color.Gray,
+            Text(stringResource(R.string.about_title), style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold, color = Color.Gray,
                 modifier = Modifier.padding(bottom = 12.dp))
 
             Card(
@@ -239,16 +242,17 @@ fun SettingsScreen(
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
-                    val versionName = com.dilinkauto.client.service.AppVersion.nameOrEmpty(context).ifEmpty { "unknown" }
+                    val versionName = com.dilinkauto.client.service.AppVersion.nameOrEmpty(context)
+                        .ifEmpty { stringResource(R.string.value_unknown) }
                     Text(stringResource(R.string.about_version, versionName), fontWeight = FontWeight.Medium, color = Color.White)
                     Spacer(Modifier.height(4.dp))
-                    Text(stringResource(R.string.about_tagline), fontSize = 12.sp, color = Color.Gray)
+                    Text(stringResource(R.string.about_tagline), style = MaterialTheme.typography.bodySmall, color = Color.Gray)
                     Spacer(Modifier.height(12.dp))
-                    Text(stringResource(R.string.about_libs_heading), fontSize = 12.sp, fontWeight = FontWeight.Medium, color = Color(0xFFB0BEC5))
-                    Text(stringResource(R.string.about_lib_dadb), fontSize = 12.sp, color = Color.Gray)
-                    Text(stringResource(R.string.about_lib_compose), fontSize = 12.sp, color = Color.Gray)
-                    Text(stringResource(R.string.about_lib_coroutines), fontSize = 12.sp, color = Color.Gray)
-                    Text(stringResource(R.string.about_lib_scrcpy), fontSize = 12.sp, color = Color.Gray)
+                    Text(stringResource(R.string.about_libs_heading), style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Medium, color = Color(0xFFB0BEC5))
+                    Text(stringResource(R.string.about_lib_dadb), style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                    Text(stringResource(R.string.about_lib_compose), style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                    Text(stringResource(R.string.about_lib_coroutines), style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                    Text(stringResource(R.string.about_lib_scrcpy), style = MaterialTheme.typography.bodySmall, color = Color.Gray)
                 }
             }
 
@@ -280,7 +284,7 @@ fun SetupItem(
             Spacer(Modifier.width(16.dp))
             Column(modifier = Modifier.weight(1f)) {
                 Text(title, fontWeight = FontWeight.Medium, color = Color.White)
-                Text(description, fontSize = 12.sp, color = Color.Gray)
+                Text(description, style = MaterialTheme.typography.bodySmall, color = Color.Gray)
             }
             Icon(Icons.Default.ChevronRight, contentDescription = null, tint = Color.Gray)
         }
