@@ -2,7 +2,7 @@ package com.dilinkauto.client.service
 
 import android.net.wifi.WifiManager
 import com.dilinkauto.client.FileLog
-import com.dilinkauto.protocol.Discovery
+import com.dilinkauto.protocol.Ports
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelChildren
@@ -29,7 +29,7 @@ import java.nio.channels.SocketChannel
 object CarIpLocator {
 
     private const val TAG = "CarIpLocator"
-    private const val CAR_ADB_PORT = Discovery.ADB_PORT
+    private const val CAR_ADB_PORT = Ports.ADB_PORT
 
     /**
      * Test seam for the port probe.

@@ -3,7 +3,7 @@ package com.dilinkauto.client.service
 import android.content.Context
 import com.dilinkauto.client.FileLog
 import com.dilinkauto.client.R
-import com.dilinkauto.protocol.Discovery
+import com.dilinkauto.protocol.Ports
 import dadb.AdbKeyPair
 import dadb.Dadb
 import java.io.File
@@ -77,7 +77,7 @@ class CarAppInstaller(
 
     companion object {
         private const val TAG = "CarAppInstaller"
-        private const val CAR_ADB_PORT = Discovery.ADB_PORT
+        private const val CAR_ADB_PORT = Ports.ADB_PORT
         private const val DADB_TIMEOUT_SECONDS = 15L
     }
 }

@@ -22,6 +22,7 @@ import com.dilinkauto.server.R
 import com.dilinkauto.server.ServerApp
 import com.dilinkauto.server.CarCrashHandler
 import com.dilinkauto.server.adb.RemoteAdbController
+import com.dilinkauto.server.adb.WifiGatewayProbe
 import com.dilinkauto.protocol.DimAlign
 import com.dilinkauto.protocol.adb.UsbAdbConnection
 import com.dilinkauto.server.decoder.VideoDecoder
@@ -52,7 +53,7 @@ class CarConnectionService : Service() {
     val videoDecoder = VideoDecoder()
     @Volatile internal var adbController: RemoteAdbController? = null
     @Volatile internal var phoneHost: String? = null
-    private var wakeLock: PowerManager.WakeLock? = null
+    private lateinit var notifier: ForegroundNotifier
     private var consecutiveFailures = 0
     private var usbAdb: UsbAdbConnection? = null
     private var userDisconnected: Boolean
@@ -183,6 +184,16 @@ class CarConnectionService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        // Foreground plumbing shared with the phone service (DRY-6). The car has
+        // no user-facing Stop action, so extraAction stays null.
+        notifier = ForegroundNotifier(
+            context = this,
+            channelId = ServerApp.CHANNEL_SERVICE,
+            notificationId = NOTIFICATION_ID,
+            wakeLockTag = "DiLinkAuto::CarConnectionService",
+            title = getString(R.string.notification_title),
+            text = { ctx, res -> ctx.getString(res) }
+        )
         targetFps = startupFps
         logWriter.setEnabled(com.dilinkauto.server.BuildConfig.DEBUG)
         logWriter.start()
@@ -261,7 +272,7 @@ class CarConnectionService : Service() {
             }
             ACTION_CONNECT -> {
                 val host = intent.getStringExtra(EXTRA_HOST) ?: return START_STICKY
-                val port = intent.getIntExtra(EXTRA_PORT, Discovery.DEFAULT_PORT)
+                val port = intent.getIntExtra(EXTRA_PORT, Ports.DEFAULT_PORT)
                 startForeground(NOTIFICATION_ID, buildNotification(R.string.notification_searching))
                 userDisconnected = false
                 _state.value = State.CONNECTING
@@ -276,7 +287,7 @@ class CarConnectionService : Service() {
         return START_STICKY
     }
 
-    fun connectManual(host: String, port: Int = Discovery.DEFAULT_PORT) {
+    fun connectManual(host: String, port: Int = Ports.DEFAULT_PORT) {
         userDisconnected = false
         _state.value = State.CONNECTING
         connectToPhone(host, port)
@@ -373,7 +384,7 @@ class CarConnectionService : Service() {
                 val gatewayIp = getWifiGatewayIp()
                 if (gatewayIp != null) {
                     carLogSend("WiFi track: trying gateway $gatewayIp")
-                    connectToPhone(gatewayIp, Discovery.DEFAULT_PORT)
+                    connectToPhone(gatewayIp, Ports.DEFAULT_PORT)
                 }
                 delay(3000)
             }
@@ -456,10 +467,10 @@ class CarConnectionService : Service() {
     private fun connectVideoAndInput(host: String) {
         scope.launch(Dispatchers.IO) {
             try {
-                carLogSend("Connecting video (${Discovery.VIDEO_PORT}) and input (${Discovery.INPUT_PORT})...")
+                carLogSend("Connecting video (${Ports.VIDEO_PORT}) and input (${Ports.INPUT_PORT})...")
 
-                val videoDef = async { Connection.connect(host, Discovery.VIDEO_PORT, scope) }
-                val inputDef = async { Connection.connect(host, Discovery.INPUT_PORT, scope) }
+                val videoDef = async { Connection.connect(host, Ports.VIDEO_PORT, scope) }
+                val inputDef = async { Connection.connect(host, Ports.INPUT_PORT, scope) }
 
                 val video = videoDef.await()
                 videoConnection = video
@@ -587,7 +598,7 @@ private fun resetAdbReadiness() {
                 while (isActive && !usbReady && _state.value == State.CONNECTING && attempts < 60) {
                     val host = phoneHost
                     if (host != null) {
-                        carLogSend("Dev mode: TCP ADB connecting to $host:${Discovery.ADB_PORT} (attempt ${attempts + 1})")
+                        carLogSend("Dev mode: TCP ADB connecting to $host:${Ports.ADB_PORT} (attempt ${attempts + 1})")
                         connectTcpAdb(host)
                         if (adbController?.isConnected == true) {
                             lastAdbHost = host
@@ -617,20 +628,20 @@ private fun resetAdbReadiness() {
         val keyDir = java.io.File(filesDir, "adb_keys")
         val controller = RemoteAdbController(
             phoneHost = host,
-            adbPort = Discovery.ADB_PORT,
+            adbPort = Ports.ADB_PORT,
             virtualDisplayId = -1,
             keyDir = keyDir
         )
 
         if (!controller.connect()) {
             _statusMessage.value = getString(R.string.status_tcp_adb_failed)
-            carLogSend("Dev mode: TCP ADB connection failed to $host:${Discovery.ADB_PORT}")
+            carLogSend("Dev mode: TCP ADB connection failed to $host:${Ports.ADB_PORT}")
             return
         }
 
         adbController = controller
         _statusMessage.value = getString(R.string.status_tcp_adb_connected)
-        carLogSend("Dev mode: TCP ADB connected to $host:${Discovery.ADB_PORT}")
+        carLogSend("Dev mode: TCP ADB connected to $host:${Ports.ADB_PORT}")
 
         usbReady = true
         noAdbCount = 0  // Reset — ADB is available now
@@ -1150,10 +1161,7 @@ val ctrl = controlConnection ?: return
             val devIp = prefs.getString("dev_phone_ip", null)
             if (!devIp.isNullOrBlank()) return devIp
         }
-        return try {
-            val wm = applicationContext.getSystemService(WIFI_SERVICE) as android.net.wifi.WifiManager
-            WifiGatewayIp.format(wm.dhcpInfo.gateway)
-        } catch (e: Exception) { null }
+        return WifiGatewayProbe.gatewayIp(this)
     }
 
     /** Deploy VD server using the Dadb connection directly, bypassing isConnected check */
@@ -1171,25 +1179,12 @@ val ctrl = controlConnection ?: return
 
     // ─── System ───
 
-    private fun acquireWakeLock() {
-        val pm = getSystemService(POWER_SERVICE) as PowerManager
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "DiLinkAuto::CarConnectionService")
-            .apply { acquire(4 * 60 * 60 * 1000L) } // 4h auto-release
-    }
+    private fun acquireWakeLock() = notifier.acquireWakeLock()
 
-    private fun buildNotification(messageRes: Int): Notification {
-        return NotificationCompat.Builder(this, ServerApp.CHANNEL_SERVICE)
-            .setContentTitle(getString(R.string.notification_title))
-            .setContentText(getString(messageRes))
-            .setSmallIcon(android.R.drawable.ic_menu_share)
-            .setOngoing(true)
-            .build()
-    }
+    private fun buildNotification(messageRes: Int): Notification =
+        notifier.buildNotification(messageRes)
 
-    private fun updateNotification(messageRes: Int) {
-        val nm = getSystemService(NOTIFICATION_SERVICE) as android.app.NotificationManager
-        nm.notify(NOTIFICATION_ID, buildNotification(messageRes))
-    }
+    private fun updateNotification(messageRes: Int) = notifier.updateNotification(messageRes)
 
     override fun onDestroy() {
         shutdown()
@@ -1201,7 +1196,7 @@ val ctrl = controlConnection ?: return
         }
         networkCallback = null
         usbAdb?.close()
-        wakeLock?.release()
+        notifier.releaseWakeLock()
         super.onDestroy()
     }
 

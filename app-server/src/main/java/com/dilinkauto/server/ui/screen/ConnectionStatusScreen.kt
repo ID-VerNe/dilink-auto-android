@@ -126,12 +126,7 @@ fun ManualConnectBox(onConnect: (String) -> Unit) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences(com.dilinkauto.protocol.AppPrefs.FILE_NAME, android.content.Context.MODE_PRIVATE) }
     val savedIp = remember { prefs.getString("last_manual_ip", null) }
-    val gatewayIp = remember {
-        try {
-            val wm = context.getSystemService(android.content.Context.WIFI_SERVICE) as android.net.wifi.WifiManager
-            com.dilinkauto.protocol.WifiGatewayIp.format(wm.dhcpInfo.gateway) ?: ""
-        } catch (_: Exception) { "" }
-    }
+    val gatewayIp = remember { com.dilinkauto.server.adb.WifiGatewayProbe.gatewayIpOr(context) }
     var ipAddress by remember {
         mutableStateOf(savedIp ?: gatewayIp.ifEmpty { "192.168.43.1" })
     }

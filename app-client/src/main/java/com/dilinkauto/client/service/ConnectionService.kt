@@ -37,7 +37,6 @@ class ConnectionService : Service() {
     private var targetFps = 30
     private var targetBitrate = VideoConfig.DEFAULT_BITRATE
     private var serviceRegistration: Discovery.ServiceRegistration? = null
-    private var wakeLock: PowerManager.WakeLock? = null
     private var connectionLoopJob: Job? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var networkChangeDebounce: Job? = null
@@ -45,6 +44,7 @@ class ConnectionService : Service() {
     private lateinit var appListBuilder: AppListBuilder
     private lateinit var displayRestorer: PhoneDisplayRestorer
     private lateinit var assetDeployer: AssetDeployer
+    private lateinit var notifier: com.dilinkauto.protocol.ForegroundNotifier
 
     enum class State { IDLE, WAITING, CONNECTED, STREAMING }
 
@@ -76,6 +76,22 @@ class ConnectionService : Service() {
         // Service.onDestroy() mid-restore cannot skip `cmd display power-on`.
         displayRestorer = PhoneDisplayRestorer(applicationContext)
         assetDeployer = AssetDeployer(applicationContext.assets)
+        // Foreground plumbing shared with the car service (DRY-6). Only the
+        // Stop action is phone-specific; the car has no user-facing stop.
+        notifier = ForegroundNotifier(
+            context = this,
+            channelId = ClientApp.CHANNEL_SERVICE,
+            notificationId = NOTIFICATION_ID,
+            wakeLockTag = "DiLinkAuto::ConnectionService",
+            title = getString(R.string.notification_title),
+            text = { ctx, res -> ctx.getString(res) },
+            extraAction = ForegroundNotifier.stopAction(
+                iconRes = android.R.drawable.ic_media_pause,
+                label = getString(R.string.notification_action_stop),
+                serviceClass = ConnectionService::class.java,
+                action = ACTION_STOP
+            )
+        )
     }
 
     private fun cacheDefaultIme() {
@@ -277,7 +293,7 @@ class ConnectionService : Service() {
                         serviceRegistration = withTimeoutOrNull(5000) {
                             Discovery.registerService(
                                 this@ConnectionService,
-                                port = Discovery.DEFAULT_PORT,
+                                port = Ports.DEFAULT_PORT,
                                 deviceName = android.os.Build.MODEL
                             )
                         }
@@ -301,11 +317,11 @@ class ConnectionService : Service() {
     private suspend fun listenAndHandleOneConnection() {
         _serviceState.value = State.WAITING
         updateNotification(R.string.notification_waiting)
-        FileLog.i(TAG, "Listening for car connection on port ${Discovery.DEFAULT_PORT}...")
+        FileLog.i(TAG, "Listening for car connection on port ${Ports.DEFAULT_PORT}...")
 
         try {
             // ─── Accept control connection (port 9637) ───
-            val ctrl = Connection.accept(Discovery.DEFAULT_PORT, serviceScope)
+            val ctrl = Connection.accept(Ports.DEFAULT_PORT, serviceScope)
             // A brand-new session begins: allow the next teardown to run again.
             resetCleanupGuard()
             controlConnection = ctrl
@@ -422,7 +438,7 @@ class ConnectionService : Service() {
             displayWidth = request.screenWidth,
             displayHeight = request.screenHeight,
             virtualDisplayId = -1,
-            adbPort = Discovery.ADB_PORT,
+            adbPort = Ports.ADB_PORT,
             vdServerJarPath = vdJarPath,
             connectionMethod = connMethod,
             vdDpi = displayDpi
@@ -561,7 +577,7 @@ class ConnectionService : Service() {
 
                 _installStatus.value = if (explicitIp != null) getString(R.string.car_install_status_connecting_to, explicitIp) else getString(R.string.car_install_status_searching)
                 val carIp = if (!explicitIp.isNullOrBlank()) {
-                    if (CarIpLocator.probePortSync(explicitIp, Discovery.ADB_PORT)) explicitIp else {
+                    if (CarIpLocator.probePortSync(explicitIp, Ports.ADB_PORT)) explicitIp else {
                         _installStatus.value = getString(R.string.car_install_status_not_reachable, explicitIp)
                         null
                     }
@@ -573,7 +589,7 @@ class ConnectionService : Service() {
                 }
 
                 _installStatus.value = getString(R.string.car_install_status_connecting_to, carIp)
-                FileLog.i(TAG, "Connecting to car ADB at $carIp:${Discovery.ADB_PORT}")
+                FileLog.i(TAG, "Connecting to car ADB at $carIp:${Ports.ADB_PORT}")
                 val dadb = carAppInstaller.connect(carIp)
                 if (dadb == null) {
                     _installStatus.value = getString(R.string.car_install_status_auth_needed)
@@ -721,35 +737,12 @@ class ConnectionService : Service() {
 
     // ─── System ───
 
-    private fun acquireWakeLock() {
-        val pm = getSystemService(POWER_SERVICE) as PowerManager
-        wakeLock = pm.newWakeLock(
-            PowerManager.PARTIAL_WAKE_LOCK,
-            "DiLinkAuto::ConnectionService"
-        ).apply { acquire(4 * 60 * 60 * 1000L) } // 4h auto-release
-    }
+    private fun acquireWakeLock() = notifier.acquireWakeLock()
 
-    private fun buildNotification(messageRes: Int): Notification {
-        val stopPi = PendingIntent.getService(
-            this, 0,
-            Intent(this, ConnectionService::class.java).apply { action = ACTION_STOP },
-            PendingIntent.FLAG_IMMUTABLE
-        )
-        return NotificationCompat.Builder(this, ClientApp.CHANNEL_SERVICE)
-            .setContentTitle(getString(R.string.notification_title))
-            .setContentText(getString(messageRes))
-            .setSmallIcon(android.R.drawable.ic_menu_share)
-            .setOngoing(true)
-            .addAction(android.R.drawable.ic_media_pause, getString(R.string.notification_action_stop), stopPi)
-            .build()
-    }
+    private fun buildNotification(messageRes: Int): Notification =
+        notifier.buildNotification(messageRes)
 
-    private fun updateNotification(messageRes: Int) {
-        try {
-            val nm = getSystemService(NOTIFICATION_SERVICE) as android.app.NotificationManager
-            nm.notify(NOTIFICATION_ID, buildNotification(messageRes))
-        } catch (_: Exception) {}
-    }
+    private fun updateNotification(messageRes: Int) = notifier.updateNotification(messageRes)
 
     override fun onDestroy() {
         stopEverything()
@@ -764,7 +757,7 @@ class ConnectionService : Service() {
             try { unregisterReceiver(it) } catch (_: Exception) {}
         }
         packageRemovedReceiver = null
-        wakeLock?.release()
+        notifier.releaseWakeLock()
         serviceScope.cancel()
         super.onDestroy()
     }

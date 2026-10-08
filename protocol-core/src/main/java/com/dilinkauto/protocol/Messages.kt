@@ -116,6 +116,60 @@ data class HandshakeRequest(
             )
             return request
         }
+
+        /**
+         * Fluent builder for the two senders of a handshake (desktop and car).
+         *
+         * The wire format and its defaults already lived here; what drifted was
+         * the *construction* of the message at each call site — the desktop and
+         * the car each hand-rolled the same 8-field assembly with different
+         * sources and, more importantly, different ownership of even-alignment
+         * (docs/audit-srp-dry.md DRY-2).
+         *
+         * The builder does **not** align dimensions. Alignment direction is
+         * sender-specific and load-bearing:
+         *  - desktop floors to even and never goes below 2 ([DimAlign.evenMin2])
+         *  - car widens its nav bar by one pixel so the viewport lands even
+         *    ([DimAlign.offsetForEvenRemainder]) — the opposite direction
+         *
+         * Forcing one rule here would silently break the other, so each caller
+         * keeps applying its own and the builder only removes field-name churn.
+         */
+        fun builder() = Builder()
+
+        class Builder {
+            private var deviceName: String = ""
+            private var screenWidth: Int = 0
+            private var screenHeight: Int = 0
+            private var screenDpi: Int = 160
+            private var appVersionCode: Int = 0
+            private var targetFps: Int = 30
+            private var appVersionName: String = ""
+            private var dpiOverride: Int = 0
+            private var bitrate: Int = 0
+
+            fun deviceName(value: String) = apply { deviceName = value }
+            fun screenSize(width: Int, height: Int) = apply { screenWidth = width; screenHeight = height }
+            fun screenDpi(value: Int) = apply { screenDpi = value }
+            fun appVersionCode(value: Int) = apply { appVersionCode = value }
+            fun targetFps(value: Int) = apply { targetFps = value }
+            /** Car only; the desktop config has no version *name*. */
+            fun appVersionName(value: String) = apply { appVersionName = value }
+            fun dpiOverride(value: Int) = apply { dpiOverride = value }
+            fun bitrate(value: Int) = apply { bitrate = value }
+
+            fun build() = HandshakeRequest(
+                deviceName = deviceName,
+                screenWidth = screenWidth,
+                screenHeight = screenHeight,
+                screenDpi = screenDpi,
+                appVersionCode = appVersionCode,
+                targetFps = targetFps,
+                appVersionName = appVersionName,
+                dpiOverride = dpiOverride,
+                bitrate = bitrate
+            )
+        }
     }
 }
 

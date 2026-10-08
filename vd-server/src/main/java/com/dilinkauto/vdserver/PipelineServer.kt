@@ -188,9 +188,9 @@ class PipelineServer(
         val videoServer: ServerSocketChannel; val inputServer: ServerSocketChannel
         try {
             videoServer = ServerSocketChannel.open(); videoServer.configureBlocking(false); videoServer.socket().reuseAddress = true
-            videoServer.socket().bind(InetSocketAddress("0.0.0.0", Discovery.VIDEO_PORT)); log("Video on :${Discovery.VIDEO_PORT}")
+            videoServer.socket().bind(InetSocketAddress("0.0.0.0", Ports.VIDEO_PORT)); log("Video on :${Ports.VIDEO_PORT}")
             inputServer = ServerSocketChannel.open(); inputServer.configureBlocking(false); inputServer.socket().reuseAddress = true
-            inputServer.socket().bind(InetSocketAddress("0.0.0.0", Discovery.INPUT_PORT)); log("Input on :${Discovery.INPUT_PORT}")
+            inputServer.socket().bind(InetSocketAddress("0.0.0.0", Ports.INPUT_PORT)); log("Input on :${Ports.INPUT_PORT}")
         } catch (e: Exception) { err("Bind: ${e.message}"); return null }
         val phoneChannel = connectToPhoneHost() ?: run { try { videoServer.close() } catch (_: Exception) {}; try { inputServer.close() } catch (_: Exception) {}; return null }
         try { sendDisplayReady(phoneChannel); log("Display ready sent") } catch (e: Exception) { err("Display ready: ${e.message}"); try { phoneChannel.close() } catch (_: Exception) {}; try { videoServer.close() } catch (_: Exception) {}; try { inputServer.close() } catch (_: Exception) {}; return null }
@@ -221,7 +221,7 @@ class PipelineServer(
     }
 
     private fun connectToPhoneHost(): SocketChannel? {
-        val addr = InetSocketAddress(phoneHost, Discovery.LIFECYCLE_PORT)
+        val addr = InetSocketAddress(phoneHost, Ports.LIFECYCLE_PORT)
         for (attempt in 0 until 60) {
             if (!running) break
             var ch: SocketChannel? = null

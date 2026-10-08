@@ -1,6 +1,6 @@
 package com.dilinkauto.server.service
 
-import com.dilinkauto.protocol.Discovery
+import com.dilinkauto.protocol.Ports
 import com.dilinkauto.protocol.VdDeploy
 import com.dilinkauto.protocol.VideoConfig
 import com.dilinkauto.server.R
@@ -54,7 +54,7 @@ internal class VdServerDeployer(private val host: CarConnectionService) {
             // Auto-fallback: try TCP ADB if we have the phone IP
             val phoneHost = host.phoneHost
             if (phoneHost != null && !host.devMode) {
-                log("Auto-fallback: trying TCP ADB to $phoneHost:${Discovery.ADB_PORT}")
+                log("Auto-fallback: trying TCP ADB to $phoneHost:${Ports.ADB_PORT}")
                 host.setStatusMessage(R.string.status_connecting_tcp_adb, phoneHost)
                 host.scope.launch(Dispatchers.IO) {
                     host.connectTcpAdb(phoneHost)

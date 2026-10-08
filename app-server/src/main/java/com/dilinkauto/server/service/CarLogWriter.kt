@@ -61,7 +61,7 @@ internal class CarLogWriter(
                 for (entry in logQueue) {
                     try {
                         val ts = LocalTime.now().format(tsFormatter)
-                        val line = "[$ts][${entry.level}] ${entry.msg}"
+                        val line = com.dilinkauto.protocol.LogLine.bracketed(ts, entry.level, entry.msg)
                         val conn = controlConnectionProvider()
                         if (conn != null && conn.isConnected) {
                             // Flush any buffered messages first.

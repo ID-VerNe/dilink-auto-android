@@ -24,12 +24,44 @@ object Discovery {
     const val SERVICE_TYPE = "_dilinkauto._tcp."
     const val SERVICE_NAME = "DiLink-Auto"
 
-    // 协议端口常量的唯一来源已移到平台无关的 :protocol-core（见 [Ports]），
-    // 这里保留同名别名以免改动三端的大量历史调用点，取值不重复定义。
+    // 协议端口常量的唯一来源是平台无关的 :protocol-core（见 [Ports]）。
+    //
+    // 下面的别名曾为避免改动"大量历史调用点"而保留；那些调用点现已全部迁移到
+    // [Ports]（docs/audit-srp-dry.md DRY-10），别名不再有使用者，故按原计划标注废弃。
+    // 保留而未删除，是为了不让下游/未同步的调用方编译失败。
+    @Deprecated(
+        message = "端口常量的唯一来源是 :protocol-core 的 Ports；请改用 Ports",
+        replaceWith = ReplaceWith("Ports.DEFAULT_PORT", "com.dilinkauto.protocol.Ports"),
+        level = DeprecationLevel.WARNING
+    )
     const val DEFAULT_PORT = Ports.DEFAULT_PORT
+
+    @Deprecated(
+        message = "端口常量的唯一来源是 :protocol-core 的 Ports；请改用 Ports",
+        replaceWith = ReplaceWith("Ports.VIDEO_PORT", "com.dilinkauto.protocol.Ports"),
+        level = DeprecationLevel.WARNING
+    )
     const val VIDEO_PORT = Ports.VIDEO_PORT
+
+    @Deprecated(
+        message = "端口常量的唯一来源是 :protocol-core 的 Ports；请改用 Ports",
+        replaceWith = ReplaceWith("Ports.INPUT_PORT", "com.dilinkauto.protocol.Ports"),
+        level = DeprecationLevel.WARNING
+    )
     const val INPUT_PORT = Ports.INPUT_PORT
+
+    @Deprecated(
+        message = "端口常量的唯一来源是 :protocol-core 的 Ports；请改用 Ports",
+        replaceWith = ReplaceWith("Ports.LIFECYCLE_PORT", "com.dilinkauto.protocol.Ports"),
+        level = DeprecationLevel.WARNING
+    )
     const val LIFECYCLE_PORT = Ports.LIFECYCLE_PORT
+
+    @Deprecated(
+        message = "端口常量的唯一来源是 :protocol-core 的 Ports；请改用 Ports",
+        replaceWith = ReplaceWith("Ports.ADB_PORT", "com.dilinkauto.protocol.Ports"),
+        level = DeprecationLevel.WARNING
+    )
     const val ADB_PORT = Ports.ADB_PORT
 
     /**
@@ -40,7 +72,7 @@ object Discovery {
      */
     suspend fun registerService(
         context: Context,
-        port: Int = DEFAULT_PORT,
+        port: Int = Ports.DEFAULT_PORT,
         deviceName: String = android.os.Build.MODEL
     ): ServiceRegistration = suspendCancellableCoroutine { cont ->
         val nsdManager = context.getSystemService(Context.NSD_SERVICE) as NsdManager

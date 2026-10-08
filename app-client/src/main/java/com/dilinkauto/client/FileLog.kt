@@ -56,7 +56,7 @@ object FileLog {
                         val ts = dateFormat.format(Date())
                         val parts = line.split("␞", limit = 3)
                         val (level, tag, msg) = if (parts.size == 3) Triple(parts[0], parts[1], parts[2]) else Triple("I", "FileLog", line)
-                        writer?.write("[$ts][$level][$tag] $msg")
+                        writer?.write(com.dilinkauto.protocol.LogLine.bracketedTagFirst(ts, level, tag, msg))
                         writer?.write("\n")
                         writer?.flush()
                     } else {

@@ -529,11 +529,16 @@ if (usbAdb?.isConnected != true) {
 
 | ID | 类型 | 位置 | 严重度 | 预估工作量 |
 |---|---|---|---|---|
-| SRP-1 | God class | `CarConnectionService.kt` (**1237**) | 🔴 高 | 2-3 天 |
-| SRP-2 | God class | `ConnectionService.kt` (**810**) | 🔴 高 | 1-2 天 |
+| SRP-1 | God class | `CarConnectionService.kt` (**1232**) | 🔴 高 | 2-3 天 |
+| SRP-2 | God class | `ConnectionService.kt` (**803**) | 🔴 高 | 1-2 天 |
 | DRY-1 | 重复算法 | 偶数对齐 ×5 | ✅ **已完成** | — |
+| DRY-2 | 重复 | 握手构造 ×2 | ✅ **已完成** | — |
 | DRY-3 | 重复实现 | `GlPipeline` 帧写出 | ✅ **已完成** | — |
 | DRY-4 | 重复逻辑 | asset CRC 校验 ×2 | ✅ **已完成** | — |
+| DRY-6 | 重复 | 通知/WakeLock ×2 | ✅ **已完成** | — |
+| DRY-7 | 重复 | WiFi gateway ×2 | ✅ **已完成** | — |
+| DRY-8 | 重复 | 日志行拼接 ×3 | ✅ **已完成** | — |
+| DRY-10 | 兼容壳 | `Discovery` vs `Ports` | ✅ **已完成** | — |
 | DRY-5 | 平行实现 | 三端会话编排 | 🟠 中 | 2-4 天（大改） |
 | SRP-3 | 职责混入 | `VideoDecoder` 黑屏检测 | 🟠 中 | 0.5 天 |
 | DRY-6 | 重复 | 通知/WakeLock ×2 | 🟡 低中 | 0.5 天 |
@@ -743,14 +748,23 @@ if (usbAdb?.isConnected != true) {
 | **DRY-4** | ✅ 已修复 | 新增 `AssetDeployer`，`ConnectionService` **866 → 810 行**；顺带修掉"写失败仍报成功 CRC"的静默行为 |
 | **DRY-12** | ✅ 已修复 | 抽出 `resetAdbReadiness()`，两处共用，并把只在 1 处的注释补全 |
 | **DRY-13** | ✅ 已修复（部分） | `disconnectAllConnections(clearListeners)` 参数化；**有意保留** control 连接的语义差异 |
+| **DRY-2** | ✅ 已修复 | `protocol-core` 新增 `HandshakeRequest.Builder`；两端不再各自手搓 8 字段 |
+| **DRY-6** | ✅ 已修复 | 新增 `protocol/ForegroundNotifier`；两端 Service 的通知/WakeLock 委托过去，**顺带补上车机端缺失的 try/catch** |
+| **DRY-7** | ✅ 已修复 | 新增 `app-server/adb/WifiGatewayProbe`，收敛 2 处 `getSystemService` + try/catch |
+| **DRY-8** | ✅ 已修复 | 新增 `protocol-core LogLine` + `LogLineTest`（6 例）；三端格式**有意保持不同** |
+| **DRY-10** | ✅ 已修复 | 26 处调用点机械迁移到 `Ports`，`Discovery` 的 5 个别名按原计划标 `@Deprecated(WARNING)` |
 | **DRY-9** | ✅ 已修复 | 新增 `TestSockets`，`ConnectionTest`/`ConnectionStressTest` 共用夹具 |
 | — | 🆕 附带完成 | **`vd-server` 从 0 个测试变为 17 个**（新建 `src/test` + junit 依赖）——§4 要求的"先建网再动热路径" |
 | — | 🆕 附带完成 | **修掉一个基线失败**：`CarIpLocatorTest` 加 `portProbeOverride` 测试缝 + 补 2 个分支用例；`./gradlew test` 现在全绿 |
 
 **当前状态**：`./gradlew test` ✅ 全绿 + `:app-client:assembleDebug` ✅ BUILD SUCCESSFUL。
 
-尚未处理：DRY-2、DRY-6、DRY-7、DRY-8、DRY-9、DRY-10、DRY-11（仅备注）、
-SRP-1、SRP-2、SRP-3、SRP-5（仅备注）、SRP-6、SRP-7、SRP-8、SRP-9、DRY-5。
+**阶段 A 全部完成**（DRY-1/2/3/4/6/7/8/9/10/12/13 + SRP-4）。
+
+尚未处理：**DRY-11**（仅备注）、**DRY-5**（大改）、
+**SRP-1、SRP-2**（两个 god class 的进一步拆分）、**SRP-3**（BlackScreenDetector）、
+SRP-5（仅备注）、**SRP-6**（LogArchiver）、**SRP-7**（allowlist 外移）、
+**SRP-8**（AdbDeployer 拆文件）、**SRP-9**（CarLaunchScreen 设置面板）。
 
 ### 6.5 已修掉的基线失败：`CarIpLocatorTest`（环境依赖型测试）
 

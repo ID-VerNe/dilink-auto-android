@@ -1,5 +1,7 @@
 package com.dilinkauto.desktop.log
 
+import com.dilinkauto.protocol.LogLine
+
 import java.io.Closeable
 import java.io.File
 import java.time.LocalDateTime
@@ -41,7 +43,7 @@ class DesktopLog(
     fun error(tag: String, message: String) = write(LEVEL_ERROR, tag, message)
 
     private fun write(level: String, tag: String, message: String) {
-        val line = "${FORMATTER.format(clock())} [$level] [$tag] $message"
+        val line = LogLine.bracketedTagLast(FORMATTER.format(clock()), level, tag, message)
         synchronized(lock) {
             if (echoToConsole) console(line)
             val target = file

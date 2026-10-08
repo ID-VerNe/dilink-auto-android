@@ -25,15 +25,17 @@ internal fun buildHandshakeRequest(
     bitrate: Int = 0
 ): HandshakeRequest {
     val pi = context.packageManager.getPackageInfo(context.packageName, 0)
-    return HandshakeRequest(
-        deviceName = "DiLink-${Build.MODEL}",
-        screenWidth = screenWidth,
-        screenHeight = screenHeight,
-        screenDpi = screenDpi,
-        appVersionCode = @Suppress("DEPRECATION") pi.versionCode,
-        targetFps = targetFps,
-        appVersionName = pi.versionName ?: "",
-        dpiOverride = dpiOverride,
-        bitrate = bitrate
-    )
+    // Dimensions arrive pre-aligned from the caller (getViewportSize), because
+    // on this side the nav bar makes the correct direction "widen the bar" —
+    // the opposite of the desktop's floor. Aligning again here would undo it.
+    return HandshakeRequest.builder()
+        .deviceName("DiLink-${Build.MODEL}")
+        .screenSize(screenWidth, screenHeight)
+        .screenDpi(screenDpi)
+        .appVersionCode(@Suppress("DEPRECATION") pi.versionCode)
+        .targetFps(targetFps)
+        .appVersionName(pi.versionName ?: "")
+        .dpiOverride(dpiOverride)
+        .bitrate(bitrate)
+        .build()
 }
