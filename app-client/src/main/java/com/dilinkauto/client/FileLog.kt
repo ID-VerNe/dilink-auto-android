@@ -3,16 +3,12 @@ package com.dilinkauto.client
 import android.os.Environment
 import android.util.Log
 import com.dilinkauto.protocol.AppPrefs
-import java.io.BufferedOutputStream
 import java.io.File
-import java.io.FileOutputStream
 import java.io.FileWriter
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ConcurrentLinkedQueue
-import java.util.zip.ZipEntry
-import java.util.zip.ZipOutputStream
 
 /**
  * File-based logger that bypasses Android logcat filtering.
@@ -35,6 +31,7 @@ object FileLog {
     private val dateFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
     private val logDir = File(Environment.getExternalStorageDirectory(), "DiLinkAuto")
     private val logFile = File(logDir, "client.log")
+    private val archiver = LogArchiver(logDir)
 
     init {
         try {
@@ -87,23 +84,14 @@ object FileLog {
 
     fun rotate() {
         queue.clear()
+        writer?.close()
+        archiver.rotate(logFile)
         try {
-            writer?.close()
-            if (logFile.exists() && logFile.length() > 0) {
-                val ts = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
-                val archiveFile = File(logDir, "client-$ts.log")
-                logFile.renameTo(archiveFile)
-            }
-            // Prune: keep only 9 archived logs (+ the new current = 10 total)
-            val archived = logDir.listFiles { f -> f.name.startsWith("client-") && f.name.endsWith(".log") }
-                ?.sortedByDescending { it.name }
-            archived?.drop(9)?.forEach { it.delete() }
-
             writer = FileWriter(logFile, false)
             writer?.write("=== DiLink Auto Client log started ${SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())} ===\n")
             writer?.flush()
         } catch (e: Exception) {
-            Log.e("FileLog", "Failed to rotate log file: ${e.message}")
+            Log.e("FileLog", "Failed to reopen log file after rotate: ${e.message}")
         }
     }
 
@@ -116,32 +104,7 @@ object FileLog {
         write("E", tag, "$msg${t?.let { " | ${it.message}" } ?: ""}")
     }
 
-    fun zipLogs(): File? {
-        return try {
-            val zipFile = File(logDir, "dilinkauto-logs.zip")
-            ZipOutputStream(BufferedOutputStream(FileOutputStream(zipFile))).use { zos ->
-                val logFiles = logDir.listFiles { f -> f.name.endsWith(".log") }
-                if (logFiles != null) {
-                    for (file in logFiles) {
-                        zos.putNextEntry(ZipEntry(file.name))
-                        file.inputStream().use { it.copyTo(zos) }
-                        zos.closeEntry()
-                    }
-                }
-                // Include VD server log if it exists
-                val vdLog = File("/data/local/tmp/vd-server.log")
-                if (vdLog.exists()) {
-                    zos.putNextEntry(ZipEntry("vd-server.log"))
-                    vdLog.inputStream().use { it.copyTo(zos) }
-                    zos.closeEntry()
-                }
-            }
-            zipFile
-        } catch (e: Exception) {
-            Log.e("FileLog", "Failed to zip logs: ${e.message}")
-            null
-        }
-    }
+    fun zipLogs(): File? = archiver.zip(extraFiles = listOf(LogArchiver.VD_SERVER_LOG))
 
     fun logDirectory(): File = logDir
 

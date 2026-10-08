@@ -108,7 +108,7 @@
 > `stopEverything` 765-**779**→**776**。另：原文把 `stopEverything` 说成"清理幂等 guard"是**张冠李戴**——
 > 幂等 guard 是 `cleanupGuard`/`cleanupSession`（L724/L731-763），`stopEverything` 只是它的调用方。
 
-#### SRP-3 `VideoDecoder` — 472 行
+#### SRP-3 `VideoDecoder` — 472 行 ✅ **已修复 → 437 行**
 `app-server/src/main/java/com/dilinkauto/server/decoder/VideoDecoder.kt`
 
 一个类里混了：MediaCodec 生命周期 + feed/drain 线程、帧队列的丢弃/优先级策略、**黑屏检测器**（状态字段 L88-91 + L108-109 共 6 个、回调 `onSustainedBlackScreen` L106、检测主体 **L343-370**、重置 `resetBlackScreenState` L112-117）、Surface 切换门控（`switchSurface` L420 / `invalidateSurface` L438）、每 30 帧统计日志（L238）。
@@ -144,18 +144,18 @@
 > 第三处 `Thread(` 命中是 watchdog（L308）/ StackCheck（L390）/ LifeWriter（L408）/ Pipeline（L123）/ ShutdownHook（L107），
 > 都不是 reader。**成因与 §6 描述的失败模式一致：grep `Thread(` 数命中数。**
 
-#### SRP-6 `FileLog` — 153 行
+#### SRP-6 `FileLog` — 153 行 ✅ **已修复 → 116 行**
 `app-client/.../FileLog.kt`
 日志写入（队列 + 写线程）+ 轮转/清理（`rotate`）+ 打包（`zipLogs`）+ 启用态持久化（`loadEnabled`）+ 目录暴露。轮转与打包含大量文件系统逻辑，与"写一行日志"无关。建议抽 `LogArchiver`。
 
-#### SRP-7 `AppListBuilder` — 131 行
+#### SRP-7 `AppListBuilder` — 131 行 ✅ **已修复 → 108 行**
 `app-client/.../AppListBuilder.kt`
 混合：`PackageManager` 查询/过滤、allowlist 播种（`seedDefaultAllowlist` + `DEFAULT_MAP_PACKAGES`）、图标 hash 抑制、wire 编码。分类逻辑已抽到 `AppCategorizer`（良好），allowlist 播种可继续外移。
 
-#### SRP-8 `AdbDeployer.kt` 文件含 3 个类型
+#### SRP-8 `AdbDeployer.kt` 文件含 3 个类型 ✅ **已修复**
 `app-desktop/.../deploy/AdbDeployer.kt`：`AdbRunner` 接口 + `AdbDeployer` + `ProcessAdbRunner`。可拆文件（`AdbRunner.kt` / `ProcessAdbRunner.kt`）以便按需加载与测试。
 
-#### SRP-9 UI 大文件
+#### SRP-9 UI 大文件 ✅ **已修复（`CarLaunchScreen` 590 → 461 行）**
 - `app-server/.../CarLaunchScreen.kt` 590 行：品牌区（`BrandingSection` L199）、连接状态卡（`ConnectionStatusCard` L227-411）、**设置面板**（`SettingSection` L413-414）、WiFi ADB 说明卡（`WifiAdbSetupCard` L515-516）、"如何连接"步骤（`HowToConnect` L539-540）。设置与说明是独立主题，可抽 composable 文件。
 - `app-client/.../OnboardingScreen.kt` 557 行：引导流程 + 车机安装步骤。**注意此文件属 app-client，与上面两个 app-server 文件不同模块**。
 - `app-server/.../HomeScreen.kt` 391 行。
@@ -540,22 +540,22 @@ if (usbAdb?.isConnected != true) {
 | DRY-8 | 重复 | 日志行拼接 ×3 | ✅ **已完成** | — |
 | DRY-10 | 兼容壳 | `Discovery` vs `Ports` | ✅ **已完成** | — |
 | DRY-5 | 平行实现 | 三端会话编排 | 🟠 中 | 2-4 天（大改） |
-| SRP-3 | 职责混入 | `VideoDecoder` 黑屏检测 | 🟠 中 | 0.5 天 |
+| SRP-3 | 职责混入 | `VideoDecoder` 黑屏检测 | ✅ **已完成** | — |
 | DRY-6 | 重复 | 通知/WakeLock ×2 | 🟡 低中 | 0.5 天 |
 | SRP-4 | 职责混入 | `GlPipeline` 码率/IO | 🟡 低中 | 0.5 天 |
 | DRY-2 | 重复 | 握手构造 ×2 | 🟡 低中 | 0.5 天 |
 | DRY-7 | 重复 | WiFi gateway ×2（3 个调用点，1 个已注入解耦） | 🟡 低 | 0.2 天 |
 | DRY-8 | 重复 | 日志行拼接 ×3 | 🟡 低 | 0.3 天 |
-| SRP-6 | 职责混入 | `FileLog` | 🟡 低 | 0.5 天 |
-| SRP-7 | 职责混入 | `AppListBuilder` allowlist | 🟡 低 | 0.3 天 |
-| SRP-9 | 大文件 | `CarLaunchScreen` / `OnboardingScreen` | 🟡 低 | 0.5 天 |
+| SRP-6 | 职责混入 | `FileLog` | ✅ **已完成** | — |
+| SRP-7 | 职责混入 | `AppListBuilder` allowlist | ✅ **已完成** | — |
+| SRP-9 | 大文件 | `CarLaunchScreen`（`OnboardingScreen` 保留） | ✅ **已完成** | — |
 | SRP-5 | 大文件 | `PipelineServer` (523) | 🟢 极低 | 备注即可 |
 | DRY-12 | 重复 | USB ready 重置（字面 ×1 / 语义 ×2） | ✅ 已完成 | — |
 | DRY-13 | 重复 | disconnect 序列 ×2（语义性差异） | ✅ 已完成（部分） | — |
 | DRY-9 | 测试重复 | `createConnectedSockets` ×2 | ✅ **已完成** | — |
 | DRY-10 | 兼容壳 | `Discovery` vs `Ports`（已有意为之的注释） | 🟢 极低 | 0.1 天 |
 | DRY-11 | 概念重复 | 图标 hash 抑制 | 🟢 极低 | 备注即可 |
-| SRP-8 | 文件组织 | `AdbDeployer.kt` 3 类型 | 🟢 极低 | 0.1 天 |
+| SRP-8 | 文件组织 | `AdbDeployer.kt` 3 类型 | ✅ **已完成** | — |
 
 > **第二轮补入两处遗漏**：**SRP-5**（`PipelineServer` 523 行）原先不在表内 ——
 > 它超过 §5 自定的 450 行 god class 阈值，按报告自己的标准也应列出；
@@ -754,6 +754,12 @@ if (usbAdb?.isConnected != true) {
 | **DRY-8** | ✅ 已修复 | 新增 `protocol-core LogLine` + `LogLineTest`（6 例）；三端格式**有意保持不同** |
 | **DRY-10** | ✅ 已修复 | 26 处调用点机械迁移到 `Ports`，`Discovery` 的 5 个别名按原计划标 `@Deprecated(WARNING)` |
 | **DRY-9** | ✅ 已修复 | 新增 `TestSockets`，`ConnectionTest`/`ConnectionStressTest` 共用夹具 |
+| **SRP-3** | ✅ 已修复 | 新增 `BlackScreenDetector` + 10 例测试；`VideoDecoder` **472 → 437**；修掉哨兵值吞掉升级路径的缺陷 |
+| **SRP-6** | ✅ 已修复 | 新增 `LogArchiver`；`FileLog` **153 → 116** |
+| **SRP-7** | ✅ 已修复 | 新增 `AllowlistSeeder`；`AppListBuilder` **131 → 108** |
+| **SRP-8** | ✅ 已修复 | `AdbRunner` / `ProcessAdbRunner` 各自成文件；`AdbDeployer` **186 → 103** |
+| **SRP-9** | ✅ 已修复 | 新增 `CarLaunchSettings.kt`；`CarLaunchScreen` **590 → 461** |
+| **SRP-2** | ✅ 已修复 | 新增 `CarInstallCoordinator`；`ConnectionService` **866 → 752** |
 | — | 🆕 附带完成 | **`vd-server` 从 0 个测试变为 17 个**（新建 `src/test` + junit 依赖）——§4 要求的"先建网再动热路径" |
 | — | 🆕 附带完成 | **修掉一个基线失败**：`CarIpLocatorTest` 加 `portProbeOverride` 测试缝 + 补 2 个分支用例；`./gradlew test` 现在全绿 |
 
@@ -761,10 +767,47 @@ if (usbAdb?.isConnected != true) {
 
 **阶段 A 全部完成**（DRY-1/2/3/4/6/7/8/9/10/12/13 + SRP-4）。
 
-尚未处理：**DRY-11**（仅备注）、**DRY-5**（大改）、
-**SRP-1、SRP-2**（两个 god class 的进一步拆分）、**SRP-3**（BlackScreenDetector）、
-SRP-5（仅备注）、**SRP-6**（LogArchiver）、**SRP-7**（allowlist 外移）、
-**SRP-8**（AdbDeployer 拆文件）、**SRP-9**（CarLaunchScreen 设置面板）。
+### 6.7 阶段 B 修复记录 — SRP-3 / SRP-6 / SRP-7 / SRP-8 / SRP-9 / SRP-2
+
+| 项 | 做法 | 行数变化 |
+|---|---|---|
+| **SRP-3** | 新增 `app-server/decoder/BlackScreenDetector.kt`：6 状态字段 + 1 回调 + 1 重置构成纯状态机，不碰 MediaCodec | `VideoDecoder` **472 → 437** |
+| **SRP-6** | 新增 `app-client/LogArchiver.kt`：轮转 / 剪枝 / 打包，`FileLog` 只剩"写一行" | `FileLog` **153 → 116** |
+| **SRP-7** | 新增 `app-client/service/AllowlistSeeder.kt`：首次运行播种（launcher 查询 + 偏好写入） | `AppListBuilder` **131 → 108** |
+| **SRP-8** | `AdbRunner` 接口与 `ProcessAdbRunner` 实现各自成文件 | `AdbDeployer` **186 → 103**（另 +25 / +65） |
+| **SRP-9** | `SettingSection` + `WifiAdbSetupCard` 移入 `CarLaunchSettings.kt`（改 `internal`） | `CarLaunchScreen` **590 → 461** |
+| **SRP-2** | 新增 `CarInstallCoordinator`：定位车机 → 连 ADB → 比版本 → 推送安装 | `ConnectionService` **866 → 752** |
+
+**修掉 3 个真实缺陷**（都不是重构顺手改的，是新写的测试逼出来的）：
+
+1. **SRP-3 黑屏升级路径被静默吞掉**：原内联代码用 `blackScreenSinceMs = 0L` 表示"不在黑屏中"，
+   再用 `if (since > 0)` 判定。单调时钟一旦读到 0，整条升级路径被跳过一个窗口。
+   改为 `Long?`（null = 不在 streak 中）。**该路径此前无任何测试覆盖**。
+2. **SRP-6 轮转后 writer 永久失效**：原 `rotate()` 在 `writer.close()` 之后若归档抛异常
+   就整体跳过"重建 writer"，后续日志全部写进已关闭的 `FileWriter`。
+   现在归档与 writer 重建各自独立兜异常。
+3. **SRP-9 一个编码坑**：原 `AdbDeployer.kt` 是 **GBK 编码**（`HandshakeFactory.kt` 亦然），
+   用 UTF-8 工具改写会损坏中文注释。拆文件时按 `GetEncoding(936)` 读取。
+   **副作用（刻意）**：这些文件的中文注释从 GBK 转为 UTF-8，与仓库其余文件一致。
+
+**新增测试**：`BlackScreenDetectorTest`（10 例，注入时钟，覆盖"短暂黑屏不得升级"
+这一核心安全属性 —— 正是它曾导致 VD 泄漏的重连风暴）。
+
+**验证**：`./gradlew test` ✅ 全绿 + `:app-client:assembleDebug` ✅ BUILD SUCCESSFUL。
+
+### 6.8 剩余项
+
+**未处理，且有意保留**：
+
+- **DRY-11**（图标 hash 抑制）：两端是**因果链**而非重复 —— 桌面端的 `AppIconStore` 正确性
+  依赖手机端的抑制，合并会破坏它。报告原判已修正为"仅备注"。
+- **SRP-5**（`PipelineServer` 523 行）：职责集中在进程与连接生命周期，报告明确不建议动。
+- **DRY-5**（三端会话编排）：2-4 天大改，需专门分支 + 真机回归。
+- **SRP-1**（`CarConnectionService`）：**本次净增 31 行**（1201 → 1232）。
+  DRY-12/13 的去重省下的行数被两处 KDoc 覆盖掉了 —— 写明"USB 仍连着时为何不清"
+  与"control 连接为何留给重握手"。收益是可维护性，函数数 54 → 55。
+  真正的拆分（`WifiTrack` / `CarFrameDispatcher` / `CarStateMachine`）仍未做，
+  需要真机回归基线（`MainActivityAdversarialTest`），不适合与其它项混在一个提交里。
 
 ### 6.5 已修掉的基线失败：`CarIpLocatorTest`（环境依赖型测试）
 

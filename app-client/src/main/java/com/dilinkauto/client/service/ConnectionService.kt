@@ -565,72 +565,21 @@ class ConnectionService : Service() {
 
     fun installCarApp(explicitIp: String? = null) {
         serviceScope.launch(Dispatchers.IO) {
-            var keepStatus = false
-            try {
-                ensureAssetsReady()
-                val apkFile = java.io.File(filesDir, "app-server.apk")
-                if (!apkFile.exists()) {
-                    _installStatus.value = getString(R.string.car_install_status_car_apk_not_found)
-                    FileLog.w(TAG, "No embedded car APK")
-                    return@launch
-                }
-
-                _installStatus.value = if (explicitIp != null) getString(R.string.car_install_status_connecting_to, explicitIp) else getString(R.string.car_install_status_searching)
-                val carIp = if (!explicitIp.isNullOrBlank()) {
-                    if (CarIpLocator.probePortSync(explicitIp, Ports.ADB_PORT)) explicitIp else {
-                        _installStatus.value = getString(R.string.car_install_status_not_reachable, explicitIp)
-                        null
-                    }
-                } else CarIpLocator.findCarAdb(controlConnection?.remoteAddress)
-                if (carIp == null) {
-                    _installStatus.value = getString(R.string.car_install_status_car_not_found)
-                    FileLog.w(TAG, "Could not find car ADB on USB or network")
-                    return@launch
-                }
-
-                _installStatus.value = getString(R.string.car_install_status_connecting_to, carIp)
-                FileLog.i(TAG, "Connecting to car ADB at $carIp:${Ports.ADB_PORT}")
-                val dadb = carAppInstaller.connect(carIp)
-                if (dadb == null) {
-                    _installStatus.value = getString(R.string.car_install_status_auth_needed)
-                    keepStatus = true
-                    return@launch
-                }
-                FileLog.d(TAG, "Dadb.create() succeeded")
-
-                try {
-                    _installStatus.value = getString(R.string.car_install_status_checking_version)
-                    val installedVersionName = carAppInstaller.readInstalledVersion(dadb)
-                    val myVersionName = AppVersion.label(this@ConnectionService)
-                    FileLog.i(TAG, "Car app: installed=$installedVersionName, embedded=$myVersionName")
-
-                    if (compareVersions(myVersionName, installedVersionName) <= 0) {
-                        _installStatus.value = getString(R.string.car_install_status_already_up_to_date, installedVersionName)
-                        return@launch
-                    }
-
-                    val result = carAppInstaller.pushAndInstall(dadb, apkFile, myVersionName)
-                    FileLog.i(TAG, "Install result: ${result.trim()}")
-
-                    if (result.contains("Success")) {
-                        appListBuilder.resetIconHashes() // car's icon cache was wiped by reinstall
-                        _installStatus.value = getString(R.string.car_install_status_car_installed, myVersionName)
-                    } else {
-                        _installStatus.value = getString(R.string.car_install_status_failed, result.trim())
-                    }
-                } finally {
-                    dadb.close()
-                }
-            } catch (e: Exception) {
-                _installStatus.value = getString(R.string.car_install_status_error, e.message ?: "unknown")
-                FileLog.e(TAG, "Car app install failed", e)
-            } finally {
-                if (!keepStatus) {
-                    delay(5000)
-                    _installStatus.value = ""
-                }
-            }
+            ensureAssetsReady()
+            installCoordinator.install(explicitIp)
         }
+    }
+
+    /** Built lazily: needs filesDir and the live connection's remote IP. */
+    private val installCoordinator: CarInstallCoordinator by lazy {
+        CarInstallCoordinator(
+            context = this,
+            apkFile = java.io.File(filesDir, "app-server.apk"),
+            installer = carAppInstaller,
+            connectedCarIp = { controlConnection?.remoteAddress },
+            onReinstalled = { appListBuilder.resetIconHashes() },
+            status = { msg -> _installStatus.value = msg }
+        )
     }
 
 

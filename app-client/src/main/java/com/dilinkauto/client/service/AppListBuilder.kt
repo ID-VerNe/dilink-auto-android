@@ -78,7 +78,7 @@ internal class AppListBuilder(
                 // the allowlist is pre-seeded with common map apps that are actually installed.
                 val prefs = context.getSharedPreferences(ConnectionService.ALLOWLIST_PREFS, Context.MODE_PRIVATE)
                 if (!prefs.getBoolean(ConnectionService.ALLOWLIST_CONFIGURED_KEY, false)) {
-                    seedDefaultAllowlist(pm, prefs)
+                    allowlistSeeder.seedIfNeeded(pm, prefs)
                 }
                 val allowed = prefs.getStringSet(ConnectionService.ALLOWLIST_PACKAGES_KEY, null)
                 val apps = if (allowed != null) allApps.filter { it.packageName in allowed } else allApps
@@ -97,33 +97,10 @@ internal class AppListBuilder(
         lastSentIconHash.clear()
     }
 
-    /** Common map app packageNames used to pre-seed the allowlist on first run. */
-    private val DEFAULT_MAP_PACKAGES = setOf(
-        "com.baidu.BaiduMap",        // Baidu Maps
-        "com.autonavi.minimap",      // AMap (Gaode)
-        "com.google.android.apps.maps", // Google Maps
-        "com.waze",                  // Waze
-        "com.soso.map",              // Sogou Map
-        "com.tencent.map",           // Tencent Map
-        "com.mapabc.mapabc"          // Mapabc
+    private val allowlistSeeder = AllowlistSeeder(
+        packagesKey = ConnectionService.ALLOWLIST_PACKAGES_KEY,
+        configuredKey = ConnectionService.ALLOWLIST_CONFIGURED_KEY
     )
-
-    /**
-     * First-run seeding: intersect the default map package list with the launcher
-     * apps actually installed. Non-installed defaults are no-ops. Persist the
-     * result and mark the allowlist configured so this only runs once.
-     */
-    private fun seedDefaultAllowlist(pm: PackageManager, prefs: SharedPreferences) {
-        val installedLauncher = pm.queryIntentActivities(
-            Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0
-        ).map { it.activityInfo.packageName }.toSet()
-        val seed = DEFAULT_MAP_PACKAGES.intersect(installedLauncher)
-        prefs.edit()
-            .putStringSet(ConnectionService.ALLOWLIST_PACKAGES_KEY, seed)
-            .putBoolean(ConnectionService.ALLOWLIST_CONFIGURED_KEY, true)
-            .apply()
-        FileLog.i(TAG, "Allowlist seeded with ${seed.size} default map apps: $seed")
-    }
 
     companion object {
         private const val TAG = "AppListBuilder"
