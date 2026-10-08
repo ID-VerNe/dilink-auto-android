@@ -150,7 +150,7 @@ Application class. Creates notification channel `dilinkauto_car_service` with `I
 
 ### CarCrashHandler
 
-Uncaught exception handler for the car app (`CarCrashHandler.kt`). On crash: saves a crash report with stack trace and device info to `filesDir/crash-pending.log`. The report is sent to the phone on the next successful connection via `carLogSend`. `consumePendingCrash()` returns and archives the pending report so it isn't re-sent on every connection. `buildDeviceInfo(context)` extends the shared `DeviceInfo.buildDeviceInfoBlock` with a Memory section and `memThreshold` line.
+Uncaught exception handler for the car app (`CarCrashHandler.kt`). On crash: saves a crash report with stack trace and device info to `filesDir/crash-pending.log`. The report is sent to the phone on the next successful connection via `carLogSend`. `consumePendingCrash()` returns and archives the pending report so it isn't re-sent on every connection. Report and device-info formatting live in `CarCrashReport` (audit R3-SRP-19): `CarCrashReport.build(thread, throwable)` for the crash text, `CarCrashReport.deviceInfo(context)` extends the shared `DeviceInfo.buildDeviceInfoBlock` with a Memory section and `memThreshold` line.
 
 ### RemoteAdbController
 

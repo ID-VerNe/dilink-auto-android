@@ -230,7 +230,7 @@ The reference car is a low-spec DiLink 4.0 head unit: 8x Cortex-A53 (no big core
 The BYD head unit runs Android 9 (API 28). Several framework APIs the project used are API 29+:
 
 - **`MediaCodecInfo.isHardwareAccelerated()` (API 29+)** threw `NoSuchMethodError` on the BYD, killing the process. Fix: removed the speculative hardware-decoder picker; `VideoDecoder.start()` calls `MediaCodec.createDecoderByType(MIMETYPE_VIDEO_AVC)` directly. `REGULAR_CODECS` lists hardware first and selects `OMX.qcom.video.decoder.avc` on the BYD.
-- **`am display move-stack` (API 29+)** gated on `SDK_INT >= 29` in `PipelineServer.moveTopApp`. On older levels the foreground app is left in place rather than a silent shell failure masking as success.
+- **`am display move-stack` (API 29+)** gated on `SDK_INT >= 29` in `CarCommandRouter.moveTopApp`. On older levels the foreground app is left in place rather than a silent shell failure masking as success.
 - **`cmd display power-on/off` (API 29+)** is the shell fallback in `DisplayPowerController`. On API 26-28 a `DisplayControl` reflection failure means the physical panel is not restored — now logged via `logErr`, was silent.
 - **`minSdk` raised to 26** for `protocol` and `app-server` (was 24). Re-arms the NewApi lint gate. `app-client` stays at 29.
 

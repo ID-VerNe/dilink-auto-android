@@ -68,6 +68,8 @@ client 和 server 都加了 `values-zh-rCN` / `values-zh`。这是面向中国�
 
 最近一轮 4-agent 并行审计后的 DRY/SRP pass:跨模块共享常量(`AppPrefs`、`AppTargets`、`VdDeploy`、`VdDeployArgs`、`WifiGatewayIp`)、协作者提取(`ApkInstaller`、`AppListBuilder`、`AppVersion`、`CarLogWriter`、`CarTouchSender`、`HandshakeFactory`、`VdServerDeployer`、`PhoneDisplayRestorer`、`VdDimensions` 等)、大文件拆分(`CarConnectionService` 1237 → 1137 行)。DPI 范围 `120..480` 和 `app_process` argv tail 在 phone 和 car 之间共享同一份 `VdDeployArgs`。
 
+第三轮 SRP/DRY 审计(`docs/audit-srp-dry-round3.md`,49 项)已全部落地,其中第二轮遗留的 `CarConnectionService` 实际行数为 **1237**(README 曾误记为 1137),本轮降至 **1206**;`ConnectionService` 752 → 728,`PipelineServer` 523 → 383(抽出 `PersistentShell`/`CarCommandRouter`/`LifecycleWriter`),`AppListBuilder` 108 → 80。
+
 ### 10. VD 泄漏修复 + 清理幂等 + 黑屏自愈(v0.18.0-dev-13)
 
 **根因**:每次重连都泄漏一个 VirtualDisplay。旧代码用 `pkill -9` 杀 VD 进程,跳过了 JVM shutdown hook,`PipelineServer.cleanup()` 从未执行 —— 导致 VD 不释放、物理面板保持关屏、`screen_off_timeout` 设置丢失(快照捕获的是自己写入的 `2147483647` 哨兵值)。连续几次重连后车机变黑屏。
