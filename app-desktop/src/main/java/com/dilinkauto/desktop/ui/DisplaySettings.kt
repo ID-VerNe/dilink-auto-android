@@ -1,21 +1,15 @@
 package com.dilinkauto.desktop.ui
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.BasicText
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
@@ -23,7 +17,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.SolidColor
@@ -158,60 +151,5 @@ internal fun DisplaySettingsView(
             onCheckedChange = onTogglePhoneScreen,
         )
         Body("连上后手机会自动熄屏；此开关用于中途手动点亮/熄灭（走输入口命令）。")
-    }
-}
-
-@Composable
-private fun SectionTitle(text: String) {
-    BasicText(text, style = TextStyle(color = Palette.Text, fontSize = 14.sp))
-}
-
-@Composable
-private fun Body(text: String) {
-    BasicText(text, style = TextStyle(color = Palette.TextDim, fontSize = 12.sp))
-}
-
-/** 无 material 依赖的勾选行：左侧一个方块 + 标签。 */
-@Composable
-private fun CheckRow(
-    label: String,
-    checked: Boolean,
-    onCheckedChange: (Boolean) -> Unit,
-    enabled: Boolean = true,
-) {
-    val color = if (enabled) Palette.Text else Palette.TextDim
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(6.dp))
-            .clickable(enabled = enabled) { onCheckedChange(!checked) }
-            .padding(vertical = 4.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Box(
-            modifier = Modifier
-                .size(16.dp)
-                .clip(RoundedCornerShape(4.dp))
-                .background(if (checked) Palette.Accent else Palette.Button),
-            contentAlignment = Alignment.Center,
-        ) {
-            if (checked) BasicText("✓", style = TextStyle(color = Palette.Backdrop, fontSize = 11.sp))
-        }
-        Spacer(Modifier.width(8.dp))
-        BasicText(label, style = TextStyle(color = color, fontSize = 13.sp))
-    }
-}
-
-@Composable
-private fun ActionButton(label: String, onClick: () -> Unit) {
-    Box(
-        modifier = Modifier
-            .clip(RoundedCornerShape(8.dp))
-            .background(Palette.Button)
-            .clickable(onClick = onClick)
-            .padding(horizontal = 12.dp, vertical = 8.dp),
-        contentAlignment = Alignment.Center,
-    ) {
-        BasicText(label, style = TextStyle(color = Palette.Text, fontSize = 13.sp))
     }
 }

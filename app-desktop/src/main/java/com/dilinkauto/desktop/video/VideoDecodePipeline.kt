@@ -98,10 +98,20 @@ class VideoDecodePipeline(
     private fun checkHardwareFallback() {
         if (!hardwareInUse) return
         if (!hardwareWatchdog.onFrame(framesDecoded.get())) return
-        hardwareInUse = false
-        log("硬件解码 ${HardwareDecodeWatchdog.DEFAULT_TIMEOUT_MS}ms 内无任何输出 —— 回退软解")
+        fallbackToSoftware("硬件解码 ${HardwareDecodeWatchdog.DEFAULT_TIMEOUT_MS}ms 内无任何输出 —— 回退软解")
         // 只关管道，不 join 解码线程：本方法是网络线程，不能在这里阻塞等待重建
         runCatching { pipe?.close() }
+    }
+
+    /**
+     * 硬解回退的落地动作（audit R3-SRP-17）：置标志 + 记日志只有这一个点。
+     *
+     * 两条触发路径各有自己的后续——喂帧侧关管道唤醒阻塞的读、解码线程侧
+     * 交给外层重建——所以调用方保留各自的收尾动作，这里只统一状态翻转。
+     */
+    private fun fallbackToSoftware(reason: String) {
+        hardwareInUse = false
+        log(reason)
     }
 
     /** 停止管线：关闭管道唤醒阻塞中的 FFmpeg 读，然后等解码线程退出。 */
@@ -151,8 +161,7 @@ class VideoDecodePipeline(
                 } catch (e: Exception) {
                     // 硬解初始化失败：本次运行内不再试，交给外层重建走软解
                     if (useHardware) {
-                        hardwareInUse = false
-                        log("硬件解码启动失败（${e.message}）—— 回退软解")
+                        fallbackToSoftware("硬件解码启动失败（${e.message}）—— 回退软解")
                     }
                     throw e
                 }

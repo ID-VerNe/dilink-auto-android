@@ -9,7 +9,7 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 
-/** [DesktopSettings] 单测：默认值、文件往返、容错与区间夹紧。 */
+/** [DesktopSettings] 单测：默认值、文件往返（经 [DesktopSettingsStore]）、容错与区间夹紧。 */
 class DesktopSettingsTest {
 
     @get:Rule
@@ -42,14 +42,14 @@ class DesktopSettingsTest {
             keepAwake = false,
         )
 
-        assertTrue(original.save(file))
-        assertEquals(original, DesktopSettings.load(file))
+        assertTrue(DesktopSettingsStore(file).save(original))
+        assertEquals(original, DesktopSettingsStore(file).load())
     }
 
     @Test
     fun load_missingFile_returnsDefaults() {
         val file = temp.newFile("nope.json").apply { delete() }
-        assertEquals(DesktopSettings(), DesktopSettings.load(file))
+        assertEquals(DesktopSettings(), DesktopSettingsStore(file).load())
     }
 
     @Test
@@ -58,7 +58,7 @@ class DesktopSettingsTest {
         file.writeText("{ this is not json")
         val errors = mutableListOf<String>()
 
-        val settings = DesktopSettings.load(file) { errors.add(it) }
+        val settings = DesktopSettingsStore(file).load { errors.add(it) }
 
         assertEquals(DesktopSettings(), settings)
         assertTrue("应回报解析失败：$errors", errors.single().contains("解析"))
@@ -81,7 +81,7 @@ class DesktopSettingsTest {
             """.trimIndent()
         )
 
-        val s = DesktopSettings.load(file)
+        val s = DesktopSettingsStore(file).load()
 
         assertEquals("192.168.3.206", s.devPhoneIp)
         assertTrue(s.devMode)
@@ -137,7 +137,7 @@ class DesktopSettingsTest {
         java.io.File(dir, "sub").writeText("occupied")
         val errors = mutableListOf<String>()
 
-        val ok = DesktopSettings().save(file) { errors.add(it) }
+        val ok = DesktopSettingsStore(file).save(DesktopSettings()) { errors.add(it) }
 
         assertFalse(ok)
         assertNotNull(errors.firstOrNull())

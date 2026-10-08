@@ -1,7 +1,7 @@
 package com.dilinkauto.desktop.config
 
+import com.dilinkauto.protocol.AppPrefs
 import com.dilinkauto.protocol.VideoConfig
-import java.io.File
 
 /**
  * 桌面端持久化配置（`%APPDATA%\DiLinkAuto\config.json`）。
@@ -44,21 +44,17 @@ data class DesktopSettings(
 
     fun toJson(): String = JsonConfig.write(toMap())
 
-    /** 写回配置文件；失败时返回 false 并回报原因（配置写不进去不该让程序起不来）。 */
-    fun save(file: File = DesktopPaths.configFile(), onError: (String) -> Unit = {}): Boolean {
-        return runCatching {
-            file.parentFile?.mkdirs()
-            file.writeText(toJson())
-        }.onFailure { onError("写入 $file 失败: ${it.message}") }.isSuccess
-    }
+    // 读盘/写盘在 [DesktopSettingsStore]（audit R3-SRP-16）。
 
     companion object {
-        const val KEY_DEV_PHONE_IP = "dev_phone_ip"
-        const val KEY_DEV_MODE = "dev_mode"
-        const val KEY_STARTUP_DPI = "startup_dpi"
-        const val KEY_STARTUP_FPS = "startup_fps"
-        const val KEY_STARTUP_BITRATE = "startup_bitrate"
-        const val KEY_LOG_ENABLED = "log_enabled"
+        // 跨端键名统一由 protocol-core 的 AppPrefs 定义（与手机/车机同源），
+        // 这里保留 KEY_* 别名以免改动大量既有调用点。
+        const val KEY_DEV_PHONE_IP = AppPrefs.DEV_PHONE_IP
+        const val KEY_DEV_MODE = AppPrefs.DEV_MODE
+        const val KEY_STARTUP_DPI = AppPrefs.STARTUP_DPI
+        const val KEY_STARTUP_FPS = AppPrefs.STARTUP_FPS
+        const val KEY_STARTUP_BITRATE = AppPrefs.STARTUP_BITRATE
+        const val KEY_LOG_ENABLED = AppPrefs.LOG_ENABLED
         const val KEY_STARTUP_HWACCEL = "startup_hwaccel"
         const val KEY_KEEP_AWAKE = "keep_awake"
 
@@ -87,25 +83,6 @@ data class DesktopSettings(
                 startupHwaccel = (values[KEY_STARTUP_HWACCEL] as? Boolean) ?: defaults.startupHwaccel,
                 keepAwake = (values[KEY_KEEP_AWAKE] as? Boolean) ?: defaults.keepAwake,
             )
-        }
-
-        /** 读取配置；文件不存在或损坏时返回默认值，并通过 [onError] 汇报原因。 */
-        fun load(
-            file: File = DesktopPaths.configFile(),
-            onError: (String) -> Unit = {},
-        ): DesktopSettings {
-            if (!file.isFile) return DesktopSettings()
-            val text = runCatching { file.readText() }
-                .getOrElse {
-                    onError("读取 $file 失败: ${it.message}")
-                    return DesktopSettings()
-                }
-            val values = runCatching { JsonConfig.parse(text) }
-                .getOrElse {
-                    onError("解析 $file 失败: ${it.message}")
-                    return DesktopSettings()
-                }
-            return from(values)
         }
 
         private fun intValue(raw: Any?, fallback: Int): Int = when (raw) {

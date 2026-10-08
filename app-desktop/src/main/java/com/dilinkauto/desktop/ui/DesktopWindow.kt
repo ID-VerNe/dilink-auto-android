@@ -40,9 +40,7 @@ import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.WindowPlacement
 import androidx.compose.ui.window.rememberWindowState
 import com.dilinkauto.desktop.DesktopApp
-import com.dilinkauto.desktop.apps.AppEntry
 import com.dilinkauto.desktop.display.Screens
-import kotlinx.coroutines.flow.MutableStateFlow
 
 /** 主视图：镜像（手机画面）/ 应用启动器 / 显示设置。 */
 enum class DesktopView { MIRROR, APPS, DISPLAY }
@@ -223,20 +221,3 @@ private fun RailButton(
 }
 
 private val RAIL_WIDTH = 96.dp
-
-/** 空会话时给 `collectAsState` 用的占位流（避免条件式调用 composable）。 */
-private val NoSessionEnded = MutableStateFlow(false)
-private val NoHardwareDecode = MutableStateFlow(false)
-private val NoApps = MutableStateFlow(emptyList<AppEntry>())
-
-/** 桌面端配色（Material 3 深色系的一个极简子集，避免额外引入 material 依赖）。 */
-internal object Palette {
-    val Backdrop = Color(0xFF101014)
-    val Rail = Color(0xFF1B1B1F)
-    val Button = Color(0xFF2A2A31)
-    val ButtonActive = Color(0xFF3A3A42)
-    val Divider = Color(0xFF33333A)
-    val Text = Color(0xFFE6E6E9)
-    val TextDim = Color(0xFF9A9AA2)
-    val Accent = Color(0xFF4C8DFF)
-}

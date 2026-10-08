@@ -3,11 +3,13 @@ package com.dilinkauto.desktop
 import com.dilinkauto.desktop.apps.AppCatalog
 import com.dilinkauto.desktop.apps.AppEntry
 import com.dilinkauto.desktop.config.DesktopSettings
+import com.dilinkauto.desktop.config.DesktopSettingsStore
 import com.dilinkauto.desktop.deploy.AdbDeployer
 import com.dilinkauto.desktop.display.KeepAwake
 import com.dilinkauto.desktop.input.InputSender
 import com.dilinkauto.desktop.log.DesktopLog
 import com.dilinkauto.desktop.ui.SwingVideoView
+import com.dilinkauto.desktop.video.FrameDumper
 import com.dilinkauto.desktop.video.VideoDecodePipeline
 import com.dilinkauto.protocol.HandshakeResponse
 import com.dilinkauto.protocol.VdDeploy
@@ -15,16 +17,13 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import java.awt.image.BufferedImage
 import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
-import javax.imageio.ImageIO
 
 /**
  * 窗口模式的运行时编排（组合根）。
@@ -71,6 +70,9 @@ class DesktopApp(
     }
 
     private var config: DesktopConfig = initialConfig
+
+    /** config.json 的读写在 [DesktopSettingsStore]（audit R3-SRP-16）。 */
+    private val settingsStore = DesktopSettingsStore(configFile)
 
     /** 当前代是否启用硬解（来自 settings，可在显示面板里改）。 */
     private var hwaccel: Boolean = settings.startupHwaccel
@@ -125,7 +127,7 @@ class DesktopApp(
             startupHwaccel = hwaccelEnabled ?: settings.startupHwaccel,
         )
         settings = next
-        next.save(configFile) { log.warn("config", it) }
+        settingsStore.save(next) { log.warn("config", it) }
         config = config.copy(dpiOverride = next.startupDpi)
         hwaccel = next.startupHwaccel
         log.info(TAG, "重连：dpiOverride=${config.dpiOverride} hwaccel=$hwaccel")
@@ -136,7 +138,7 @@ class DesktopApp(
     fun setKeepAwake(enabled: Boolean) {
         val next = settings.copy(keepAwake = enabled)
         settings = next
-        next.save(configFile) { log.warn("config", it) }
+        settingsStore.save(next) { log.warn("config", it) }
         _keepAwakeOn.value = enabled
         log.info(TAG, "保持常亮：$enabled")
         lifecycle.execute { applyKeepAwake() }
@@ -201,6 +203,9 @@ class DesktopApp(
         service.onVideoFrame = { pipeline.feed(it) }
         pipeline.start()
 
+        // 每秒一条会话统计（SRP-12：循环本体在 SessionStatsLogger）。
+        SessionStatsLogger(log, pipeline) { hardwareFlow.value = it }.start(scope)
+
         val currentGeneration = ++generation
         val session = Session(
             generation = currentGeneration,
@@ -211,23 +216,6 @@ class DesktopApp(
             hardwareDecode = hardwareFlow,
             input = service.inputSender,
         )
-
-        scope.launch {
-            // 每秒一条统计：联调时用它判断瓶颈在接收侧还是解码侧。
-            var last = 0L
-            while (true) {
-                delay(1_000)
-                val decoded = pipeline.framesDecoded.get()
-                log.info(
-                    "stats",
-                    "decoded fps=${decoded - last} total=$decoded " +
-                        "rebuilds=${pipeline.decoderRebuilds.get()} recv=${pipeline.framesFed.get()} " +
-                        "cfg=${pipeline.configsFed.get()} hw=${pipeline.hardwareInUse}",
-                )
-                last = decoded
-                hardwareFlow.value = pipeline.hardwareInUse
-            }
-        }
 
         scope.launch {
             log.info("session", "连接 ${config.phoneHost}:${config.controlPort} ...")
@@ -285,26 +273,5 @@ class DesktopApp(
 
     private companion object {
         const val TAG = "app"
-    }
-}
-
-/**
- * 联调钩子：`DILINK_DUMP_FRAME=<png 路径>` 时把第 N 帧画面落盘，
- * `DILINK_DUMP_FRAME_AT` 指定第几帧（默认 96 ≈ 解码开始 4 秒后；VD 里的 App
- * 需要时间投射，联调时可调大等到画面就绪）。锁屏/显示器休眠时无法截屏，
- * 用解码输出来证明"画面是真内容"。不设置则零行为变化。
- */
-private class FrameDumper(private val log: DesktopLog) {
-    private val path = System.getenv("DILINK_DUMP_FRAME")?.takeIf { it.isNotBlank() }?.let(::File)
-    private val at = System.getenv("DILINK_DUMP_FRAME_AT")?.toLongOrNull() ?: 96L
-    private var done = false
-
-    fun maybeDump(image: BufferedImage, framesDecoded: Long) {
-        val target = path ?: return
-        if (done || framesDecoded < at) return
-        done = true
-        runCatching { ImageIO.write(image, "png", target) }
-            .onSuccess { log.info("video", "解码帧已落盘: ${target.absolutePath}") }
-            .onFailure { log.warn("video", "解码帧落盘失败: ${it.message}") }
     }
 }
