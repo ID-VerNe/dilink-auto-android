@@ -149,14 +149,9 @@ class Connection(
                 for (frame in writeQueue) {
                     if (!connected.get() || !isActive) break
 
-                    // Encode header
-                    val frameLength = 2 + frame.payload.size
-                    headerBuf[0] = (frameLength shr 24).toByte()
-                    headerBuf[1] = (frameLength shr 16).toByte()
-                    headerBuf[2] = (frameLength shr 8).toByte()
-                    headerBuf[3] = frameLength.toByte()
-                    headerBuf[4] = frame.channel
-                    headerBuf[5] = frame.messageType
+                    // Encode header — the byte layout lives in FrameCodec only
+                    // (single definition shared with writeFrame/writeFrameToChannel).
+                    FrameCodec.encodeHeaderInto(headerBuf, frame)
 
                     // Gathering write: header + payload in single syscall
                     val bufs = if (frame.payload.isNotEmpty()) {
@@ -320,7 +315,14 @@ class Connection(
     companion object {
         private const val HEARTBEAT_INTERVAL_MS = 3000L
         private const val HEARTBEAT_TIMEOUT_MS = 10000L
-        private const val SOCKET_BUF_BYTES = 262144 // 256KB — request send/receive buffer
+
+        /**
+         * TCP send/receive buffer request (256KB). Raised above the OS default
+         * because 1080p keyframes burst larger than the default window.
+         * Public because vd-server's socket setup uses the same value — this
+         * constant is the single source for both ends of the video path.
+         */
+        const val SOCKET_BUF_BYTES = 262144
 
         suspend fun connect(host: String, port: Int, scope: CoroutineScope): Connection =
             withContext(Dispatchers.IO) {

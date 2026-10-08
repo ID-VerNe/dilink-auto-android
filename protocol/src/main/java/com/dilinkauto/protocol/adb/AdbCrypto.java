@@ -3,11 +3,16 @@ package com.dilinkauto.protocol.adb;
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.security.KeyFactory;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
 import java.security.MessageDigest;
 import java.security.PrivateKey;
 import java.security.PublicKey;
 import java.security.Signature;
 import java.security.interfaces.RSAPublicKey;
+import java.security.spec.PKCS8EncodedKeySpec;
+import java.security.spec.X509EncodedKeySpec;
 
 /**
  * ADB cryptographic helpers shared by both transports
@@ -29,7 +34,9 @@ import java.security.interfaces.RSAPublicKey;
  * Key *storage* policy (file location priority, PEM vs DER, migration) is
  * intentionally NOT shared — the two transports have genuinely different
  * storage rules (USB migrates across sdcard/extFilesDir/filesDir; TCP stores
- * PEM for Dadb compatibility). Those stay in their respective classes.
+ * PEM for Dadb compatibility). Those stay in their respective classes. The
+ * generate/load *primitives* and the AUTH reply sequencing, however, live
+ * here so the two transports cannot diverge on them.
  */
 final class AdbCrypto {
 
@@ -63,6 +70,47 @@ final class AdbCrypto {
         sig.initSign(priv);
         sig.update(digestInfo);
         return sig.sign();
+    }
+
+    /** Reply chosen for one inbound AUTH message (see [buildAuthReply]). */
+    static final class AuthReply {
+        /** AUTH_SIGNATURE or AUTH_RSAPUBLICKEY. */
+        final int authType;
+        /** Payload for [AdbProtocol.encodeAuth]. */
+        final byte[] payload;
+
+        AuthReply(int authType, byte[] payload) {
+            this.authType = authType;
+            this.payload = payload;
+        }
+    }
+
+    /**
+     * Pick the reply to an inbound AUTH message. The host-side sequence is
+     * fixed: first AUTH_TOKEN → AUTH_SIGNATURE (sign the prehashed token with
+     * the stored key); a second AUTH_TOKEN means the signature was rejected →
+     * AUTH_RSAPUBLICKEY (the phone then asks the user to approve the key).
+     *
+     * Shared by [TcpAdbConnection] and [UsbAdbConnection] so the reply
+     * sequencing and the sign/encode calls cannot silently diverge (this area
+     * already produced one silent TCP/USB divergence — see class KDoc).
+     *
+     * @param authType             type field of the inbound AUTH message
+     * @param token                inbound payload (the 20-byte prehashed token for AUTH_TOKEN)
+     * @param keyPair              the host key pair
+     * @param signatureAlreadySent whether this connection already answered a
+     *                             token with AUTH_SIGNATURE
+     * @return the reply to send, or null when [authType] is not AUTH_TOKEN
+     */
+    static AuthReply buildAuthReply(int authType, byte[] token, KeyPair keyPair,
+                                    boolean signatureAlreadySent) throws Exception {
+        if (authType != AdbProtocol.AUTH_TOKEN) return null;
+        if (!signatureAlreadySent) {
+            return new AuthReply(AdbProtocol.AUTH_SIGNATURE,
+                    signAuthToken(keyPair.getPrivate(), token));
+        }
+        return new AuthReply(AdbProtocol.AUTH_RSAPUBLICKEY,
+                encodePublicKey(keyPair.getPublic()));
     }
 
     /**
@@ -111,6 +159,28 @@ final class AdbCrypto {
             le[i] = be[be.length - 1 - i];
         }
         return le;
+    }
+
+    /**
+     * Build an RSA key pair from DER-encoded PKCS#8 (private) and X.509
+     * (public) bytes — the *load* half of the shared keypair flow. Storage
+     * policy (which files, PEM vs DER, migration) stays in each transport.
+     */
+    static KeyPair loadKeyPair(byte[] privateKeyDer, byte[] publicKeyDer) throws Exception {
+        KeyFactory kf = KeyFactory.getInstance("RSA");
+        PrivateKey priv = kf.generatePrivate(new PKCS8EncodedKeySpec(privateKeyDer));
+        PublicKey pub = kf.generatePublic(new X509EncodedKeySpec(publicKeyDer));
+        return new KeyPair(pub, priv);
+    }
+
+    /**
+     * Generate the 2048-bit RSA key pair the ADB handshake needs — the
+     * *generate* half of the shared keypair flow.
+     */
+    static KeyPair generateKeyPair() throws Exception {
+        KeyPairGenerator kpg = KeyPairGenerator.getInstance("RSA");
+        kpg.initialize(2048);
+        return kpg.generateKeyPair();
     }
 
     /**

@@ -33,6 +33,23 @@ private fun ByteBuffer.readShortLengthPrefixed(): String {
     return String(bytes, Charsets.UTF_8)
 }
 
+/**
+ * Lenient variant of [readShortLengthPrefixed] for *optional trailing* string
+ * fields: returns "" when the 2-byte length (or the declared bytes) are not
+ * present instead of throwing. Older peers may omit these fields entirely —
+ * strict parsing would turn that into a hard decode failure.
+ * (Previously hand-written at each call site with slightly different bounds
+ * checks; both sites now share this helper.)
+ */
+private fun ByteBuffer.readShortLengthPrefixedOrEmpty(): String {
+    if (remaining() < 2) return ""
+    val len = getShort().toInt() and 0xFFFF
+    if (len == 0 || remaining() < len) return ""
+    val bytes = ByteArray(len)
+    get(bytes)
+    return String(bytes, Charsets.UTF_8)
+}
+
 /** Read [len] bytes as a ByteArray, or throw [ProtocolDecodeException] if unavailable. */
 private fun ByteBuffer.readBytes(len: Int): ByteArray {
     if (len == 0) return ByteArray(0)
@@ -57,7 +74,7 @@ data class HandshakeRequest(
     val displayMode: Byte = DISPLAY_MODE_VIRTUAL,
     val screenDpi: Int = 160,
     val appVersionCode: Int,
-    val targetFps: Int = 30,
+    val targetFps: Int = VideoConfig.TARGET_FPS,
     val appVersionName: String = "",
     /**
      * Car-side user override for the VD DPI. 0 = auto-calibrate via
@@ -109,7 +126,9 @@ data class HandshakeRequest(
                 displayMode = if (buf.hasRemaining()) buf.get() else DISPLAY_MODE_VIRTUAL,
                 screenDpi = if (buf.remaining() >= 4) buf.getInt() else 160,
                 appVersionCode = if (buf.remaining() >= 4) buf.getInt() else 0,
-                targetFps = if (buf.remaining() >= 4) buf.getInt() else 30,
+                // Fallback for legacy peers that omit the field: this fork's
+                // tuned target (24), not the generic 30.
+                targetFps = if (buf.remaining() >= 4) buf.getInt() else VideoConfig.TARGET_FPS,
                 appVersionName = if (buf.remaining() >= 2) buf.readShortLengthPrefixed() else "",
                 dpiOverride = if (buf.remaining() >= 4) buf.getInt() else 0,
                 bitrate = if (buf.remaining() >= 4) buf.getInt() else 0
@@ -143,7 +162,7 @@ data class HandshakeRequest(
             private var screenHeight: Int = 0
             private var screenDpi: Int = 160
             private var appVersionCode: Int = 0
-            private var targetFps: Int = 30
+            private var targetFps: Int = VideoConfig.TARGET_FPS
             private var appVersionName: String = ""
             private var dpiOverride: Int = 0
             private var bitrate: Int = 0
@@ -215,12 +234,7 @@ data class HandshakeResponse(
             val dh = buf.getInt()
             val vdId = if (buf.hasRemaining()) buf.getInt() else -1
             val adbP = if (buf.hasRemaining()) buf.getInt() else Ports.ADB_PORT
-            val jarPath = if (buf.remaining() >= 2) {
-                val pathLen = buf.getShort().toInt() and 0xFFFF
-                if (pathLen > 0 && buf.remaining() >= pathLen) {
-                    String(buf.readBytes(pathLen), Charsets.UTF_8)
-                } else ""
-            } else ""
+            val jarPath = buf.readShortLengthPrefixedOrEmpty() // optional trailing field
             val connMethod = if (buf.hasRemaining()) buf.get() else CONNECTION_METHOD_USB_ADB
             val vdDpi = if (buf.remaining() >= 4) buf.getInt() else VideoConfig.VIRTUAL_DISPLAY_DPI
             return HandshakeResponse(
@@ -379,12 +393,7 @@ data class AppListMessage(val apps: List<AppInfo>) {
                 val category = AppCategory.fromId(buf.get())
                 val iconSize = if (buf.remaining() >= 4) buf.getInt() else 0
                 val iconPng = if (iconSize > 0 && buf.remaining() >= iconSize) buf.readBytes(iconSize) else ByteArray(0)
-                val iconHash = if (buf.remaining() >= 2) {
-                    val hashLen = buf.getShort().toInt() and 0xFFFF
-                    if (hashLen > 0 && buf.remaining() >= hashLen) {
-                        String(buf.readBytes(hashLen), Charsets.UTF_8)
-                    } else ""
-                } else ""
+                val iconHash = buf.readShortLengthPrefixedOrEmpty() // optional trailing field
                 AppInfo(
                     packageName = pkg,
                     appName = name,
@@ -526,21 +535,3 @@ data class AppInfoDataMessage(
         }
     }
 }
-
-// ─── Constants ───
-
-const val PROTOCOL_VERSION = 1
-
-const val DISPLAY_MODE_MIRROR: Byte = 0
-const val DISPLAY_MODE_VIRTUAL: Byte = 1
-
-const val FEATURE_VIDEO = 0x01
-const val FEATURE_AUDIO = 0x02
-const val FEATURE_MEDIA_CONTROL = 0x08
-const val FEATURE_NAVIGATION = 0x10
-
-// Connection methods (handshake response)
-const val CONNECTION_METHOD_USB_ADB: Byte = 0
-const val CONNECTION_METHOD_WIFI_ADB: Byte = 1
-const val CONNECTION_METHOD_SHIZUKU: Byte = 2
-

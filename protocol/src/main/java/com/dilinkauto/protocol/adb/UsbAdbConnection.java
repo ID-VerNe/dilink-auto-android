@@ -524,44 +524,45 @@ public class UsbAdbConnection {
 
     private void handleAuth(int type, byte[] data) {
         log("AUTH received: type=" + type + " (TOKEN=" + AdbProtocol.AUTH_TOKEN + ") dataLen=" + (data != null ? data.length : 0) + " signatureSent=" + authSignatureSent);
-        if (type == AdbProtocol.AUTH_TOKEN) {
-            if (!authSignatureSent) {
-                // First attempt: try signing the token with our stored key.
-                // If the phone has "Always allow" checked for this key, CNXN follows immediately.
-                // If not, the phone sends another AUTH_TOKEN, and we fall through to RSA public key.
-                //
-                // ADB sends a raw 20-byte token that must be treated as a PRE-HASHED
-                // SHA-1 digest (see [AdbCrypto.signAuthToken] for the rationale).
-                try {
-                    String fp = keyDiagInfo != null ? keyDiagInfo : "unknown";
-                    log("Signing AUTH_TOKEN with stored key (" + fp + ") using prehashed SHA-1");
-                    sendRaw(AdbProtocol.encodeAuth(AdbProtocol.AUTH_SIGNATURE,
-                            AdbCrypto.signAuthToken(keyPair.getPrivate(), data)));
-                    authSignatureSent = true;
-                    log("Sent AUTH_SIGNATURE — waiting for CNXN or second AUTH_TOKEN");
-                } catch (Exception e) {
-                    logE("Failed to sign auth token: " + e.getMessage());
-                }
-            } else {
-                // Signature was rejected — phone didn't recognize our key.
-                // Send our public key for user approval (phone shows "Allow USB debugging?" dialog).
-                logW("AUTH_SIGNATURE rejected — key not recognized by phone. Sending RSA public key for approval.");
-                try {
-                    byte[] pubKey = AdbCrypto.encodePublicKey(keyPair.getPublic());
-                    // Log key details for debugging key mismatch
-                    String keyPreview = new String(pubKey, 0, Math.min(40, pubKey.length));
-                    log("AUTH_RSAPUBLICKEY preview: [" + keyPreview + "...] len=" + pubKey.length
-                        + " last4=[" + (pubKey.length > 4 ? String.format("%02x%02x%02x%02x",
-                            pubKey[pubKey.length-4], pubKey[pubKey.length-3],
-                            pubKey[pubKey.length-2], pubKey[pubKey.length-1]) : "?") + "]");
-                    sendRaw(AdbProtocol.encodeAuth(AdbProtocol.AUTH_RSAPUBLICKEY, pubKey));
-                    log("Sent AUTH_RSAPUBLICKEY (pubKeyLen=" + pubKey.length + ") — user must approve on phone");
-                } catch (Exception e) {
-                    logE("Failed to encode public key: " + e.getMessage());
-                }
+        if (type != AdbProtocol.AUTH_TOKEN) {
+            logW("Unexpected AUTH type: " + type);
+            return;
+        }
+        if (!authSignatureSent) {
+            // First attempt: try signing the token with our stored key.
+            // If the phone has "Always allow" checked for this key, CNXN follows immediately.
+            // If not, the phone sends another AUTH_TOKEN, and we fall through to RSA public key.
+            //
+            // ADB sends a raw 20-byte token that must be treated as a PRE-HASHED
+            // SHA-1 digest (see [AdbCrypto.signAuthToken] for the rationale).
+            try {
+                String fp = keyDiagInfo != null ? keyDiagInfo : "unknown";
+                log("Signing AUTH_TOKEN with stored key (" + fp + ") using prehashed SHA-1");
+                // Reply sequencing shared with TcpAdbConnection (AdbCrypto.buildAuthReply).
+                AdbCrypto.AuthReply reply = AdbCrypto.buildAuthReply(type, data, keyPair, false);
+                sendRaw(AdbProtocol.encodeAuth(reply.authType, reply.payload));
+                authSignatureSent = true;
+                log("Sent AUTH_SIGNATURE — waiting for CNXN or second AUTH_TOKEN");
+            } catch (Exception e) {
+                logE("Failed to sign auth token: " + e.getMessage());
             }
         } else {
-            logW("Unexpected AUTH type: " + type);
+            // Signature was rejected — phone didn't recognize our key.
+            // Send our public key for user approval (phone shows "Allow USB debugging?" dialog).
+            logW("AUTH_SIGNATURE rejected — key not recognized by phone. Sending RSA public key for approval.");
+            try {
+                AdbCrypto.AuthReply reply = AdbCrypto.buildAuthReply(type, data, keyPair, true);
+                // Log key details for debugging key mismatch
+                String keyPreview = new String(reply.payload, 0, Math.min(40, reply.payload.length));
+                log("AUTH_RSAPUBLICKEY preview: [" + keyPreview + "...] len=" + reply.payload.length
+                    + " last4=[" + (reply.payload.length > 4 ? String.format("%02x%02x%02x%02x",
+                        reply.payload[reply.payload.length-4], reply.payload[reply.payload.length-3],
+                        reply.payload[reply.payload.length-2], reply.payload[reply.payload.length-1]) : "?") + "]");
+                sendRaw(AdbProtocol.encodeAuth(reply.authType, reply.payload));
+                log("Sent AUTH_RSAPUBLICKEY (pubKeyLen=" + reply.payload.length + ") — user must approve on phone");
+            } catch (Exception e) {
+                logE("Failed to encode public key: " + e.getMessage());
+            }
         }
     }
 
@@ -624,22 +625,20 @@ public class UsbAdbConnection {
             try {
                 byte[] privBytes = readFile(privFile);
                 byte[] pubBytes = readFile(pubFile);
-                KeyFactory kf = KeyFactory.getInstance("RSA");
-                PrivateKey priv = kf.generatePrivate(new PKCS8EncodedKeySpec(privBytes));
-                PublicKey pub = kf.generatePublic(new X509EncodedKeySpec(pubBytes));
-                String fp = AdbCrypto.fingerprint(pub.getEncoded());
+                // Keypair load/generate primitives live in AdbCrypto (shared with
+                // TcpAdbConnection); only the storage policy above stays USB-specific.
+                KeyPair kp = AdbCrypto.loadKeyPair(privBytes, pubBytes);
+                String fp = AdbCrypto.fingerprint(kp.getPublic().getEncoded());
                 keyDiagInfo = "LOADED path=" + privFile.getAbsolutePath() + " fp=" + fp;
                 log("Loaded existing ADB key pair (fingerprint=" + fp + ")");
-                return new KeyPair(pub, priv);
+                return kp;
             } catch (Exception e) {
                 logW("Failed to load key pair, generating new: " + e.getMessage());
             }
         }
 
         try {
-            KeyPairGenerator kpg = KeyPairGenerator.getInstance("RSA");
-            kpg.initialize(2048);
-            KeyPair kp = kpg.generateKeyPair();
+            KeyPair kp = AdbCrypto.generateKeyPair();
             writeFile(privFile, kp.getPrivate().getEncoded());
             writeFile(pubFile, kp.getPublic().getEncoded());
             String fp = AdbCrypto.fingerprint(kp.getPublic().getEncoded());

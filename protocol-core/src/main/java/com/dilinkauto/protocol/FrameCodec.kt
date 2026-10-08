@@ -19,7 +19,10 @@ import java.util.concurrent.locks.LockSupport
  * │ Payload     (N bytes)                   │  Message-specific data
  * └─────────────────────────────────────────┘
  *
- * Maximum payload size: 2 MB (sufficient for H.264 keyframes at 1080p)
+ * Maximum payload size: [MAX_PAYLOAD_SIZE] (128 MB) — a defensive cap, not a
+ * target. Real payloads top out at ~1-2 MB (H.264 keyframes at 1080p). This is
+ * separate from ADB's 256 KB transfer limit (`AdbProtocol.MAX_PAYLOAD`), which
+ * only applies inside the ADB stream, not to this TCP framing.
  */
 object FrameCodec {
 
@@ -55,10 +58,11 @@ object FrameCodec {
     private val headerLocal = ThreadLocal.withInitial { ByteArray(HEADER_SIZE) }
 
     /**
-     * Encode a frame's 6-byte header into [buf]. Shared by [writeFrame] and
-     * [writeFrameToChannel] so the byte layout lives in one place.
+     * Encode a frame's 6-byte header into [buf]. Shared by [writeFrame],
+     * [writeFrameToChannel] and the Connection write coroutine so the byte
+     * layout lives in one place.
      */
-    private fun encodeHeaderInto(buf: ByteArray, frame: Frame) {
+    internal fun encodeHeaderInto(buf: ByteArray, frame: Frame) {
         val frameLength = 2 + frame.payload.size
         buf[0] = (frameLength shr 24).toByte()
         buf[1] = (frameLength shr 16).toByte()
@@ -103,30 +107,50 @@ object FrameCodec {
      * @return The decoded frame, or null if the stream ended cleanly.
      * @throws ProtocolException if the frame is malformed.
      */
-    fun readFrame(input: InputStream): Frame? {
-        // Read frame length (4 bytes)
-        val lengthBuf = readExact(input, 4) ?: return null
-        val frameLength = ByteBuffer.wrap(lengthBuf)
-            .order(ByteOrder.BIG_ENDIAN)
-            .getInt()
+    fun readFrame(input: InputStream): Frame? = readFrameCore(
+        readLength = { readFrameLength(input) },
+        readBytes = { count -> readExact(input, count) }
+    )
 
+    /** Read the 4-byte big-endian frame length prefix, or null on clean EOF. */
+    private fun readFrameLength(input: InputStream): Int? {
+        val lengthBuf = readExact(input, 4) ?: return null
+        return ByteBuffer.wrap(lengthBuf).order(ByteOrder.BIG_ENDIAN).getInt()
+    }
+
+    /**
+     * Shared skeleton of the two blocking read paths ([readFrame] and
+     * [readFrameBlocking]): decode the length prefix, validate it, read the
+     * 2-byte channel/type pair and the payload through the caller's primitive
+     * readers, then assemble the frame.
+     *
+     * The suspend [readFrame] variant cannot share this core — Kotlin forbids
+     * invoking suspend lambdas from a blocking caller — so it reuses
+     * [validatePayloadSize] and [finishFrame] directly instead.
+     *
+     * @param readLength returns the 4-byte frame length, or null on clean EOF
+     * @param readBytes reads exactly N bytes, or returns null on EOF
+     */
+    private fun readFrameCore(readLength: () -> Int?, readBytes: (Int) -> ByteArray?): Frame? {
+        val frameLength = readLength() ?: return null
         val payloadSize = validatePayloadSize(frameLength)
 
-        // Read channel + type (2 bytes)
-        val chType = readExact(input, 2)
+        val chType = readBytes(2)
             ?: throw ProtocolException("Unexpected end of stream: missing channel/type")
+        val payload = if (payloadSize > 0) readBytes(payloadSize) else null
+        return finishFrame(payloadSize, chType[0], chType[1], payload)
+    }
 
-        // Read payload directly — no intermediate buffer + copyOfRange
-        val payload = if (payloadSize > 0) {
-            readExact(input, payloadSize)
-                ?: throw ProtocolException("Unexpected end of stream: expected $payloadSize bytes")
+    /**
+     * Shared tail of every read path: build the frame from the declared payload
+     * size plus the channel/type and payload that were already read. A null
+     * [payload] with a positive [payloadSize] means the stream ended mid-frame.
+     */
+    private fun finishFrame(payloadSize: Int, channelId: Byte, msgType: Byte, payload: ByteArray?): Frame {
+        val data = if (payloadSize > 0) {
+            payload ?: throw ProtocolException("Unexpected end of stream: expected $payloadSize bytes")
         } else ByteArray(0)
-
-        return Frame(
-            channel = chType[0],
-            messageType = chType[1],
-            payload = payload
-        )
+        return Frame(channelId, msgType, data)
     }
 
     /**
@@ -154,22 +178,17 @@ object FrameCodec {
      * Read a frame from a non-blocking NIO reader (blocking API, for non-coroutine callers).
      * Returns null on EOF.
      */
-    fun readFrameBlocking(reader: NioReader): Frame? {
-        val frameLength = reader.readIntOrNullBlocking() ?: return null
-        val payloadSize = validatePayloadSize(frameLength)
-
-        val channelId = reader.readByteBlocking()
-        val msgType = reader.readByteBlocking()
-
-        val payload = if (payloadSize > 0) {
-            ByteArray(payloadSize).also { reader.readFullyBlocking(it) }
-        } else ByteArray(0)
-
-        return Frame(channelId, msgType, payload)
-    }
+    fun readFrameBlocking(reader: NioReader): Frame? = readFrameCore(
+        readLength = { reader.readIntOrNullBlocking() },
+        readBytes = { count -> ByteArray(count).also { reader.readFullyBlocking(it) } }
+    )
 
     /**
      * Read a frame from a non-blocking NIO reader. Returns null on EOF.
+     *
+     * Shares [validatePayloadSize] / [finishFrame] with the blocking paths; the
+     * read sequence itself stays written out here because [NioReader]'s suspend
+     * primitives cannot be passed into [readFrameCore] from a coroutine.
      */
     suspend fun readFrame(reader: NioReader): Frame? {
         val frameLength = reader.readIntOrNull() ?: return null
@@ -185,9 +204,8 @@ object FrameCodec {
 
         val payload = if (payloadSize > 0) {
             ByteArray(payloadSize).also { reader.readFully(it) }
-        } else ByteArray(0)
-
-        return Frame(channelId, msgType, payload)
+        } else null
+        return finishFrame(payloadSize, channelId, msgType, payload)
     }
 
     /**

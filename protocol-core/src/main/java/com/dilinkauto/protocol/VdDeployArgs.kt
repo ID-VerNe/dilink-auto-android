@@ -39,12 +39,13 @@ object VdDeployArgs {
         val encodeScale = minOf(1f, MAX_ENCODE_WIDTH.toFloat() / encodeWidth, MAX_ENCODE_HEIGHT.toFloat() / encodeHeight)
         val ew = DimAlign.even((encodeWidth * encodeScale).toInt())
         val eh = DimAlign.even((encodeHeight * encodeScale).toInt())
-        val br = if (bitrate in MIN_BITRATE..MAX_BITRATE) bitrate else VideoConfig.DEFAULT_BITRATE
+        // 输入校验范围有意比 UI 范围宽（见 VideoConfig 的分层说明），
+        // 让手工写过的旧配置继续可部署。
+        val br = if (bitrate in VideoConfig.INPUT_MIN_BITRATE..VideoConfig.INPUT_MAX_BITRATE) {
+            bitrate
+        } else VideoConfig.DEFAULT_BITRATE
         return "$vdWidth $vdHeight $dpi $phoneHost $ew $eh $fps $br"
     }
-
-    const val MIN_BITRATE = 500_000
-    const val MAX_BITRATE = 20_000_000
 
     /**
      * Coerce a raw DPI override to the valid range, with 0 = Auto (no override).

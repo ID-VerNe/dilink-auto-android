@@ -20,4 +20,14 @@ object AppPrefs {
     // Phone-side log toggle (SettingsScreen toggles, FileLog + ConnectionService read)
     const val LOG_ENABLED = "log_enabled"
     const val LOG_ENABLED_USER_SET = "log_enabled_user_set"
+
+    // Car-side session/settings state (CarConnectionService reads+writes).
+    // The desktop app mirrors these same key names in DesktopSettings for
+    // config parity — keep both ends resolving to these constants.
+    const val USER_DISCONNECTED = "user_disconnected"
+    const val DEV_MODE = "dev_mode"
+    const val STARTUP_DPI = "startup_dpi"
+    const val STARTUP_FPS = "startup_fps"
+    const val STARTUP_BITRATE = "startup_bitrate"
+    const val DEV_PHONE_IP = "dev_phone_ip"
 }

@@ -4,18 +4,13 @@ import java.io.Closeable
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.security.KeyFactory
 import java.security.KeyPair
-import java.security.KeyPairGenerator
 import java.security.PrivateKey
-import java.security.PublicKey
-import java.security.Signature
-import java.security.spec.PKCS8EncodedKeySpec
-import java.security.spec.X509EncodedKeySpec
 
 /**
  * Persistent ADB connection over TCP that reuses a single socket for all commands.
@@ -164,14 +159,17 @@ class TcpAdbConnection(
     data class AdbMessage(val command: Int, val arg0: Int, val arg1: Int, val data: ByteArray?)
 
     private fun readMessage(): AdbMessage {
-        val header = ByteArray(24)
+        val header = ByteArray(AdbProtocol.HEADER_SIZE)
         readFully(header)
-        val buf = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN)
-        val command = buf.getInt()
-        val arg0 = buf.getInt()
-        val arg1 = buf.getInt()
-        val dataLen = buf.getInt()
-        // skip checksum and magic
+        // Shared 24-byte header parser (also used by UsbAdbConnection). Unlike the
+        // previous inline parse, it validates magic == command ^ 0xFFFFFFFF and
+        // this path now fails fast on a malformed header instead of accepting it.
+        val parsed = AdbProtocol.parseHeader(header)
+            ?: throw IOException("Malformed ADB header (bad magic)")
+        val command = parsed[0]
+        val arg0 = parsed[1]
+        val arg1 = parsed[2]
+        val dataLen = parsed[3]
         val data = if (dataLen > 0) {
             val d = ByteArray(dataLen)
             readFully(d)
@@ -196,18 +194,11 @@ class TcpAdbConnection(
     // -- AUTH (delegated to AdbCrypto; shared with UsbAdbConnection) --
 
     private fun handleAuth(type: Int, data: ByteArray, keyPair: KeyPair) {
-        if (type == AdbProtocol.AUTH_TOKEN) {
-            if (!authSignatureSent) {
-                // Sign token with stored key (SHA-1 DigestInfo + NONEwithRSA)
-                writeRaw(AdbProtocol.encodeAuth(AdbProtocol.AUTH_SIGNATURE,
-                    AdbCrypto.signAuthToken(keyPair.private, data)))
-                authSignatureSent = true
-            } else {
-                // Signature rejected — send public key for user approval
-                writeRaw(AdbProtocol.encodeAuth(AdbProtocol.AUTH_RSAPUBLICKEY,
-                    AdbCrypto.encodePublicKey(keyPair.public)))
-            }
-        }
+        // Reply sequencing (sign token first, public key on the second challenge)
+        // is shared with UsbAdbConnection via AdbCrypto.buildAuthReply.
+        val reply = AdbCrypto.buildAuthReply(type, data, keyPair, authSignatureSent) ?: return
+        writeRaw(AdbProtocol.encodeAuth(reply.authType, reply.payload))
+        authSignatureSent = true
     }
 
     private fun writeRaw(data: ByteArray) {
@@ -231,10 +222,9 @@ class TcpAdbConnection(
 
         if (privFile.exists() && pubFile.exists()) {
             return try {
-                val kf = KeyFactory.getInstance("RSA")
-                val pubKey = kf.generatePublic(X509EncodedKeySpec(readKeyBytes(pubFile)))
-                val privKey = kf.generatePrivate(PKCS8EncodedKeySpec(readKeyBytes(privFile)))
-                KeyPair(pubKey, privKey)
+                // Keypair load/generate primitives live in AdbCrypto (shared with
+                // UsbAdbConnection); only the PEM/DER storage format differs here.
+                AdbCrypto.loadKeyPair(readKeyBytes(privFile), readKeyBytes(pubFile))
             } catch (e: Exception) {
                 generateAndStore(privFile, pubFile)
             }
@@ -257,8 +247,7 @@ class TcpAdbConnection(
     }
 
     private fun generateAndStore(privFile: File, pubFile: File): KeyPair {
-        val kpg = KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }
-        val kp = kpg.generateKeyPair()
+        val kp = AdbCrypto.generateKeyPair()
         // Save in PEM format (compatible with both PEM-aware and direct readers).
         // Dadb reads PEM; the AdbCrypto auth path only ever uses the in-memory
         // KeyPair, so the on-disk format is chosen for Dadb compatibility.

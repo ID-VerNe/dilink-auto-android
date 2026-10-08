@@ -8,13 +8,13 @@ package com.dilinkauto.protocol
  * *mutually incompatible* behaviours (see DRY-1 in docs/audit-srp-dry.md):
  *
  *  - `x and 0x7FFFFFFE` — clear the low bit. 0 stays 0, 1 becomes 0.
- *    Used by [VdDeployArgs], `VdDimensions`, `CarConnectionService.getViewportSize`.
+ *    Used by [VdDeployArgs], `VdDimensions`, `CarViewport.size` (car side).
  *  - floor-to-even then `coerceAtLeast(2)` — same as above but floored at 2,
  *    because the encoder rejects anything below 2. Used by the desktop
  *    [com.dilinkauto.desktop.HandshakeFactory].
  *  - "widen the nav bar by one so the *viewport* lands even" — rounds the
  *    subtraction *up*, the opposite direction. Used by
- *    `CarConnectionService.navBarWidthPx`.
+ *    `CarViewport.navBarWidthPx`.
  *
  * The three disagree on 0/1 inputs and on negatives, and the nav-bar variant
  * can never produce a 0/1 dimension — which is exactly why its divergence was

@@ -6,9 +6,35 @@ package com.dilinkauto.protocol
  */
 object VideoConfig {
     const val TARGET_FPS = 24  // 24fps: 42ms/frame budget on weak A53+Adreno 505; cuts WiFi/GPU/allocation 20% vs 30fps
-    const val DEFAULT_BITRATE = 4_000_000 // 4 Mbps CBR default
+
+    // ─── Bitrate bounds, layered on purpose ───
+    // All bitrate limits live here so the four consumers (settings UI, deploy
+    // argv validation, runtime adaptive controller, encoder default) cannot
+    // drift into four different value sets again.
+
+    /** Default / start bitrate for the video pipeline (CBR). */
+    const val DEFAULT_BITRATE = 4_000_000 // 4 Mbps
+
+    /** UI-accepted range for the settings screens' bitrate field. */
     const val MIN_BITRATE = 1_000_000     // 1 Mbps
     const val MAX_BITRATE = 12_000_000    // 12 Mbps
+
+    /**
+     * Deployment argv validation range — deliberately wider than the UI range
+     * so older configs and manually-edited values keep deploying.
+     * (Consumed by [VdDeployArgs.format].)
+     */
+    const val INPUT_MIN_BITRATE = 500_000
+    const val INPUT_MAX_BITRATE = 20_000_000
+
+    /**
+     * Quality floor for the runtime adaptive bitrate controller. Higher than
+     * [MIN_BITRATE]: below ~1.5 Mbps the decoder picture on the car becomes
+     * visibly unusable, which is worse than the controller just not throttling
+     * further. (Consumed by `AdaptiveBitrate` in vd-server.)
+     */
+    const val ADAPTIVE_MIN_BITRATE = 1_500_000
+
     const val FRAME_INTERVAL_MS = 1000L / TARGET_FPS  // ~42ms at 24fps
     const val VIRTUAL_DISPLAY_DPI = 480  // legacy fallback constant
     const val TARGET_SW_DP = 600  // smallest-width dp for VD size calculation

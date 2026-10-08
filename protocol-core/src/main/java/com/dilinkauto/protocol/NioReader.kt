@@ -74,31 +74,28 @@ class NioReader(
 
     /**
      * Fill the buffer until at least [needed] bytes are available.
-     * Uses Selector.select() for instant wakeup when data arrives (no polling delay).
      * Returns false on EOF, true when enough data is ready.
+     *
+     * Coroutine variant of the shared fill loop: same read/wait primitives as
+     * [fillOrEofBlocking], plus periodic logging and cooperative cancellation
+     * ([yield] + isActive check) around the selector wait.
      */
     private suspend fun fillOrEof(needed: Int): Boolean {
         growIfNeeded(needed)
         // Read from channel until we have enough
         while (buf.remaining() < needed) {
-            buf.compact()
-            val n = channel.read(buf)
-            buf.flip()
+            val n = readIntoBuffer()
             if (n == -1) return false
             if (n == 0) {
-                // No data available — wait for data using Selector (instant wakeup)
+                // No data available — log periodically, then wait for data
+                // using Selector (instant wakeup).
                 noDataCount++
                 if (noDataCount % 100 == 1L) {
                     PlatformLog.d("NioReader", "no data #$noDataCount: needed=$needed remaining=${buf.remaining()} capacity=${buf.capacity()}")
                 }
                 yield() // cooperate with coroutine cancellation
-                try {
-                    if (!coroutineContext.isActive || !selector.isOpen) return false
-                    selector.select(selectTimeoutMs) // blocks thread until data or timeout
-                    if (selector.isOpen) selector.selectedKeys().clear()
-                } catch (_: ClosedSelectorException) {
-                    return false
-                }
+                if (!coroutineContext.isActive) return false
+                if (!awaitReadable()) return false
             }
         }
         return true
@@ -147,21 +144,42 @@ class NioReader(
     private fun fillOrEofBlocking(needed: Int): Boolean {
         growIfNeeded(needed)
         while (buf.remaining() < needed) {
-            buf.compact()
-            val n = channel.read(buf)
-            buf.flip()
+            val n = readIntoBuffer()
             if (n == -1) return false
             if (n == 0) {
-                try {
-                    if (!selector.isOpen) return false
-                    selector.select(selectTimeoutMs)
-                    if (selector.isOpen) selector.selectedKeys().clear()
-                } catch (_: ClosedSelectorException) {
-                    return false
-                }
+                if (!awaitReadable()) return false
             }
         }
         return true
+    }
+
+    // ── Shared fill primitives (used by both the coroutine and blocking loops) ──
+
+    /**
+     * One non-blocking read attempt into the internal buffer.
+     * Returns bytes read, 0 when no data is pending, -1 on EOF.
+     */
+    private fun readIntoBuffer(): Int {
+        buf.compact()
+        val n = channel.read(buf)
+        buf.flip()
+        return n
+    }
+
+    /**
+     * Block the calling thread on the selector until data arrives (or the
+     * select timeout expires). Returns false when the selector was closed —
+     * i.e. [close]/disconnect ran concurrently, which counts as EOF.
+     */
+    private fun awaitReadable(): Boolean {
+        return try {
+            if (!selector.isOpen) return false
+            selector.select(selectTimeoutMs) // blocks thread until data or timeout
+            if (selector.isOpen) selector.selectedKeys().clear()
+            true
+        } catch (_: ClosedSelectorException) {
+            false
+        }
     }
 
     /**
