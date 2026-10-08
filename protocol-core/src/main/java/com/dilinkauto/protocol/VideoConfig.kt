@@ -7,6 +7,10 @@ package com.dilinkauto.protocol
 object VideoConfig {
     const val TARGET_FPS = 24  // 24fps: 42ms/frame budget on weak A53+Adreno 505; cuts WiFi/GPU/allocation 20% vs 30fps
 
+    /** UI-accepted frame-rate range for the settings screens' FPS field. */
+    const val MIN_FPS = 10
+    const val MAX_FPS = 60
+
     // ─── Bitrate bounds, layered on purpose ───
     // All bitrate limits live here so the four consumers (settings UI, deploy
     // argv validation, runtime adaptive controller, encoder default) cannot
