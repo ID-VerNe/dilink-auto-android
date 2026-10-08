@@ -30,9 +30,6 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -43,6 +40,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.dilinkauto.server.R
 import com.dilinkauto.server.service.CarConnectionService
+import com.dilinkauto.server.ui.theme.SuccessColor
+import com.dilinkauto.server.ui.theme.WarningColor
 
 /**
  * Full-screen launch / connection screen — no nav bar, connection-focused.
@@ -56,15 +55,34 @@ fun CarLaunchScreen(service: CarConnectionService) {
     val state by service.state.collectAsState()
     val phoneName by service.phoneName.collectAsState()
     val statusMessage by service.statusMessage.collectAsState()
-    var devMode by remember { mutableStateOf(service.devMode) }
-    var startupDpi by remember { mutableStateOf(service.startupDpi) }
-    var startupFps by remember { mutableStateOf(service.startupFps) }
-    var startupBitrate by remember { mutableStateOf(service.startupBitrate) }
+    // Observed, not shadowed — CarPrefs owns the persisted values (SRP-06).
+    val devMode by service.carPrefs.devModeFlow.collectAsState()
+    val startupDpi by service.carPrefs.startupDpiFlow.collectAsState()
+    val startupFps by service.carPrefs.startupFpsFlow.collectAsState()
+    val startupBitrate by service.carPrefs.startupBitrateFlow.collectAsState()
+
+    // Both layouts below render the very same card; hoisting the wiring here
+    // keeps the 11-argument call and its callbacks in one place.
+    val statusCard: @Composable () -> Unit = {
+        ConnectionStatusCard(
+            state = state,
+            phoneName = phoneName,
+            statusMessage = statusMessage,
+            devMode = devMode,
+            onDevModeChange = { service.carPrefs.devMode = it },
+            startupDpi = startupDpi,
+            onStartupDpiChange = { service.carPrefs.startupDpi = it },
+            startupFps = startupFps,
+            onStartupFpsChange = { service.setStartupFps(it) },
+            startupBitrate = startupBitrate,
+            onStartupBitrateChange = { service.carPrefs.startupBitrate = it }
+        )
+    }
 
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color(0xFF0D1117))
+            .background(MaterialTheme.colorScheme.background)
     ) {
         BoxWithConstraints(
             modifier = Modifier.fillMaxSize().padding(40.dp),
@@ -98,31 +116,7 @@ fun CarLaunchScreen(service: CarConnectionService) {
                         modifier = Modifier.weight(1f),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        ConnectionStatusCard(
-                            state = state,
-                            phoneName = phoneName,
-                            statusMessage = statusMessage,
-                            devMode = devMode,
-                            onDevModeChange = { newValue ->
-                                devMode = newValue
-                                service.devMode = newValue
-                            },
-                            startupDpi = startupDpi,
-                            onStartupDpiChange = { newValue ->
-                                startupDpi = newValue
-                                service.startupDpi = newValue
-                            },
-                            startupFps = startupFps,
-                            onStartupFpsChange = { newValue ->
-                                startupFps = newValue
-                                service.startupFps = newValue
-                            },
-                            startupBitrate = startupBitrate,
-                            onStartupBitrateChange = { newValue ->
-                                startupBitrate = newValue
-                                service.startupBitrate = newValue
-                            }
-                        )
+                        statusCard()
 
                         if (devMode && (state == CarConnectionService.State.IDLE ||
                                     state == CarConnectionService.State.CONNECTING)) {
@@ -145,31 +139,7 @@ fun CarLaunchScreen(service: CarConnectionService) {
                 ) {
                     BrandingSection()
                     Spacer(Modifier.height(32.dp))
-                    ConnectionStatusCard(
-                        state = state,
-                        phoneName = phoneName,
-                        statusMessage = statusMessage,
-                        devMode = devMode,
-                        onDevModeChange = { newValue ->
-                            devMode = newValue
-                            service.devMode = newValue
-                        },
-                        startupDpi = startupDpi,
-                        onStartupDpiChange = { newValue ->
-                            startupDpi = newValue
-                            service.startupDpi = newValue
-                        },
-                        startupFps = startupFps,
-                        onStartupFpsChange = { newValue ->
-                            startupFps = newValue
-                            service.startupFps = newValue
-                        },
-                        startupBitrate = startupBitrate,
-                        onStartupBitrateChange = { newValue ->
-                            startupBitrate = newValue
-                            service.startupBitrate = newValue
-                        }
-                    )
+                    statusCard()
 
                     if (devMode && (state == CarConnectionService.State.IDLE ||
                                 state == CarConnectionService.State.CONNECTING)) {
@@ -236,7 +206,7 @@ private fun ConnectionStatusCard(
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF161B22))
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
     ) {
         Column(modifier = Modifier.padding(20.dp)) {
             Row(
@@ -249,9 +219,9 @@ private fun ConnectionStatusCard(
                         .size(12.dp)
                         .background(
                             when (state) {
-                                CarConnectionService.State.STREAMING -> Color(0xFF4CAF50)
-                                CarConnectionService.State.CONNECTED -> Color(0xFFFFA726)
-                                CarConnectionService.State.CONNECTING -> Color(0xFFFFA726)
+                                CarConnectionService.State.STREAMING -> SuccessColor
+                                CarConnectionService.State.CONNECTED -> WarningColor
+                                CarConnectionService.State.CONNECTING -> WarningColor
                                 else -> MaterialTheme.colorScheme.onSurfaceVariant
                             },
                             RoundedCornerShape(6.dp)
@@ -314,7 +284,7 @@ private fun ConnectionStatusCard(
                         Text(
                             if (devMode) stringResource(R.string.dev_mode_desc_on)
                             else stringResource(R.string.dev_mode_desc_off),
-                            color = if (devMode) Color(0xFFFFA726) else MaterialTheme.colorScheme.onSurfaceVariant,
+                            color = if (devMode) WarningColor else MaterialTheme.colorScheme.onSurfaceVariant,
                             style = MaterialTheme.typography.bodySmall
                         )
                     }
@@ -322,7 +292,7 @@ private fun ConnectionStatusCard(
                         checked = devMode,
                         onCheckedChange = onDevModeChange,
                         colors = SwitchDefaults.colors(
-                            checkedTrackColor = Color(0xFFFFA726)
+                            checkedTrackColor = WarningColor
                         )
                     )
                 }
@@ -412,7 +382,7 @@ private fun HowToConnect() {
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF161B22))
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
     ) {
         Column(modifier = Modifier.padding(20.dp)) {
             Text(

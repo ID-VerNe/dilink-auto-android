@@ -12,8 +12,9 @@ import java.util.concurrent.Executors
  *
  * A dedicated single-thread executor keeps touch encoding off the UI thread
  * and serializes sends so the input channel's frame ordering stays stable.
- * Drop/send counters gate log spam: only the first 3 and every 100th event is
- * logged, which keeps the phone log readable during a touch storm.
+ * Drop/send counters gate log spam via [shouldLog]: the first few events
+ * ([SEND_LOG_FIRST] sends / [DROP_LOG_FIRST] drops) and every [LOG_EVERY]-th
+ * are logged, which keeps the phone log readable during a touch storm.
  *
  * Extracted from [CarConnectionService].
  */
@@ -28,6 +29,14 @@ internal class CarTouchSender(
     private var dropCount = 0L
     private var sendCount = 0L
 
+    /**
+     * Log-spam gate (audit R3-DRY-22): log the first [firstN] events, then
+     * every [LOG_EVERY]-th. Single definition — the predicate used to be
+     * written out four times, in two variants that could drift apart.
+     */
+    private fun shouldLog(count: Long, firstN: Long): Boolean =
+        count <= firstN || count % LOG_EVERY == 0L
+
     fun sendTouchEvent(event: TouchEvent) {
         val conn = checkConn("Touch") ?: return
         val payload = event.encode()
@@ -35,7 +44,7 @@ internal class CarTouchSender(
             try {
                 conn.sendInput(event.action, payload)
                 sendCount++
-                if (sendCount <= 5 || sendCount % 100 == 0L) {
+                if (shouldLog(sendCount, SEND_LOG_FIRST)) {
                     log("Touch #$sendCount action=${event.action} ptr=${event.pointerId} x=${"%.2f".format(event.x)} y=${"%.2f".format(event.y)}", "I")
                 }
             } catch (e: Exception) { log("Touch send failed: ${e.message}", "W") }
@@ -49,7 +58,7 @@ internal class CarTouchSender(
             try {
                 conn.sendInput(InputMsg.TOUCH_MOVE_BATCH, payload)
                 sendCount++
-                if (sendCount <= 5 || sendCount % 100 == 0L) {
+                if (shouldLog(sendCount, SEND_LOG_FIRST)) {
                     log("Touch batch #$sendCount (${pointers.size} pointers)", "I")
                 }
             } catch (e: Exception) { log("Touch batch send failed: ${e.message}", "W") }
@@ -57,23 +66,22 @@ internal class CarTouchSender(
     }
 
     /**
-     * Shared null-conn + not-connected check with the `<= 3 || % 100` drop-gate.
-     * Returns the connection if usable, or null after bumping dropCount and
-     * logging the reason. Both public send methods route through this so the
-     * gating predicate lives in one place.
+     * Shared null-conn + not-connected check. Returns the connection if usable,
+     * or null after bumping dropCount and logging the reason. Both public send
+     * methods route through this so the gating predicate lives in one place.
      */
     private fun checkConn(label: String): Connection? {
         val conn = inputConnectionProvider()
         if (conn == null) {
             dropCount++
-            if (dropCount <= 3 || dropCount % 100 == 0L) {
+            if (shouldLog(dropCount, DROP_LOG_FIRST)) {
                 log("$label DROP #$dropCount: inputConnection=null state=${stateProvider()}", "I")
             }
             return null
         }
         if (!conn.isConnected) {
             dropCount++
-            if (dropCount <= 3 || dropCount % 100 == 0L) {
+            if (shouldLog(dropCount, DROP_LOG_FIRST)) {
                 log("$label DROP #$dropCount: inputConnection not connected", "I")
             }
             return null
@@ -88,4 +96,15 @@ internal class CarTouchSender(
     }
 
     fun shutdown() { executor.shutdownNow() }
+
+    private companion object {
+        /** First N successful sends are always logged (session start is interesting). */
+        const val SEND_LOG_FIRST = 5L
+
+        /** First N drops are always logged — fewer than sends, drops repeat verbatim. */
+        const val DROP_LOG_FIRST = 3L
+
+        /** After the first few, log every Nth event. */
+        const val LOG_EVERY = 100L
+    }
 }

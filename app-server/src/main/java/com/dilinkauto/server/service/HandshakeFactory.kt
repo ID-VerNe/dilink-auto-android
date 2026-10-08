@@ -25,7 +25,7 @@ internal fun buildHandshakeRequest(
     bitrate: Int = 0
 ): HandshakeRequest {
     val pi = context.packageManager.getPackageInfo(context.packageName, 0)
-    // Dimensions arrive pre-aligned from the caller (getViewportSize), because
+    // Dimensions arrive pre-aligned from the caller (CarViewport.size), because
     // on this side the nav bar makes the correct direction "widen the bar" —
     // the opposite of the desktop's floor. Aligning again here would undo it.
     return HandshakeRequest.builder()

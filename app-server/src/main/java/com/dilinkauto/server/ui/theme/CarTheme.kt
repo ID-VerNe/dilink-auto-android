@@ -8,6 +8,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
+import com.dilinkauto.protocol.UiPalette
 
 /**
  * Car-optimized dark theme.
@@ -15,15 +16,15 @@ import androidx.compose.ui.unit.sp
  */
 
 val CarDark = darkColorScheme(
-    primary = Color(0xFF4FC3F7),
-    onPrimary = Color.Black,
-    secondary = Color(0xFF1A73E8),
+    primary = Color(UiPalette.PRIMARY),
+    onPrimary = Color(UiPalette.ON_PRIMARY),
+    secondary = Color(UiPalette.SECONDARY),
     tertiary = Color(0xFF4CAF50),
-    background = Color(0xFF0D1117),
-    surface = Color(0xFF161B22),
+    background = Color(UiPalette.BACKGROUND),
+    surface = Color(UiPalette.SURFACE),
     surfaceVariant = Color(0xFF1E2430),
-    onBackground = Color.White,
-    onSurface = Color.White,
+    onBackground = Color(UiPalette.ON_BACKGROUND),
+    onSurface = Color(UiPalette.ON_SURFACE),
     onSurfaceVariant = Color(0xFFAAAAAA),
     error = Color(0xFFEF5350)
 )
@@ -53,3 +54,33 @@ val NavigationColor = Color(0xFF4CAF50)
 val MusicColor = Color(0xFFE91E63)
 val CommunicationColor = Color(0xFF2196F3)
 val OtherColor = Color(0xFF9E9E9E)
+
+// ── Semantic state colors (audit R3-DRY-06) ──
+//
+// Screens used to hard-code the same hex literals (0xFFFFA726, 0x161B22, …) in
+// 20+ places, so a tweak to one indicator never reached the others. New call
+// sites must use these tokens instead of raw Color(0xFF...) values.
+
+/** Streaming / success indicators (green). */
+val SuccessColor = Color(0xFF4CAF50)
+
+/** Connecting / pending / attention / dev-mode highlights (amber). */
+val WarningColor = Color(0xFFFFA726)
+
+/** Informational icon tint (blue). */
+val InfoColor = Color(0xFF64B5F6)
+
+/** Pinned-item icon tint (yellow). */
+val PinnedColor = Color(0xFFFFD54F)
+
+/** Chrome background of the persistent nav bars / now-playing bar — one step darker than [CarDark]'s background. */
+val NavBarBackgroundColor = Color(0xFF0A0E14)
+
+/** Unselected choice-chip container. */
+val ChipUnselectedColor = Color(0xFF21262D)
+
+/** Elevated card container used by the settings screen. */
+val CardElevatedColor = Color(0xFF1A2332)
+
+/** Unfocused text-field border. */
+val OutlineBorderColor = Color(0xFF2A2F3A)

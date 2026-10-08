@@ -37,7 +37,10 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.dilinkauto.server.R
+import com.dilinkauto.server.data.ManualConnectState
 import com.dilinkauto.server.service.CarConnectionService
+import com.dilinkauto.server.ui.theme.SuccessColor
+import com.dilinkauto.server.ui.theme.WarningColor
 
 /**
  * Connection-status panel shown inside [HomeContent] when the link is not yet
@@ -84,7 +87,7 @@ fun ConnectionStatus(
                 }
                 CarConnectionService.State.CONNECTING -> {
                     CircularProgressIndicator(
-                        color = Color(0xFFFFA726),
+                        color = WarningColor,
                         modifier = Modifier.size(48.dp)
                     )
                     Spacer(Modifier.height(24.dp))
@@ -98,7 +101,7 @@ fun ConnectionStatus(
                     Icon(
                         Icons.Default.PhoneAndroid,
                         contentDescription = null,
-                        tint = Color(0xFF4CAF50),
+                        tint = SuccessColor,
                         modifier = Modifier.size(48.dp)
                     )
                     Spacer(Modifier.height(24.dp))
@@ -124,12 +127,10 @@ fun ConnectionStatus(
 @Composable
 fun ManualConnectBox(onConnect: (String) -> Unit) {
     val context = LocalContext.current
-    val prefs = remember { context.getSharedPreferences(com.dilinkauto.protocol.AppPrefs.FILE_NAME, android.content.Context.MODE_PRIVATE) }
-    val savedIp = remember { prefs.getString("last_manual_ip", null) }
-    val gatewayIp = remember { com.dilinkauto.server.adb.WifiGatewayProbe.gatewayIpOr(context) }
-    var ipAddress by remember {
-        mutableStateOf(savedIp ?: gatewayIp.ifEmpty { "192.168.43.1" })
-    }
+    // Prefs + gateway probing live in the state holder (SRP-08); this box only
+    // binds to its default and writes the last-used address back through it.
+    val manualConnect = remember(context) { ManualConnectState(context) }
+    var ipAddress by remember { mutableStateOf(manualConnect.defaultIp) }
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -164,7 +165,7 @@ fun ManualConnectBox(onConnect: (String) -> Unit) {
                     onClick = {
                         val ip = ipAddress.trim()
                         if (ip.isNotBlank()) {
-                            prefs.edit().putString("last_manual_ip", ip).apply()
+                            manualConnect.remember(ip)
                             onConnect(ip)
                         }
                     },

@@ -9,14 +9,14 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.dilinkauto.server.R
-import com.dilinkauto.server.service.CarConnectionService
+import com.dilinkauto.server.service.CarViewport
+import com.dilinkauto.server.ui.theme.NavBarBackgroundColor
 
 /**
  * Persistent navigation bar — always visible during streaming mode.
@@ -37,37 +37,58 @@ private fun rememberNavBarSize(): Dp {
     val screenWidthPx = LocalConfiguration.current.screenWidthDp.let {
         (it * density.density).toInt()
     }
-    val navBarPx = CarConnectionService.navBarWidthPx(density.density, screenWidthPx)
+    val navBarPx = CarViewport.navBarWidthPx(density.density, screenWidthPx)
     return with(density) { navBarPx.toDp() }
 }
 
-/** The three NavActionButtons (Home, Back, Eject) in a fixed order. */
+/** Stable identity of the three nav actions, independent of display order. */
+private enum class NavAction { Home, Back, Eject }
+
+/**
+ * The three nav actions (Home, Back, Eject) for both layouts (audit R3-DRY-16).
+ *
+ * The rail renders them Home/Back/Eject top-down; the bottom bar renders them
+ * reversed (Eject/Home/Back) so that rotating the device keeps each button on
+ * the same physical side. [modifier] supplies the per-layout sizing (vertical
+ * padding for the rail, `weight(1f)` for the bar), so the button set itself
+ * stays defined in one place.
+ */
 @Composable
 private fun NavActionButtons(
     onBack: () -> Unit,
     onHome: () -> Unit,
     onDisconnect: () -> Unit,
-    modifierFor: (Int) -> Modifier
+    reverse: Boolean = false,
+    modifier: Modifier = Modifier
 ) {
-    NavActionButton(
-        icon = Icons.Default.Home,
-        label = stringResource(R.string.nav_home),
-        onClick = onHome,
-        modifier = modifierFor(0)
-    )
-    NavActionButton(
-        icon = Icons.Default.ArrowBack,
-        label = stringResource(R.string.nav_back),
-        onClick = onBack,
-        modifier = modifierFor(1)
-    )
-    NavActionButton(
-        icon = Icons.Default.LinkOff,
-        label = stringResource(R.string.nav_eject),
-        onClick = onDisconnect,
-        tint = MaterialTheme.colorScheme.error,
-        modifier = modifierFor(2)
-    )
+    val order = if (reverse) {
+        listOf(NavAction.Eject, NavAction.Home, NavAction.Back)
+    } else {
+        listOf(NavAction.Home, NavAction.Back, NavAction.Eject)
+    }
+    for (action in order) {
+        when (action) {
+            NavAction.Home -> NavActionButton(
+                icon = Icons.Default.Home,
+                label = stringResource(R.string.nav_home),
+                onClick = onHome,
+                modifier = modifier
+            )
+            NavAction.Back -> NavActionButton(
+                icon = Icons.Default.ArrowBack,
+                label = stringResource(R.string.nav_back),
+                onClick = onBack,
+                modifier = modifier
+            )
+            NavAction.Eject -> NavActionButton(
+                icon = Icons.Default.LinkOff,
+                label = stringResource(R.string.nav_eject),
+                onClick = onDisconnect,
+                tint = MaterialTheme.colorScheme.error,
+                modifier = modifier
+            )
+        }
+    }
 }
 
 @Composable
@@ -85,12 +106,12 @@ fun PersistentNavBar(
         modifier = modifier
             .width(navBarDp)
             .fillMaxHeight()
-            .background(Color(0xFF0A0E14))
+            .background(NavBarBackgroundColor)
             .padding(vertical = 12.dp, horizontal = 4.dp)
     ) {
         NavActionButtons(
             onBack = onBack, onHome = onHome, onDisconnect = onDisconnect,
-            modifierFor = { Modifier.padding(vertical = 4.dp) }
+            modifier = Modifier.padding(vertical = 4.dp)
         )
     }
 }
@@ -110,28 +131,14 @@ fun PersistentBottomNavBar(
         modifier = modifier
             .fillMaxWidth()
             .height(navBarDp)
-            .background(Color(0xFF0A0E14))
+            .background(NavBarBackgroundColor)
             .padding(horizontal = 12.dp, vertical = 4.dp)
     ) {
-        // Order is reversed on the bottom bar (Eject, Home, Back) to mirror the
-        // rail's top-down order when rotated. modifierFor applies the weight.
-        NavActionButton(
-            icon = Icons.Default.LinkOff,
-            label = stringResource(R.string.nav_eject),
-            onClick = onDisconnect,
-            tint = MaterialTheme.colorScheme.error,
-            modifier = Modifier.weight(1f)
-        )
-        NavActionButton(
-            icon = Icons.Default.Home,
-            label = stringResource(R.string.nav_home),
-            onClick = onHome,
-            modifier = Modifier.weight(1f)
-        )
-        NavActionButton(
-            icon = Icons.Default.ArrowBack,
-            label = stringResource(R.string.nav_back),
-            onClick = onBack,
+        // Reversed order on the bottom bar (Eject, Home, Back) to mirror the
+        // rail's top-down order when rotated; weight(1f) spreads the three keys.
+        NavActionButtons(
+            onBack = onBack, onHome = onHome, onDisconnect = onDisconnect,
+            reverse = true,
             modifier = Modifier.weight(1f)
         )
     }

@@ -21,9 +21,9 @@ import com.dilinkauto.protocol.*
 import com.dilinkauto.server.R
 import com.dilinkauto.server.ServerApp
 import com.dilinkauto.server.CarCrashHandler
+import com.dilinkauto.server.CarCrashReport
 import com.dilinkauto.server.adb.RemoteAdbController
 import com.dilinkauto.server.adb.WifiGatewayProbe
-import com.dilinkauto.protocol.DimAlign
 import com.dilinkauto.protocol.adb.UsbAdbConnection
 import com.dilinkauto.server.decoder.VideoDecoder
 import kotlinx.coroutines.*
@@ -56,35 +56,22 @@ class CarConnectionService : Service() {
     private lateinit var notifier: ForegroundNotifier
     private var consecutiveFailures = 0
     private var usbAdb: UsbAdbConnection? = null
-    private var userDisconnected: Boolean
-        get() = prefs.getBoolean("user_disconnected", false)
-        set(value) = prefs.edit().putBoolean("user_disconnected", value).apply()
-
-    var devMode: Boolean
-        get() = prefs.getBoolean("dev_mode", false)
-        set(value) = prefs.edit().putBoolean("dev_mode", value).apply()
+    /**
+     * SharedPreferences facade (audit R3-SRP-01 item 9) — owns every pref key this
+     * service touches. Lazy construction: a Service's field initializers run before
+     * `attachBaseContext`, and opening the prefs file needs the base context.
+     */
+    internal val carPrefs: CarPrefs by lazy { CarPrefs(this) }
 
     /**
-     * Car-side startup DPI override. 0 = auto-calibrate via VideoConfig.calculateOptimalDpi
-     * (the portrait-app-safe cap, default). Non-zero in [120, 480] bypasses the cap and is
-     * sent to the phone as `dpiOverride` in HandshakeRequest; the phone uses it verbatim and
-     * echoes it back as `vdDpi`. Read at handshake construction time, so a change takes effect
-     * on the next connect (or mid-stream rotation re-handshake), not live.
+     * Persist a new startup FPS *and* apply it to the live [targetFps], so the
+     * running decoder and the next handshake pick it up immediately. DPI/bitrate
+     * have no live counterpart — they are read at handshake construction time.
      */
-    var startupDpi: Int
-        get() = prefs.getInt("startup_dpi", 0)
-        set(value) = prefs.edit().putInt("startup_dpi", value).apply()
-
-    var startupFps: Int
-        get() = prefs.getInt("startup_fps", VideoConfig.TARGET_FPS)
-        set(value) {
-            prefs.edit().putInt("startup_fps", value).apply()
-            targetFps = value
-        }
-
-    var startupBitrate: Int
-        get() = prefs.getInt("startup_bitrate", VideoConfig.DEFAULT_BITRATE)
-        set(value) = prefs.edit().putInt("startup_bitrate", value).apply()
+    fun setStartupFps(value: Int) {
+        carPrefs.startupFps = value
+        targetFps = value
+    }
 
     // ─── Handshake ───
     internal var handshakeVdDpi = VideoConfig.VIRTUAL_DISPLAY_DPI // DPI from phone (may be adjusted for DeX)
@@ -114,9 +101,6 @@ class CarConnectionService : Service() {
 
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private val usbPermissionAction = "com.dilinkauto.server.USB_PERMISSION"
-
-    /** Shared prefs accessor — centralizes the file-name + mode so it isn't repeated per field. */
-    private val prefs get() = getSharedPreferences(AppPrefs.FILE_NAME, MODE_PRIVATE)
 
     private val usbReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -194,7 +178,9 @@ class CarConnectionService : Service() {
             title = getString(R.string.notification_title),
             text = { ctx, res -> ctx.getString(res) }
         )
-        targetFps = startupFps
+        // carPrefs initialises its observable mirrors from the persisted values,
+        // so the UI renders the stored settings from its first frame (SRP-06).
+        targetFps = carPrefs.startupFps
         logWriter.setEnabled(com.dilinkauto.server.BuildConfig.DEBUG)
         logWriter.start()
         videoDecoder.logSink = { msg -> carLogSend(msg) }
@@ -223,7 +209,7 @@ class CarConnectionService : Service() {
         CarCrashHandler.logSink = { msg -> carLogSend(msg) }
 
         // Log device info for diagnostics
-        carLogSend(CarCrashHandler.buildDeviceInfo(this))
+        carLogSend(CarCrashReport.deviceInfo(this))
 
         // Send any crash report from the previous run
         val crash = CarCrashHandler.consumePendingCrash()
@@ -274,7 +260,7 @@ class CarConnectionService : Service() {
                 val host = intent.getStringExtra(EXTRA_HOST) ?: return START_STICKY
                 val port = intent.getIntExtra(EXTRA_PORT, Ports.DEFAULT_PORT)
                 startForeground(NOTIFICATION_ID, buildNotification(R.string.notification_searching))
-                userDisconnected = false
+                carPrefs.userDisconnected = false
                 _state.value = State.CONNECTING
                 connectToPhone(host, port)
             }
@@ -288,7 +274,7 @@ class CarConnectionService : Service() {
     }
 
     fun connectManual(host: String, port: Int = Ports.DEFAULT_PORT) {
-        userDisconnected = false
+        carPrefs.userDisconnected = false
         _state.value = State.CONNECTING
         connectToPhone(host, port)
         startUsbTrack()  // dev mode TCP ADB or USB ADB
@@ -318,7 +304,7 @@ class CarConnectionService : Service() {
         resetAdbReadiness()
 
         logWriter.setEnabled(com.dilinkauto.server.BuildConfig.DEBUG)  // Reset to default each session
-        userDisconnected = false
+        carPrefs.userDisconnected = false
         _state.value = State.CONNECTING
         _statusMessage.value = getString(R.string.status_connecting)
         updateNotification(R.string.notification_searching)
@@ -431,19 +417,10 @@ class CarConnectionService : Service() {
                 carLogSend("Control connected to $host:$port — sending handshake")
 
                 val displayMetrics = resources.displayMetrics
-                val vp = getViewportSize(displayMetrics.widthPixels, displayMetrics.heightPixels, displayMetrics.density)
+                val vp = CarViewport.size(displayMetrics.widthPixels, displayMetrics.heightPixels, displayMetrics.density)
                 val viewportWidth = vp.first
                 val viewportHeight = vp.second
-                val handshake = buildHandshakeRequest(
-                    context = this@CarConnectionService,
-                    screenWidth = viewportWidth,
-                    screenHeight = viewportHeight,
-                    screenDpi = displayMetrics.densityDpi,
-                    targetFps = targetFps,
-                    dpiOverride = startupDpi,
-                    bitrate = startupBitrate
-                )
-                ctrl.sendControl(ControlMsg.HANDSHAKE_REQUEST, handshake.encode())
+                sendHandshake(ctrl, viewportWidth, viewportHeight, displayMetrics.densityDpi)
                 handshakeDone = true  // Stop gateway/mDNS retry loops immediately
 
                 withContext(Dispatchers.Main) { updateNotification(R.string.notification_connected) }
@@ -458,6 +435,27 @@ class CarConnectionService : Service() {
                 handleDisconnect()
             }
         }
+    }
+
+    /**
+     * Build + send a HANDSHAKE_REQUEST on [ctrl].
+     *
+     * Shared by the initial connect path and the mid-stream re-handshake: both
+     * pass the same viewport/DPI and read the same persisted settings, so the
+     * request fields cannot drift between the two call sites (they had
+     * converged by hand before; this makes it structural).
+     */
+    private fun sendHandshake(ctrl: Connection, widthPx: Int, heightPx: Int, dpi: Int) {
+        val handshake = buildHandshakeRequest(
+            context = this,
+            screenWidth = widthPx,
+            screenHeight = heightPx,
+            screenDpi = dpi,
+            targetFps = targetFps,
+            dpiOverride = carPrefs.startupDpi,
+            bitrate = carPrefs.startupBitrate
+        )
+        ctrl.sendControl(ControlMsg.HANDSHAKE_REQUEST, handshake.encode())
     }
 
     /**
@@ -512,7 +510,7 @@ class CarConnectionService : Service() {
  * `adbController.isConnected` separately, and `startConnection` must not, or it
  * would undo the restart it just triggered.
  */
-private fun resetAdbReadiness() {
+    private fun resetAdbReadiness() {
         if (usbAdb?.isConnected != true) {
             usbReady = false
             // Only reset if there is no ADB instance at all; a non-null usbAdb
@@ -549,7 +547,7 @@ private fun resetAdbReadiness() {
 
     private fun startUsbTrack() {
         if (usbReady) return // Already connected
-        if (devMode) {
+        if (carPrefs.devMode) {
             carLogSend("Development mode active — using TCP ADB instead of USB")
             startTcpAdbTrack()
             return
@@ -686,7 +684,7 @@ private fun resetAdbReadiness() {
 
     private fun onUsbDeviceAttached(device: UsbDevice) {
         if (UsbAdbConnection.findAdbInterface(device) == null) return
-        userDisconnected = false
+        carPrefs.userDisconnected = false
 
         val usbManager = getSystemService(USB_SERVICE) as UsbManager
         if (usbManager.hasPermission(device)) {
@@ -951,12 +949,12 @@ private fun resetAdbReadiness() {
      */
     fun onCarViewportChanged(widthPx: Int, heightPx: Int, dpi: Int) {
         val dm = resources.displayMetrics
-        val vp = getViewportSize(widthPx, heightPx, dm.density)
+        val vp = CarViewport.size(widthPx, heightPx, dm.density)
         val newVpW = vp.first
         val newVpH = vp.second
         if (newVpW == vdWidth && newVpH == vdHeight) return
         if (_state.value != State.STREAMING && _state.value != State.CONNECTED) return
-val ctrl = controlConnection ?: return
+        val ctrl = controlConnection ?: return
         if (!ctrl.isConnected) return
         carLogSend("Car viewport changed -> re-handshake ${newVpW}x${newVpH} (was ${vdWidth}x${vdHeight})")
         // rehandshakeOnExistingControl is suspend; this entry point is not.
@@ -979,7 +977,7 @@ val ctrl = controlConnection ?: return
         }
         if (_state.value != State.STREAMING && _state.value != State.CONNECTED) return
         carLogSend("[BLACK] re-handshake at current viewport ${vdWidth}x$vdHeight")
-        rehandshakeOnExistingControl(ctrl, vdWidth, vdHeight, startupDpi)
+        rehandshakeOnExistingControl(ctrl, vdWidth, vdHeight, carPrefs.startupDpi)
     }
 
     /**
@@ -1027,17 +1025,8 @@ val ctrl = controlConnection ?: return
         _state.value = State.CONNECTING
         _statusMessage.value = getString(R.string.status_starting_vd)
 
-        val handshake = buildHandshakeRequest(
-            context = this@CarConnectionService,
-            screenWidth = newVpW,
-            screenHeight = newVpH,
-            screenDpi = dpi,
-            targetFps = targetFps,
-            dpiOverride = startupDpi,
-            bitrate = startupBitrate
-        )
         try {
-            ctrl.sendControl(ControlMsg.HANDSHAKE_REQUEST, handshake.encode())
+            sendHandshake(ctrl, newVpW, newVpH, dpi)
         } catch (e: Exception) {
             carLogSend("Re-handshake send failed: ${e.message}")
             handleDisconnect()
@@ -1061,7 +1050,7 @@ val ctrl = controlConnection ?: return
 
     fun disconnectFromPhone() {
         carLogSend("User disconnect — will not auto-reconnect")
-        userDisconnected = true
+        carPrefs.userDisconnected = true
         scope.launch(Dispatchers.IO) {
             try { controlConnection?.sendControl(ControlMsg.DISCONNECT) } catch (_: Exception) {}
             disconnectAllConnections()
@@ -1110,7 +1099,7 @@ val ctrl = controlConnection ?: return
         // be connected even though no USB device is present.
         if (adbController?.isConnected == true) usbReady = true
 
-        if (userDisconnected) {
+        if (carPrefs.userDisconnected) {
             _state.value = State.IDLE
             // Don't clear userDisconnected — persisted until USB re-plug or manual START
             usbReady = false
@@ -1136,7 +1125,7 @@ val ctrl = controlConnection ?: return
                 else (500L * (1L shl (consecutiveFailures - 1).coerceAtMost(4))).coerceAtMost(8000L)
             carLogSend("Reconnect backoff: ${backoffMs}ms (failures=$consecutiveFailures)")
             delay(backoffMs)
-            if (_state.value == State.IDLE && !userDisconnected) {
+            if (_state.value == State.IDLE && !carPrefs.userDisconnected) {
                 startConnection()
             }
         }
@@ -1157,8 +1146,8 @@ val ctrl = controlConnection ?: return
 
     private fun getWifiGatewayIp(): String? {
         // Dev mode: check for manual phone IP in SharedPreferences first
-        if (devMode) {
-            val devIp = prefs.getString("dev_phone_ip", null)
+        if (carPrefs.devMode) {
+            val devIp = carPrefs.devPhoneIp
             if (!devIp.isNullOrBlank()) return devIp
         }
         return WifiGatewayProbe.gatewayIp(this)
@@ -1208,23 +1197,8 @@ val ctrl = controlConnection ?: return
         const val EXTRA_HOST = "host"
         const val EXTRA_PORT = "port"
         const val NOTIFICATION_ID = 2001
-        const val NAV_BAR_TARGET_DP = 76f
 
-        fun getViewportSize(widthPx: Int, heightPx: Int, density: Float): Pair<Int, Int> {
-            val isLandscape = widthPx > heightPx
-            val navBarPx = navBarWidthPx(density, if (isLandscape) widthPx else heightPx)
-            val viewportWidth = if (isLandscape) widthPx - navBarPx else widthPx
-            val viewportHeight = if (isLandscape) heightPx else heightPx - navBarPx
-            return Pair(DimAlign.even(viewportWidth), DimAlign.even(viewportHeight))
-        }
-
-        fun navBarWidthPx(density: Float, screenWidthPx: Int): Int {
-            val targetPx = (NAV_BAR_TARGET_DP * density).toInt()
-            // The viewport is `screenWidthPx - navBarPx`, so the bar is the only
-            // value we may nudge to land on an even viewport — it must be widened,
-            // not narrowed. Rounds the offset UP, unlike DimAlign.even.
-            return DimAlign.offsetForEvenRemainder(screenWidthPx, targetPx)
-        }
+        // Viewport geometry lives in [CarViewport] (audit R3-SRP-01 item 11).
     }
 }
 

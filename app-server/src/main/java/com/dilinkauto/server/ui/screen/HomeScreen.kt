@@ -70,11 +70,15 @@ import com.dilinkauto.protocol.MediaAction
 import com.dilinkauto.protocol.PlaybackState
 import com.dilinkauto.server.R
 import com.dilinkauto.server.ServerApp
+import com.dilinkauto.server.data.PinnedAppsRepository
 import com.dilinkauto.server.service.CarConnectionService
 import com.dilinkauto.server.ui.theme.CommunicationColor
+import com.dilinkauto.server.ui.theme.InfoColor
 import com.dilinkauto.server.ui.theme.MusicColor
 import com.dilinkauto.server.ui.theme.NavigationColor
 import com.dilinkauto.server.ui.theme.OtherColor
+import com.dilinkauto.server.ui.theme.OutlineBorderColor
+import com.dilinkauto.server.ui.theme.PinnedColor
 import kotlin.math.max
 
 /**
@@ -169,15 +173,13 @@ fun AppGrid(
     val gridState = rememberLazyGridState()
 
     val context = LocalContext.current
-    val prefs = remember { context.getSharedPreferences("dilinkauto_pinned", android.content.Context.MODE_PRIVATE) }
-    var pinnedApps by remember {
-        mutableStateOf(prefs.getStringSet("pinned_apps", emptySet())?.toSet() ?: emptySet())
-    }
+    val pinnedRepo = remember(context) { PinnedAppsRepository(context) }
+    // Local observable copy — this state only drives recomposition; the
+    // persistence itself is the repository's job (SRP-07).
+    var pinnedApps by remember { mutableStateOf(pinnedRepo.load()) }
 
     val togglePin: (String) -> Unit = { pkg ->
-        val newPinned = if (pinnedApps.contains(pkg)) pinnedApps - pkg else pinnedApps + pkg
-        pinnedApps = newPinned
-        prefs.edit().putStringSet("pinned_apps", newPinned).apply()
+        pinnedApps = pinnedRepo.toggle(pkg)
     }
 
     val filteredApps = remember(apps, searchQuery, pinnedApps) {
@@ -253,7 +255,7 @@ fun AppGrid(
                 focusedTextColor = Color.White,
                 unfocusedTextColor = Color.White,
                 focusedBorderColor = MaterialTheme.colorScheme.primary,
-                unfocusedBorderColor = Color(0xFF2A2F3A),
+                unfocusedBorderColor = OutlineBorderColor,
                 cursorColor = MaterialTheme.colorScheme.primary
             )
         )
@@ -354,7 +356,7 @@ fun AppTile(
                     Icon(
                         if (data.isPinned) Icons.Default.PushPin else Icons.Outlined.PushPin,
                         null,
-                        tint = Color(0xFFFFD54F),
+                        tint = PinnedColor,
                         modifier = Modifier.size(28.dp)
                     )
                 },
@@ -382,7 +384,7 @@ fun AppTile(
                     onAppInfo()
                 },
                 leadingIcon = {
-                    Icon(Icons.Default.Info, null, tint = Color(0xFF64B5F6), modifier = Modifier.size(28.dp))
+                    Icon(Icons.Default.Info, null, tint = InfoColor, modifier = Modifier.size(28.dp))
                 },
                 modifier = Modifier.padding(vertical = 4.dp)
             )

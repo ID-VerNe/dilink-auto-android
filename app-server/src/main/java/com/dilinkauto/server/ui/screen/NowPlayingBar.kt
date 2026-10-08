@@ -24,6 +24,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.dilinkauto.protocol.MediaMetadata
 import com.dilinkauto.protocol.PlaybackState
+import com.dilinkauto.server.ui.theme.NavBarBackgroundColor
 
 /**
  * Bottom bar showing the current media track and transport controls.
@@ -40,7 +41,7 @@ fun NowPlayingBar(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .background(Color(0xFF0A0E14))
+            .background(NavBarBackgroundColor)
             .padding(horizontal = 24.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {

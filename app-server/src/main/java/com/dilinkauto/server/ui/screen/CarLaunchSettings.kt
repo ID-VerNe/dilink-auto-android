@@ -35,6 +35,9 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.dilinkauto.server.R
+import com.dilinkauto.server.ui.theme.CardElevatedColor
+import com.dilinkauto.server.ui.theme.ChipUnselectedColor
+import com.dilinkauto.server.ui.theme.WarningColor
 
 /**
  * Settings row + WiFi-ADB setup card from the car launch screen.
@@ -73,7 +76,7 @@ internal fun SettingSection(
                     Spacer(Modifier.width(8.dp))
                     Text(
                         currentValueText,
-                        color = Color(0xFFFFA726),
+                        color = WarningColor,
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Bold
                     )
@@ -125,7 +128,7 @@ internal fun SettingSection(
                     onClick = { onPresetSelected(value) },
                     shape = RoundedCornerShape(8.dp),
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = if (isSelected) MaterialTheme.colorScheme.primary else Color(0xFF21262D),
+                        containerColor = if (isSelected) MaterialTheme.colorScheme.primary else ChipUnselectedColor,
                         contentColor = if (isSelected) Color.White else MaterialTheme.colorScheme.onSurfaceVariant
                     ),
                     modifier = Modifier.height(30.dp),
@@ -152,12 +155,12 @@ internal fun WifiAdbSetupCard() {
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF1A2332))
+        colors = CardDefaults.cardColors(containerColor = CardElevatedColor)
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
             Text(
                 stringResource(R.string.wifi_adb_setup_title),
-                color = Color(0xFFFFA726),
+                color = WarningColor,
                 style = MaterialTheme.typography.titleSmall
             )
             Spacer(Modifier.height(8.dp))

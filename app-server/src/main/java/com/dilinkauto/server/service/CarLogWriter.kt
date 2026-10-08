@@ -1,13 +1,13 @@
 package com.dilinkauto.server.service
 
 import android.util.Log
+import com.dilinkauto.protocol.AsyncLogQueue
 import com.dilinkauto.protocol.Connection
 import com.dilinkauto.protocol.DataMsg
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
@@ -32,8 +32,8 @@ internal class CarLogWriter(
 ) {
     private data class LogEntry(val msg: String, val level: String)
 
-    /** Off-thread log queue: callers do a non-blocking trySend. */
-    private val logQueue = Channel<LogEntry>(1024)
+    /** Off-thread log queue: callers do a non-blocking offer; bounded at 1024. */
+    private val logQueue = AsyncLogQueue<LogEntry>(1024)
     private val writerJob = Job()
     private val scope = CoroutineScope(writerJob + Dispatchers.IO)
 
@@ -58,7 +58,7 @@ internal class CarLogWriter(
         started = true
         scope.launch {
             try {
-                for (entry in logQueue) {
+                logQueue.consume { entry ->
                     try {
                         val ts = LocalTime.now().format(tsFormatter)
                         val line = com.dilinkauto.protocol.LogLine.bracketed(ts, entry.level, entry.msg)
@@ -99,7 +99,7 @@ internal class CarLogWriter(
             "E" -> Log.e(tag, msg)
             else -> Log.i(tag, msg)
         }
-        logQueue.trySend(LogEntry(msg, level))
+        logQueue.offer(LogEntry(msg, level))
     }
 
     /** Cancel the writer coroutine. Called from [CarConnectionService.shutdown]. */

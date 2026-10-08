@@ -2,7 +2,6 @@ package com.dilinkauto.server.ui.screen
 
 import android.util.Log
 import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -26,11 +25,9 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import com.dilinkauto.server.R
 import com.dilinkauto.server.service.CarConnectionService
 import com.dilinkauto.server.ui.nav.PersistentBottomNavBar
@@ -80,35 +77,10 @@ fun CarShell(service: CarConnectionService) {
         currentScreen = Screen.APP
     }
 
-    // App info dialog
+    // App info dialog (layout in AppInfoDialog, audit R3-SRP-19)
     val appInfoData by service.appInfoData.collectAsState()
-    if (appInfoData != null) {
-        val info = appInfoData!!
-        val dateStr = remember(info.installTime) {
-            java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.getDefault())
-                .format(java.util.Date(info.installTime))
-        }
-        AlertDialog(
-            onDismissRequest = { service.clearAppInfoData() },
-            title = { Text(info.appName, color = Color.White, fontSize = 20.sp) },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    InfoRow("Package", info.packageName)
-                    InfoRow("Version", info.versionName)
-                    InfoRow("Version code", info.versionCode.toString())
-                    InfoRow("Target SDK", info.targetSdk.toString())
-                    InfoRow("Installed", dateStr)
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = { service.clearAppInfoData() }) {
-                    Text("OK", fontSize = 16.sp)
-                }
-            },
-            containerColor = MaterialTheme.colorScheme.surface,
-            titleContentColor = Color.White,
-            textContentColor = MaterialTheme.colorScheme.onSurfaceVariant
-        )
+    appInfoData?.let { info ->
+        AppInfoDialog(info = info, onDismiss = { service.clearAppInfoData() })
     }
 
     if (showStreamingMode) {
@@ -211,24 +183,5 @@ private fun CarContentArea(
             }
             currentScreen == Screen.HOME -> HomeContent(service = service, onAppClick = launchApp)
         }
-    }
-}
-
-@Composable
-private fun InfoRow(label: String, value: String) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween
-    ) {
-        Text(
-            "$label:",
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            fontSize = 14.sp
-        )
-        Text(
-            value,
-            color = Color.White,
-            fontSize = 14.sp
-        )
     }
 }
