@@ -1,7 +1,6 @@
 package com.dilinkauto.client.service
 
 import android.content.Context
-import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import com.dilinkauto.client.FileLog
@@ -32,9 +31,7 @@ internal class AllowlistSeeder(
     fun seedIfNeeded(pm: PackageManager, prefs: SharedPreferences) {
         if (prefs.getBoolean(configuredKey, false)) return
 
-        val installedLauncher = pm.queryIntentActivities(
-            Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0
-        ).map { it.activityInfo.packageName }.toSet()
+        val installedLauncher = LauncherApps.queryInstalledPackageNames(pm)
 
         val seed = DEFAULT_MAP_PACKAGES.intersect(installedLauncher)
         prefs.edit()

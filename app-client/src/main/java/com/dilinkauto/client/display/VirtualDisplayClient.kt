@@ -3,6 +3,7 @@ package com.dilinkauto.client.display
 import com.dilinkauto.client.FileLog
 import com.dilinkauto.protocol.FrameCodec
 import com.dilinkauto.protocol.NioReader
+import com.dilinkauto.protocol.VdLifecycle
 import kotlinx.coroutines.*
 import java.net.InetSocketAddress
 import java.nio.ByteBuffer
@@ -97,7 +98,7 @@ class VirtualDisplayClient(
 
                 // Read MSG_DISPLAY_READY from VD
                 val msgType = rdr.readByte()
-                if (msgType == MSG_DISPLAY_READY) {
+                if (msgType == VdLifecycle.MSG_DISPLAY_READY) {
                     displayId = rdr.readInt()
                     val flags = rdr.readByte()
                     hasDirectInjection = (flags.toInt() and 1) != 0
@@ -135,7 +136,7 @@ class VirtualDisplayClient(
                     val msgType = rdr.readByte()
 
                     when (msgType) {
-                        MSG_STACK_EMPTY -> {
+                        VdLifecycle.MSG_STACK_EMPTY -> {
                             FileLog.i(TAG, "VD stack empty")
                             onStackEmpty?.invoke()
                         }
@@ -169,7 +170,7 @@ class VirtualDisplayClient(
         return try {
             synchronized(writeLock) {
                 writeBuf.clear()
-                writeBuf.put(CMD_STOP.toByte())
+                writeBuf.put(VdLifecycle.CMD_STOP.toByte())
                 writeBuf.flip()
                 FrameCodec.writeAll(ch, writeBuf)
             }
@@ -202,11 +203,7 @@ class VirtualDisplayClient(
         private const val TAG = "VirtualDisplayClient"
         // Port the VD server reverse-connects to. Matches Ports.LIFECYCLE_PORT.
         const val SERVER_PORT = com.dilinkauto.protocol.Ports.LIFECYCLE_PORT
-
-        // Must match VirtualDisplayServer constants
-        private const val MSG_DISPLAY_READY: Byte = 0x10
-        private const val MSG_STACK_EMPTY: Byte = 0x11
-
-        private const val CMD_STOP = 0xFF
+        // Lifecycle wire constants (MSG_DISPLAY_READY / MSG_STACK_EMPTY / CMD_STOP)
+        // live in com.dilinkauto.protocol.VdLifecycle — shared with vd-server.
     }
 }

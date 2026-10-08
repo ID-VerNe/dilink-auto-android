@@ -32,9 +32,8 @@ class ConnectionService : Service() {
     @Volatile private var controlConnection: Connection? = null
     @Volatile private var vdClient: VirtualDisplayClient? = null
     private var pendingAppLaunch: String? = null
-    private var vdWaitJob: Job? = null
     private var handshakeJob: Job? = null
-    private var targetFps = 30
+    private var targetFps = VideoConfig.TARGET_FPS
     private var targetBitrate = VideoConfig.DEFAULT_BITRATE
     private var serviceRegistration: Discovery.ServiceRegistration? = null
     private var connectionLoopJob: Job? = null
@@ -268,7 +267,7 @@ class ConnectionService : Service() {
                 stopSelf()
             }
             ACTION_INSTALL_CAR -> {
-                val explicitIp = intent?.getStringExtra("car_ip")
+                val explicitIp = intent.getStringExtra("car_ip")
                 installCarApp(explicitIp)
             }
             ACTION_ALLOWLIST_UPDATED -> {
@@ -527,18 +526,29 @@ class ConnectionService : Service() {
                 background = true
             )
 
-            ShizukuManager.execAndWait(plan.killCommand)
-            // Do NOT launch a second engine while the old one may still be alive.
-            // Two instances race for the same VirtualDisplay / DTA / 9638-9639
-            // binds, and the loser skips cleanup() entirely — a leaked VD per
-            // reconnect. Wait for a real exit before starting the new one.
-            if (!ShizukuManager.waitForVdServerExit(VD_EXIT_WAIT_MS)) {
-                FileLog.w(TAG, "Previous VD server did not exit within ${VD_EXIT_WAIT_MS}ms — forcing kill")
-                ShizukuManager.execAndWait(VdDeploy.stopCommand)
-                ShizukuManager.waitForVdServerExit(VD_EXIT_WAIT_MS)
-            }
+            // Order, convergence rule and the force-kill fallback all live in
+            // the shared deploy sequence (protocol-core) so this path can no
+            // longer drift from the car's two ADB paths or the desktop path.
+            val executor = object : VdDeployExecutor {
+                override suspend fun shellSync(command: String) {
+                    ShizukuManager.execAndWait(command)
+                }
 
-            ShizukuManager.execBackground(plan.launchCommand)
+                override suspend fun launch(command: String): Boolean {
+                    // Fire-and-forget: Shizuku tracks the parent sh PID, not the
+                    // engine, so there is no launch status to observe here. The
+                    // `setsid ... &` form in the plan (background=true) keeps the
+                    // engine alive past the parent sh's exit — see VdDeploy.commandLine.
+                    ShizukuManager.execBackground(command)
+                    return true
+                }
+
+                override suspend fun probe(): VdProbeResult = ShizukuManager.probeVdServer()
+            }
+            val outcome = vdRunDeploySequence(plan, executor)
+            if (outcome.forcedKill) {
+                FileLog.w(TAG, "Previous VD server did not exit in time — forced kill used")
+            }
             // 打出 jar CRC：测试时可直接从日志确认这次跑的是哪一版引擎，
             // 避免"装了新 APK 却跑旧代码"无从查证。
             FileLog.i(TAG, "VD server started via Shizuku: ${vdWidth}x$vdHeight @${dpi}dpi jarCrc=$jarCrc")
@@ -583,35 +593,6 @@ class ConnectionService : Service() {
     }
 
 
-    // ─── App List ───
-
-    // ─── App Shortcuts ───
-
-    private fun sendAppInfoData(packageName: String) {
-        val conn = controlConnection ?: return
-        serviceScope.launch(Dispatchers.IO) {
-            try {
-                val pm = packageManager
-                val pi = pm.getPackageInfo(packageName, 0)
-                val ai = pm.getApplicationInfo(packageName, 0)
-                val appName = pm.getApplicationLabel(ai).toString()
-                val msg = AppInfoDataMessage(
-                    packageName = packageName,
-                    appName = appName,
-                    versionName = pi.versionName ?: "",
-                    versionCode = if (android.os.Build.VERSION.SDK_INT >= 28)
-                        pi.longVersionCode else pi.versionCode.toLong(),
-                    installTime = pi.firstInstallTime,
-                    targetSdk = pi.applicationInfo.targetSdkVersion
-                )
-                conn.sendData(DataMsg.APP_INFO_DATA, msg.encode())
-                FileLog.i(TAG, "Sent app info for $packageName v${pi.versionName}")
-            } catch (e: Exception) {
-                FileLog.w(TAG, "Failed to query/send app info for $packageName: ${e.message}")
-            }
-        }
-    }
-
     // ─── Cleanup ───
 
     /**
@@ -645,8 +626,6 @@ class ConnectionService : Service() {
         FileLog.i(TAG, "cleanupSession: tearing down session")
         handshakeJob?.cancel()
         handshakeJob = null
-        vdWaitJob?.cancel()
-        vdWaitJob = null
         // Graceful stop: CMD_STOP first so the engine's readLifecycleCommands()
         // sets running=false and its finally block runs cleanup() (releases the
         // VD, restores IME + letterbox + screen settings, re-powers the panel).
@@ -721,9 +700,6 @@ class ConnectionService : Service() {
         const val ALLOWLIST_PACKAGES_KEY = "allowed_packages"
         const val ALLOWLIST_CONFIGURED_KEY = "allowlist_configured"
         const val NOTIFICATION_ID = 1001
-
-        /** How long to wait for the previous vd-server process to actually exit. */
-        private const val VD_EXIT_WAIT_MS = 3000L
 
         /** Propagate log toggle to car. Called from settings UI and onCreate. */
         fun setLogEnabled(context: android.content.Context, enabled: Boolean) {

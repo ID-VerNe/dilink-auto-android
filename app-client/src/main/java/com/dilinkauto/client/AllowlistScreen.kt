@@ -24,6 +24,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.dilinkauto.client.service.ConnectionService
+import com.dilinkauto.client.service.LauncherApps
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -46,8 +47,7 @@ fun AllowlistScreen(onBack: () -> Unit) {
     var apps by remember { mutableStateOf<List<AllowRow>>(emptyList()) }
     LaunchedEffect(Unit) {
         apps = withContext(Dispatchers.IO) {
-            val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-            pm.queryIntentActivities(intent, 0)
+            LauncherApps.queryResolveInfos(pm)
                 .map { it.activityInfo.packageName to it.loadLabel(pm).toString() }
                 .distinctBy { it.first }
                 .map { AllowRow(it.first, it.second) }
@@ -162,14 +162,7 @@ fun AllowlistScreen(onBack: () -> Unit) {
                         }
                         if (icon != null) {
                             val bmp = remember(row.pkg) {
-                                (icon as? android.graphics.drawable.BitmapDrawable)?.bitmap
-                                    ?: run {
-                                        val b = android.graphics.Bitmap.createBitmap(28, 28, android.graphics.Bitmap.Config.ARGB_8888)
-                                        val canvas = android.graphics.Canvas(b)
-                                        icon.setBounds(0, 0, 28, 28)
-                                        icon.draw(canvas)
-                                        b
-                                    }
+                                IconRenderer.toBitmap(icon, 28, rescale = false)
                             }
                             Icon(
                                 painter = BitmapPainter(bmp.asImageBitmap()),

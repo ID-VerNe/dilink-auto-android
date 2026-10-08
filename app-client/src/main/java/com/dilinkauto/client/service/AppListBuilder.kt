@@ -1,12 +1,7 @@
 package com.dilinkauto.client.service
 
 import android.content.Context
-import android.content.Intent
-import android.content.SharedPreferences
-import android.content.pm.PackageManager
-import com.dilinkauto.client.ClientApp
 import com.dilinkauto.client.FileLog
-import com.dilinkauto.protocol.AppCategory
 import com.dilinkauto.protocol.AppInfo
 import com.dilinkauto.protocol.AppListMessage
 import com.dilinkauto.protocol.Connection
@@ -21,67 +16,28 @@ import kotlinx.coroutines.launch
  * The list is filtered by the user's allowlist (see [com.dilinkauto.client.AllowlistScreen])
  * before going on the wire, so the car only receives selected packages — shrinking
  * the wire payload and the car's icon-decode work. Icon data is sent once per
- * package per session ([lastSentIconHash] suppresses unchanged icons); the
- * car's AppIconCache persists them across sessions.
+ * package per session ([IconHashGate]); the car's AppIconCache persists them
+ * across sessions.
+ *
+ * List assembly lives in [AppInfoProvider] and the icon suppression in
+ * [IconHashGate] (audit R3-SRP-18); this class keeps the allowlist filter and
+ * the send.
  */
 internal class AppListBuilder(
     private val context: Context,
     private val scope: CoroutineScope
 ) {
-    // Tracks the last icon hash sent per package — survives across reconnections
-    // within the same service lifetime to avoid re-sending unchanged icons.
-    private val lastSentIconHash = mutableMapOf<String, String>()
+    private val appInfoProvider = AppInfoProvider(context)
+    private val iconGate = IconHashGate()
 
     /** Re-send the app list to the car. No-op if [conn] is null. */
     fun sendAppList(conn: Connection?) {
         if (conn == null) return
-        val pm = context.packageManager
 
         scope.launch(Dispatchers.IO) {
             try {
-                val allApps = pm.queryIntentActivities(
-                    Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0
-                ).filter { info ->
-                    // Skip hidden apps (Xiaomi HyperOS, some custom ROMs disable
-                    // the launcher component without removing the package)
-                    val pkg = info.activityInfo.packageName
-                    val cn = android.content.ComponentName(pkg, info.activityInfo.name)
-                    val state = pm.getComponentEnabledSetting(cn)
-                    state != PackageManager.COMPONENT_ENABLED_STATE_DISABLED
-                }.map { info ->
-                    val pkg = info.activityInfo.packageName
-                    // Use lastUpdateTime as a lightweight change indicator.
-                    // The car-side AppIconCache handles persistence, multi-size
-                    // resizing, and in-memory Bitmap caching.
-                    val hash = try {
-                        pm.getPackageInfo(pkg, 0).lastUpdateTime.toString()
-                    } catch (_: Exception) { "" }
-                    // Only include icon data if the hash differs from last sent
-                    val prevHash = lastSentIconHash[pkg]
-                    val iconPng = if (hash.isNotEmpty() && hash == prevHash) {
-                        ByteArray(0) // car can use its cached icon
-                    } else {
-                        lastSentIconHash[pkg] = hash
-                        ClientApp.loadIconPng(pm, pkg, 192)
-                    }
-                    AppInfo(
-                        pkg,
-                        info.loadLabel(pm).toString(),
-                        AppCategorizer.categorize(pkg),
-                        iconPng,
-                        hash
-                    )
-                }.sortedBy { it.category.id }
-
-                // Apply the user's car-app allowlist: only selected packages reach the car,
-                // shrinking the wire payload and the car's icon-decode work. On first run
-                // the allowlist is pre-seeded with common map apps that are actually installed.
-                val prefs = context.getSharedPreferences(ConnectionService.ALLOWLIST_PREFS, Context.MODE_PRIVATE)
-                if (!prefs.getBoolean(ConnectionService.ALLOWLIST_CONFIGURED_KEY, false)) {
-                    allowlistSeeder.seedIfNeeded(pm, prefs)
-                }
-                val allowed = prefs.getStringSet(ConnectionService.ALLOWLIST_PACKAGES_KEY, null)
-                val apps = if (allowed != null) allApps.filter { it.packageName in allowed } else allApps
+                val allApps = appInfoProvider.build(iconGate)
+                val apps = filterByAllowlist(allApps)
 
                 conn.sendData(DataMsg.APP_LIST, AppListMessage(apps).encode())
                 val skipped = apps.count { it.iconPng.isEmpty() }
@@ -92,9 +48,25 @@ internal class AppListBuilder(
         }
     }
 
+    /**
+     * Apply the user's car-app allowlist: only selected packages reach the car,
+     * shrinking the wire payload and the car's icon-decode work. On first run
+     * the allowlist is pre-seeded with common map apps that are actually installed.
+     * A null selection (never configured) passes everything through.
+     */
+    private fun filterByAllowlist(allApps: List<AppInfo>): List<AppInfo> {
+        val pm = context.packageManager
+        val prefs = context.getSharedPreferences(ConnectionService.ALLOWLIST_PREFS, Context.MODE_PRIVATE)
+        if (!prefs.getBoolean(ConnectionService.ALLOWLIST_CONFIGURED_KEY, false)) {
+            allowlistSeeder.seedIfNeeded(pm, prefs)
+        }
+        val allowed = prefs.getStringSet(ConnectionService.ALLOWLIST_PACKAGES_KEY, null)
+        return if (allowed != null) allApps.filter { it.packageName in allowed } else allApps
+    }
+
     /** Clear the icon-hash cache so the next [sendAppList] re-sends every icon. */
     fun resetIconHashes() {
-        lastSentIconHash.clear()
+        iconGate.reset()
     }
 
     private val allowlistSeeder = AllowlistSeeder(

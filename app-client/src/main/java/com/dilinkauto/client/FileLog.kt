@@ -3,12 +3,13 @@ package com.dilinkauto.client
 import android.os.Environment
 import android.util.Log
 import com.dilinkauto.protocol.AppPrefs
+import com.dilinkauto.protocol.AsyncLogQueue
+import kotlinx.coroutines.runBlocking
 import java.io.File
 import java.io.FileWriter
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.concurrent.ConcurrentLinkedQueue
 
 /**
  * File-based logger that bypasses Android logcat filtering.
@@ -16,14 +17,14 @@ import java.util.concurrent.ConcurrentLinkedQueue
  *
  * On rotate(), the current log is renamed with a timestamp and a fresh log starts.
  * Old session logs accumulate in the folder (client-YYYYMMDD-HHmmss.log).
- * Thread-safe: uses a lock-free queue drained by a single writer thread.
+ * Thread-safe: uses an [AsyncLogQueue] drained by a single writer thread.
  */
 object FileLog {
 
     /** Toggled from Settings. When false, no file writes or logcat output. */
     @Volatile var enabled = true
 
-    private val queue = ConcurrentLinkedQueue<String>()
+    private val queue = AsyncLogQueue<String>()
     @Volatile private var writer: FileWriter? = null
     // SimpleDateFormat is NOT thread-safe — the writer thread formats all
     // timestamps, so a single shared instance is safe here. Callers only ever
@@ -44,10 +45,11 @@ object FileLog {
         }
 
         Thread({
-            while (true) {
-                try {
-                    val line = queue.poll()
-                    if (line != null) {
+            // Single consumer. runBlocking parks this thread on the queue's
+            // channel receive — no polling sleep, wakes as soon as a line arrives.
+            runBlocking {
+                queue.consume { line ->
+                    try {
                         // Format on the writer thread only — SimpleDateFormat is
                         // not thread-safe, and this is the single consumer.
                         val ts = dateFormat.format(Date())
@@ -56,10 +58,8 @@ object FileLog {
                         writer?.write(com.dilinkauto.protocol.LogLine.bracketedTagFirst(ts, level, tag, msg))
                         writer?.write("\n")
                         writer?.flush()
-                    } else {
-                        Thread.sleep(200) // reduced poll rate for low-end devices
-                    }
-                } catch (_: Exception) {}
+                    } catch (_: Exception) {}
+                }
             }
         }, "FileLog").apply { isDaemon = true; start() }
     }
@@ -111,6 +111,6 @@ object FileLog {
     private fun write(level: String, tag: String, msg: String) {
         // No timestamp formatting on the calling thread — queue the raw pieces and
         // let the single writer thread format with the shared SimpleDateFormat.
-        queue.add("$level␞$tag␞$msg")
+        queue.offer("$level␞$tag␞$msg")
     }
 }

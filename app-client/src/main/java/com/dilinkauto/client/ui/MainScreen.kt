@@ -258,7 +258,7 @@ fun CarInstallCard(installStatus: String, onInstallOnCar: (String?) -> Unit) {
                 Icon(
                     Icons.Default.DirectionsCar,
                     contentDescription = null,
-                    tint = if (isDone) Color(0xFF4CAF50) else if (isError || isAuthNeeded) Color(0xFFFFA726) else MaterialTheme.colorScheme.primary,
+                    tint = if (isDone) InstallStatusVisuals.DoneColor else if (isError || isAuthNeeded) InstallStatusVisuals.AttentionColor else MaterialTheme.colorScheme.primary,
                     modifier = Modifier.size(24.dp)
                 )
                 Spacer(Modifier.width(12.dp))
@@ -267,22 +267,17 @@ fun CarInstallCard(installStatus: String, onInstallOnCar: (String?) -> Unit) {
                     Text(
                         if (installStatus.isEmpty()) stringResource(R.string.car_app_desc) else installStatus,
                         fontSize = 12.sp,
-                        color = when (status) {
-                            InstallStatus.DONE -> Color(0xFF4CAF50)
-                            InstallStatus.ERROR -> Color(0xFFEF5350)
-                            InstallStatus.AUTH_NEEDED -> Color(0xFFFFA726)
-                            else -> if (isInstalling) Color(0xFFFFA726) else Color.Gray
-                        }
+                        color = InstallStatusVisuals.statusColor(status) ?: Color.Gray
                     )
                 }
                 if (isInstalling) {
                     CircularProgressIndicator(
                         modifier = Modifier.size(24.dp),
                         strokeWidth = 2.dp,
-                        color = Color(0xFFFFA726)
+                        color = InstallStatusVisuals.AttentionColor
                     )
                 } else if (isDone) {
-                    Icon(Icons.Default.CheckCircle, contentDescription = null, tint = Color(0xFF4CAF50), modifier = Modifier.size(24.dp))
+                    Icon(Icons.Default.CheckCircle, contentDescription = null, tint = InstallStatusVisuals.DoneColor, modifier = Modifier.size(24.dp))
                 } else {
                     Button(
                         onClick = { onInstallOnCar(null) },

@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.IBinder
 import android.util.Log
+import com.dilinkauto.protocol.VdProbeResult
 import moe.shizuku.server.IRemoteProcess
 import moe.shizuku.server.IShizukuService
 import rikka.shizuku.Shizuku
@@ -208,34 +209,24 @@ object ShizukuManager {
     }
 
     /**
-     * Block until no vd-server process remains, or [timeoutMs] elapses.
+     * One liveness probe of the vd-server engine, in the output form
+     * ([com.dilinkauto.protocol.VdDeploy.probeCommand]) — Shizuku's
+     * `execAndWait` exposes stdout but not the exit code, so this is the
+     * Shizuku-side counterpart of the car/desktop exit-code probe.
      *
-     * Used at two points where "the old engine is gone" must be true before
-     * proceeding:
-     *  - before launching a new engine, so two instances never race for the same
-     *    VirtualDisplay / DTA / 9638-9639 ports;
-     *  - after the graceful stop, to confirm cleanup() actually ran before we
-     *    declare the session torn down.
-     *
-     * `pkill -0` performs an existence check without delivering a signal, so this
-     * is safe to poll.
-     *
-     * @return true if no vd-server is running (or Shizuku is unavailable, in
-     *         which case we cannot verify and report true to avoid hanging).
+     * Returns [VdProbeResult.UNKNOWN] when Shizuku is unavailable or the probe
+     * itself fails; the deploy sequence treats that as "accept the exit" so a
+     * dead transport never stalls deployment. The convergence rules (two
+     * consecutive GONE) live in [com.dilinkauto.protocol.vdAwaitExit] — this
+     * class intentionally does not implement its own wait loop anymore.
      */
-    fun waitForVdServerExit(timeoutMs: Long, pollMs: Long = 100): Boolean {
-        if (!isAvailable) return true
-        val deadline = System.currentTimeMillis() + timeoutMs
-        while (System.currentTimeMillis() < deadline) {
-            val out = try { execAndWait(com.dilinkauto.protocol.VdDeploy.probeCommand) } catch (_: Exception) { null }
-            val alive = out?.trim()?.endsWith("Y") == true
-            if (!alive) return true
-            try { Thread.sleep(pollMs) } catch (_: InterruptedException) { return false }
-        }
-        val stillAlive = try {
-            execAndWait(com.dilinkauto.protocol.VdDeploy.probeCommand)?.trim()?.endsWith("Y") == true
-        } catch (_: Exception) { false }
-        if (stillAlive) FileLog.w(TAG, "vd-server still alive after ${timeoutMs}ms wait")
-        return !stillAlive
+    fun probeVdServer(): VdProbeResult {
+        if (!isAvailable) return VdProbeResult.UNKNOWN
+        val out = try {
+            execAndWait(com.dilinkauto.protocol.VdDeploy.probeCommand)
+        } catch (_: Exception) {
+            null
+        } ?: return VdProbeResult.UNKNOWN
+        return if (out.trim().endsWith("Y")) VdProbeResult.ALIVE else VdProbeResult.GONE
     }
 }
