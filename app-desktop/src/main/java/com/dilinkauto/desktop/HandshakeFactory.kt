@@ -1,5 +1,6 @@
 package com.dilinkauto.desktop
 
+import com.dilinkauto.protocol.DimAlign
 import com.dilinkauto.protocol.HandshakeRequest
 
 /**
@@ -22,8 +23,5 @@ object HandshakeFactory {
     )
 
     /** 向下取偶数，并保证最小为 2（奇数边长会被 H.264 编码器拒绝或导致画面错位）。 */
-    fun evenAlign(value: Int): Int {
-        val floored = if (value % 2 == 0) value else value - 1
-        return floored.coerceAtLeast(2)
-    }
+    fun evenAlign(value: Int): Int = DimAlign.evenMin2(value)
 }

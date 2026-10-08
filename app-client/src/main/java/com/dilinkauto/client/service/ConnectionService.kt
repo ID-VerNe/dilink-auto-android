@@ -44,6 +44,7 @@ class ConnectionService : Service() {
     private lateinit var carAppInstaller: CarAppInstaller
     private lateinit var appListBuilder: AppListBuilder
     private lateinit var displayRestorer: PhoneDisplayRestorer
+    private lateinit var assetDeployer: AssetDeployer
 
     enum class State { IDLE, WAITING, CONNECTED, STREAMING }
 
@@ -74,6 +75,7 @@ class ConnectionService : Service() {
         // No scope passed: the restorer owns a process-lifetime scope so a
         // Service.onDestroy() mid-restore cannot skip `cmd display power-on`.
         displayRestorer = PhoneDisplayRestorer(applicationContext)
+        assetDeployer = AssetDeployer(applicationContext.assets)
     }
 
     private fun cacheDefaultIme() {
@@ -132,8 +134,8 @@ class ConnectionService : Service() {
             // 不会重置路径，会拼出 /storage/emulated/0/sdcard/DiLinkAuto 影子目录。
             val dir = java.io.File(VdDeploy.DIR_PATH)
             dir.mkdirs()
-            extractAsset(VdDeploy.JAR_NAME, java.io.File(dir, VdDeploy.JAR_NAME))
-            extractAsset("app-server.apk", java.io.File(filesDir, "app-server.apk"))
+            assetDeployer.extract(VdDeploy.JAR_NAME, java.io.File(dir, VdDeploy.JAR_NAME))
+            assetDeployer.extract("app-server.apk", java.io.File(filesDir, "app-server.apk"))
             assetsReady = true
         }
     }
@@ -144,48 +146,6 @@ class ConnectionService : Service() {
         repeat(50) {
             if (apkFile.exists()) return
             delay(100)
-        }
-    }
-
-    /**
-     * 把 assets 里的字节原子地写入 [target]。
-     *
-     * 先写同目录下的 `.tmp` 再 rename，避免两种线上事故：
-     *  1. `app_process` 正在 mmap 旧 jar 时被截断覆写 → SIGBUS 让进程崩溃，
-     *     实测还会连带 adbd 重启（无线调试端口被重置）。
-     *  2. 写入中途失败留下半截文件 → 下次 `app_process` 加载时 exit_code=134
-     *     (SIGABRT) 且不打印任何日志，属于无法排查的静默失败。
-     *
-     * rename 只替换目录项，老进程的 mmap仍指向旧 inode，因此运行中的
-     * vd-server 不受影响（已在真机实测：PID 存活、设备稳定）。
-     */
-    private fun writeAtomically(target: java.io.File, bytes: ByteArray) {
-        val tmp = java.io.File("${target.absolutePath}.tmp")
-        tmp.writeBytes(bytes)
-        if (!tmp.renameTo(target)) {
-            // FUSE 上某些场景 rename 可能失败，退化为直接写（仍优于整体丢失）
-            target.writeBytes(bytes)
-            tmp.delete()
-        }
-    }
-
-    private fun extractAsset(assetName: String, target: java.io.File) {
-        try {
-            val assetBytes = assets.open(assetName).use { it.readBytes() }
-            val assetCrc = java.util.zip.CRC32().apply { update(assetBytes) }.value
-
-            if (target.exists()) {
-                val fileCrc = java.util.zip.CRC32().apply { update(target.readBytes()) }.value
-                if (fileCrc == assetCrc) {
-                    FileLog.i(TAG, "$assetName up-to-date (crc=$assetCrc)")
-                    return
-                }
-            }
-
-            writeAtomically(target, assetBytes)
-            FileLog.i(TAG, "$assetName deployed to ${target.absolutePath} (${assetBytes.size} bytes, crc=$assetCrc)")
-        } catch (e: Exception) {
-            FileLog.w(TAG, "Failed to extract $assetName: ${e.message}")
         }
     }
 
@@ -202,27 +162,11 @@ class ConnectionService : Service() {
      */
     private fun ensureVdServerJarCurrent(): Long {
         val target = java.io.File(VdDeploy.JAR_PATH)
-        var crc = -1L
-        try {
-            val assetBytes = assets.open(VdDeploy.JAR_NAME).use { it.readBytes() }
-            val assetCrc = java.util.zip.CRC32().apply { update(assetBytes) }.value
-            crc = assetCrc
-
-            target.parentFile?.mkdirs()
-            if (target.exists()) {
-                val fileCrc = java.util.zip.CRC32().apply { update(target.readBytes()) }.value
-                if (fileCrc == assetCrc) {
-                    FileLog.i(TAG, "VD jar up-to-date (crc=$assetCrc)")
-                    return assetCrc
-                }
-            }
-
-            writeAtomically(target, assetBytes)
-            FileLog.i(TAG, "VD jar refreshed: ${target.absolutePath} (${assetBytes.size} bytes, crc=$assetCrc)")
-        } catch (e: Exception) {
-            FileLog.e(TAG, "VD jar refresh failed: ${e.message}")
-            // 磁盘上已有可用 jar 时继续启动，否则让调用方决定是否放弃
-            if (!target.exists() || target.length() == 0L) crc = -1L
+        val crc = assetDeployer.ensureCurrent(VdDeploy.JAR_NAME, target)
+        if (crc < 0L) {
+            // CRC state unknown (asset unreadable / write failed). The old jar on
+            // disk may be stale, so report -1 rather than guessing.
+            FileLog.w(TAG, "VD jar CRC unknown; on-disk jar at ${target.absolutePath} may be stale")
         }
         return crc
     }

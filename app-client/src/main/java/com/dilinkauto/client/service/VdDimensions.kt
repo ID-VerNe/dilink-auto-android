@@ -1,6 +1,7 @@
 package com.dilinkauto.client.service
 
 import android.util.DisplayMetrics
+import com.dilinkauto.protocol.DimAlign
 import com.dilinkauto.protocol.HandshakeRequest
 import com.dilinkauto.protocol.VdDeployArgs
 import com.dilinkauto.protocol.VideoConfig
@@ -33,16 +34,16 @@ internal object VdDimensions {
      *   VirtualDisplay creation.
      */
     fun compute(request: HandshakeRequest, dm: DisplayMetrics): Triple<Int, Int, Int> {
-        var vdWidth = request.screenWidth and 0x7FFFFFFE.toInt()
-        var vdHeight = request.screenHeight and 0x7FFFFFFE.toInt()
+        var vdWidth = DimAlign.even(request.screenWidth)
+        var vdHeight = DimAlign.even(request.screenHeight)
 
         val isCarLandscape = vdWidth > vdHeight
         val isPhoneLandscape = dm.widthPixels > dm.heightPixels
         val phonePhysicalWidth = if (isPhoneLandscape == isCarLandscape) dm.widthPixels else dm.heightPixels
         if (vdWidth < phonePhysicalWidth) {
             val scale = phonePhysicalWidth.toFloat() / vdWidth
-            vdWidth = (vdWidth * scale).toInt() and 0x7FFFFFFE.toInt()
-            vdHeight = (vdHeight * scale).toInt() and 0x7FFFFFFE.toInt()
+            vdWidth = DimAlign.even((vdWidth * scale).toInt())
+            vdHeight = DimAlign.even((vdHeight * scale).toInt())
         }
 
         val dpi = if (request.dpiOverride > 0) {

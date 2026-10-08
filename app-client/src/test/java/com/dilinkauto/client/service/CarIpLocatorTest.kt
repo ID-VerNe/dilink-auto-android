@@ -2,6 +2,7 @@ package com.dilinkauto.client.service
 
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.runTest
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -36,15 +37,58 @@ class CarIpLocatorTest {
 
     @Test
     fun findCarAdb_returnsNullWhenNoControlConnectionAndNoInterfaces() = runTest {
-        // With a null remote IP and no WiFi manager wired, the locator must
-        // traverse every strategy and return null without throwing.
-        val saved = CarIpLocator.wifiManager
+        // A null remote IP, no WiFi manager, and a probe that reports every host
+        // as closed. The probe is stubbed because findCarAdb sweeps real
+        // subnets — without the stub this asserts "no machine on this LAN is
+        // listening on 5555", which is a property of the test host, not of
+        // CarIpLocator, and fails on any developer machine with a real car or
+        // another ADB device on the same network.
+        val savedWifi = CarIpLocator.wifiManager
+        val savedProbe = CarIpLocator.portProbeOverride
         try {
             CarIpLocator.wifiManager = null
+            CarIpLocator.portProbeOverride = { _, _ -> false }
             val result = CarIpLocator.findCarAdb(controlConnectionRemoteIp = null)
             assertNull("findCarAdb must return null when no car is reachable", result)
         } finally {
-            CarIpLocator.wifiManager = saved
+            CarIpLocator.wifiManager = savedWifi
+            CarIpLocator.portProbeOverride = savedProbe
+        }
+    }
+
+    @Test
+    fun findCarAdb_prefersTheControlConnectionRemoteIpWhenItsPortIsOpen() = runTest {
+        // With a reachable control connection the first strategy must win,
+        // before any subnet scanning happens.
+        val savedWifi = CarIpLocator.wifiManager
+        val savedProbe = CarIpLocator.portProbeOverride
+        try {
+            CarIpLocator.wifiManager = null
+            CarIpLocator.portProbeOverride = { ip, port -> ip == "10.0.0.7" && port == 5555 }
+            val result = CarIpLocator.findCarAdb(controlConnectionRemoteIp = "10.0.0.7")
+            assertEquals("10.0.0.7", result)
+        } finally {
+            CarIpLocator.wifiManager = savedWifi
+            CarIpLocator.portProbeOverride = savedProbe
+        }
+    }
+
+    @Test
+    fun findCarAdb_ignoresAClosedControlConnectionAndKeepsSearching() = runTest {
+        // A control connection whose ADB port is closed must not end the search —
+        // the car may be reachable on another strategy.
+        val savedWifi = CarIpLocator.wifiManager
+        val savedProbe = CarIpLocator.portProbeOverride
+        try {
+            CarIpLocator.wifiManager = null
+            // Nothing is reachable, so this asserts the closed control IP is
+            // discarded and the scan completes with null rather than short-circuit.
+            CarIpLocator.portProbeOverride = { _, _ -> false }
+            val result = CarIpLocator.findCarAdb(controlConnectionRemoteIp = "10.0.0.7")
+            assertNull(result)
+        } finally {
+            CarIpLocator.wifiManager = savedWifi
+            CarIpLocator.portProbeOverride = savedProbe
         }
     }
 }

@@ -10,7 +10,6 @@ import android.view.InputDevice
 import android.view.MotionEvent
 import android.view.Surface
 import com.dilinkauto.protocol.*
-import java.io.IOException
 import java.lang.reflect.Method
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -63,10 +62,7 @@ internal class GlPipeline(
     private fun log(msg: String) = PipeLog.log(msg)
     private fun err(msg: String) = PipeLog.err(msg)
 
-    // Write-loop policy for the car video channel. Mirrors FrameCodec's constants;
-    // see writeAll() below.
-    private val WRITE_TIMEOUT_NS = 5_000_000_000L // 5 seconds
-    private val WRITE_BACKOFF_NS = 100_000L // 100us
+    // Write-loop policy (5s deadline + 100us backoff) now comes from FrameCodec.
 
     /**
      * Initialize EGL/GLES on the current thread, create the SurfaceTexture
@@ -125,7 +121,7 @@ internal class GlPipeline(
 
         var nextFrameNanos = System.nanoTime()
         var frameCount = 0L; var keyFrameCount = 0L; var lastLogAt = 0L
-        var bitrate = bitrate; var cleanSinceNanos = 0L
+        val adaptive = AdaptiveBitrate(bitrate)
         log("Pipeline: ${encodeWidth}x${encodeHeight} ${fps}fps ${bitrate/1_000_000}Mbps")
 
         try {
@@ -159,16 +155,15 @@ internal class GlPipeline(
                             if ((bufInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0) keyFrameCount++
                             val ws = System.nanoTime()
                             writeFrame(carVideo, msgType, payload)
-                            val wm = (System.nanoTime() - ws) / 1_000_000
-                            if (wm > 15) { cleanSinceNanos = 0L; val nr = maxOf(1_500_000, (bitrate * 0.75f).toInt()); if (nr < bitrate) { bitrate = nr; applyBitrate(encoder, bitrate); requestSyncFrame(encoder) } }
-                            else if (cleanSinceNanos == 0L) cleanSinceNanos = System.nanoTime()
+                            val wm = System.nanoTime() - ws
+                            if (adaptive.onFrameWritten(wm)) applyBitrate(encoder, adaptive.currentBitrate)
+                            if (adaptive.needsSyncFrame) { requestSyncFrame(encoder); adaptive.onBitrateApplied() }
                             drained++; frameCount++
                         }
                         encoder.releaseOutputBuffer(idx, false)
                     }
                 }
-                if (cleanSinceNanos > 0L && (System.nanoTime() - cleanSinceNanos) / 1_000_000 >= 2000L) { val nr = minOf(this.bitrate, bitrate + 500_000); if (nr > bitrate) { bitrate = nr; applyBitrate(encoder, bitrate) }; cleanSinceNanos = System.nanoTime() }
-                if (frameCount - lastLogAt >= 120) { lastLogAt = frameCount; log("Pipeline: $frameCount frames ${bitrate/1_000_000}Mbps keys=$keyFrameCount") }
+                if (frameCount - lastLogAt >= 120) { lastLogAt = frameCount; log("Pipeline: $frameCount frames ${adaptive.currentBitrate/1_000_000}Mbps keys=$keyFrameCount") }
             }
         } finally {
             // cbThread is non-daemon; if writeFrame throws or GL faults, the
@@ -178,23 +173,17 @@ internal class GlPipeline(
         log("Pipeline exited: $frameCount frames")
     }
 
+    /**
+     * Frame header layout and write deadline live in [FrameCodec] (protocol-core).
+     *
+     * This used to be a hand-rolled copy with a comment claiming vd-server could
+     * not reach the protocol module. That was false — vd-server already depends on
+     * :protocol, which re-exports :protocol-core via `api(...)`, and this file has
+     * imported `com.dilinkauto.protocol.*` all along (see docs/audit-srp-dry.md
+     * DRY-3). One definition now, so a protocol change cannot silently diverge.
+     */
     private fun writeFrame(ch: SocketChannel, msgType: Byte, payload: ByteArray) {
-        val fl = 2 + payload.size; val hdr = byteArrayOf((fl shr 24).toByte(), (fl shr 16).toByte(), (fl shr 8).toByte(), fl.toByte(), Channel.VIDEO, msgType)
-        writeAll(ch, ByteBuffer.wrap(hdr)); if (payload.isNotEmpty()) writeAll(ch, ByteBuffer.wrap(payload))
-    }
-    // Mirrors FrameCodec.writeAll's write-progress deadline and 100us backoff.
-    // vd-server is a shell module that does not depend on the protocol module,
-    // so the loop is duplicated here — but the literals are named so a change to
-    // one file's policy is at least readable in the other.
-    private fun writeAll(ch: SocketChannel, buf: ByteBuffer) {
-        var dl = System.nanoTime() + WRITE_TIMEOUT_NS
-        while (buf.hasRemaining()) {
-            if (ch.write(buf) > 0) dl = System.nanoTime() + WRITE_TIMEOUT_NS
-            else {
-                if (System.nanoTime() > dl) throw IOException("Write timeout")
-                LockSupport.parkNanos(WRITE_BACKOFF_NS)
-            }
-        }
+        FrameCodec.writeFrameToChannel(ch, FrameCodec.Frame(Channel.VIDEO, msgType, payload))
     }
     private fun applyBitrate(enc: MediaCodec, br: Int) { try { val p = Bundle(); p.putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, br); enc.setParameters(p) } catch (_: Exception) {} }
     private fun requestSyncFrame(enc: MediaCodec) { try { val p = Bundle(); p.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0); enc.setParameters(p) } catch (_: Exception) {} }

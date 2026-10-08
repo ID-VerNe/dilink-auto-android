@@ -31,11 +31,31 @@ object CarIpLocator {
     private const val TAG = "CarIpLocator"
     private const val CAR_ADB_PORT = Discovery.ADB_PORT
 
+    /**
+     * Test seam for the port probe.
+     *
+     * [findCarAdb] scans every strategy in the caller's real network: local
+     * subnets, /proc/net/arp, the neighbour cache, a parallel /24 sweep and the
+     * gateway. On a developer machine that means it can legitimately find a
+     * *real* host listening on 5555, so a test asserting "nothing reachable" was
+     * asserting something about the machine it ran on rather than about this
+     * code — it failed on any LAN with an ADB-capable device and passed on an
+     * isolated runner.
+     *
+     * Set to a lambda in tests to make reachability deterministic. Production
+     * leaves it null and the real probe runs.
+     */
+    @Volatile
+    var portProbeOverride: ((String, Int) -> Boolean)? = null
+
+    private fun probe(ip: String, port: Int): Boolean =
+        portProbeOverride?.invoke(ip, port) ?: probePortBlocking(ip, port, 500, 5)
+
     /** Returns the car's IPv4 address, or null if no ADB endpoint was found. */
     suspend fun findCarAdb(controlConnectionRemoteIp: String?): String? {
         // 1. Check the control connection's remote address (car is already connected)
         controlConnectionRemoteIp?.let { ip ->
-            if (probePort(ip, CAR_ADB_PORT)) {
+            if (probe(ip, CAR_ADB_PORT)) {
                 FileLog.i(TAG, "Found car ADB at $ip (control connection)")
                 return ip
             }
@@ -52,7 +72,7 @@ object CarIpLocator {
                 val ip = line.split("\\s+".toRegex()).firstOrNull() ?: continue
                 if (ip == "0.0.0.0") continue
                 if (subnetIps.contains(ip)) continue
-                if (probePort(ip, CAR_ADB_PORT)) {
+                if (probe(ip, CAR_ADB_PORT)) {
                     FileLog.i(TAG, "Found car ADB at $ip (ARP)")
                     return ip
                 }
@@ -72,7 +92,7 @@ object CarIpLocator {
                     val ip = line.split("\\s+".toRegex()).firstOrNull() ?: continue
                     if (!ip.matches(Regex("\\d+\\.\\d+\\.\\d+\\.\\d+"))) continue
                     if (subnetIps.contains(ip)) continue
-                    if (probePort(ip, CAR_ADB_PORT)) {
+                    if (probe(ip, CAR_ADB_PORT)) {
                         FileLog.i(TAG, "Found car ADB at $ip (neighbor)")
                         return ip
                     }
@@ -132,7 +152,7 @@ object CarIpLocator {
         val ips = (1..254).map { "$prefix.$it" }.filter { it !in ownIpSet }
         ips.chunked(maxConcurrent).forEach { batch ->
             val results = batch.map { ip ->
-                async(Dispatchers.IO) { if (probePortBlocking(ip, CAR_ADB_PORT, 150, 5)) ip else null }
+                async(Dispatchers.IO) { if (probe(ip, CAR_ADB_PORT)) ip else null }
             }
             results.forEach { deferred ->
                 val found = deferred.await()

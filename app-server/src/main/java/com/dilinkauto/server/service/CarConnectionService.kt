@@ -22,6 +22,7 @@ import com.dilinkauto.server.R
 import com.dilinkauto.server.ServerApp
 import com.dilinkauto.server.CarCrashHandler
 import com.dilinkauto.server.adb.RemoteAdbController
+import com.dilinkauto.protocol.DimAlign
 import com.dilinkauto.protocol.adb.UsbAdbConnection
 import com.dilinkauto.server.decoder.VideoDecoder
 import kotlinx.coroutines.*
@@ -303,10 +304,7 @@ class CarConnectionService : Service() {
         vdDeployer.reset()
         handshakeDone = false
         _videoReady.value = false
-        if (usbAdb?.isConnected != true) {
-            usbReady = false
-            if (usbAdb == null) usbConnecting = false // only reset if no ADB instance (auth may be pending)
-        }
+        resetAdbReadiness()
 
         logWriter.setEnabled(com.dilinkauto.server.BuildConfig.DEBUG)  // Reset to default each session
         userDisconnected = false
@@ -489,7 +487,45 @@ class CarConnectionService : Service() {
         }
     }
 
-    private fun disconnectAllConnections() {
+    /**
+ * Clears the USB-ADB readiness flags when no USB device is actually connected.
+ *
+ * Shared by [startConnection] and [handleDisconnect], which previously each had
+ * their own copy of this block (DRY-12). The two had already drifted: only
+ * `startConnection` carried the "auth may be pending" comment explaining why
+ * `usbConnecting` is only cleared when `usbAdb` is null.
+ *
+ * Deliberately does NOT clear readiness when USB is connected — a physical
+ * device that survived a reconnect keeps its state. Likewise it does not touch
+ * the TCP-ADB controller: `handleDisconnect` restores `usbReady` from
+ * `adbController.isConnected` separately, and `startConnection` must not, or it
+ * would undo the restart it just triggered.
+ */
+private fun resetAdbReadiness() {
+        if (usbAdb?.isConnected != true) {
+            usbReady = false
+            // Only reset if there is no ADB instance at all; a non-null usbAdb
+            // may still be waiting on the user to accept the auth prompt.
+            if (usbAdb == null) usbConnecting = false
+        }
+    }
+
+    /**
+     * Drops the video/input/control connections and nulls the handles.
+     *
+     * @param clearListeners also detach the disconnect callbacks. Needed when
+     *   tearing down mid-stream on purpose, so [handleDisconnect] does not run
+     *   for a teardown we initiated. Omitted when we *want* the disconnect
+     *   handler to fire.
+     */
+    private fun disconnectAllConnections(clearListeners: Boolean = false) {
+        // Detach callbacks first so a disconnect we asked for does not re-enter
+        // handleDisconnect() and tear down state we are about to rebuild.
+        if (clearListeners) {
+            videoConnection?.clearDisconnectListener()
+            inputConnection?.clearDisconnectListener()
+            controlConnection?.clearDisconnectListener()
+        }
         videoConnection?.disconnect()
         videoConnection = null
         inputConnection?.disconnect()
@@ -963,6 +999,8 @@ val ctrl = controlConnection ?: return
 
         // Tear down video/input synchronously — clear disconnect listeners so
         // handleDisconnect() is not invoked for this intentional mid-stream teardown.
+        // The control connection is reused by this re-handshake, so it is left
+        // untouched: only the video/input legs go down.
         videoConnection?.clearDisconnectListener()
         inputConnection?.clearDisconnectListener()
         videoConnection?.disconnect(); videoConnection = null
@@ -1056,14 +1094,10 @@ val ctrl = controlConnection ?: return
         wifiReady = false
         vdServerStarted = false
         handshakeDone = false
-        if (usbAdb?.isConnected != true) {
-            usbReady = false
-            if (usbAdb == null) usbConnecting = false
-        }
-        // Preserve TCP ADB readiness if controller is still connected
-        if (adbController?.isConnected == true) {
-            usbReady = true
-        }
+        resetAdbReadiness()
+        // Preserve TCP ADB readiness across a WiFi flap: the controller may still
+        // be connected even though no USB device is present.
+        if (adbController?.isConnected == true) usbReady = true
 
         if (userDisconnected) {
             _state.value = State.IDLE
@@ -1186,13 +1220,15 @@ val ctrl = controlConnection ?: return
             val navBarPx = navBarWidthPx(density, if (isLandscape) widthPx else heightPx)
             val viewportWidth = if (isLandscape) widthPx - navBarPx else widthPx
             val viewportHeight = if (isLandscape) heightPx else heightPx - navBarPx
-            return Pair(viewportWidth and 0x7FFFFFFE.toInt(), viewportHeight and 0x7FFFFFFE.toInt())
+            return Pair(DimAlign.even(viewportWidth), DimAlign.even(viewportHeight))
         }
 
         fun navBarWidthPx(density: Float, screenWidthPx: Int): Int {
             val targetPx = (NAV_BAR_TARGET_DP * density).toInt()
-            val viewport = screenWidthPx - targetPx
-            return if (viewport % 2 != 0) targetPx + 1 else targetPx
+            // The viewport is `screenWidthPx - navBarPx`, so the bar is the only
+            // value we may nudge to land on an even viewport — it must be widened,
+            // not narrowed. Rounds the offset UP, unlike DimAlign.even.
+            return DimAlign.offsetForEvenRemainder(screenWidthPx, targetPx)
         }
     }
 }

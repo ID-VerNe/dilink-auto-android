@@ -13,18 +13,8 @@ import java.util.concurrent.TimeUnit
 
 class ConnectionTest {
 
-    private fun createConnectedSockets(): Pair<SocketChannel, SocketChannel> {
-        val server = ServerSocketChannel.open()
-        server.bind(InetSocketAddress("127.0.0.1", 0))
-        val port = (server.localAddress as InetSocketAddress).port
-
-        val client = SocketChannel.open()
-        client.connect(InetSocketAddress("127.0.0.1", port))
-        val accepted = server.accept()
-        server.close()
-
-        return Pair(client, accepted)
-    }
+    private fun createConnectedSockets(): Pair<SocketChannel, SocketChannel> =
+        TestSockets.createConnectedSockets()
 
     @Test
     fun testNonBlockingChannelQueuingAndDelivery() = runTest {
