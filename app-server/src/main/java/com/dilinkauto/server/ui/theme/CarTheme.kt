@@ -29,15 +29,27 @@ val CarDark = darkColorScheme(
     error = Color(0xFFEF5350)
 )
 
+/**
+ * Car type scale (audit UX-07). Screens used to hand-write their own sizes
+ * (11–28sp), which let peer text drift apart and let two slots — `titleSmall`
+ * and `bodySmall` — silently fall through to the Material defaults.
+ *
+ * Every size is deliberately large: this screen is read at arm's length in a
+ * moving vehicle. Nothing here may go below 12sp.
+ */
 val CarTypography = Typography(
-    headlineLarge = TextStyle(fontSize = 32.sp, fontWeight = FontWeight.Bold),
-    headlineMedium = TextStyle(fontSize = 24.sp, fontWeight = FontWeight.SemiBold),
-    titleLarge = TextStyle(fontSize = 20.sp, fontWeight = FontWeight.Medium),
-    titleMedium = TextStyle(fontSize = 18.sp, fontWeight = FontWeight.Medium),
-    bodyLarge = TextStyle(fontSize = 16.sp),
-    bodyMedium = TextStyle(fontSize = 14.sp),
-    labelLarge = TextStyle(fontSize = 14.sp, fontWeight = FontWeight.Medium),
-    labelSmall = TextStyle(fontSize = 14.sp)
+    headlineLarge = TextStyle(fontSize = 32.sp, fontWeight = FontWeight.Bold),       // launch branding
+    headlineMedium = TextStyle(fontSize = 24.sp, fontWeight = FontWeight.SemiBold),  // full-screen empty states
+    headlineSmall = TextStyle(fontSize = 22.sp, fontWeight = FontWeight.SemiBold),   // sub-screen title
+    titleLarge = TextStyle(fontSize = 20.sp, fontWeight = FontWeight.Medium),        // dialog title
+    titleMedium = TextStyle(fontSize = 18.sp, fontWeight = FontWeight.Medium),       // card / status title
+    titleSmall = TextStyle(fontSize = 14.sp, fontWeight = FontWeight.Medium),        // section label
+    bodyLarge = TextStyle(fontSize = 16.sp),                                         // list / menu item
+    bodyMedium = TextStyle(fontSize = 14.sp),                                        // body copy
+    bodySmall = TextStyle(fontSize = 12.sp),                                         // captions and hints
+    labelLarge = TextStyle(fontSize = 14.sp, fontWeight = FontWeight.Medium),        // buttons
+    labelMedium = TextStyle(fontSize = 12.sp, fontWeight = FontWeight.Medium),       // inline value badge
+    labelSmall = TextStyle(fontSize = 12.sp)                                         // choice chips
 )
 
 @Composable

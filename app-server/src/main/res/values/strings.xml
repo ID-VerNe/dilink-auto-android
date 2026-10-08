@@ -53,6 +53,21 @@
     <string name="video_fps_desc">Frame rate sent to decoder. Lower FPS reduces CPU/GPU load</string>
     <string name="video_fps_hint">24 FPS cuts 20% CPU/GPU and Wi-Fi load vs 30 FPS</string>
 
+    <!-- Setting Presets -->
+    <string name="preset_auto">Auto</string>
+    <string name="preset_dpi_160">160 (Standard)</string>
+    <string name="preset_bitrate_2m">2M (Fastest)</string>
+    <string name="preset_bitrate_2_5m">2.5M (Recommended)</string>
+    <string name="preset_bitrate_3m">3M (Balanced)</string>
+    <string name="preset_bitrate_4m">4M (Default)</string>
+    <string name="preset_bitrate_6m">6M (High quality)</string>
+    <string name="preset_fps_20">20 FPS (Eco)</string>
+    <string name="preset_fps_24">24 FPS (Recommended)</string>
+    <string name="preset_fps_30">30 FPS (Smooth)</string>
+    <string name="preset_fps_60">60 FPS (High refresh)</string>
+    <string name="fps_value">%1$d FPS</string>
+    <string name="manual_custom_hint">Custom</string>
+
     <!-- Manual Connect -->
     <string name="manual_connect_label">Or connect manually by IP</string>
     <string name="manual_connect_ip_label">Phone IP address</string>
@@ -111,12 +126,33 @@
     <!-- App Context Actions -->
     <string name="action_uninstall">Uninstall</string>
     <string name="action_app_info">App info</string>
+    <string name="action_cancel">Cancel</string>
+    <string name="action_ok">OK</string>
+
+    <!-- App Info dialog -->
+    <string name="app_info_package">Package</string>
+    <string name="app_info_version">Version</string>
+    <string name="app_info_version_code">Version code</string>
+    <string name="app_info_target_sdk">Target SDK</string>
+    <string name="app_info_installed">Installed</string>
+
+    <!-- Destructive action confirmation -->
+    <string name="action_uninstall_confirm_title">Uninstall %1$s?</string>
+    <string name="action_uninstall_confirm_body">This uninstalls the app from your phone. It cannot be undone.</string>
+
+    <!-- Now playing transport -->
+    <string name="now_playing_previous">Previous</string>
+    <string name="now_playing_play">Play</string>
+    <string name="now_playing_pause">Pause</string>
+    <string name="now_playing_next">Next</string>
 
     <!-- Home screen copy -->
     <string name="search_apps">Search apps</string>
     <string name="clear_search">Clear search</string>
+    <string name="no_apps_match">No apps match “%1$s”</string>
     <string name="pin_to_top">Pin to top</string>
     <string name="unpin_from_top">Unpin from top</string>
+    <string name="app_manage_hint">Long-press an app to pin, uninstall, or see info</string>
     <string name="searching_for_phone">Searching for phone</string>
     <string name="phone_hint">Make sure DiLink Auto is running on your phone\nand both devices are on the same network</string>
     <string name="connecting">Connecting</string>

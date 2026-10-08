@@ -27,6 +27,11 @@ fun NavActionButton(
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
         modifier = modifier
+            // The icon is 40dp, so without a floor the touch target in the rail
+            // was only 40dp wide — under the 44–48dp guidance, on a control that
+            // is tapped blind while driving (audit UX-11). The rail has 68dp of
+            // usable width, so a 48dp floor fits without clipping.
+            .widthIn(min = 48.dp)
             .clip(RoundedCornerShape(8.dp))
             .clickable(onClick = onClick)
             .padding(vertical = 10.dp)

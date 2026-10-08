@@ -12,9 +12,10 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import com.dilinkauto.protocol.AppInfoDataMessage
+import com.dilinkauto.server.R
 
 /**
  * App-info dialog (audit R3-SRP-19): package / version / install-time details
@@ -31,19 +32,19 @@ internal fun AppInfoDialog(info: AppInfoDataMessage, onDismiss: () -> Unit) {
     }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(info.appName, color = Color.White, fontSize = 20.sp) },
+        title = { Text(info.appName, color = Color.White, style = MaterialTheme.typography.titleLarge) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                InfoRow("Package", info.packageName)
-                InfoRow("Version", info.versionName)
-                InfoRow("Version code", info.versionCode.toString())
-                InfoRow("Target SDK", info.targetSdk.toString())
-                InfoRow("Installed", dateStr)
+                InfoRow(stringResource(R.string.app_info_package), info.packageName)
+                InfoRow(stringResource(R.string.app_info_version), info.versionName)
+                InfoRow(stringResource(R.string.app_info_version_code), info.versionCode.toString())
+                InfoRow(stringResource(R.string.app_info_target_sdk), info.targetSdk.toString())
+                InfoRow(stringResource(R.string.app_info_installed), dateStr)
             }
         },
         confirmButton = {
             TextButton(onClick = onDismiss) {
-                Text("OK", fontSize = 16.sp)
+                Text(stringResource(R.string.action_ok), style = MaterialTheme.typography.labelLarge)
             }
         },
         containerColor = MaterialTheme.colorScheme.surface,
@@ -61,12 +62,12 @@ private fun InfoRow(label: String, value: String) {
         Text(
             "$label:",
             color = MaterialTheme.colorScheme.onSurfaceVariant,
-            fontSize = 14.sp
+            style = MaterialTheme.typography.bodyMedium
         )
         Text(
             value,
             color = Color.White,
-            fontSize = 14.sp
+            style = MaterialTheme.typography.bodyMedium
         )
     }
 }

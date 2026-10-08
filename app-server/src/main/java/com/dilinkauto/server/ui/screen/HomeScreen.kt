@@ -34,9 +34,7 @@ import androidx.compose.material.icons.filled.Navigation
 import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.outlined.PushPin
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
@@ -45,6 +43,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.collectAsState
@@ -63,7 +62,6 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import com.dilinkauto.protocol.AppCategory
 import com.dilinkauto.protocol.AppInfo
 import com.dilinkauto.protocol.MediaAction
@@ -109,7 +107,7 @@ fun HomeContent(
                 Text(
                     stringResource(R.string.home_allowlist_empty),
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    fontSize = 16.sp,
+                    style = MaterialTheme.typography.bodyLarge,
                     textAlign = TextAlign.Center
                 )
             }
@@ -170,6 +168,11 @@ fun AppGrid(
     modifier: Modifier = Modifier
 ) {
     var searchQuery by remember { mutableStateOf("") }
+
+    // Uninstall is destructive and runs on the *phone* (the car only sends the
+    // request), so it is confirmed here before anything leaves the device
+    // (audit UX-01). Holds the tile whose menu entry was tapped.
+    var pendingUninstall by remember { mutableStateOf<AppTileData?>(null) }
     val gridState = rememberLazyGridState()
 
     val context = LocalContext.current
@@ -201,30 +204,63 @@ fun AppGrid(
                 // Adaptive(100.dp) but without the runtime measurement crash risk
                 val gridColumns = max(3, (maxWidth / 100.dp).toInt().coerceAtMost(12))
 
-                LazyVerticalGrid(
-                    state = gridState,
-                    columns = GridCells.Fixed(gridColumns),
-                    modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(start = 24.dp, top = 24.dp, end = 8.dp, bottom = 8.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    items(filteredApps, key = { it.packageName }, contentType = { "app_tile" }) { app ->
-                        AppTile(
-                            data = AppTileData(
+                if (filteredApps.isEmpty() && searchQuery.isNotBlank()) {
+                    // Nothing matched: say so and offer the way out. A blank grid
+                    // reads as "loading failed" (audit UX-09).
+                    Box(
+                        modifier = Modifier.fillMaxSize().padding(32.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(
+                                stringResource(R.string.no_apps_match, searchQuery),
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                textAlign = TextAlign.Center
+                            )
+                            Spacer(Modifier.height(8.dp))
+                            TextButton(onClick = { searchQuery = "" }) {
+                                Text(stringResource(R.string.clear_search))
+                            }
+                        }
+                    }
+                } else {
+                    LazyVerticalGrid(
+                        state = gridState,
+                        columns = GridCells.Fixed(gridColumns),
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(start = 24.dp, top = 24.dp, end = 8.dp, bottom = 8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        items(filteredApps, key = { it.packageName }, contentType = { "app_tile" }) { app ->
+                            val tile = AppTileData(
                                 packageName = app.packageName,
                                 appName = app.appName,
                                 category = app.category,
                                 isPinned = pinnedApps.contains(app.packageName)
-                            ),
-                            onClick = { onAppClick(app.packageName) },
-                            onUninstall = { onUninstall(app.packageName) },
-                            onAppInfo = { onAppInfo(app.packageName) },
-                            onTogglePin = { togglePin(app.packageName) }
-                        )
+                            )
+                            AppTile(
+                                data = tile,
+                                onClick = { onAppClick(app.packageName) },
+                                onUninstall = { pendingUninstall = tile },
+                                onAppInfo = { onAppInfo(app.packageName) },
+                                onTogglePin = { togglePin(app.packageName) }
+                            )
+                        }
                     }
                 }
             }
+
+        // Management actions (pin / uninstall / info) live in the tile's
+        // long-press menu, which a car touchscreen gives no clue about — say it
+        // out loud (audit UX-08).
+        Text(
+            stringResource(R.string.app_manage_hint),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(start = 24.dp, end = 24.dp, top = 4.dp)
+        )
 
         // Search bar
         OutlinedTextField(
@@ -259,8 +295,48 @@ fun AppGrid(
                 cursorColor = MaterialTheme.colorScheme.primary
             )
         )
+    }
 
-
+    // Confirmation for the destructive menu action (audit UX-01). The request
+    // only leaves for the phone after this dialog is accepted.
+    pendingUninstall?.let { target ->
+        AlertDialog(
+            onDismissRequest = { pendingUninstall = null },
+            title = {
+                Text(
+                    stringResource(R.string.action_uninstall_confirm_title, target.appName),
+                    color = Color.White,
+                    style = MaterialTheme.typography.titleLarge
+                )
+            },
+            text = {
+                Text(
+                    stringResource(R.string.action_uninstall_confirm_body),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodyLarge
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    pendingUninstall = null
+                    onUninstall(target.packageName)
+                }) {
+                    Text(
+                        stringResource(R.string.action_uninstall),
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.labelLarge
+                    )
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingUninstall = null }) {
+                    Text(stringResource(R.string.action_cancel), style = MaterialTheme.typography.labelLarge)
+                }
+            },
+            containerColor = MaterialTheme.colorScheme.surface,
+            titleContentColor = Color.White,
+            textContentColor = MaterialTheme.colorScheme.onSurfaceVariant
+        )
     }
 }
 
@@ -346,7 +422,7 @@ fun AppTile(
         ) {
             DropdownMenuItem(
                 text = {
-                    Text(if (data.isPinned) stringResource(R.string.unpin_from_top) else stringResource(R.string.pin_to_top), color = Color.White, fontSize = 18.sp)
+                    Text(if (data.isPinned) stringResource(R.string.unpin_from_top) else stringResource(R.string.pin_to_top), color = Color.White, style = MaterialTheme.typography.titleMedium)
                 },
                 onClick = {
                     menuExpanded = false
@@ -364,7 +440,7 @@ fun AppTile(
             )
             DropdownMenuItem(
                 text = {
-                    Text(stringResource(R.string.action_uninstall), color = Color.White, fontSize = 18.sp)
+                    Text(stringResource(R.string.action_uninstall), color = Color.White, style = MaterialTheme.typography.titleMedium)
                 },
                 onClick = {
                     menuExpanded = false
@@ -377,7 +453,7 @@ fun AppTile(
             )
             DropdownMenuItem(
                 text = {
-                    Text(stringResource(R.string.action_app_info), color = Color.White, fontSize = 18.sp)
+                    Text(stringResource(R.string.action_app_info), color = Color.White, style = MaterialTheme.typography.titleMedium)
                 },
                 onClick = {
                     menuExpanded = false

@@ -37,7 +37,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
+import com.dilinkauto.protocol.SettingsFormat
 import com.dilinkauto.server.R
 import com.dilinkauto.server.service.CarConnectionService
 import com.dilinkauto.server.ui.theme.SuccessColor
@@ -303,22 +303,19 @@ private fun ConnectionStatusCard(
                     title = stringResource(R.string.startup_dpi_title),
                     subtitle = stringResource(R.string.startup_dpi_desc),
                     hint = stringResource(R.string.startup_dpi_hint),
-                    currentValueText = if (startupDpi > 0) startupDpi.toString() else "Auto",
-                    isCustom = startupDpi !in listOf(0, 140, 160, 180, 200, 240),
+                    currentValueText = if (startupDpi > 0) startupDpi.toString() else stringResource(R.string.preset_auto),
+                    manualSeed = SettingsFormat.manualSeed(startupDpi, SettingsFormat.DPI_PRESETS),
                     presets = listOf(
-                        "Auto" to 0,
+                        stringResource(R.string.preset_auto) to SettingsFormat.DPI_AUTO,
                         "140" to 140,
-                        "160 (标配)" to 160,
+                        stringResource(R.string.preset_dpi_160) to 160,
                         "180" to 180,
                         "200" to 200
                     ),
                     selectedPresetValue = startupDpi,
-                    onPresetSelected = { onStartupDpiChange(it) },
-                    onManualValueChange = { input ->
-                        val digits = input.filter { it in '0'..'9' }.take(3)
-                        val parsed = digits.toIntOrNull() ?: 0
-                        val coerced = com.dilinkauto.protocol.VdDeployArgs.coerceDpiOverride(parsed)
-                        onStartupDpiChange(coerced)
+                    onValueChange = onStartupDpiChange,
+                    coerceManualValue = { text ->
+                        SettingsFormat.coerceDpi(text.toIntOrNull() ?: SettingsFormat.DPI_AUTO)
                     }
                 )
 
@@ -328,22 +325,21 @@ private fun ConnectionStatusCard(
                     title = stringResource(R.string.video_bitrate_title),
                     subtitle = stringResource(R.string.video_bitrate_desc),
                     hint = stringResource(R.string.video_bitrate_hint),
-                    currentValueText = "${startupBitrate / 1_000_000}M",
-                    isCustom = startupBitrate !in listOf(2_000_000, 2_500_000, 3_000_000, 4_000_000, 6_000_000),
+                    currentValueText = SettingsFormat.formatBitrateMbps(startupBitrate),
+                    manualSeed = SettingsFormat.manualSeed(
+                        startupBitrate, SettingsFormat.BITRATE_PRESETS, divisor = 1_000_000
+                    ),
                     presets = listOf(
-                        "2M (极速)" to 2_000_000,
-                        "2.5M (推荐439)" to 2_500_000,
-                        "3M (均衡)" to 3_000_000,
-                        "4M (默认)" to 4_000_000,
-                        "6M (高清)" to 6_000_000
+                        stringResource(R.string.preset_bitrate_2m) to 2_000_000,
+                        stringResource(R.string.preset_bitrate_2_5m) to 2_500_000,
+                        stringResource(R.string.preset_bitrate_3m) to 3_000_000,
+                        stringResource(R.string.preset_bitrate_4m) to 4_000_000,
+                        stringResource(R.string.preset_bitrate_6m) to 6_000_000
                     ),
                     selectedPresetValue = startupBitrate,
-                    onPresetSelected = { onStartupBitrateChange(it) },
-                    onManualValueChange = { input ->
-                        val digits = input.filter { it in '0'..'9' }.take(2)
-                        val mbps = digits.toIntOrNull() ?: 4
-                        val bps = (mbps.coerceIn(1, 20)) * 1_000_000
-                        onStartupBitrateChange(bps)
+                    onValueChange = onStartupBitrateChange,
+                    coerceManualValue = { text ->
+                        SettingsFormat.coerceBitrate((text.toIntOrNull() ?: 4) * 1_000_000)
                     },
                     manualSuffix = "Mbps"
                 )
@@ -354,20 +350,18 @@ private fun ConnectionStatusCard(
                     title = stringResource(R.string.video_fps_title),
                     subtitle = stringResource(R.string.video_fps_desc),
                     hint = stringResource(R.string.video_fps_hint),
-                    currentValueText = "${startupFps} FPS",
-                    isCustom = startupFps !in listOf(20, 24, 30, 60),
+                    currentValueText = stringResource(R.string.fps_value, startupFps),
+                    manualSeed = SettingsFormat.manualSeed(startupFps, SettingsFormat.FPS_PRESETS),
                     presets = listOf(
-                        "20 FPS (超节能)" to 20,
-                        "24 FPS (推荐439)" to 24,
-                        "30 FPS (流畅)" to 30,
-                        "60 FPS (高刷)" to 60
+                        stringResource(R.string.preset_fps_20) to 20,
+                        stringResource(R.string.preset_fps_24) to 24,
+                        stringResource(R.string.preset_fps_30) to 30,
+                        stringResource(R.string.preset_fps_60) to 60
                     ),
                     selectedPresetValue = startupFps,
-                    onPresetSelected = { onStartupFpsChange(it) },
-                    onManualValueChange = { input ->
-                        val digits = input.filter { it in '0'..'9' }.take(2)
-                        val fps = digits.toIntOrNull() ?: 24
-                        onStartupFpsChange(fps.coerceIn(10, 60))
+                    onValueChange = onStartupFpsChange,
+                    coerceManualValue = { text ->
+                        SettingsFormat.coerceFps(text.toIntOrNull() ?: 24)
                     },
                     manualSuffix = "FPS"
                 )
@@ -417,7 +411,7 @@ private fun ConnectStep(number: String, text: String) {
             Text(
                 number,
                 color = MaterialTheme.colorScheme.primary,
-                fontSize = 14.sp,
+                style = MaterialTheme.typography.titleSmall,
                 fontWeight = FontWeight.Bold
             )
         }

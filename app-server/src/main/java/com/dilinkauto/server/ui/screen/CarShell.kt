@@ -23,7 +23,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -176,7 +175,7 @@ private fun CarContentArea(
                         Text(
                             statusMessage.ifEmpty { stringResource(R.string.status_starting_vd) },
                             color = Color.White,
-                            fontSize = 18.sp
+                            style = MaterialTheme.typography.titleMedium
                         )
                     }
                 }

@@ -1,16 +1,18 @@
 package com.dilinkauto.server.ui.screen
 
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -27,7 +29,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -47,20 +51,51 @@ import com.dilinkauto.server.ui.theme.WarningColor
  * Note they were not standalone top-level composables — SettingSection was
  * invoked three times from inside ConnectionStatusCard, so moving them also
  * meant moving those call sites out.
+ *
+ * ## Manual-entry contract (audit UX-02)
+ *
+ * The field owns its own raw text while the user is editing and only reports a
+ * value on **Done** or **focus loss**. It used to echo the *coerced persisted*
+ * value back on every keystroke, so typing "160" collapsed to 120 on the first
+ * digit and silently stored the wrong DPI. [coerceManualValue] receives the
+ * finished digit string — never a partial one — and returns the value to store,
+ * which is handed to [onValueChange] exactly like a chip tap is.
+ *
+ * @param manualSeed digits to prefill the field with, or `""` when
+ *   [selectedPresetValue] is one of [presets] (a selected chip is the readout,
+ *   so the field stays empty). Callers pass the raw stored number rather than
+ *   stripping digits out of the display label — the label may be "2.5M", whose
+ *   digits are not the value.
  */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 internal fun SettingSection(
     title: String,
     subtitle: String,
     hint: String,
     currentValueText: String,
-    isCustom: Boolean,
+    manualSeed: String,
     presets: List<Pair<String, Int>>,
     selectedPresetValue: Int,
-    onPresetSelected: (Int) -> Unit,
-    onManualValueChange: (String) -> Unit,
+    onValueChange: (Int) -> Unit,
+    coerceManualValue: (String) -> Int,
     manualSuffix: String = ""
 ) {
+    val focusManager = LocalFocusManager.current
+
+    // Raw text is seeded once per stored value, not re-derived on every
+    // keystroke — that is the whole point of the fix above.
+    var rawText by remember(manualSeed) { mutableStateOf(manualSeed) }
+    // Guards against committing on the initial (unfocused) composition and
+    // against double-committing when Done also clears focus.
+    var hadFocus by remember { mutableStateOf(false) }
+
+    val commit: () -> Unit = {
+        hadFocus = false
+        val digits = rawText.filter { it.isDigit() }
+        if (digits.isNotEmpty()) onValueChange(coerceManualValue(digits))
+    }
+
     Column(modifier = Modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -77,7 +112,7 @@ internal fun SettingSection(
                     Text(
                         currentValueText,
                         color = WarningColor,
-                        fontSize = 12.sp,
+                        style = MaterialTheme.typography.labelMedium,
                         fontWeight = FontWeight.Bold
                     )
                 }
@@ -91,21 +126,30 @@ internal fun SettingSection(
 
             // Manual Input field
             OutlinedTextField(
-                value = if (isCustom) currentValueText.replace(Regex("[^0-9]"), "") else "",
-                onValueChange = onManualValueChange,
+                value = rawText,
+                onValueChange = { input -> rawText = input.filter { it.isDigit() }.take(3) },
                 singleLine = true,
                 placeholder = {
                     Text(
-                        if (manualSuffix.isNotEmpty()) manualSuffix else "自定义",
+                        if (manualSuffix.isNotEmpty()) manualSuffix else stringResource(R.string.manual_custom_hint),
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        fontSize = 12.sp
+                        style = MaterialTheme.typography.bodySmall
                     )
                 },
                 keyboardOptions = KeyboardOptions(
                     keyboardType = KeyboardType.Number,
                     imeAction = ImeAction.Done
                 ),
-                modifier = Modifier.width(96.dp),
+                keyboardActions = KeyboardActions(onDone = {
+                    commit()
+                    focusManager.clearFocus()
+                }),
+                modifier = Modifier
+                    .width(96.dp)
+                    .onFocusChanged { focusState ->
+                        if (focusState.isFocused) hadFocus = true
+                        else if (hadFocus) commit()
+                    },
                 colors = OutlinedTextFieldDefaults.colors(
                     focusedTextColor = Color.White,
                     unfocusedTextColor = Color.White,
@@ -117,24 +161,28 @@ internal fun SettingSection(
 
         Spacer(Modifier.height(8.dp))
 
-        // Preset Chips Row
-        Row(
+        // Preset chips — FlowRow so a longer translation or a narrow viewport
+        // wraps onto a second line instead of overflowing the card edge.
+        FlowRow(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             presets.forEach { (label, value) ->
                 val isSelected = selectedPresetValue == value
                 Button(
-                    onClick = { onPresetSelected(value) },
+                    onClick = { onValueChange(value) },
                     shape = RoundedCornerShape(8.dp),
                     colors = ButtonDefaults.buttonColors(
                         containerColor = if (isSelected) MaterialTheme.colorScheme.primary else ChipUnselectedColor,
-                        contentColor = if (isSelected) Color.White else MaterialTheme.colorScheme.onSurfaceVariant
+                        // onPrimary is black in this theme: white on the light-blue
+                        // container measured 2.00:1 (audit UX-03).
+                        contentColor = if (isSelected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
                     ),
                     modifier = Modifier.height(30.dp),
-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
                 ) {
-                    Text(label, fontSize = 11.sp, fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal)
+                    Text(label, style = MaterialTheme.typography.labelSmall, fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal)
                 }
             }
         }
@@ -142,10 +190,9 @@ internal fun SettingSection(
         Spacer(Modifier.height(4.dp))
         Text(
             hint,
-            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodySmall,
-            fontSize = 11.sp,
-            lineHeight = 15.sp
+            lineHeight = 16.sp
         )
     }
 }
@@ -168,7 +215,7 @@ internal fun WifiAdbSetupCard() {
                 stringResource(R.string.wifi_adb_setup_desc),
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.bodySmall,
-                lineHeight = 20.sp
+                lineHeight = 18.sp
             )
         }
     }
