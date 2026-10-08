@@ -26,6 +26,9 @@ app-server/src/main/assets/vd-server.jar
 # Claude settings
 .claude/
 
+# WorkBuddy agent working memory (local only)
+.workbuddy/
+
 # IDE
 .vscode/
 
