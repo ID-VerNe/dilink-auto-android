@@ -59,8 +59,7 @@ internal class GlPipeline(
     /** VD input surface, ready after [initEglAndSurfaceTexture] returns. */
     fun vdSurface(): Surface? = vdInputSurface
 
-    private fun log(msg: String) = PipeLog.log(msg)
-    private fun err(msg: String) = PipeLog.err(msg)
+    // Logging goes straight to the PipeLog singleton — no local alias (audit R3-DRY-22③).
 
     // Write-loop policy (5s deadline + 100us backoff) now comes from FrameCodec.
 
@@ -100,7 +99,7 @@ internal class GlPipeline(
         quadBuf = ByteBuffer.allocateDirect(quad.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
         quadBuf!!.put(quad).position(0)
 
-        log("EGL/GL ready, VD input surface created")
+        PipeLog.log("EGL/GL ready, VD input surface created")
     }
 
     /**
@@ -122,7 +121,7 @@ internal class GlPipeline(
         var nextFrameNanos = System.nanoTime()
         var frameCount = 0L; var keyFrameCount = 0L; var lastLogAt = 0L
         val adaptive = AdaptiveBitrate(bitrate)
-        log("Pipeline: ${encodeWidth}x${encodeHeight} ${fps}fps ${bitrate/1_000_000}Mbps")
+        PipeLog.log("Pipeline: ${encodeWidth}x${encodeHeight} ${fps}fps ${bitrate/1_000_000}Mbps")
 
         try {
             while (running()) {
@@ -163,14 +162,14 @@ internal class GlPipeline(
                         encoder.releaseOutputBuffer(idx, false)
                     }
                 }
-                if (frameCount - lastLogAt >= 120) { lastLogAt = frameCount; log("Pipeline: $frameCount frames ${adaptive.currentBitrate/1_000_000}Mbps keys=$keyFrameCount") }
+                if (frameCount - lastLogAt >= 120) { lastLogAt = frameCount; PipeLog.log("Pipeline: $frameCount frames ${adaptive.currentBitrate/1_000_000}Mbps keys=$keyFrameCount") }
             }
         } finally {
             // cbThread is non-daemon; if writeFrame throws or GL faults, the
             // parked Looper would prevent a clean JVM exit. quitSafely in finally.
             cbThread.quitSafely()
         }
-        log("Pipeline exited: $frameCount frames")
+        PipeLog.log("Pipeline exited: $frameCount frames")
     }
 
     /**

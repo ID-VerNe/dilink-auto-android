@@ -11,6 +11,11 @@ import java.io.OutputStream
  * vd-server.log file the car reads. Centralizing the format here keeps the
  * `[Pipeline]` prefix consistent and removes the per-class `log`/`err`
  * duplicates that were copy-pasted across the four files.
+ *
+ * Convention (audit R3-DRY-22③): regular log lines always call [log] directly —
+ * no per-class alias wrappers. The injected `logErr: (String) -> Unit` parameter
+ * that [TouchInjector]/[DisplayPowerController] take is *not* such an alias: it
+ * is a DI seam so [PipelineServer] owns error routing.
  */
 internal object PipeLog {
     fun log(msg: String) { println("[Pipeline] $msg"); System.out.flush() }

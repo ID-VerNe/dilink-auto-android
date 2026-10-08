@@ -34,7 +34,7 @@ internal class DisplayPowerController(
             val cur = execShellOutput("settings get secure default_input_method")?.trim()
             if (com.dilinkauto.protocol.ImeRestore.shouldRestoreIme(cur)) {
                 savedDefaultIme = cur
-                log("Saved original IME: $savedDefaultIme")
+                PipeLog.log("Saved original IME: $savedDefaultIme")
             }
         } catch (_: Exception) {}
         try {
@@ -85,7 +85,7 @@ internal class DisplayPowerController(
         if (ime != null && com.dilinkauto.protocol.ImeRestore.shouldRestoreIme(ime)) {
             try {
                 com.dilinkauto.protocol.ImeRestore.imeRestoreCommands(ime).forEach { execShell(it) }
-                log("Restored original IME: $ime")
+                PipeLog.log("Restored original IME: $ime")
             } catch (_: Exception) {}
         }
         restoreSetting("screen_off_timeout", savedScreenOffTimeout)
@@ -109,6 +109,5 @@ internal class DisplayPowerController(
         try { execShell("settings put system $key $v") } catch (_: Exception) {}
     }
 
-    private fun log(msg: String) = PipeLog.log(msg)
     private fun execShell(cmd: String) = ShellExec.execShell(shellProvider(), cmd)
 }

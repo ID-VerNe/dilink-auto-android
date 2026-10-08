@@ -51,11 +51,9 @@ internal class TouchInjector(
             inputManager = stub.getDeclaredMethod("asInterface", android.os.IBinder::class.java).invoke(null, binder)
             injectInputEventMethod = inputManager!!.javaClass.getMethod("injectInputEvent", android.view.InputEvent::class.java, Int::class.javaPrimitiveType)
             try { setDisplayIdMethod = MotionEvent::class.java.getDeclaredMethod("setDisplayId", Int::class.javaPrimitiveType) } catch (_: Exception) {}
-            log("InputManager ready")
+            PipeLog.log("InputManager ready")
         } catch (e: Exception) { logErr("InputManager: ${e.message}") }
     }
-
-    private fun log(msg: String) = PipeLog.log(msg)
 
     /** Decode a touch frame and inject it. */
     fun handleTouchFrame(f: FrameCodec.Frame) {

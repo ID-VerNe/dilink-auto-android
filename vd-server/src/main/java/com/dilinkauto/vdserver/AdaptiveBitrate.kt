@@ -1,5 +1,7 @@
 package com.dilinkauto.vdserver
 
+import com.dilinkauto.protocol.VideoConfig
+
 /**
  * Adaptive bitrate policy for the encode hot path.
  *
@@ -80,8 +82,14 @@ internal class AdaptiveBitrate(
     }
 
     companion object {
-        /** Never encode below this, however backed up the car is. */
-        const val MIN_BITRATE = 1_500_000
+        /**
+         * Never encode below this, however backed up the car is.
+         *
+         * Value lives in [VideoConfig.ADAPTIVE_MIN_BITRATE] so every bitrate
+         * bound is single-sourced; kept as a local alias for existing call
+         * sites and tests.
+         */
+        const val MIN_BITRATE = VideoConfig.ADAPTIVE_MIN_BITRATE
 
         /** How much the rate climbs per clean interval. */
         const val RECOVERY_STEP = 500_000
