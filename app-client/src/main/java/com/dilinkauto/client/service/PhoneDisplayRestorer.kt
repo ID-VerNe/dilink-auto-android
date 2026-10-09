@@ -5,6 +5,7 @@ import android.content.Intent
 import android.os.PowerManager
 import android.os.SystemClock
 import com.dilinkauto.client.FileLog
+import com.dilinkauto.client.MainActivity
 import com.dilinkauto.client.ShizukuManager
 import com.dilinkauto.protocol.AppPrefs
 import com.dilinkauto.protocol.ImeRestore
@@ -135,7 +136,10 @@ internal class PhoneDisplayRestorer(
 
             // Layer 2: Launch MainActivity with FLAG_TURN_SCREEN_ON.
             try {
-                val intent = Intent(appContext, Class.forName("com.dilinkauto.client.MainActivity"))
+                // Direct reference, not Class.forName (audit A-L19): the class
+                // lives in the same module, so the reflection only bought a
+                // runtime "class not found" surface with no benefit.
+                val intent = Intent(appContext, MainActivity::class.java)
                 intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 intent.addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
                 intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
@@ -152,8 +156,17 @@ internal class PhoneDisplayRestorer(
                 PowerManager.ACQUIRE_CAUSES_WAKEUP or
                 PowerManager.ON_AFTER_RELEASE
             val wl = pm.newWakeLock(flags, "DiLink:display:restore2")
-            wl.acquire(3000)
-            wl.release()
+            try {
+                wl.acquire(3000)
+            } finally {
+                // try/finally + isHeld (audit A-L20): acquire() throws when
+                // the framework refuses (e.g. the timeout arg is invalid on a
+                // vendor ROM), and releasing a lock that failed to acquire —
+                // or that the 3s timeout already auto-released — throws
+                // RuntimeException from here, skipping nothing else in this
+                // method only because the restore is already done.
+                if (wl.isHeld) wl.release()
+            }
         } catch (e: Exception) {
             FileLog.w(TAG, "forceWakeScreen error: ${e.message}")
         }

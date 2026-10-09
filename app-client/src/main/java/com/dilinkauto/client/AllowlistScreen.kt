@@ -66,10 +66,19 @@ fun AllowlistScreen(onBack: () -> Unit) {
             .putBoolean(ConnectionService.ALLOWLIST_CONFIGURED_KEY, true)
             .apply()
         // Re-send so the car grid updates immediately while a session is live.
-        val intent = Intent(context, ConnectionService::class.java).apply {
-            action = ConnectionService.ACTION_ALLOWLIST_UPDATED
+        // Plain startService, NOT startForegroundService (audit A-L21): a
+        // running service is already foregrounded, and upgrading here would
+        // re-arm the "must call startForeground within 5s" contract for an
+        // action that never posts a notification. Skipped entirely when the
+        // service is stopped — starting it just to deliver a list refresh
+        // would resurrect a stopped service in a non-foreground state; the
+        // persisted selection is read on the next session start anyway.
+        if (ConnectionService.serviceState.value != ConnectionService.State.IDLE) {
+            val intent = Intent(context, ConnectionService::class.java).apply {
+                action = ConnectionService.ACTION_ALLOWLIST_UPDATED
+            }
+            context.startService(intent)
         }
-        context.startService(intent)
     }
 
     val filtered = remember(apps, query) {

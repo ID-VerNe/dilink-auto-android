@@ -28,7 +28,7 @@ internal class AppInfoProvider(private val context: Context) {
                 pkg,
                 info.loadLabel(pm).toString(),
                 AppCategorizer.categorize(pkg),
-                iconGate.iconFor(pkg, hash) { ClientApp.loadIconPng(pm, pkg, 192) },
+                iconGate.iconFor(pkg, hash) { ClientApp.loadIconPng(pm, pkg, 192, cacheKey = hash) },
                 hash
             )
         }.sortedBy { it.category.id }

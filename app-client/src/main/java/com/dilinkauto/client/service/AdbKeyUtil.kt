@@ -21,11 +21,24 @@ internal object AdbKeyUtil {
      * Read or generate the Dadb key pair at `[filesDir]/adbkey{,.pub}`.
      * Files are kept in the app's internal storage so they survive across
      * sessions and are reachable by Dadb.
+     *
+     * Self-healing (audit A-L24): regenerate whenever *either* half is
+     * missing. `AdbKeyPair.read` throws on a missing private key, and a
+     * private key without its public half reads back with an empty public
+     * key — a state a process killed between the two writes can leave
+     * behind. That used to bubble up as an opaque generic install failure;
+     * now the pair is simply rebuilt before the read.
      */
     fun ensureAdbKeyPair(filesDir: File): AdbKeyPair {
         val privKey = File(filesDir, "adbkey")
         val pubKey = File(filesDir, "adbkey.pub")
-        if (!privKey.exists()) {
+        if (!privKey.exists() || !pubKey.exists()) {
+            // Drop the surviving half first: a stale public key next to a
+            // regenerated private key is exactly the corrupted state the
+            // audit flagged, and generate() may not overwrite both files
+            // atomically.
+            privKey.delete()
+            pubKey.delete()
             filesDir.mkdirs()
             AdbKeyPair.generate(privKey, pubKey)
         }

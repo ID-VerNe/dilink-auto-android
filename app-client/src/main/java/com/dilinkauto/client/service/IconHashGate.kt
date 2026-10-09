@@ -13,7 +13,12 @@ internal class IconHashGate {
 
     // Tracks the last icon hash sent per package — survives across reconnections
     // within the same service lifetime to avoid re-sending unchanged icons.
-    private val lastSent = mutableMapOf<String, String>()
+    //
+    // Concurrent (audit A-M11): reset() runs on the Main thread when a session
+    // is torn down while iconFor() runs on the IO thread that builds the app
+    // list — a plain LinkedHashMap shared that way can lose entries or, on
+    // structural modification during a concurrent read, corrupt itself.
+    private val lastSent = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     /**
      * Returns the PNG to put on the wire for [pkg] with the current [hash]:

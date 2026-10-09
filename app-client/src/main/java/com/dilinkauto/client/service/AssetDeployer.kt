@@ -79,9 +79,13 @@ internal class AssetDeployer(private val assets: AssetManager) {
     }
 
     /**
-     * @return the jar's CRC when it is known to be current (or was just
-     *   refreshed), or `-1` when the state is unknown and the caller should
-     *   decide whether to abort.
+     * Ensures [target] holds the current contents of [assetName] and reports
+     * which jar will run.
+     *
+     * @return the CRC of the jar now in place: verified current, freshly
+     *   written, or the last usable on-disk copy when the refresh failed
+     *   (that copy still runs); `-1` when there is no usable file and the
+     *   caller should decide whether to abort.
      */
     fun ensureCurrent(assetName: String, target: File): Long =
         when (val r = extract(assetName, target)) {
@@ -93,10 +97,25 @@ internal class AssetDeployer(private val assets: AssetManager) {
             is Result.Failed -> {
                 FileLog.e(TAG, "VD jar refresh failed: ${r.reason}")
                 // A usable jar already on disk is still usable; otherwise the
-                // caller has to decide whether to abort.
-                if (!target.exists() || target.length() == 0L) -1L else -1L
+                // caller has to decide whether to abort. The CRC of that file
+                // is returned so the caller can log/report exactly which jar
+                // will run (audit A-L15: both branches used to return -1L
+                // unconditionally, making the KDoc's "usable value" contract
+                // unreachable and every caller's fallback branch dead).
+                usableExistingCrc(target)
             }
         }
+
+    /**
+     * CRC of a non-empty readable [target], or -1 when there is no usable
+     * file (missing, empty, unreadable). Read failure means the state is
+     * unknown, which is what the -1 sentinel tells the caller.
+     */
+    private fun usableExistingCrc(target: File): Long = try {
+        if (!target.exists() || target.length() == 0L) -1L else crc32(target.readBytes())
+    } catch (_: Exception) {
+        -1L
+    }
 
     private fun crc32(bytes: ByteArray): Long = CRC32().apply { update(bytes) }.value
 
@@ -108,16 +127,31 @@ internal class AssetDeployer(private val assets: AssetManager) {
      * (some emulated external volumes) rename can fail, and a complete-but-
      * unrenamed file still beats losing the asset entirely.
      */
-    private fun writeAtomically(target: File, bytes: ByteArray) {
-        val tmp = File("${target.absolutePath}.tmp")
-        tmp.writeBytes(bytes)
-        if (!tmp.renameTo(target)) {
-            target.writeBytes(bytes)
-            tmp.delete()
-        }
-    }
+    private fun writeAtomically(target: File, bytes: ByteArray) = writeViaTempFile(target, bytes)
 
     companion object {
         private const val TAG = "AssetDeployer"
+
+        /**
+         * The [writeAtomically] body, in the companion so the cleanup
+         * discipline is unit-testable without an Android [AssetManager].
+         *
+         * The `finally` is load-bearing (audit A-L16): the fallback direct
+         * write can throw too, and without the delete every failed refresh
+         * stranded another `<target>.tmp` sibling on shared storage.
+         */
+        internal fun writeViaTempFile(target: File, bytes: ByteArray) {
+            val tmp = File("${target.absolutePath}.tmp")
+            try {
+                tmp.writeBytes(bytes)
+                if (!tmp.renameTo(target)) {
+                    target.writeBytes(bytes)
+                }
+            } finally {
+                // No-op when the rename already consumed the tmp (it no
+                // longer exists) — delete() just returns false.
+                tmp.delete()
+            }
+        }
     }
 }

@@ -1,9 +1,9 @@
 package com.dilinkauto.client
 
-import android.os.Environment
 import android.util.Log
 import com.dilinkauto.protocol.AppPrefs
 import com.dilinkauto.protocol.AsyncLogQueue
+import com.dilinkauto.protocol.VdDeploy
 import kotlinx.coroutines.runBlocking
 import java.io.File
 import java.io.FileWriter
@@ -21,16 +21,30 @@ import java.util.Locale
  */
 object FileLog {
 
+    /** Max queued lines before the oldest policy drops the newest (audit A-05). */
+    private const val LOG_QUEUE_CAPACITY = 2048
+
     /** Toggled from Settings. When false, no file writes or logcat output. */
     @Volatile var enabled = true
 
-    private val queue = AsyncLogQueue<String>()
+    /**
+     * Bounded queue (audit A-05): the DATA channel dispatch is asynchronous and
+     * the frame payload cap lets a peer enqueue huge lines; an UNLIMITED queue
+     * turned that into unbounded heap growth on a remote trigger. Overflow
+     * drops the newest line — for a debug log that is always the right trade.
+     */
+    private val queue = AsyncLogQueue<String>(capacity = LOG_QUEUE_CAPACITY)
     @Volatile private var writer: FileWriter? = null
     // SimpleDateFormat is NOT thread-safe — the writer thread formats all
     // timestamps, so a single shared instance is safe here. Callers only ever
     // queue raw message strings (no formatting on the calling thread).
     private val dateFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
-    private val logDir = File(Environment.getExternalStorageDirectory(), "DiLinkAuto")
+    // Same literal path the vd-server engine writes to (VdDeploy.DIR_PATH —
+    // audit A-L23). Environment.getExternalStorageDirectory() resolved to a
+    // *different* directory on this ROM (the code's own comments recorded the
+    // divergence), so log sharing showed client logs from one folder while
+    // the engine's log lived in another. One constant, one place.
+    private val logDir = File(VdDeploy.DIR_PATH)
     private val logFile = File(logDir, "client.log")
     private val archiver = LogArchiver(logDir)
 

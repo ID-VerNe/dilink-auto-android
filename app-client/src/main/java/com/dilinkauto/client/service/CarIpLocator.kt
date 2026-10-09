@@ -7,9 +7,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.net.InetSocketAddress
-import java.nio.channels.SocketChannel
+import java.net.Socket
 
 /**
  * Locates the car's ADB-over-WiFi service (port 5555) on the local network.
@@ -49,20 +51,33 @@ object CarIpLocator {
     var portProbeOverride: ((String, Int) -> Boolean)? = null
 
     private fun probe(ip: String, port: Int): Boolean =
-        portProbeOverride?.invoke(ip, port) ?: probePortBlocking(ip, port, 500, 5)
+        portProbeOverride?.invoke(ip, port) ?: probePortBlocking(ip, port, 500)
+
+    /**
+     * Serializes [findCarAdb] (audit A-M8): two concurrent car-app installs
+     * used to each walk the full strategy chain, running two /24 sweeps at
+     * once — 508 sockets across two interfaces on one phone. The install path
+     * can genuinely be entered twice before the first finishes, so the scan
+     * itself is now single-flight; a second caller waits for the first result
+     * instead of duplicating it.
+     */
+    private val scanMutex = Mutex()
 
     /** Returns the car's IPv4 address, or null if no ADB endpoint was found. */
-    suspend fun findCarAdb(controlConnectionRemoteIp: String?): String? {
+    suspend fun findCarAdb(controlConnectionRemoteIp: String?): String? = scanMutex.withLock {
         // 1. Check the control connection's remote address (car is already connected)
         controlConnectionRemoteIp?.let { ip ->
             if (probe(ip, CAR_ADB_PORT)) {
                 FileLog.i(TAG, "Found car ADB at $ip (control connection)")
-                return ip
+                return@withLock ip
             }
         }
 
-        // 2. Scan ALL local subnets (phone may be on both home WiFi + hotspot)
-        val subnetIps = getLocalSubnetIps()
+        // 2. Scan ALL local subnets (phone may be on both home WiFi + hotspot).
+        // Snapshot-safe (A-M8): prefer the published snapshot so the sweep and
+        // the own-IP filter share one immutable view; fall back to a live walk
+        // until the network-change owner publishes one.
+        val subnetIps = subnetSnapshot ?: getLocalSubnetIps()
         val prefixes = subnetIps.map { it.substringBeforeLast(".") }.distinct()
         FileLog.d(TAG, "Local subnets: $subnetIps (prefixes: $prefixes)")
 
@@ -74,7 +89,7 @@ object CarIpLocator {
                 if (subnetIps.contains(ip)) continue
                 if (probe(ip, CAR_ADB_PORT)) {
                     FileLog.i(TAG, "Found car ADB at $ip (ARP)")
-                    return ip
+                    return@withLock ip
                 }
             }
         } catch (e: Exception) {
@@ -94,7 +109,7 @@ object CarIpLocator {
                     if (subnetIps.contains(ip)) continue
                     if (probe(ip, CAR_ADB_PORT)) {
                         FileLog.i(TAG, "Found car ADB at $ip (neighbor)")
-                        return ip
+                        return@withLock ip
                     }
                 }
             } catch (_: Exception) {} finally {
@@ -115,7 +130,7 @@ object CarIpLocator {
             val elapsed = System.currentTimeMillis() - startMs
             if (result != null) {
                 FileLog.i(TAG, "Found car ADB at $result ($prefix.0/24, ${elapsed}ms)")
-                return result
+                return@withLock result
             }
             FileLog.d(TAG, "$prefix.0/24: no ADB found (${elapsed}ms)")
         }
@@ -123,20 +138,56 @@ object CarIpLocator {
         // 6. Gateway
         try {
             @Suppress("DEPRECATION")
-            val wm = wifiManager ?: return null
+            val wm = wifiManager ?: return@withLock null
             val ip = com.dilinkauto.protocol.WifiGatewayIp.format(wm.dhcpInfo.gateway)
             if (ip != null && !subnetIps.contains(ip) && probePort(ip, CAR_ADB_PORT)) {
                 FileLog.i(TAG, "Found car ADB at $ip (gateway)")
-                return ip
+                return@withLock ip
             }
         } catch (_: Exception) {}
 
-        return null
+        null
     }
 
-    /** WiFi manager — set by [ConnectionService] at startup (avoids a static Service reference). */
+    /**
+     * WiFi manager — set by [ConnectionService] at startup (avoids a static
+     * Service reference).
+     *
+     * `@Volatile` is enough for the assignment itself (audit A-M8): the race
+     * the audit flagged was not this publication but two concurrent
+     * [findCarAdb] sweeps — see [scanMutex].
+     */
     @Volatile
     var wifiManager: WifiManager? = null
+
+    /**
+     * Last-published snapshot of this device's local IPv4 addresses.
+     *
+     * Publishing once per network change (A-M8) keeps interface enumeration
+     * off the per-call scan path and gives the sweep and the own-IP filter
+     * one immutable view — a per-call list could straddle an interface change
+     * mid-scan (e.g. the hotspot going down between the enumeration and the
+     * /24 batch). Null until first published; [findCarAdb] then falls back to
+     * a live walk, so behaviour is correct before the owner publishes too.
+     */
+    @Volatile
+    private var subnetSnapshot: List<String>? = null
+
+    /**
+     * Publish the subnet snapshot (thread-safe). Called from onCreate and on
+     * network change by the owner of the network state — the ConnectionService
+     * call site is wired by the lead.
+     */
+    fun setLocalSubnetSnapshot(ips: List<String>) {
+        // Copy on write: the snapshot is read by scan threads while a new
+        // publication may be in flight.
+        subnetSnapshot = ips.toList()
+    }
+
+    /** Forget the snapshot — the next [findCarAdb] falls back to a live walk. */
+    fun clearLocalSubnetSnapshot() {
+        subnetSnapshot = null
+    }
 
     private fun getLocalSubnetIps(): List<String> = NetUtil.localIpv4Addresses()
 
@@ -166,36 +217,31 @@ object CarIpLocator {
     }
 
     /**
-     * Single port-probe body. Opens a non-blocking SocketChannel, polls
-     * [finishConnect] until it succeeds or [timeoutMs] elapses, sleeping
-     * [sleepMs] between polls. Returns true on successful connect.
+     * Single port-probe body. Blocking connect with a bounded timeout
+     * (audit A-L17): `Socket.connect(remote, timeout)` waits inside the
+     * kernel.
      *
-     * All three former probes ([probePortRaw], [probePortSync], the suspend
-     * [probePort]) were byte-identical except for these two constants and
-     * whether the caller was a suspend function; they now route through
-     * this single body.
+     * The previous form opened a non-blocking socket channel and polled
+     * `finishConnect` with a `Thread.sleep` between attempts — every one of
+     * the 254 sweep IPs (×2 interfaces) cost a wakeup per poll for the whole
+     * 500ms deadline on unreachable hosts, on the already loaded IO
+     * dispatcher. `connect` gives the same deadline with zero polling, and
+     * correctness is unchanged: a refused/silent host still times out to
+     * false within [timeoutMs].
+     *
+     * All probes (the suspend [probe], [probePortSync], the gateway step)
+     * route through this single body.
      */
-    private fun probePortBlocking(ip: String, port: Int, timeoutMs: Long, sleepMs: Long): Boolean {
+    private fun probePortBlocking(ip: String, port: Int, timeoutMs: Long): Boolean {
         return try {
-            val ch = SocketChannel.open()
-            ch.configureBlocking(false)
-            ch.connect(InetSocketAddress(ip, port))
-            val deadline = System.currentTimeMillis() + timeoutMs
-            try {
-                while (!ch.finishConnect()) {
-                    if (System.currentTimeMillis() > deadline) return false
-                    Thread.sleep(sleepMs)
-                }
-                true
-            } finally {
-                ch.close()
-            }
+            Socket().use { it.connect(InetSocketAddress(ip, port), timeoutMs.toInt()) }
+            true
         } catch (_: Exception) { false }
     }
 
     /** Synchronous port probe with a 500ms timeout — used by the manual install path. */
-    fun probePortSync(ip: String, port: Int): Boolean = probePortBlocking(ip, port, 500, 5)
+    fun probePortSync(ip: String, port: Int): Boolean = probePortBlocking(ip, port, 500)
 
     private suspend fun probePort(ip: String, port: Int): Boolean =
-        withContext(Dispatchers.IO) { probePortBlocking(ip, port, 500, 5) }
+        withContext(Dispatchers.IO) { probePortBlocking(ip, port, 500) }
 }

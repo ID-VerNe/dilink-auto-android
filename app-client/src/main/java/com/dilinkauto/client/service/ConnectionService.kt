@@ -46,6 +46,35 @@ class ConnectionService : Service() {
     private lateinit var appListBuilder: AppListBuilder
     private lateinit var displayRestorer: PhoneDisplayRestorer
 
+    // ─── Session generation (audit A-01) ───
+    //
+    // cleanupSession() used to be guarded by a single AtomicBoolean that the
+    // network callbacks reset *before* the cancelled loop's finally block had
+    // run, so one generation's late teardown consumed the guard belonging to
+    // the *next* generation: the fresh lifecycle ServerSocket was never closed
+    // and the stale vdClient kept streaming (the leaked-VD failure mode).
+    //
+    // Every accept now mints a generation id; a teardown only runs when the id
+    // it captured is still the active one, so a stale finally block is a no-op
+    // and the new session's teardown always gets its own guard.
+    private val sessionSeq = java.util.concurrent.atomic.AtomicInteger(0)
+    @Volatile private var activeSessionId = 0
+
+    /** Serialises the vdClient read-modify-write in handleHandshake (audit A-03). */
+    private val vdLock = Any()
+
+    /**
+     * Process-lifetime scope for teardown work (audit A-04).
+     *
+     * `cleanupSession()` runs on Main from several call sites and
+     * `VirtualDisplayClient.stopVdServer()` joins a write worker for up to
+     * 1s — an ANR-shaped stall. Moving the blocking part here (instead of
+     * serviceScope, which onDestroy() cancels before the work runs, and
+     * instead of Main) keeps the physical-panel restore alive after the
+     * service is stopped. Mirrors PhoneDisplayRestorer's own scope contract.
+     */
+    private val teardownScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
     /**
      * 内嵌资产（vd-server.jar / app-server.apk）的部署器。
      *
@@ -109,11 +138,33 @@ class ConnectionService : Service() {
         // into CarIpLocator; the locator is a plain object for unit-testability).
         @Suppress("DEPRECATION")
         CarIpLocator.wifiManager = applicationContext.getSystemService(WIFI_SERVICE) as? android.net.wifi.WifiManager
+        // A-M8: publish the subnet snapshot once here instead of enumerating
+        // interfaces per scan; findCarAdb is additionally serialized (Mutex).
+        refreshSubnetSnapshot()
         carAppInstaller = CarAppInstaller(this) { msg -> _installStatusStatic.value = msg }
         appListBuilder = AppListBuilder(applicationContext, serviceScope)
         // No scope passed: the restorer owns a process-lifetime scope so a
         // Service.onDestroy() mid-restore cannot skip `cmd display power-on`.
         displayRestorer = PhoneDisplayRestorer(applicationContext)
+    }
+
+    /** Snapshot the device's local IPv4 addresses for CarIpLocator's sweep (audit A-M8). */
+    private fun refreshSubnetSnapshot() {
+        val localIps = try {
+            java.util.Collections.list(java.net.NetworkInterface.getNetworkInterfaces())
+                .flatMap { it.interfaceAddresses ?: emptyList() }
+                .map { it.address }
+                .filterIsInstance<java.net.Inet4Address>()
+                .mapNotNull { it.hostAddress }
+                .toList()
+        } catch (e: Exception) {
+            FileLog.w(TAG, "Subnet enumeration failed: ${e.message}")
+            emptyList()
+        }
+        CarIpLocator.setLocalSubnetSnapshot(localIps)
+        if (localIps.isNotEmpty()) {
+            FileLog.i(TAG, "Local IPv4 snapshot for car scan: ${localIps.joinToString(", ")}")
+        }
     }
 
     private fun cacheDefaultIme() {
@@ -218,12 +269,14 @@ class ConnectionService : Service() {
             override fun onAvailable(network: Network) {
                 FileLog.i(TAG, "Network available: $network")
                 networkChangeDebounce?.cancel()
+                // Re-publish the local-IPv4 snapshot: the sweep must not inherit
+                // the previous network's addresses (audit A-M8).
+                refreshSubnetSnapshot()
                 val state = _serviceState.value
                 if (state == State.WAITING) {
                     FileLog.i(TAG, "New network while WAITING — restarting listen loop")
                     cleanupSession()
                     connectionLoopJob?.cancel()
-                    resetCleanupGuard()
                     startConnectionLoop()
                 }
             }
@@ -264,7 +317,6 @@ class ConnectionService : Service() {
                 FileLog.i(TAG, "Network changed while WAITING — restarting listen loop")
                 cleanupSession()
                 connectionLoopJob?.cancel()
-                resetCleanupGuard()
                 startConnectionLoop()
             }
             State.CONNECTED, State.STREAMING -> {
@@ -351,16 +403,23 @@ class ConnectionService : Service() {
         updateNotification(R.string.notification_waiting)
         FileLog.i(TAG, "Listening for car connection on port ${Ports.DEFAULT_PORT}...")
 
+        // Declared outside try so the finally can scope its teardown to the
+        // generation this iteration accepted (see the session-generation doc).
+        var sessionId = 0
         try {
             // ─── Accept control connection (port 9637) ───
             val ctrl = Connection.accept(Ports.DEFAULT_PORT, serviceScope)
-            // A brand-new session begins: allow the next teardown to run again.
-            resetCleanupGuard()
+            // A brand-new session begins: mint its generation and allow the next
+            // teardown to run against it. Any late teardown from a previous
+            // generation is ignored by cleanupSession's id check.
+            sessionId = sessionSeq.incrementAndGet()
+            activeSessionId = sessionId
+            resetCleanupGuard(sessionId)
             controlConnection = ctrl
             activeConnection = ctrl
             _serviceState.value = State.CONNECTED
             updateNotification(R.string.notification_connected)
-            FileLog.i(TAG, "Car connected (control), waiting for handshake")
+            FileLog.i(TAG, "Car connected (control, session #$sessionId), waiting for handshake")
 
             ctrl.onFrames(Channel.CONTROL) { frame -> handleControlFrame(frame) }
             ctrl.onFrames(Channel.DATA) { frame -> handleDataFrame(frame) }
@@ -379,7 +438,10 @@ class ConnectionService : Service() {
         } catch (e: Exception) {
             FileLog.w(TAG, "Connection error: ${e.message}")
         } finally {
-            cleanupSession()
+            // Only tears down when this generation is still the active one —
+            // a network-change restart that already accepted a new session must
+            // not consume that session's cleanup guard.
+            cleanupSession(sessionId)
             delay(1000)
         }
     }
@@ -393,7 +455,24 @@ class ConnectionService : Service() {
             ControlMsg.HANDSHAKE_REQUEST -> {
                 val req = HandshakeRequest.decode(frame.payload)
                 FileLog.i(TAG, "Handshake from car: ${req.deviceName} ${req.screenWidth}x${req.screenHeight}")
-                handleHandshake(req)
+                // A-02: handleHandshake does disk I/O (jar CRC), a bind (19647)
+                // and package enumeration — all far too heavy for the reader
+                // coroutine that dispatches this frame inline. Run it on the
+                // handshake job; the previous handshake is cancelled first so a
+                // rotation re-handshake cannot interleave with its predecessor.
+                handshakeJob?.cancel()
+                handshakeJob = serviceScope.launch(Dispatchers.IO) {
+                    try {
+                        handleHandshake(req)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        // Connection's reader also guards its listener, but this
+                        // coroutine must not die silently: a failed handshake
+                        // has to tear the session down, not just kill the job.
+                        FileLog.e(TAG, "Handshake failed", e)
+                    }
+                }
             }
             // LAUNCH_APP, GO_BACK, GO_HOME, APP_UNINSTALL, APP_INFO
             // now go directly Car → VD via port 9639 Channel.CONTROL
@@ -434,6 +513,10 @@ class ConnectionService : Service() {
     }
 
     private fun handleHandshake(request: HandshakeRequest) {
+        // P-M3: the version field was carried and never validated by any of the
+        // three consumers — a peer claiming an incompatible version had its
+        // trailing fields read at the wrong offsets. Reject at the boundary.
+        requireSupportedProtocolVersion(request.protocolVersion)
         val conn = controlConnection ?: return
         FileLog.i(TAG, "Car display: ${request.screenWidth}x${request.screenHeight} @${request.screenDpi}dpi fps=${request.targetFps} bitrate=${request.bitrate}")
         targetFps = request.targetFps
@@ -449,10 +532,15 @@ class ConnectionService : Service() {
         // Mid-stream re-handshake: the car rotated and is reusing the control
         // connection. Tear down the old VD before creating a new one at the
         // new orientation. Old VD exits via its watchdog, restoring the panel.
-        if (vdClient != null) {
-            FileLog.i(TAG, "Re-handshake: tearing down old VD (rotation)")
-            vdClient?.stopVdServer()
-            vdClient?.disconnect()
+        // A-03: the whole read-modify-write is under vdLock — two overlapping
+        // handshakes (rotation + reconnect) used to both pass the null check
+        // and both bind 19647; the loser leaked its ServerSocket.
+        synchronized(vdLock) {
+            vdClient?.let {
+                FileLog.i(TAG, "Re-handshake: tearing down old VD (rotation)")
+                it.stopVdServer()
+                it.disconnect()
+            }
             vdClient = null
         }
 
@@ -464,29 +552,31 @@ class ConnectionService : Service() {
         val (vdWidth, vdHeight, displayDpi) = VdDimensions.compute(request, phoneRealW, phoneRealH)
         FileLog.i(TAG, "VD: ${vdWidth}x${vdHeight} @${displayDpi}dpi (car ${request.screenWidth}x${request.screenHeight} @${request.screenDpi}dpi, phone real ${phoneRealW}x${phoneRealH}, override=${request.dpiOverride})")
 
-        // Open lifecycle channel if not already open (survives re-handshakes)
-        if (vdClient == null) {
-            val lifecycleClient = VirtualDisplayClient(serviceScope, this@ConnectionService)
-            lifecycleClient.onStackEmpty = {
-            val c = controlConnection
-            if (c?.isConnected == true) {
-                try { c.sendControl(ControlMsg.VD_STACK_EMPTY) } catch (_: Exception) {}
-            }
-        }
-        lifecycleClient.onDisplayReady = {
-            val c = controlConnection
-            if (c?.isConnected == true) {
-                try {
-                    c.sendControl(ControlMsg.VD_PORTS_BOUND)
-                    FileLog.i(TAG, "Sent VD_PORTS_BOUND to car — direct video/input streaming")
-                } catch (e: Exception) {
-                    FileLog.e(TAG, "Failed to send VD_PORTS_BOUND", e)
+        // Open lifecycle channel if not already open (survives re-handshakes).
+        // A-03: created under vdLock so a concurrent handshake cannot double-bind.
+        synchronized(vdLock) {
+            vdClient ?: VirtualDisplayClient(serviceScope, this@ConnectionService).also {
+                it.onStackEmpty = {
+                    val c = controlConnection
+                    if (c?.isConnected == true) {
+                        try { c.sendControl(ControlMsg.VD_STACK_EMPTY) } catch (_: Exception) {}
+                    }
                 }
+                it.onDisplayReady = {
+                    val c = controlConnection
+                    if (c?.isConnected == true) {
+                        try {
+                            c.sendControl(ControlMsg.VD_PORTS_BOUND)
+                            FileLog.i(TAG, "Sent VD_PORTS_BOUND to car — direct video/input streaming")
+                        } catch (e: Exception) {
+                            FileLog.e(TAG, "Failed to send VD_PORTS_BOUND", e)
+                        }
+                    }
+                }
+                it.startListening(VirtualDisplayClient.SERVER_PORT)
+                vdClient = it
+                FileLog.i(TAG, "VD lifecycle channel open on 127.0.0.1:${VirtualDisplayClient.SERVER_PORT}")
             }
-        }
-            lifecycleClient.startListening(VirtualDisplayClient.SERVER_PORT)
-            vdClient = lifecycleClient
-            FileLog.i(TAG, "VD lifecycle channel open on localhost:${VirtualDisplayClient.SERVER_PORT}")
         }
 
         // 握手响应里告知车机端 jar 路径前，先确保磁盘上的 jar 就是当前 APK
@@ -497,7 +587,12 @@ class ConnectionService : Service() {
         // child 的前导斜杠不重置父路径，拼接会得到 /storage/emulated/0/sdcard/DiLinkAuto
         // 这类影子目录，与实际写入位置不一致。
         val vdJarPath = VdDeploy.JAR_PATH
-        val connMethod = if (ShizukuManager.checkPermission()) CONNECTION_METHOD_SHIZUKU else CONNECTION_METHOD_USB_ADB
+        // A-L18: snapshot the Shizuku decision ONCE and thread it through both
+        // the response and the deploy path. Reading checkPermission() for the
+        // response and isAvailable later for the deploy let a binder death
+        // between the two produce "we said SHIZUKU but deployed nothing".
+        val useShizuku = ShizukuManager.checkPermission()
+        val connMethod = if (useShizuku) CONNECTION_METHOD_SHIZUKU else CONNECTION_METHOD_USB_ADB
         val resp = HandshakeResponse(
             accepted = true,
             deviceName = android.os.Build.MODEL,
@@ -525,7 +620,7 @@ class ConnectionService : Service() {
             }
 
             // If Shizuku is available, deploy VD server directly BEFORE waiting for lifecycle connection
-            if (ShizukuManager.isAvailable) {
+            if (useShizuku) {
                 startVdServerViaShizuku(request.screenWidth, request.screenHeight, vdWidth, vdHeight, displayDpi, vdJarCrc)
             }
 
@@ -595,7 +690,12 @@ class ConnectionService : Service() {
                 encodeWidth = carWidth, encodeHeight = carHeight,
                 phoneHost = "127.0.0.1", fps = targetFps,
                 bitrate = targetBitrate,
-                background = true
+                background = true,
+                // S-01: pin the engine's 9638/9639 accepts to the receiver we are
+                // serving. The phone knows the car's IP from the control
+                // connection's remote address; without this any host on the
+                // phone's WiFi could drive the shell-UID engine.
+                carHost = controlConnection?.remoteAddress ?: VdDeployArgs.CAR_HOST_ANY
             )
 
             // Order, convergence rule and the force-kill fallback all live in
@@ -611,8 +711,12 @@ class ConnectionService : Service() {
                     // engine, so there is no launch status to observe here. The
                     // `setsid ... &` form in the plan (background=true) keeps the
                     // engine alive past the parent sh's exit — see VdDeploy.commandLine.
-                    ShizukuManager.execBackground(command)
-                    return true
+                    //
+                    // A-M7: execBackground returns false when Shizuku is gone or
+                    // the process could not be spawned; propagating it stops the
+                    // "VD server started" log from being printed for an engine
+                    // that never launched.
+                    return ShizukuManager.execBackground(command)
                 }
 
                 override suspend fun probe(): VdProbeResult = ShizukuManager.probeVdServer()
@@ -620,6 +724,11 @@ class ConnectionService : Service() {
             val outcome = vdRunDeploySequence(plan, executor)
             if (outcome.forcedKill) {
                 FileLog.w(TAG, "Previous VD server did not exit in time — forced kill used")
+            }
+            if (!outcome.launched) {
+                FileLog.e(TAG, "VD server launch failed (Shizuku execBackground returned false) — tearing down")
+                cleanupSession()
+                return
             }
             // 打出 jar CRC：测试时可直接从日志确认这次跑的是哪一版引擎，
             // 避免"装了新 APK 却跑旧代码"无从查证。
@@ -634,7 +743,18 @@ class ConnectionService : Service() {
     private fun handleDataFrame(frame: FrameCodec.Frame) {
         when (frame.messageType) {
             DataMsg.CAR_LOG -> {
-                val line = String(frame.payload, Charsets.UTF_8)
+                // A-05: the DATA dispatch is asynchronous (the reader does not
+                // throttle it) and MAX_PAYLOAD_SIZE used to be 128MB, so a peer
+                // could push a single "log line" that allocated up to 256MB as a
+                // String and entered the unbounded FileLog queue. Cap the line;
+                // truncate rather than drop so the rest of the log stays usable.
+                val cap = CAR_LOG_LINE_MAX_BYTES
+                val bytes = frame.payload
+                if (bytes.size > cap) {
+                    FileLog.w(TAG, "CAR_LOG frame ${bytes.size}B exceeds $cap — truncating")
+                }
+                val safe = if (bytes.size > cap) bytes.copyOf(cap) else bytes
+                val line = String(safe, Charsets.UTF_8)
                 FileLog.i("CarLog", line)
             }
         }
@@ -645,10 +765,36 @@ class ConnectionService : Service() {
 
     private val _installStatus get() = _installStatusStatic
 
+    /**
+     * A-M9: double-taps (or a re-delivered ACTION_INSTALL_CAR) used to launch
+     * two concurrent install flows that pushed the same APK to the same remote
+     * path. Serialized with an in-flight guard; a second request is dropped
+     * with a status line instead of racing the first.
+     */
+    private val installInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** IPv4 literal (what the car-side ADB service actually listens on). */
+    private val IPV4_REGEX = Regex("^((25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.){3}(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)$")
+
     fun installCarApp(explicitIp: String? = null) {
+        val ip = explicitIp?.trim()?.takeIf { it.isNotEmpty() }
+        if (ip != null && !IPV4_REGEX.matches(ip)) {
+            _installStatus.value = "Invalid IP: $ip"
+            FileLog.w(TAG, "installCarApp: rejecting malformed IP '$ip'")
+            return
+        }
+        if (!installInFlight.compareAndSet(false, true)) {
+            _installStatus.value = "Install already in progress"
+            FileLog.i(TAG, "installCarApp: already in progress — ignoring")
+            return
+        }
         serviceScope.launch(Dispatchers.IO) {
-            ensureAssetsReady()
-            installCoordinator.install(explicitIp)
+            try {
+                ensureAssetsReady()
+                installCoordinator.install(ip)
+            } finally {
+                installInFlight.set(false)
+            }
         }
     }
 
@@ -679,47 +825,77 @@ class ConnectionService : Service() {
      * `Force-waking physical display` lines. Each repeat raced the previous
      * one's `pkill`, which is how VDs leaked.
      *
-     * Set on entry, cleared by [resetCleanupGuard] which the call sites invoke
-     * when they are about to establish a *new* session (so the next teardown is
-     * allowed to run again).
+     * Two guards now compose: the generation id (a stale teardown from an
+     * already-replaced session is ignored entirely) and this AtomicBoolean (at
+     * most one teardown per generation).
      */
     private val cleanupGuard = java.util.concurrent.atomic.AtomicBoolean(false)
 
-    /** Allow the next [cleanupSession] to execute. Call before starting a new session. */
-    private fun resetCleanupGuard() {
-        cleanupGuard.set(false)
+    /**
+     * Allow the next [cleanupSession] to execute for [sessionId]. Called when a
+     * new session is established (accept / mid-stream re-handshake) so the next
+     * teardown is allowed to run again.
+     */
+    private fun resetCleanupGuard(sessionId: Int = activeSessionId) {
+        if (sessionId == activeSessionId) cleanupGuard.set(false)
     }
 
-    private fun cleanupSession() {
+    /**
+     * Tear the current session down.
+     *
+     * @param sessionId generation this teardown belongs to; a stale value (an
+     *   already-replaced session's late `finally`) is ignored so it cannot
+     *   consume the active session's guard.
+     */
+    private fun cleanupSession(sessionId: Int = activeSessionId) {
+        if (sessionId != activeSessionId) {
+            FileLog.d(TAG, "cleanupSession: stale session #$sessionId (active #$activeSessionId) — skipping")
+            return
+        }
         if (!cleanupGuard.compareAndSet(false, true)) {
             FileLog.d(TAG, "cleanupSession: already cleaned up this session — skipping")
             return
         }
-        FileLog.i(TAG, "cleanupSession: tearing down session")
+        FileLog.i(TAG, "cleanupSession: tearing down session #$sessionId")
         handshakeJob?.cancel()
         handshakeJob = null
-        // Graceful stop: CMD_STOP first so the engine's readLifecycleCommands()
-        // sets running=false and its finally block runs cleanup() (releases the
-        // VD, restores IME + letterbox + screen settings, re-powers the panel).
-        // Only if that does not take effect do we fall through to the shell kill
-        // inside PhoneDisplayRestorer.
-        val client = vdClient
-        if (client != null) {
-            client.stopVdServer()
-            client.disconnect()
+        // Snapshot + clear shared state synchronously so a concurrent handshake
+        // sees the old client gone (the RMW itself is inside vdLock).
+        val client: VirtualDisplayClient?
+        synchronized(vdLock) {
+            client = vdClient
+            vdClient = null
         }
-        vdClient = null
-        InputInjectionService.instance?.clearVirtualDisplay()
-        controlConnection?.disconnect()
+        val conn = controlConnection
         controlConnection = null
         activeConnection = null
+        InputInjectionService.instance?.clearVirtualDisplay()
         appListBuilder.resetIconHashes() // Force resend icons on reconnect
         _serviceState.value = State.WAITING
         val ime = savedDefaultIme
         savedDefaultIme = null
-        // Runs on PhoneDisplayRestorer's own process-lifetime scope: the two-stage
-        // stop + `cmd display power-on` cannot be cancelled by onDestroy().
-        displayRestorer.restore(ime)
+
+        // Everything that can block runs on the process-lifetime teardownScope,
+        // never on the caller's thread: cleanupSession is invoked from Main
+        // (loop finally, stopEverything) and from the network callbacks, and
+        // stopVdServer() joins a write worker for up to 1s (audit A-04).
+        //
+        // Order preserved: graceful CMD_STOP → channel close → panel/IME restore.
+        // Runs on process-lifetime scope because onDestroy() cancels serviceScope —
+        // a restore launched there would die before `cmd display power-on`.
+        teardownScope.launch {
+            // Graceful stop: CMD_STOP first so the engine's readLifecycleCommands()
+            // sets running=false and its finally block runs cleanup() (releases the
+            // VD, restores IME + letterbox + screen settings, re-powers the panel).
+            // Only if that does not take effect do we fall through to the shell kill
+            // inside PhoneDisplayRestorer.
+            try { client?.stopVdServer() } catch (e: Exception) { FileLog.w(TAG, "stopVdServer: ${e.message}") }
+            try { client?.disconnect() } catch (e: Exception) { FileLog.w(TAG, "vdClient disconnect: ${e.message}") }
+            try { conn?.disconnect() } catch (e: Exception) { FileLog.w(TAG, "control disconnect: ${e.message}") }
+            // Runs on PhoneDisplayRestorer's own process-lifetime scope: the two-stage
+            // stop + `cmd display power-on` cannot be cancelled by onDestroy().
+            displayRestorer.restore(ime)
+        }
     }
 
     private fun stopEverything() {
@@ -764,6 +940,10 @@ class ConnectionService : Service() {
 
     companion object {
         private const val TAG = "ConnectionService"
+
+        /** Max bytes of a single car→phone CAR_LOG line (audit A-05). */
+        private const val CAR_LOG_LINE_MAX_BYTES = 8 * 1024
+
         const val ACTION_START = "com.dilinkauto.client.START"
         const val ACTION_STOP = "com.dilinkauto.client.STOP"
         const val ACTION_INSTALL_CAR = "com.dilinkauto.client.INSTALL_CAR"

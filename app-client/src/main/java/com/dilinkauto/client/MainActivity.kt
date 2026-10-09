@@ -24,6 +24,23 @@ class MainActivity : ComponentActivity() {
         set(value) { prefs.edit().putBoolean(KEY_ONBOARDING_DONE, value).apply() }
 
     /**
+     * Explicit "user stopped the service" flag (audit A-L21).
+     *
+     * Persisted, not in-memory, on purpose: the resurrection path this guards
+     * is PhoneDisplayRestorer launching MainActivity with
+     * FLAG_TURN_SCREEN_ON after a teardown — a *fresh* Activity instance, so
+     * an in-memory flag would be back to its default (false) by the time
+     * onCreate ran. Lives in this Activity's own prefs file: nothing outside
+     * the module needs it yet. (The notification's stop action goes straight
+     * to ConnectionService, which cannot write an Activity-owned flag; if the
+     * two stop entry points ever need to share the state, the key belongs in
+     * AppPrefs so the service can clear it too.)
+     */
+    private var userStopped: Boolean
+        get() = prefs.getBoolean(KEY_USER_STOPPED, false)
+        set(value) { prefs.edit().putBoolean(KEY_USER_STOPPED, value).apply() }
+
+    /**
      * Top-level screen routing (audit R3-SRP-09) — replaces the previous
      * onboarding/settings/allowlist boolean trio with a single sealed state.
      */
@@ -45,9 +62,15 @@ class MainActivity : ComponentActivity() {
         screen = if (onboardingCompleted) Screen.Main else Screen.Onboarding
 
         // Auto-start the service when the app is opened (e.g. by the car via USB ADB).
-        // Only if onboarding is done and the service isn't already running — calling
-        // startForegroundService on an already-running service is harmless but noisy.
-        if (onboardingCompleted && ConnectionService.serviceState.value == ConnectionService.State.IDLE) {
+        // Only if onboarding is done, the service isn't already running, and the user
+        // has not explicitly stopped it — calling startForegroundService on an
+        // already-running service is harmless but noisy. The stop flag is what keeps
+        // a restore-launched recreate (FLAG_TURN_SCREEN_ON from
+        // PhoneDisplayRestorer) from resurrecting a service the user just stopped
+        // (audit A-L21).
+        if (onboardingCompleted && !userStopped &&
+            ConnectionService.serviceState.value == ConnectionService.State.IDLE
+        ) {
             startConnectionService()
         }
 
@@ -85,6 +108,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startConnectionService() {
+        userStopped = false
         val intent = Intent(this, ConnectionService::class.java).apply {
             action = ConnectionService.ACTION_START
         }
@@ -92,6 +116,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun stopConnectionService() {
+        userStopped = true
         val intent = Intent(this, ConnectionService::class.java).apply {
             action = ConnectionService.ACTION_STOP
         }
@@ -109,5 +134,6 @@ class MainActivity : ComponentActivity() {
     companion object {
         private const val PREFS_NAME = "dilinkauto_onboarding"
         private const val KEY_ONBOARDING_DONE = "has_completed_onboarding"
+        private const val KEY_USER_STOPPED = "user_stopped_service"
     }
 }

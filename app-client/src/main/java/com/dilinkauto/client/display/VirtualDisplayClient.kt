@@ -51,15 +51,21 @@ class VirtualDisplayClient(
      * Opens the ServerSocket immediately (synchronous, instant).
      * Call this BEFORE deploying the VD server so the socket is ready
      * when the VD server connects back.
+     *
+     * Bound to loopback, not 0.0.0.0: the channel is documented as
+     * localhost-only (the VD server reverse-connects from the phone itself),
+     * and the first message read after accept (`MSG_DISPLAY_READY`) carries the
+     * displayId that touch is injected into — a LAN peer winning the accept race
+     * could redirect that (audit A-M10).
      */
     fun startListening(port: Int = SERVER_PORT) {
         try { serverChannel?.close() } catch (_: Exception) {}
         val ch = ServerSocketChannel.open()
         ch.configureBlocking(false)
         ch.socket().reuseAddress = true
-        ch.socket().bind(InetSocketAddress("0.0.0.0", port))
+        ch.socket().bind(InetSocketAddress("127.0.0.1", port))
         serverChannel = ch
-        FileLog.i(TAG, "Listening for VD server lifecycle on 0.0.0.0:$port")
+        FileLog.i(TAG, "Listening for VD server lifecycle on 127.0.0.1:$port")
     }
 
     /**
@@ -83,8 +89,20 @@ class VirtualDisplayClient(
                 val deadline = System.currentTimeMillis() + timeoutMs
                 var accepted: SocketChannel? = null
                 while (isActive && System.currentTimeMillis() < deadline) {
-                    accepted = ch.accept()
-                    if (accepted != null) break
+                    val candidate = ch.accept()
+                    if (candidate != null) {
+                        // Loopback listener: refuse anything that is not from
+                        // 127.0.0.1 and keep waiting for the real engine.
+                        val remote = candidate.remoteAddress
+                        val isLoopback = remote is InetSocketAddress && remote.address.isLoopbackAddress
+                        if (!isLoopback) {
+                            FileLog.w(TAG, "Refused non-loopback lifecycle connection from $remote")
+                            try { candidate.close() } catch (_: Exception) {}
+                        } else {
+                            accepted = candidate
+                            break
+                        }
+                    }
                     delay(50)
                 }
 

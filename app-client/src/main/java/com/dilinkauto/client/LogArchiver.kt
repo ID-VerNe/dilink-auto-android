@@ -1,6 +1,7 @@
 package com.dilinkauto.client
 
 import android.util.Log
+import com.dilinkauto.protocol.VdDeploy
 import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileOutputStream
@@ -83,9 +84,16 @@ internal class LogArchiver(
                 file.inputStream().use { it.copyTo(zos) }
                 zos.closeEntry()
             }
-            // The vd-server log lives in the shell's dir, outside logDir.
+            // The vd-server log used to live in the shell's own dir, outside
+            // logDir. It now resolves to VdDeploy.LOG_PATH (audit A-L23) —
+            // which is inside logDir, so the scan above already staged it.
+            // Adding it again as an extra would throw ZipException
+            // ("duplicate entry") and fail the whole share; track what is
+            // staged and skip duplicates instead.
+            val staged = logFiles.mapTo(mutableSetOf()) { it.absolutePath }
             for (file in extraFiles) {
                 if (!file.exists()) continue
+                if (!staged.add(file.absolutePath)) continue
                 zos.putNextEntry(ZipEntry(file.name))
                 file.inputStream().use { it.copyTo(zos) }
                 zos.closeEntry()
@@ -101,7 +109,12 @@ internal class LogArchiver(
         private const val TAG = "LogArchiver"
         const val ZIP_NAME = "dilinkauto-logs.zip"
 
-        /** Where the vd-server shell process writes its log. */
-        val VD_SERVER_LOG = File("/data/local/tmp/vd-server.log")
+        /**
+         * Where the vd-server shell process writes its log — the same path the
+         * deploy command redirects to (audit A-L23: this used to point at
+         * /data/local/tmp, a file the engine never writes on this build, so
+         * every archived zip contained a stale/absent log).
+         */
+        val VD_SERVER_LOG = File(VdDeploy.LOG_PATH)
     }
 }

@@ -34,6 +34,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -48,6 +49,8 @@ import androidx.compose.ui.unit.dp
 import com.dilinkauto.client.R
 import com.dilinkauto.client.service.ConnectionService
 import com.dilinkauto.client.service.InstallStatus
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * Main phone screen: status, start/stop, car-install card, share-logs.
@@ -204,7 +207,13 @@ fun MainScreen(
 
 @Composable
 fun StatusCard(state: ConnectionService.State) {
-    val ipAddresses = remember { getLocalIpAddresses() }
+    // NetworkInterface enumeration is a blocking syscall — off the composition
+    // thread (audit A-L22), mirroring AllowlistScreen's load pattern: state
+    // starts empty and LaunchedEffect fills it on IO.
+    var ipAddresses by remember { mutableStateOf<List<String>>(emptyList()) }
+    LaunchedEffect(Unit) {
+        ipAddresses = withContext(Dispatchers.IO) { getLocalIpAddresses() }
+    }
 
     val (color, title, subtitle) = when (state) {
         ConnectionService.State.IDLE -> Triple(
