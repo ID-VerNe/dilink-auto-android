@@ -36,10 +36,29 @@ app-server/src/main/assets/vd-server.jar
 signing.properties
 keystore.properties
 
-# Local test artifacts and logs
+# Release signing key material (audit B-01): the keystore was committed in
+# history and is now treated as compromised — never track it again. The new
+# key lives only in CI secrets.
+*.keystore
+*.jks
+*.p12
+
+# Local test artifacts and logs (explicit, not just extension globs, so a
+# stray `git add -A` cannot promote them — audit B-10)
 *.apk
 *.idsig
 *.zip
+*.log
 .plan/
 app-client/DiLinkAuto/
 /debug-logs/
+/apk-backup/
+/DiLinkAuto-*.apk
+/dilinkauto-logs*.zip
+/session-log*.txt
+
+# Vendored third-party sources mistakenly checked in (audit B-09)
+/org/
+
+# Agent scratch state (was only ignored via .git/info/exclude — audit B-I3)
+.freebuff/

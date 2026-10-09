@@ -29,6 +29,9 @@ android {
 
     val releaseKeystorePassword = System.getenv("RELEASE_KEYSTORE_PASSWORD")
     val releaseKeyPassword = System.getenv("RELEASE_KEY_PASSWORD")
+    val wantsRelease = gradle.startParameter.taskNames.any {
+        it.contains("release", ignoreCase = true)
+    }
     if (releaseKeystorePassword != null && releaseKeyPassword != null) {
         signingConfigs {
             create("release") {
@@ -38,6 +41,22 @@ android {
                 keyPassword = releaseKeyPassword
             }
         }
+    } else if (wantsRelease) {
+        // Audit B-12: without this the release build silently produced an
+        // UNSIGNED APK (uninstallable over a properly signed build, and
+        // publishable to a release channel by accident). A release build with
+        // no signing configuration is always a mistake — fail at configuration
+        // time with the exact variables that are missing.
+        throw GradleException(
+            "Release build requested but RELEASE_KEYSTORE_PASSWORD / " +
+                "RELEASE_KEY_PASSWORD are not set. Set both (the keystore " +
+                "itself is never committed — see docs/audit-project-2026-10-09.md B-01)."
+        )
+    } else {
+        logger.lifecycle(
+            "[signing] release signing env vars not set — debug builds use the default " +
+                "debug key; release builds would fail fast (audit B-12)."
+        )
     }
 
     buildTypes {
@@ -180,22 +199,37 @@ tasks.register("buildVdServer") {
 }
 
 // Embed the car (server) APK in client assets so the phone can auto-install it on the car
+//
+// Audit B-05: a missing source APK used to be a println warning, so a release
+// build could silently ship a *stale* app-server.apk left over from a previous
+// run; the target is now deleted before the check and a missing source is a
+// hard build error. (The variant-mismatch problem — release client embedding a
+// debug-built server APK — is a tracked follow-up; the debug server APK is the
+// intended product input for now, see docs/audit-project-2026-10-09.md B-05.)
 tasks.register("embedServerApk") {
     dependsOn(":app-server:assembleDebug")
     val serverApk = file("${rootDir}/app-server/build/outputs/apk/debug/app-server-debug.apk")
     val assetsDir = file("src/main/assets")
 
+    // Declared so Gradle can see what this task consumes/produces; still always
+    // runs (a stale embedded APK is worse than a re-copy).
+    inputs.file(serverApk).withPropertyName("serverApk")
+    outputs.file("${assetsDir}/app-server.apk").withPropertyName("embeddedApk")
     outputs.upToDateWhen { false }
 
     doLast {
         assetsDir.mkdirs()
         val target = file("${assetsDir}/app-server.apk")
-        if (serverApk.exists()) {
-            serverApk.copyTo(target, overwrite = true)
-            println("Server APK embedded: ${target.length()} bytes")
-        } else {
-            println("WARNING: Server APK not found at ${serverApk.absolutePath}")
+        // Delete first: a stale copy must never survive a failed embed.
+        if (target.exists()) target.delete()
+        if (!serverApk.exists()) {
+            throw GradleException(
+                "Server APK not found at ${serverApk.absolutePath} — " +
+                    "run :app-server:assembleDebug first. Refusing to embed a stale APK."
+            )
         }
+        serverApk.copyTo(target, overwrite = true)
+        println("Server APK embedded: ${target.length()} bytes")
     }
 }
 
