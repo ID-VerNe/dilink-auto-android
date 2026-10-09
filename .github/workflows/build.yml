@@ -11,7 +11,11 @@ permissions:
 
 jobs:
   build:
-    runs-on: self-hosted
+    # Audit B-03: pull_request used to run on the self-hosted runner, which is
+    # persistent between runs, holds the Gradle cache and is LAN-reachable —
+    # i.e. it executed untrusted PR code on a machine with state. PR builds now
+    # run on GitHub-hosted runners.
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'self-hosted' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -32,7 +36,7 @@ jobs:
           export ANDROID_HOME=$HOME/android-sdk
           export ANDROID_SDK_ROOT=$ANDROID_HOME
           echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> $GITHUB_ENV
           if [ ! -f "$ANDROID_HOME/platforms/android-34/build.prop" ]; then
             wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O /tmp/cmdline-tools.zip
             mkdir -p $ANDROID_HOME/cmdline-tools/latest
@@ -45,17 +49,25 @@ jobs:
               > /dev/null
           fi
 
+      # Audit B-09/F-09: signing secrets are only ever injected on push to
+      # main — never on pull_request, where the build runs attacker-supplied
+      # code and `printenv` would be enough to exfiltrate them.
       - name: Build Release APK
         run: |
           chmod +x gradlew
-          ./gradlew :app-client:assembleRelease
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # PR: compile + unit tests only, no signing, no release packaging.
+            ./gradlew :app-client:assembleDebug :app-client:testDebugUnitTest
+          else
+            ./gradlew :app-client:assembleRelease
+          fi
         env:
-          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
-          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
-          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+          RELEASE_KEYSTORE_PASSWORD: ${{ github.event_name != 'pull_request' && secrets.RELEASE_KEYSTORE_PASSWORD || '' }}
+          RELEASE_KEY_ALIAS: ${{ github.event_name != 'pull_request' && secrets.RELEASE_KEY_ALIAS || '' }}
+          RELEASE_KEY_PASSWORD: ${{ github.event_name != 'pull_request' && secrets.RELEASE_KEY_PASSWORD || '' }}
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: dilink-auto-client-release
-          path: app-client/build/outputs/apk/release/app-client-release.apk
+          path: app-client/build/outputs/apk/*/app-client-*.apk
