@@ -19,6 +19,16 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+
+    testOptions {
+        // Same as app-client / app-server / vd-server: the ADB crypto encoder
+        // (AdbCrypto.encodePublicKey) and TcpAdbConnection's logging reach
+        // android.util.Base64 / android.util.Log on the mockable jar. With this
+        // flag those calls return defaults instead of throwing
+        // "Method ... not mocked", so the pure framing/crypto helpers in
+        // com.dilinkauto.protocol.adb stay unit-testable on the JVM.
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 dependencies {
@@ -46,4 +56,9 @@ dependencies {
     compileOnly("androidx.core:core-ktx:1.12.0") {
         exclude(group = "androidx.lifecycle")
     }
+
+    // ADB framing (AdbProtocol) and the pure crypto helpers in AdbCrypto are
+    // plain JVM — they get the project's usual JUnit4 unit tests. No coroutines
+    // needed: the proposed tests are blocking/plain @Test methods.
+    testImplementation("junit:junit:4.13.2")
 }
