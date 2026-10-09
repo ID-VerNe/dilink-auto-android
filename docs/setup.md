@@ -55,6 +55,23 @@ Low-spec DiLink 4.0 head units like the tested 1280x800 BYD ship with a default 
 - Enter a value in the range **[120, 480]** to force a specific DPI for the next session. The car coerces input through `VdDeployArgs.coerceDpiOverride` so the phone and car always agree on what counts as a valid override.
 - The override is stored in the car's `startup_dpi` SharedPreferences and applied at initial WiFi connect as well as at mid-stream rotation re-handshake. Changing it does not affect a running session — reconnect to apply.
 
+## Security Model (Trust Boundaries)
+
+**DiLink-Auto is designed for a trusted local network only.** Every wire between the phone, the car app and the desktop client is cleartext TCP with no pairing secret, and the VD server runs as `shell UID (2000)` — the same privilege level as `adb shell`. Treat the phone's hotspot SSID as equivalent to holding USB debug access to the phone.
+
+What this means in practice:
+
+- **Anyone who can reach ports `9637/9638/9639` can control the mirrored session**: launch apps, inject touch, uninstall packages, and turn the phone's physical screen off. Mitigations shipped after the 2026-10-09 audit (`docs/audit-project-2026-10-09.md`, S-01/S-02):
+  - the VD server binds `0.0.0.0:9638/9639` but **refuses accepts from any IP other than the receiver it was launched for** (`CAR_HOST` argv slot, populated by the deployer from the live control connection's remote address);
+  - every package/component name that reaches `am start` / `pm uninstall` is shape-validated and shell-quoted (`requirePackageName` / `requireComponentName` + `VdDeploy.shellQuote`);
+  - the phone's lifecycle listener on `19647` binds **loopback only** and rejects non-loopback peers;
+  - the protocol decoders reject malformed frames instead of crashing, and the reader kills the connection (not the process) on any bad frame.
+- **Shizuku (optional)** grants shell-equivalent privileges to the phone app by design — anything that can bind Shizuku can direct shell commands. Only pair Shizuku with apps you trust. The Shizuku provider in the manifest is guarded by `android.permission.INTERACT_ACROSS_USERS_FULL` (signature|privileged).
+- **Do not expose these ports** to a hotspot shared with untrusted devices, a public WiFi, or a hostile AP. Use a dedicated SSID for the car link when possible.
+- **No encryption or integrity**: a MITM on the same LAN can watch the mirrored screen and inject input. There is no pairing protocol yet (tracked follow-up in the audit report).
+- The **release signing keystore is never committed** (audit B-01). Release builds require `RELEASE_KEYSTORE_PASSWORD` / `RELEASE_KEY_PASSWORD` and fail fast when they are missing; the keystore itself lives only in CI secrets.
+- The car app's **ADB key pair** is stored in app-private `filesDir` (not world-readable `/sdcard`), so a co-installed app cannot steal the phone-ADB credential.
+
 ## Building
 
 ```bash
