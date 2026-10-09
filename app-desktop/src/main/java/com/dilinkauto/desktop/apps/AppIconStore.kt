@@ -52,8 +52,64 @@ class AppIconStore(
     val size: Int get() = icons.size
 
     companion object {
-        /** 默认解码器：把 PNG 字节解成 [BufferedImage]。失败返回 null，由调用方决定回退策略。 */
-        fun decodePng(png: ByteArray): BufferedImage? =
-            runCatching { ImageIO.read(ByteArrayInputStream(png)) }.getOrNull()
+        /**
+         * 单张图标解码前的宽高上限（audit D-M5）。
+         *
+         * PNG 是压缩格式，"几十 KB 的文件"完全可以是几千像素宽的位图 ——
+         * 一张 8000x8000 的解码结果是 ~256MB 的 BufferedImage，而唯一的旧边界
+         * （协议帧 128MB）远不够拦。应用列表图标 512 已经远超实际需要（手机
+         * 启动器图标最大 192dp，约 1080px 的极端情况也不过 512 的一倍）。
+         */
+        const val MAX_ICON_DIM = 512
+
+        /**
+         * 单张图标的**原始字节**上限（audit D-M5）。
+         *
+         * 解压炸弹的另一种形态是"合法尺寸、但被刻意撑大的 PNG"（极大 palette /
+         * ancillary chunk）。1MB 足够任何真实图标（512x512 的 PNG 通常 < 300KB）。
+         */
+        const val MAX_ICON_BYTES = 1 shl 20
+
+        /**
+         * 默认解码器：把 PNG 字节解成 [BufferedImage]。失败（或不合法）返回 null，
+         * 由调用方决定回退策略。
+         *
+         * **先读 header 再解码**（audit D-M5）：[ImageIO.read] 本身没有任何尺寸
+         * 限额，所以先用 [ImageIO.createImageInputStream] + `ImageReader` 取宽高，
+         * 超限直接拒解码 —— 炸弹在分配位图**之前**就被挡住。
+         */
+        fun decodePng(png: ByteArray): BufferedImage? {
+            if (png.size > MAX_ICON_BYTES) return null
+            val header = runCatching { readHeader(png) }.getOrNull() ?: return null
+            val (width, height) = header
+            // getWidth/getHeight 在 header 不完整时可能返回 -1：同样按"拒解码"处理
+            if (width <= 0 || height <= 0) return null
+            if (width > MAX_ICON_DIM || height > MAX_ICON_DIM) return null
+            return runCatching { ImageIO.read(ByteArrayInputStream(png)) }.getOrNull()
+        }
+
+        /**
+         * 读 PNG header 拿宽高；读不出来（格式不认识 / 文件过短）返回 null。
+         *
+         * 用 [ImageIO.getImageReaders] 逐个问"你能读这个吗"而不是按扩展名猜 ——
+         * 输入是网络字节，没有文件名可依。
+         */
+        private fun readHeader(png: ByteArray): Pair<Int, Int>? {
+            val stream = ImageIO.createImageInputStream(ByteArrayInputStream(png))
+                ?: return null
+            stream.use { input ->
+                val readers = ImageIO.getImageReaders(input)
+                if (!readers.hasNext()) return null
+                val reader = readers.next()
+                // ImageReader 不是 kotlin.io.use 的 Closeable（平台类型窄化问题），
+                // 用 try/finally + dispose() 显式收尾。
+                try {
+                    reader.input = input
+                    return reader.getWidth(0) to reader.getHeight(0)
+                } finally {
+                    runCatching { reader.dispose() }
+                }
+            }
+        }
     }
 }

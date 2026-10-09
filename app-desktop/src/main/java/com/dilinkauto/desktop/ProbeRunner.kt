@@ -1,9 +1,9 @@
 package com.dilinkauto.desktop
 
+import com.dilinkauto.desktop.deploy.AdbDeploy
 import com.dilinkauto.desktop.deploy.AdbDeployer
 import com.dilinkauto.desktop.log.DesktopLog
 import com.dilinkauto.protocol.HandshakeResponse
-import com.dilinkauto.protocol.VdDeploy
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -85,7 +85,10 @@ internal class ProbeRunner(
             log.warn(TAG, "手机无 Shizuku，且未设 DILINK_DEV_MODE=1 —— 无法部署 VD server")
             throw IOException("未设 DILINK_DEV_MODE=1，无法部署 VD server")
         }
-        val jarPath = response.vdServerJarPath.ifBlank { VdDeploy.JAR_PATH }
+        // 对端可控字段的白名单校验（audit D-01，与 DesktopApp 同一套）：
+        // adbPort 只允许标准端口，vdServerJarPath 必须落在 /sdcard/DiLinkAuto/ 下。
+        AdbDeploy.checkAdbPort(response.adbPort)
+        val jarPath = AdbDeploy.sanitizeJarPath(response.vdServerJarPath)
         val deployed = deployer.deploy(
             config = config,
             adbPort = response.adbPort,

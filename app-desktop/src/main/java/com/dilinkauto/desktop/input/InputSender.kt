@@ -6,6 +6,7 @@ import com.dilinkauto.protocol.InputMsg
 import com.dilinkauto.protocol.LaunchAppMessage
 import com.dilinkauto.protocol.TouchEvent
 import com.dilinkauto.protocol.TouchMoveBatch
+import java.io.IOException
 
 /**
  * 桌面端输入编码器：把鼠标手势 / 导航命令编码成协议帧并投递到手机的输入口（9639）。
@@ -18,6 +19,14 @@ import com.dilinkauto.protocol.TouchMoveBatch
  *  - 触摸：`Channel.INPUT` + `TOUCH_DOWN / TOUCH_MOVE_BATCH / TOUCH_UP`；
  *  - 命令：`Channel.CONTROL` + `GO_HOME / GO_BACK / GO_RECENT / LAUNCH_APP / SET_DISPLAY_POWER`
  *    （这些命令走输入口而不是控制口，手机侧注释已明确此约定）。
+ *
+ * ── transport 抛错的处理（audit D-L4）──
+ * [transport] 是 EDT 同步调用的（鼠标监听器在 EDT 上），而底层
+ * `Connection.sendFrame` 在连接已断开时会抛 IOException。此前这个异常会从
+ * MouseAdapter 里逃出去：AWT 打一栈（用户视角"抖一下"），而 [pressed] 还停在
+ * true —— 下一次 MOVE 又会尝试发送，手机上出现"粘指"（指针从不抬起）。
+ * 现在所有发送都经 [send]，异常统一当作"传输已消失"处理：清 [transport] 与
+ * [pressed]，后续事件按"未连接"返回 false。
  */
 class InputSender(private val clock: () -> Long = System::currentTimeMillis) {
 
@@ -35,28 +44,27 @@ class InputSender(private val clock: () -> Long = System::currentTimeMillis) {
 
     /** 左键按下。返回 false 表示当前无输入连接、事件已丢弃。 */
     fun down(x: Float, y: Float): Boolean {
-        val send = transport ?: return false
+        val t = transport ?: return false
         pressed = true
-        send(Channel.INPUT, InputMsg.TOUCH_DOWN, touch(InputMsg.TOUCH_DOWN, x, y).encode())
-        return true
+        val sent = send(t, Channel.INPUT, InputMsg.TOUCH_DOWN, touch(InputMsg.TOUCH_DOWN, x, y).encode())
+        if (!sent) pressed = false
+        return sent
     }
 
     /** 拖动。走批量 MOVE（单指也批量），与手机侧的批量注入路径一致。 */
     fun move(x: Float, y: Float): Boolean {
         if (!pressed) return false
-        val send = transport ?: return false
+        val t = transport ?: return false
         val batch = TouchMoveBatch(listOf(touch(InputMsg.TOUCH_MOVE, x, y)))
-        send(Channel.INPUT, InputMsg.TOUCH_MOVE_BATCH, batch.encode())
-        return true
+        return send(t, Channel.INPUT, InputMsg.TOUCH_MOVE_BATCH, batch.encode())
     }
 
     /** 抬起。若此前未按下则忽略（避免重复 UP）。 */
     fun up(x: Float, y: Float): Boolean {
         if (!pressed) return false
-        val send = transport ?: return false
+        val t = transport ?: return false
         pressed = false
-        send(Channel.INPUT, InputMsg.TOUCH_UP, touch(InputMsg.TOUCH_UP, x, y).encode())
-        return true
+        return send(t, Channel.INPUT, InputMsg.TOUCH_UP, touch(InputMsg.TOUCH_UP, x, y).encode())
     }
 
     fun goHome(): Boolean = sendCommand(ControlMsg.GO_HOME)
@@ -78,9 +86,40 @@ class InputSender(private val clock: () -> Long = System::currentTimeMillis) {
         sendCommand(ControlMsg.SET_DISPLAY_POWER, byteArrayOf(if (on) 1 else 0))
 
     private fun sendCommand(messageType: Byte, payload: ByteArray = ByteArray(0)): Boolean {
-        val send = transport ?: return false
-        send(Channel.CONTROL, messageType, payload)
-        return true
+        val t = transport ?: return false
+        return send(t, Channel.CONTROL, messageType, payload)
+    }
+
+    /**
+     * 真正投递一帧（audit D-L4）。
+     *
+     * `Connection.sendFrame` 在连接断开时会抛 IOException（ProtocolDecodeException
+     * 之外的发送失败路径）。异常一律吞掉并按"传输已消失"处理：清 transport 与
+     * pressed。**不能**让异常从鼠标监听器里逃出去 —— 那会让 [pressed] 卡在 true。
+     *
+     * @return 是否成功送达
+     */
+    private fun send(
+        transport: (Byte, Byte, ByteArray) -> Unit,
+        channel: Byte,
+        messageType: Byte,
+        payload: ByteArray,
+    ): Boolean = try {
+        transport(channel, messageType, payload)
+        true
+    } catch (_: IOException) {
+        transportGone()
+        false
+    } catch (_: Exception) {
+        // 兜底：任何 Leiden 异常都按"通道死了"处理，绝不放它回到 EDT 的监听器上。
+        transportGone()
+        false
+    }
+
+    /** 传输消失了：摘掉通道并清按压状态。 */
+    private fun transportGone() {
+        transport = null
+        pressed = false
     }
 
     /** 清除按压状态。会话断开/重连时调用，避免新会话误发 MOVE。 */

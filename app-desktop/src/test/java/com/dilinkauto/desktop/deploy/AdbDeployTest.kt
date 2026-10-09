@@ -7,7 +7,9 @@ import com.dilinkauto.protocol.VdDeployArgs
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
+import java.io.IOException
 
 /**
  * [AdbDeploy] 纯命令拼装单测。
@@ -158,5 +160,105 @@ class AdbDeployTest {
         // 旧版手机（trailing 字段缺失解码为 0）→ 保持旧行为
         val plan = AdbDeploy.plan(config(width = 1280, height = 720), phoneVdWidth = 0, phoneVdHeight = 0)
         assertTrue("应回退视口: ${plan.args}", plan.args.startsWith("1280 720 "))
+    }
+
+    // ─── D-M4：对端 VD 尺寸无上界（DimAlign.even 把负数映射到 ~2^31）────
+
+    @Test
+    fun `clampVdDimension 把越界尺寸夹进 2 到 4096`() {
+        assertEquals(2, AdbDeploy.clampVdDimension(0))
+        assertEquals(2, AdbDeploy.clampVdDimension(1))
+        // 关键：DimAlign.even(-1) = 2147483646（符号位被清掉）—— 敌意对端的放大器
+        assertEquals(2, AdbDeploy.clampVdDimension(-1))
+        assertEquals(2, AdbDeploy.clampVdDimension(-9999))
+        assertEquals(2, AdbDeploy.clampVdDimension(2))
+        assertEquals(4096, AdbDeploy.clampVdDimension(4096))
+        assertEquals(4096, AdbDeploy.clampVdDimension(99999))
+        assertEquals(4096, AdbDeploy.clampVdDimension(Int.MAX_VALUE))
+        // 奇数向下取偶后在区间内
+        assertEquals(4094, AdbDeploy.clampVdDimension(4095))
+        assertEquals(1280, AdbDeploy.clampVdDimension(1281))
+    }
+
+    @Test
+    fun `plan 对敌意 VD 尺寸夹到上限而不是原样下发`() {
+        // 手机侧 VdDimensions.compute 的输出被伪造/出错时，不能在设备上申请
+        // 任意大的 VirtualDisplay（设备 OOM）—— 夹到 4096。
+        val plan = AdbDeploy.plan(config(width = 1280, height = 720), phoneVdWidth = 99999, phoneVdHeight = Int.MAX_VALUE)
+        assertTrue("VD 尺寸应被夹住: ${plan.args}", plan.args.startsWith("4096 4096 "))
+    }
+
+    @Test
+    fun `plan 负数 VD 尺寸被当作未下发退回视口`() {
+        // phoneVdWidth <= 0 的语义是"旧版手机未下发"，走视口而不是 evenMin2 的 2
+        val plan = AdbDeploy.plan(config(width = 1280, height = 720), phoneVdWidth = -1, phoneVdHeight = -1)
+        assertTrue("负数应按未下发处理: ${plan.args}", plan.args.startsWith("1280 720 "))
+    }
+
+    // ─── D-01：握手响应里的 adbPort / vdServerJarPath 白名单 ───
+
+    @Test
+    fun `checkAdbPort 只接受标准 adb 端口`() {
+        // 手机侧（app-client handleHandshake）写死 Ports.ADB_PORT，所以收窄无兼容代价
+        AdbDeploy.checkAdbPort(Ports.ADB_PORT)
+        for (bad in listOf(0, 1, 5554, 5556, 5037, -1, 65536, Int.MAX_VALUE)) {
+            try {
+                AdbDeploy.checkAdbPort(bad)
+                fail("端口 $bad 应被拒绝")
+            } catch (e: IOException) {
+                assertTrue("拒绝原因应可读: ${e.message}", e.message!!.contains("adb 端口"))
+            }
+        }
+    }
+
+    @Test
+    fun `sanitizeJarPath 空白回退默认路径`() {
+        assertEquals(VdDeploy.JAR_PATH, AdbDeploy.sanitizeJarPath(""))
+        assertEquals(VdDeploy.JAR_PATH, AdbDeploy.sanitizeJarPath("   "))
+    }
+
+    @Test
+    fun `sanitizeJarPath 接受默认路径与同目录文件`() {
+        assertEquals(VdDeploy.JAR_PATH, AdbDeploy.sanitizeJarPath(VdDeploy.JAR_PATH))
+        assertEquals(
+            "${VdDeploy.DIR_PATH}/vd-server-2.jar",
+            AdbDeploy.sanitizeJarPath("${VdDeploy.DIR_PATH}/vd-server-2.jar"),
+        )
+        // 前后空白无所谓（协议上同一条字符串，手机侧可能带换行符）
+        assertEquals(
+            VdDeploy.JAR_PATH,
+            AdbDeploy.sanitizeJarPath("  ${VdDeploy.JAR_PATH}\n"),
+        )
+    }
+
+    @Test
+    fun `sanitizeJarPath 拒绝白名单外的路径`() {
+        val bad = listOf(
+            "/data/local/tmp/evil.jar",              // 任意代码
+            "/sdcard/evil.jar",                      // 同盘不同目录
+            "${VdDeploy.DIR_PATH}../evil.jar",       // 目录穿越（前缀看似合法）
+            "${VdDeploy.DIR_PATH}/../../data/x.jar", // 深层穿越
+            "vd-server.jar",                         // 相对路径
+            "/sdcard/DiLinkAutoX/vd-server.jar",     // 前缀不匹配（少了结尾斜杠的边界）
+        )
+        for (path in bad) {
+            try {
+                AdbDeploy.sanitizeJarPath(path)
+                fail("路径应被拒绝: $path")
+            } catch (e: IOException) {
+                assertTrue("拒绝原因应可读（$path）: ${e.message}", e.message!!.contains("白名单"))
+            }
+        }
+    }
+
+    @Test
+    fun `plan 收到的 jar 路径必须已过白名单`() {
+        // D-01 的分工：白名单在 AdbDeploy.sanitizeJarPath（调用点 = DesktopApp /
+        // ProbeRunner），plan 只负责把已校验的路径拼进 CLASSPATH。
+        val plan = AdbDeploy.plan(config(), jarPath = AdbDeploy.sanitizeJarPath("/sdcard/DiLinkAuto/x.jar"))
+        assertTrue(
+            "CLASSPATH 应是校验后的路径: ${plan.launchCommand}",
+            plan.launchCommand.contains("CLASSPATH=${VdDeploy.shellQuote("/sdcard/DiLinkAuto/x.jar")}"),
+        )
     }
 }

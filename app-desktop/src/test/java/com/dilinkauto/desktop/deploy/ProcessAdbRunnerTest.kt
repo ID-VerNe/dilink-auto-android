@@ -102,6 +102,101 @@ class ProcessAdbRunnerTest {
         assertFalse(runner.run(listOf("devices"), waitForExit = true, timeoutMs = 1_000, onOutput = {}))
     }
 
+    // ─── D-M7：超时进程必须 reap + 关流 ───
+
+    /**
+     * 超时强杀的进程必须被 **reap**（audit D-M7）。
+     *
+     * 旧实现在 `destroyForcibly()` 后就返回：进程还在退出过程中（native handle 靠
+     * GC finalize），stdio 也一直开着。这里验证那条兜底路径真的走到了 ——
+     * [ProcessAdbRunner.reapedProcesses] 是它唯一的可观测信号。
+     */
+    @Test
+    fun `同步命令超时后进程被 reap`() {
+        val (command, args) = longLivedCommand()
+        val runner = ProcessAdbRunner(adbPath = command)
+
+        val startedAt = System.nanoTime()
+        val ok = runner.run(args, waitForExit = true, timeoutMs = 300, onOutput = {})
+        val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000
+
+        assertFalse("超时命令必须返回 false", ok)
+        assertTrue("至少要等满超时时间（实际 ${elapsedMs}ms）", elapsedMs >= 300)
+        assertEquals("超时后必须 reap（强杀 + 有界 waitFor + 关流）", 1, runner.reapedProcesses())
+        assertTrue("同步命令不进持有列表", runner.heldProcesses().isEmpty())
+    }
+
+    /** 正常结束的命令不走 reap 路径（reap 只服务于超时兜底）。 */
+    @Test
+    fun `正常结束的命令不触发 reap`() {
+        val runner = ProcessAdbRunner(adbPath = if (isWindows()) "cmd" else "/bin/sh")
+        val args = if (isWindows()) listOf("/c", "exit", "0") else listOf("-c", "true")
+
+        assertTrue(runner.run(args, waitForExit = true, timeoutMs = 10_000, onOutput = {}))
+        assertEquals(0, runner.reapedProcesses())
+    }
+
+    // ─── D-M8：adb.exe 解析到绝对路径 ───
+
+    /** 环境变量给的是绝对路径 → 直接用它（用户的显式配置优先级最高）。 */
+    @Test
+    fun `resolveAdbPath 优先使用绝对路径的 DILINK_ADB`() {
+        val resolved = ProcessAdbRunner.resolveAdbPath(
+            envAdb = "C:\\Android\\platform-tools\\adb.exe",
+            candidates = listOf("C:\\Sdk\\platform-tools\\adb.exe"),
+            exists = { true },
+        )
+        assertEquals("C:\\Android\\platform-tools\\adb.exe", resolved)
+    }
+
+    /** 环境变量给的是相对路径 → **拒绝**（相对路径会被 CWD 解释，等于没校验）。 */
+    @Test
+    fun `resolveAdbPath 拒绝相对的 DILINK_ADB`() {
+        val resolved = ProcessAdbRunner.resolveAdbPath(
+            envAdb = "adb.exe",
+            candidates = listOf("C:\\Sdk\\platform-tools\\adb.exe"),
+            exists = { true },
+        )
+        assertEquals("相对值必须被拒绝，退回已知位置", "C:\\Sdk\\platform-tools\\adb.exe", resolved)
+    }
+
+    @Test
+    fun `resolveAdbPath 拒绝双点相对路径`() {
+        val resolved = ProcessAdbRunner.resolveAdbPath(
+            envAdb = "..\\..\\evil\\adb.exe",
+            candidates = listOf("C:\\Sdk\\platform-tools\\adb.exe"),
+            exists = { true },
+        )
+        assertEquals("C:\\Sdk\\platform-tools\\adb.exe", resolved)
+    }
+
+    @Test
+    fun `resolveAdbPath 未设环境变量时用第一个存在的已知位置`() {
+        val resolved = ProcessAdbRunner.resolveAdbPath(
+            envAdb = null,
+            candidates = listOf("C:\\A\\adb.exe", "C:\\B\\adb.exe"),
+            exists = { it == "C:\\B\\adb.exe" },
+        )
+        assertEquals("C:\\B\\adb.exe", resolved)
+    }
+
+    @Test
+    fun `resolveAdbPath 都找不到时回退裸名`() {
+        val resolved = ProcessAdbRunner.resolveAdbPath(
+            envAdb = "   ",
+            candidates = listOf("C:\\A\\adb.exe"),
+            exists = { false },
+        )
+        assertEquals("adb", resolved)
+    }
+
+    /** 默认入口（读真实环境）至少要给出一个非空值 —— CI 上通常回退 "adb"。 */
+    @Test
+    fun `defaultAdbPath 在未配置环境变量时也能给出一个可用值`() {
+        val path = ProcessAdbRunner.defaultAdbPath()
+        assertTrue("解析结果不应为空: $path", path.isNotBlank())
+    }
+
     private fun isWindows(): Boolean =
         System.getProperty("os.name")?.startsWith("Windows") == true
 }

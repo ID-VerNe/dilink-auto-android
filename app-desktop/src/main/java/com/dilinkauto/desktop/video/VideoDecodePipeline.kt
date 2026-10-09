@@ -18,11 +18,13 @@ import java.util.concurrent.atomic.AtomicLong
  *
  * 解码器重建：`grab()` 出错或读到 EOF（会话尚未停止）时，丢弃旧管道，新建
  * gate + pipe + grabber，重放缓存的 CONFIG 并等下一个 IDR——与车机端 MediaCodec
- * flush 后的恢复策略一致。
+ * flush 后的恢复策略一致。重建是**指数退避**的（500ms→8s）：坏码流下紧凑重试
+ * 只会以 ~2 次/秒空转；连续重建到上限还会向上升级（audit D-M3）。
  *
  * 硬解（Phase 5b）：构造时给 [hwaccel]（如 `"d3d11va"`）就先用硬解跑；若
  * [HardwareDecodeWatchdog] 判定"起来了但一帧都出不来"，则本次运行内永久回退软解
- * ——硬解失败通常是驱动/机器不支持，重试也不会好。
+ * ——硬解失败通常是驱动/机器不支持，重试也不会好。判定由**独立的定时线程**跑
+ * （audit D-M2）：放在喂帧路径上时，卡在 `start()` 或手机停帧都不会触发。
  *
  * 持续黑屏（WIN-07）：与车机端共用 protocol-core 的 [BlackScreenDetector]，
  * 命中后经 [onSustainedBlackScreen] 交给上层（桌面端的选择是"重建一代会话"）。
@@ -34,6 +36,11 @@ import java.util.concurrent.atomic.AtomicLong
 class VideoDecodePipeline(
     /** 硬解加速器名（FFmpeg 的 `-hwaccel` 取值，如 "d3d11va"）；null = 纯软解。 */
     private val hwaccel: String? = null,
+    /**
+     * 硬解"起不来"的判定器。可注入是为了单测（与 [HardwareDecodeWatchdog] 自己
+     * 的 `clock` 注入同理）：D-M2 的验证要看"检查跑没跑"，不能靠等 3 秒真实时间。
+     */
+    hardwareWatchdog: HardwareDecodeWatchdog = HardwareDecodeWatchdog(),
 ) {
     /**
      * 解码线程回调，每个解码出的画面调用一次。
@@ -55,11 +62,37 @@ class VideoDecodePipeline(
      */
     var onSustainedBlackScreen: (() -> Unit)? = null
 
+    /**
+     * 解码线程被抛弃（join 超时且解阻塞无效）时触发一次（audit D-M1）。
+     *
+     * 上层据此知道这一代的解码器泄漏了 —— 桌面端的做法是打一条 WARN。不能在这里
+     * 做更激进的动作（halt 进程之类）：泄漏一个守护线程优于杀死整个应用。
+     */
+    var onDecoderAbandoned: (() -> Unit)? = null
+
+    /**
+     * 解码器连续重建达到 [MAX_REBUILDS] 仍出不了画面时触发一次（audit D-M3）。
+     *
+     * 触发点是"持续解码失败以 ~2 次/秒无限重建"的出口：坏 CONFIG 重放会让
+     * `grab()` 立刻抛，循环永远出不来，唯一症状是统计行的 `rebuilds=` 增长。
+     * 上层据此把这一代判为没救（桌面端触发自动重连）。
+     */
+    var onDecodeStalled: (() -> Unit)? = null
+
     val framesDecoded = AtomicLong()
     val decoderRebuilds = AtomicLong()
 
     /** 网络线程收到的帧总数（含 CONFIG）；联调时与 framesDecoded 对照，定位瓶颈在接收侧还是解码侧。 */
     val framesFed = AtomicLong()
+
+    /**
+     * 是否已经向上升级过"解码器反复重建"（audit D-M3）。
+     *
+     * 升级必须**只发一次**：退避封顶后循环仍会以 8s/次继续重建兜底，若每次迭代都
+     * 回调，上层（桌面端会自动重连，重连预算有限）会被重复触发，日志也会每 8s
+     * 刷一条同样的内容。
+     */
+    private val escalated = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /** 收到的 CONFIG（SPS/PPS）次数。 */
     val configsFed = AtomicLong()
@@ -70,7 +103,7 @@ class VideoDecodePipeline(
         private set
 
     /** 硬解起不来的判定器；只有配置了 [hwaccel] 时才参与。 */
-    private val hardwareWatchdog = HardwareDecodeWatchdog()
+    private val hardwareWatchdog = hardwareWatchdog
 
     /**
      * 持续黑屏判定器。探测方法与车机端完全一致，只有持续窗口不同
@@ -94,6 +127,12 @@ class VideoDecodePipeline(
     private var running = false
     private var decodeThread: Thread? = null
 
+    /** 硬解回退看门狗的定时线程（audit D-M2）：与有没有帧喂进来无关。 */
+    private var fallbackTimer: Thread? = null
+
+    /** 被 stop() 抛弃的解码线程计数（audit D-M1）：join 超时即 +1，泄漏不再无声无息。 */
+    val abandonedDecoders = java.util.concurrent.atomic.AtomicLong()
+
     init {
         // 检测器的升级出口在构造时绑一次（不像车机端那样每帧设/清）：
         // 出口字段只有这一处写，喂帧路径就只剩一次 onFrame 调用。
@@ -113,6 +152,23 @@ class VideoDecodePipeline(
             isDaemon = true
             start()
         }
+        // D-M2：硬解回退检查的独立定时线程（原来是 feed 内联的一步，见那里说明）。
+        fallbackTimer = Thread({ fallbackLoop() }, "HwFallback").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    /** 硬解看门狗的定时循环（audit D-M2）：与有没有帧喂进来无关，到点就查。 */
+    private fun fallbackLoop() {
+        while (running) {
+            runCatching { checkHardwareFallback() }
+            try {
+                Thread.sleep(HARDWARE_POLL_MS)
+            } catch (_: InterruptedException) {
+                return // stop() 打断
+            }
+        }
     }
 
     /** 网络线程调用，非阻塞：把收到的视频帧转交闸门。 */
@@ -130,36 +186,59 @@ class VideoDecodePipeline(
             // 逐帧解析 NAL 头，顺带一次整数比较，比另起线程便宜。
             blackScreen.onFrame(isKeyFrame, frame.payload.size)
         }
-        checkHardwareFallback()
+        // 注意：硬解回退检查**不**在这里做（audit D-M2）。原来它是本方法的最后一步，
+        // 而上面的 `gate ?: return` 让它在"解码器卡在 start() / 手机停帧"时永远跑
+        // 不到 —— 硬解挂了就一直挂着。现在由独立的定时线程驱动，见 [fallbackLoop]。
     }
 
     /**
-     * 硬解回退检查。放在 [feed] 里而不是另起看门狗线程：喂帧本来就是在网络线程上
-     * 每秒几十次的高频路径，顺手做一次时间比较比多一个线程便宜得多。
+     * 硬解回退检查。只由 [fallbackTimer] 线程调用（audit D-M2）。
      *
-     * 触发后关掉当前管道——解码线程阻塞在 `grab()` 上的读到 EOF 就会退出并重建，
+     * **为什么从 feed 挪走**：原来它是 feed 的最后一步，而 feed 开头有
+     * `gate ?: return` —— 解码器卡在 `grabber.start()`（管道还没建立）或手机
+     * 干脆停帧（没有帧进来）时检查跑不到，硬解挂了就永远挂着，只剩黑屏。
+     * 独立的定时线程不依赖"有没有帧喂进来"。
+     *
+     * 触发后关掉**当前**管道——解码线程阻塞在 `grab()` 上的读到 EOF 就会退出并重建，
      * 而 [hardwareInUse] 已是 false，重建出来的就是软解解码器。
+     *
+     * internal：单测要直接驱动它来验证判据（时间由注入的 [HardwareDecodeWatchdog]
+     * 时钟决定），生产代码只从 [fallbackLoop] 调。
      */
-    private fun checkHardwareFallback() {
+    internal fun checkHardwareFallback() {
         if (!hardwareInUse) return
         if (!hardwareWatchdog.onFrame(framesDecoded.get())) return
         fallbackToSoftware("硬件解码 ${HardwareDecodeWatchdog.DEFAULT_TIMEOUT_MS}ms 内无任何输出 —— 回退软解")
-        // 只关管道，不 join 解码线程：本方法是网络线程，不能在这里阻塞等待重建
+        // D-M2：关的是"这一刻的当前管道"。管道引用在这里现取现用（同一行内），
+        // 不存在跨语句被解码线程替换的窗口。
         runCatching { pipe?.close() }
     }
 
     /**
      * 硬解回退的落地动作（audit R3-SRP-17）：置标志 + 记日志只有这一个点。
      *
-     * 两条触发路径各有自己的后续——喂帧侧关管道唤醒阻塞的读、解码线程侧
-     * 交给外层重建——所以调用方保留各自的收尾动作，这里只统一状态翻转。
+     * 两条触发路径各有自己的后续——[checkHardwareFallback] 关管道唤醒阻塞的读、
+     * 解码线程侧交给外层重建——所以调用方保留各自的收尾动作，这里只统一状态翻转。
      */
     private fun fallbackToSoftware(reason: String) {
         hardwareInUse = false
         log(reason)
     }
 
-    /** 停止管线：关闭管道唤醒阻塞中的 FFmpeg 读，然后等解码线程退出。 */
+    /**
+     * 停止管线：关闭管道唤醒阻塞中的 FFmpeg 读，然后等解码线程退出。
+     *
+     * ── join 超时怎么办（audit D-M1）──
+     * `interrupt()` 打不断 native `av_read_frame`（FFmpeg 在 JNI 里等数据），
+     * 所以 2s 的 join 完全可能超时。此时线程**必须**被当作已抛弃：它手上的 native
+     * FFmpeg / D3D11VA 上下文与 FFmpegFrameGrabber 都不会再释放（stop/release 都在
+     * 线程自己的 finally 里）。处理方式是：
+     *  1. 大声计数（[abandonedDecoders]）并打日志 —— 泄漏不再无声无息；
+     *  2. 反复 close 管道：`VideoStreamPipe` 的 `ensureCurrent` 每 100ms 查一次
+     *     `closed`，多关几轮能让阻塞在读上的线程收到 EOF 而走到自己的 finally；
+     *  3. 若仍在跑，[onDecoderAbandoned] 向上升级。
+     * 会话中途 restart 每次泄漏一线程 + 一 native 上下文，这是它的可见化路径。
+     */
     fun stop() {
         if (!running) return
         running = false
@@ -167,7 +246,25 @@ class VideoDecodePipeline(
         pipe?.close()
         decodeThread?.interrupt()
         decodeThread?.join(STOP_JOIN_TIMEOUT_MS)
+        fallbackTimer?.interrupt()
+        if (decodeThread?.isAlive == true) {
+            abandonedDecoders.incrementAndGet()
+            log(
+                "stop() 超时：解码线程未在 ${STOP_JOIN_TIMEOUT_MS}ms 内退出（累计抛弃 " +
+                    "${abandonedDecoders.get()} 个）—— 该线程的 native 解码器无法回收",
+            )
+            // 解阻塞：ensureCurrent 每 100ms 查一次 closed，多关几轮提高 EOF 到达率
+            repeat(UNBLOCK_CLOSE_ATTEMPTS) {
+                if (decodeThread?.isAlive != true) return@repeat
+                runCatching { pipe?.close() }
+                runCatching { decodeThread?.join(UNBLOCK_JOIN_MS) }
+            }
+            if (decodeThread?.isAlive == true) {
+                onDecoderAbandoned?.invoke()
+            }
+        }
         decodeThread = null
+        fallbackTimer = null
     }
 
     private fun decodeLoop() {
@@ -243,10 +340,24 @@ class VideoDecodePipeline(
                     "decoder rebuild #${decoderRebuilds.get()}：重放 CONFIG 并等下一个 IDR " +
                         "(droppedPreConfig=${g.droppedPreConfig} skippedP=${g.skippedPFrames})"
                 )
+                // 指数退避（audit D-M3）：持续失败时固定 500ms 的紧凑重试会以
+                // ~2 次/秒无限转下去（坏 CONFIG 重放让 grab() 立刻抛），既烧 CPU
+                // 又没有任何症状变化。从第 [BACKOFF_ESCALATE_AFTER] 次起退避加倍，
+                // 封顶 [REBUILD_BACKOFF_MAX_MS]；到 [MAX_REBUILDS] 向上升级。
+                val backoff = rebuildBackoffMs(decoderRebuilds.get())
                 try {
-                    Thread.sleep(REBUILD_BACKOFF_MS)
+                    Thread.sleep(backoff)
                 } catch (_: InterruptedException) {
                     // stop() 打断休眠：回到循环顶部退出
+                }
+                if (decoderRebuilds.get() >= MAX_REBUILDS) {
+                    // D-M3：码流反复重建仍出不了画面 —— 这一代已经没救了。
+                    // 只升级一次（[escalated] 闩锁）：isAlive 的循环继续以 8s 一次的
+                    // 重建兜底自愈，把"怎么办"的决定权交给上层（桌面端触发自动重连）。
+                    if (escalated.compareAndSet(false, true)) {
+                        log("解码器连续重建 ${MAX_REBUILDS} 次仍无画面 —— 向上升级")
+                        onDecodeStalled?.invoke()
+                    }
                 }
             }
         }
@@ -255,6 +366,20 @@ class VideoDecodePipeline(
 
     private fun log(message: String) {
         onLog?.invoke(message)
+    }
+
+    /**
+     * 第 [rebuilds] 次重建前要睡多久（audit D-M3）。
+     *
+     * 前 [BACKOFF_ESCALATE_AFTER] 次保持 [REBUILD_BACKOFF_MS] 的紧凑恢复
+     * （正常的单次码流抖动值得快速爬起来），之后每次翻倍直到
+     * [REBUILD_BACKOFF_MAX_MS] 封顶。抽成纯函数是为了能单测退避曲线 ——
+     * 这条曲线的形状直接决定"持续失败时是否空转"。
+     */
+    internal fun rebuildBackoffMs(rebuilds: Long): Long {
+        if (rebuilds <= BACKOFF_ESCALATE_AFTER) return REBUILD_BACKOFF_MS
+        val doublings = (rebuilds - BACKOFF_ESCALATE_AFTER).coerceAtMost(MAX_BACKOFF_DOUBLINGS.toLong())
+        return (REBUILD_BACKOFF_MS shl doublings.toInt()).coerceAtMost(REBUILD_BACKOFF_MAX_MS)
     }
 
     companion object {
@@ -272,5 +397,26 @@ class VideoDecodePipeline(
 
         private const val STOP_JOIN_TIMEOUT_MS = 2_000L
         private const val REBUILD_BACKOFF_MS = 500L
+
+        /** 从第几次重建开始加倍退避（audit D-M3）。 */
+        private const val BACKOFF_ESCALATE_AFTER = 3L
+
+        /** 退避上限（audit D-M3）：8s —— 足够让编码器/网络缓过来，又不至于让用户等太久。 */
+        private const val REBUILD_BACKOFF_MAX_MS = 8_000L
+
+        /** 500ms 翻几次到 8s：500→1000→2000→4000→8000，共 4 次。 */
+        private const val MAX_BACKOFF_DOUBLINGS = 4
+
+        /** 连续重建到这个次数就向上升级（audit D-M3）。 */
+        private const val MAX_REBUILDS = 30L
+
+        /** 硬解看门狗的轮询间隔（audit D-M2）。 */
+        private const val HARDWARE_POLL_MS = 100L
+
+        /** 解阻塞被抛弃的解码线程时，重复 close 管道的次数（audit D-M1）。 */
+        private const val UNBLOCK_CLOSE_ATTEMPTS = 5
+
+        /** 每轮解阻塞 close 后等解码线程退出的时间（audit D-M1）。 */
+        private const val UNBLOCK_JOIN_MS = 200L
     }
 }

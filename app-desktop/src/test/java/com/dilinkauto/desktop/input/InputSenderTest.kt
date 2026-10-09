@@ -11,6 +11,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.IOException
 
 /**
  * [InputSender] 单测：用记录型 transport 断言协议帧的通道/类型/载荷。
@@ -172,5 +173,72 @@ class InputSenderTest {
         assertFalse(sender.move(0.5f, 0.5f))
         assertTrue(rec.frames.isEmpty())
         assertTrue(sender.down(0.5f, 0.5f))
+    }
+
+    // ─── D-L4：transport 抛错不能从鼠标监听器里逃出去 ───
+
+    /** 一发送就抛 [IOException] 的 transport：模拟 `Connection.sendFrame` 在连接已断开时的行为。 */
+    private class ThrowingTransport : (Byte, Byte, ByteArray) -> Unit {
+        var calls = 0
+        override fun invoke(channel: Byte, messageType: Byte, payload: ByteArray) {
+            calls++
+            throw IOException("Not connected")
+        }
+    }
+
+    @Test
+    fun `down 时 transport 抛错不逃出监听器_且清掉 pressed`() {
+        val transport = ThrowingTransport()
+        val sender = InputSender(clock = { 1L }).apply { this.transport = transport }
+
+        // 关键：异常不得逃出 —— 它会从 MouseAdapter 里冒到 AWT，打一栈并留下卡住的
+        // pressed（手机上"粘指"）
+        assertFalse(sender.down(0.5f, 0.5f))
+
+        // pressed 必须被清掉：否则下一次 MOVE 又会尝试发送
+        assertFalse("抛错后不得仍认为已按下", sender.move(0.6f, 0.6f))
+        assertFalse(sender.up(0.6f, 0.6f))
+    }
+
+    @Test
+    fun `transport 抛错后被视为已断开`() {
+        val transport = ThrowingTransport()
+        val sender = InputSender(clock = { 1L }).apply { this.transport = transport }
+        assertTrue(sender.isConnected)
+
+        sender.down(0.5f, 0.5f)
+
+        assertFalse("发送失败即视为传输已消失", sender.isConnected)
+        // 连命令也发不出去（返回 false 而不是再抛一次）
+        assertFalse(sender.goHome())
+    }
+
+    @Test
+    fun `move 抛错后 pressed 被清掉_手机侧不会粘指`() {
+        // DOWN 成功、MOVE 失败：pressed 仍必须清掉 —— 否则 UP 之前一直有幽灵移动
+        val failing = object : (Byte, Byte, ByteArray) -> Unit {
+            var count = 0
+            override fun invoke(channel: Byte, messageType: Byte, payload: ByteArray) {
+                if (++count > 1) throw IOException("gone")
+            }
+        }
+        val sender = InputSender(clock = { 1L }).apply { transport = failing }
+
+        assertTrue(sender.down(0.5f, 0.5f))
+        assertFalse(sender.move(0.6f, 0.6f))
+        assertEquals(2, failing.count)
+    }
+
+    @Test
+    fun `非 IOException 的异常也不得逃出`() {
+        // Connection.sendFrame 在写队列已关闭时抛的是 ClosedSendChannelException
+        // （IllegalStateException，不是 IOException）—— 同样必须被兜住。
+        val transport = { _: Byte, _: Byte, _: ByteArray ->
+            throw IllegalStateException("Channel was closed")
+        }
+        val sender = InputSender(clock = { 1L }).apply { this.transport = transport }
+
+        assertFalse(sender.down(0.5f, 0.5f))
+        assertFalse(sender.move(0.6f, 0.6f))
     }
 }

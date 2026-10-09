@@ -4,6 +4,7 @@ import com.dilinkauto.desktop.apps.AppCatalog
 import com.dilinkauto.desktop.apps.AppEntry
 import com.dilinkauto.desktop.config.DesktopSettings
 import com.dilinkauto.desktop.config.DesktopSettingsStore
+import com.dilinkauto.desktop.deploy.AdbDeploy
 import com.dilinkauto.desktop.deploy.AdbDeployer
 import com.dilinkauto.desktop.display.KeepAwake
 import com.dilinkauto.desktop.input.InputSender
@@ -12,7 +13,6 @@ import com.dilinkauto.desktop.ui.SwingVideoView
 import com.dilinkauto.desktop.video.FrameDumper
 import com.dilinkauto.desktop.video.VideoDecodePipeline
 import com.dilinkauto.protocol.HandshakeResponse
-import com.dilinkauto.protocol.VdDeploy
 import com.dilinkauto.protocol.VdDeployArgs
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -28,6 +28,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import javax.swing.SwingUtilities
 
 /**
  * 窗口模式的运行时编排（组合根）。
@@ -159,12 +160,18 @@ class DesktopApp(
 
     /** 切换"会话期间保持本机常亮"（Phase 5d）。 */
     fun setKeepAwake(enabled: Boolean) {
-        val next = settings.copy(keepAwake = enabled)
-        settings = next
-        settingsStore.save(next) { log.warn("config", it) }
-        _keepAwakeOn.value = enabled
-        log.info(TAG, "保持常亮：$enabled")
-        lifecycle.execute { applyKeepAwake() }
+        // 与 [restart] 一样走 [lifecycle] 单线程（audit D-02）：settings 的读写
+        // （含 settingsStore.save 落盘）此前分散在 lifecycle 线程与 Compose UI
+        // 线程，`setKeepAwake` 与 `restart(dpiOverride)` 交错会把用户的 DPI 修改
+        // 静默丢掉。本方法可能被 UI 线程调用，所以把整个"改值+落盘"推回 lifecycle。
+        lifecycle.execute {
+            val next = settings.copy(keepAwake = enabled)
+            settings = next
+            settingsStore.save(next) { log.warn("config", it) }
+            _keepAwakeOn.value = enabled
+            log.info(TAG, "保持常亮：$enabled")
+            applyKeepAwake()
+        }
     }
 
     /** 关闭窗口时的收尾：停会话（触发手机回收 VD）→ 停解码 → 关闭所有后台资源。 */
@@ -190,11 +197,17 @@ class DesktopApp(
 
         val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
         val service = DesktopConnectionService(scope, config)
-        val videoView = SwingVideoView(
-            onTouchDown = { x, y -> service.inputSender.down(x, y) },
-            onTouchMove = { x, y -> service.inputSender.move(x, y) },
-            onTouchUp = { x, y -> service.inputSender.up(x, y) },
-        )
+        // SwingVideoView 必须在 EDT 上创建（audit D-L5）：它内部设 opaque、加
+        // 鼠标监听、建 Graphics——Swing 组件的构造与状态修改受 EDT 约束，在
+        // EDT 外构造可能出现渲染/焦点/监听器的可见性错乱。本方法跑在 lifecycle
+        // 线程上，所以用 invokeAndWait 把构造搬回 EDT（只此一次，阻塞可接受）。
+        val videoView = runOnEdt {
+            SwingVideoView(
+                onTouchDown = { x, y -> service.inputSender.down(x, y) },
+                onTouchMove = { x, y -> service.inputSender.move(x, y) },
+                onTouchUp = { x, y -> service.inputSender.up(x, y) },
+            )
+        }
 
         val catalog = AppCatalog()
         service.onAppList = { catalog.onAppList(it) }
@@ -233,6 +246,12 @@ class DesktopApp(
             }
             // WIN-07：码流持续黑屏（编码器卡死但 TCP 仍通）时升级到自动重连。
             onSustainedBlackScreen = { onSustainedBlackScreen() }
+            // D-M3：解码器连续重建到上限仍出不了画面（坏 CONFIG 重放等）时升级，
+            // 否则循环会以 ~2 次/秒无限转，唯一症状是统计行 rebuilds= 增长。
+            onDecodeStalled = { onDecodeStalled() }
+            // D-M1：解码线程被抛弃 = native 解码器泄漏。这里只大声记 WARN（
+            // SessionStatsLogger 的统计行也带上它），让"泄漏"有可观测的信号。
+            onDecoderAbandoned = { log.warn(TAG, "解码线程被抛弃（native 解码器无法回收）—— 见 decoder 日志") }
         }
         service.onVideoFrame = { pipeline.feed(it) }
         pipeline.start()
@@ -251,26 +270,37 @@ class DesktopApp(
             input = service.inputSender,
         )
 
+        // D-L1：先赋值再 launch。反过来（先 launch 后赋值）的话协程体里的代际守卫
+        // `_session.value === session` 可能读到**上一代**（早先的窗口关闭用例就
+        // 因此丢过 sessionEnded 信号：窗口不自动关）。
+        this.scope = scope
+        this.service = service
+        this.pipeline = pipeline
+        _session.value = session
+
         scope.launch {
             log.info("session", "连接 ${config.phoneHost}:${config.controlPort} ...")
             service.runSession()
             log.info("session", "已结束（解码帧总数=${pipeline.framesDecoded.get()}）")
             keepAwake.disable()
-            // 代际守卫（audit WIN-04）：只有**仍未被下一代顶替**的会话才把"结束"发给窗口。
-            // 「应用并重连」会先结束旧代、再建新代，旧代那个 true 落在 UI 还在收集它的时候
-            // 就会把窗口关掉退出 —— 正常断连（_session 仍是这一代）才该关窗。
+            // 代际守卫（audit WIN-04 / D-03）：只有**仍未被下一代顶替**的会话才
+            // 收掉 adb 并把"结束"发给窗口。「应用并重连」会先结束旧代、再建新代，
+            // 旧代那个 true 落在 UI 还在收集它的时候就会把窗口关掉退出 —— 正常
+            // 断连（_session 仍是这一代）才该关窗。
             //
-            // 启动失败豁免（2026-10-09 真机）：**从未到过 STREAMING** 的会话断开不关窗。
-            // 否则"双击 exe 时手机端 app 还没启动" → Connection refused → 3 秒即整窗退出，
-            // 用户视角就是"闪退"（实测 desktop.log 09:23:37 全程）。窗口留着停在
-            // DISCONNECTED，用户开好手机端后点「应用并重连」即可。
-            if (_session.value === session && reachedStreaming.get()) sessionEnded.value = true
+            // 启动失败豁免（2026-10-09 真机）：**从未到过 STREAMING** 的会话断开
+            // 不关窗。否则"双击 exe 时手机端 app 还没启动" → Connection refused
+            // → 3 秒即整窗退出，用户视角就是"闪退"（实测 desktop.log 09:23:37
+            // 全程）。窗口留着停在 DISCONNECTED，用户开好手机端后点「应用并重连」。
+            if (_session.value === session) {
+                // D-03：正常断连（手机侧 DISCONNECT / EOF）也必须关掉 adbDeployer
+                // —— 桌面端持有的 `adb shell` 进程就是设备侧引擎的存活锚点，不关
+                // 则引擎与 adb.exe 一直活到用户关窗或「应用并重连」（VirtualDisplay
+                // 泄漏）。此前只有 openSession/stop 调 closeSession() 才走到这里。
+                runCatching { adbDeployer.close() }
+                if (reachedStreaming.get()) sessionEnded.value = true
+            }
         }
-
-        this.scope = scope
-        this.service = service
-        this.pipeline = pipeline
-        _session.value = session
     }
 
     private fun closeSession() {
@@ -307,7 +337,16 @@ class DesktopApp(
             )
             throw IOException("未开启 dev_mode，无法部署 VD server（无 Shizuku）")
         }
-        val jarPath = response.vdServerJarPath.ifBlank { VdDeploy.JAR_PATH }
+        // 对端可控字段的白名单校验（audit D-01，CRITICAL）：adbPort 与
+        // vdServerJarPath 都来自握手响应，会原样进入 `adb -s host:port shell
+        // "CLASSPATH=... exec app_process ..."`。不校验 = 被 MITM / 占位的 LAN
+        // 主机拿到 shell 身份的任意代码执行。两者都不做"夹紧后继续"的静默兜底 ——
+        // 抛出去终止会话，让用户在日志里看到真实原因。
+        AdbDeploy.checkAdbPort(response.adbPort)
+        val jarPath = AdbDeploy.sanitizeJarPath(response.vdServerJarPath)
+        // vdWidth/vdHeight 的钳制不在本方法里：AdbDeploy.plan 对 phoneVd*>0 的
+        // 输入统一走 clampVdDimension（evenMin2 + coerceIn(2,4096)），与 D-M4
+        // 共用一条实现；0/负值在那里退回视口尺寸。
         val deployed = adbDeployer.deploy(
             config = config,
             adbPort = response.adbPort,
@@ -356,6 +395,51 @@ class DesktopApp(
         }
         log.warn(TAG, "疑似持续黑屏：自动重连（第 $attempt/$MAX_BLACK_SCREEN_RECONNECTS 次）")
         restart(dpiOverride = null, hwaccelEnabled = null)
+    }
+
+    /**
+     * 解码器连续重建到上限仍无画面（audit D-M3）。
+     *
+     * 升级动作与持续黑屏相同（重建一代会话，让手机侧重新起编码器），但共用同一份
+     * 预算：两者都是"这一代已经没救了"，让它们各自重连只会把窗口变成重连风暴。
+     * 预算用尽后只记日志 —— 已经大声告诉用户去哪手动重连了。
+     */
+    private fun onDecodeStalled() {
+        val attempt = blackScreenReconnects.incrementAndGet()
+        if (attempt > MAX_BLACK_SCREEN_RECONNECTS) {
+            log.warn(
+                TAG,
+                "解码器反复重建仍无画面：本进程内已自动重连 $MAX_BLACK_SCREEN_RECONNECTS 次，" +
+                    "不再自动重试 —— 请在「显示」页点「应用并重连」",
+            )
+            return
+        }
+        log.warn(TAG, "解码器反复重建仍无画面：自动重连（第 $attempt/$MAX_BLACK_SCREEN_RECONNECTS 次）")
+        restart(dpiOverride = null, hwaccelEnabled = null)
+    }
+
+    /**
+     * 在 Swing EDT 上同步执行 [block] 并返回其结果（audit D-L5）。
+     *
+     * [openSession] 跑在 lifecycle 线程上，而 [SwingVideoView] 的构造（设 opaque、
+     * 加鼠标监听、建 Graphics）受 Swing 的单线程规则约束，必须在 EDT 上做。
+     * `invokeAndWait` 返回 void，结果经 [holder] 取回。
+     *
+     * 异常兜底：EDT 不可用 / 被打断时退回直接构造 —— 没有真实 EDT 也就没有线程
+     * 规则可违反（block 自身抛错时这里会再抛一次同样的异常，语义不变）。
+     */
+    private fun <T> runOnEdt(block: () -> T): T {
+        if (SwingUtilities.isEventDispatchThread()) return block()
+        val holder = java.util.concurrent.atomic.AtomicReference<T>()
+        try {
+            SwingUtilities.invokeAndWait { holder.set(block()) }
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return block()
+        } catch (_: java.lang.reflect.InvocationTargetException) {
+            return block()
+        }
+        return holder.get()
     }
 
     private companion object {

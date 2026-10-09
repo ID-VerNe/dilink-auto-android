@@ -219,6 +219,125 @@ class DesktopAppTest {
         }
     }
 
+    // ─── D-01：握手响应里的对端可控字段必须被拒绝 ───
+
+    /**
+     * 手机下发白名单外的 jar 路径 → 会话终止，且日志给出可读原因。
+     *
+     * 这是 CRITICAL 修复的端到端断言：`vdServerJarPath` 会原样进设备侧
+     * `CLASSPATH=<path> exec app_process ...`。敌意/被占位的 LAN 主机借此在
+     * 设备上以 shell 身份跑任意代码。拒绝必须**可见**（终止会话 + 日志说明），
+     * 不能是静默兜底换默认路径 —— 那会让用户以为连上了。
+     */
+    @Test
+    fun `敌意 jar 路径被拒绝并终止会话`() {
+        val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        val phone = NoShizukuPhone(
+            scope,
+            vdServerJarPath = "/data/local/tmp/evil-vd-server.jar",
+        )
+        val logLines = Collections.synchronizedList(mutableListOf<String>())
+        val app = newApp(
+            phone.port,
+            logLines,
+            settings = DesktopSettings(devMode = true),
+        )
+        try {
+            app.start()
+            val session = awaitSession(app)
+            awaitCondition("假手机收到握手请求") { phone.handshakeReceived.isCompleted }
+
+            awaitCondition("会话因 jar 路径越界而终止（DISCONNECTED）") {
+                session.state.value == SessionState.DISCONNECTED
+            }
+            assertFalse("越界路径（未到过 STREAMING）不得触发自动关窗", session.sessionEnded.value)
+            assertTrue(
+                "日志里应说明 jar 路径被拒: ${synchronized(logLines) { logLines.toList() }}",
+                synchronized(logLines) { logLines.any { it.contains("白名单") && it.contains("vd-server.jar") } },
+            )
+        } finally {
+            app.stop()
+            phone.close()
+            scope.cancel()
+        }
+    }
+
+    /**
+     * 手机下发非标准 adb 端口 → 会话终止。
+     *
+     * 端口拼进 `adb connect <host>:<port>`：对端写任意值就能让本端去连它选定的
+     * 服务。必须是显式拒绝而不是"夹紧到 5555 继续"。
+     */
+    @Test
+    fun `非标准 adb 端口被拒绝并终止会话`() {
+        val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        val phone = NoShizukuPhone(scope, adbPort = 4444)
+        val logLines = Collections.synchronizedList(mutableListOf<String>())
+        val app = newApp(
+            phone.port,
+            logLines,
+            settings = DesktopSettings(devMode = true),
+        )
+        try {
+            app.start()
+            val session = awaitSession(app)
+            awaitCondition("假手机收到握手请求") { phone.handshakeReceived.isCompleted }
+
+            awaitCondition("会话因端口越界而终止（DISCONNECTED）") {
+                session.state.value == SessionState.DISCONNECTED
+            }
+            assertTrue(
+                "日志里应说明端口被拒: ${synchronized(logLines) { logLines.toList() }}",
+                synchronized(logLines) { logLines.any { it.contains("adb 端口非法") } },
+            )
+        } finally {
+            app.stop()
+            phone.close()
+            scope.cancel()
+        }
+    }
+
+    /**
+     * 越界的 VD 尺寸必须被钳制而不是原样下发（D-M4 的端到端一面）。
+     *
+     * 敌意对端在手机上申请超大 VirtualDisplay = 设备 OOM。机器上**有** adb 时
+     * `adb connect` 可能返回成功，于是部署会一路走到 launch 才失败，会话随后要等
+     * 30s 的 VD-ready 超时才终止（WIN-06 的设计）——所以这里不断言"会话终止"，
+     * 而是断言最终 argv:peer 给的 -1 / Int.MAX_VALUE 被钳回视口尺寸，`app_process`
+     * 命令行里不出现任何越界值。
+     */
+    @Test
+    fun `越界 VD 尺寸不会走到部署`() {
+        val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        val phone = NoShizukuPhone(scope, vdWidth = -1, vdHeight = Int.MAX_VALUE)
+        val logLines = Collections.synchronizedList(mutableListOf<String>())
+        val app = newApp(phone.port, logLines, settings = DesktopSettings(devMode = true))
+        try {
+            app.start()
+            awaitSession(app)
+            awaitCondition("假手机收到握手请求") { phone.handshakeReceived.isCompleted }
+
+            awaitCondition("部署进入 app_process 启动阶段") {
+                synchronized(logLines) { logLines.any { it.contains("app_process 参数") } }
+            }
+            val argsLine = synchronized(logLines) { logLines.first { it.contains("app_process 参数") } }
+            // 前两个 argv = VD 宽高，走 AdbDeploy.plan 的钳制规则：
+            //  - vdWidth=-1(<=0) → 回落本端视口宽(1280,偶数对齐);
+            //  - vdHeight=Int.MAX_VALUE(>0) → evenMin2 + coerceIn(2,4096) → 4096
+            //    (audit D-M4  sanctioned 的上限：>1080p 会让 439 车机软解崩帧).
+            val args = argsLine.substringAfter("app_process 参数").trim().split(" ")
+            assertEquals(1280, args[0].toInt())
+            assertEquals(4096, args[1].toInt())
+            // 负值与 Int.MAX_VALUE 本身都不能以任何形态出现在命令行里
+            assertFalse("越界尺寸不得出现在 argv: $argsLine", argsLine.contains("MAX_VALUE"))
+            assertFalse("越界尺寸不得出现在 argv: $argsLine", argsLine.contains("2147483647"))
+        } finally {
+            app.stop()
+            phone.close()
+            scope.cancel()
+        }
+    }
+
     // ─── 辅助 ───
 
     private val configFile: File get() = File(tmp.root, "config.json")
@@ -228,6 +347,7 @@ class DesktopAppTest {
         logLines: MutableList<String>? = null,
         videoPort: Int = freePort(),
         inputPort: Int = freePort(),
+        settings: DesktopSettings = DesktopSettings(),
     ): DesktopApp {
         val collected = logLines
         val log = DesktopLog(
@@ -238,7 +358,7 @@ class DesktopAppTest {
         )
         return DesktopApp(
             configFile = configFile,
-            settings = DesktopSettings(),
+            settings = settings,
             log = log,
             initialConfig = DesktopConfig(
                 phoneHost = "127.0.0.1",
@@ -376,7 +496,13 @@ private class StreamingPhone(
  * **不**发 `VD_PORTS_BOUND`。驱动的正是"由本端用 adb 部署 VD"那条路径 ——
  * 部署闸门（dev_mode）拒绝后，桌面端应当立刻终止会话。
  */
-private class NoShizukuPhone(scope: CoroutineScope) : Closeable {
+private class NoShizukuPhone(
+    scope: CoroutineScope,
+    private val adbPort: Int = Ports.ADB_PORT,
+    private val vdServerJarPath: String = "",
+    private val vdWidth: Int = 0,
+    private val vdHeight: Int = 0,
+) : Closeable {
 
     private val server = ServerSocketChannel.open().apply {
         configureBlocking(false)
@@ -402,9 +528,12 @@ private class NoShizukuPhone(scope: CoroutineScope) : Closeable {
                     displayWidth = 1280,
                     displayHeight = 720,
                     virtualDisplayId = 7,
-                    adbPort = Ports.ADB_PORT,
+                    adbPort = adbPort,
+                    vdServerJarPath = vdServerJarPath,
                     connectionMethod = CONNECTION_METHOD_USB_ADB,
                     vdDpi = 240,
+                    vdWidth = vdWidth,
+                    vdHeight = vdHeight,
                 ).encode(),
             )
         }

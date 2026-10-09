@@ -25,8 +25,14 @@ class KeepAwake(private val driver: Driver = defaultDriver()) {
 
     /** 平台相关的那一个系统调用；抽出来是为了让判定逻辑可以脱离 Windows 单测。 */
     interface Driver {
-        /** 返回 0 表示失败（`SetThreadExecutionState` 的返回值语义）。 */
-        fun setExecutionState(flags: Long): Long
+        /**
+         * 调用 `SetThreadExecutionState`。
+         *
+         * Win32 原型是 `EXECUTION_STATE SetThreadExecutionState(EXECUTION_STATE)`
+         * —— **32 位** 参数与返回值（Windows SDK 里 EXECUTION_STATE 就是 DWORD）。
+         * 所以这里按 Int 映射；返回 0 表示失败。
+         */
+        fun setExecutionState(flags: Int): Int
     }
 
     private val executor = Executors.newSingleThreadExecutor { runnable ->
@@ -46,11 +52,11 @@ class KeepAwake(private val driver: Driver = defaultDriver()) {
     /** 释放常亮请求。返回 false 表示平台不支持或调用失败。 */
     fun disable(): Boolean = apply(ES_CONTINUOUS, active = false)
 
-    private fun apply(flags: Long, active: Boolean): Boolean {
+    private fun apply(flags: Int, active: Boolean): Boolean {
         val ok = try {
-            val result = executor.submit<Long> { driver.setExecutionState(flags) }
+            val result = executor.submit<Int> { driver.setExecutionState(flags) }
                 .get(CALL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-            result != 0L
+            result != 0
         } catch (_: Exception) {
             false
         }
@@ -65,13 +71,20 @@ class KeepAwake(private val driver: Driver = defaultDriver()) {
 
     /** 非 Windows，或 JNA/内核库不可用时使用的空驱动。 */
     object NoopDriver : Driver {
-        override fun setExecutionState(flags: Long): Long = 0L
+        override fun setExecutionState(flags: Int): Int = 0
     }
 
     companion object {
-        const val ES_CONTINUOUS = 0x80000000L
-        const val ES_SYSTEM_REQUIRED = 0x00000001L
-        const val ES_DISPLAY_REQUIRED = 0x00000002L
+        /**
+         * Win32 EXECUTION_STATE 标志位。
+         *
+         * 按 Int 映射（audit D-I1）：`0x80000000` 在 Kotlin 里默认是 Long，写成
+         * `Int` 需要显式 `.toInt()` —— 这正是此前的映射错误（把 32 位 API 当 64 位
+         * 参数传，x64 上"恰好工作"是因为 callee 只读低 32 位）。
+         */
+        const val ES_CONTINUOUS = 0x80000000.toInt()
+        const val ES_SYSTEM_REQUIRED = 0x00000001
+        const val ES_DISPLAY_REQUIRED = 0x00000002
 
         private const val CALL_TIMEOUT_MS = 2_000L
 
@@ -85,10 +98,11 @@ class KeepAwake(private val driver: Driver = defaultDriver()) {
     private class WindowsDriver : Driver {
         private val kernel32: Kernel32 = Native.load("kernel32", Kernel32::class.java)
 
-        override fun setExecutionState(flags: Long): Long = kernel32.SetThreadExecutionState(flags)
+        // Int 映射（audit D-I1）：Win32 的 esFlags 是 32 位 DWORD。
+        override fun setExecutionState(flags: Int): Int = kernel32.SetThreadExecutionState(flags)
 
         private interface Kernel32 : Library {
-            fun SetThreadExecutionState(esFlags: Long): Long
+            fun SetThreadExecutionState(esFlags: Int): Int
         }
     }
 }

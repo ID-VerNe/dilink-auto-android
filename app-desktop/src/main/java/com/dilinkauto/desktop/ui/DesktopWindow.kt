@@ -186,6 +186,17 @@ fun DesktopWindow(app: DesktopApp, onClose: () -> Unit) {
                             // 全屏状态下位置被忽略，先退回浮动窗口再搬。
                             if (fullscreen) setFullscreen(false)
                             window.setLocation(screen.x, screen.y)
+                            // D-L7：只 setLocation 不 setSize 的话，从小屏搬到大屏
+                            // 窗口还是原来大小（浪费屏幕），从大屏搬到小屏则大部分
+                            // 在屏外（用户只看到一角）。按目标屏 bounds 钳制尺寸，
+                            // 留出任务栏余量。极小屏时保证上界不低于下限（coerceIn
+                            // 要求 min <= max）。
+                            val maxWidth = maxOf(MIN_MOVED_WINDOW_PX, screen.width - MOVED_WINDOW_MARGIN_PX)
+                            val maxHeight = maxOf(MIN_MOVED_WINDOW_PX, screen.height - MOVED_WINDOW_MARGIN_PX)
+                            window.setSize(
+                                window.width.coerceIn(MIN_MOVED_WINDOW_PX, maxWidth),
+                                window.height.coerceIn(MIN_MOVED_WINDOW_PX, maxHeight),
+                            )
                         },
                         onToggleKeepAwake = { app.setKeepAwake(it) },
                         onTogglePhoneScreen = { on ->
@@ -263,3 +274,9 @@ private fun RailButton(
 }
 
 private val RAIL_WIDTH = 96.dp
+
+/** 搬窗口后允许的最小尺寸（audit D-L7）：再小就没法用了。 */
+private const val MIN_MOVED_WINDOW_PX = 480
+
+/** 搬窗口时给目标屏留的余量（任务条 / 屏边，audit D-L7）。 */
+private const val MOVED_WINDOW_MARGIN_PX = 80

@@ -65,6 +65,81 @@ class DesktopSettingsTest {
         assertTrue("应回报解析失败：$errors", errors.single().contains("解析"))
     }
 
+    /**
+     * D-L6：损坏的 config.json 必须**自愈**。
+     *
+     * 旧实现只是回报一行错误然后回默认值 —— 文件一直坏在那里，之后每次启动都静默
+     * 回默认（用户发现 `dev_phone_ip` 丢了却不知道原因）。现在解析失败即用默认值
+     * 重写文件，让它恢复可编辑状态。
+     */
+    @Test
+    fun load_corruptFile_rewritesFileSoItSelfHeals() {
+        val file = temp.newFile("config.json")
+        file.writeText("{ this is not json")
+        val errors = mutableListOf<String>()
+
+        val settings = DesktopSettingsStore(file).load { errors.add(it) }
+
+        assertEquals(DesktopSettings(), settings)
+        assertTrue("应回报解析失败：$errors", errors.any { it.contains("解析") })
+        // 文件被重写成合法配置：再读一次拿回默认值且不再报错
+        val rereadErrors = mutableListOf<String>()
+        assertEquals(DesktopSettings(), DesktopSettingsStore(file).load { rereadErrors.add(it) })
+        assertTrue("自愈后不应再有解析错误: $rereadErrors", rereadErrors.isEmpty())
+    }
+
+    /** D-L6 的另一半：自愈后的文件必须还能正常保存/读回（不能留下半残状态）。 */
+    @Test
+    fun load_corruptFile_rewriteKeepsFileWritable() {
+        val file = temp.newFile("config.json")
+        file.writeText("not json at all")
+        DesktopSettingsStore(file).load()
+
+        assertTrue(DesktopSettingsStore(file).save(DesktopSettings(devPhoneIp = "10.0.0.9")))
+        assertEquals("10.0.0.9", DesktopSettingsStore(file).load().devPhoneIp)
+    }
+
+    /**
+     * D-02：保存必须是原子写（tmp + Files.move）。
+     *
+     * 直接 file.writeText 是原地截断读：并发保存交错时另一方会读到半截文件，
+     * 用户拿到一份损坏的 config.json。这里断言三件事：
+     *  1. 保存成功后目标文件存在且内容正确；
+     *  2. **不留** `.tmp` 残留（泄漏的 tmp 会让目录越来越乱）；
+     *  3. 连续多次保存（模拟两次快速修改）后文件仍是合法配置。
+     */
+    @Test
+    fun save_isAtomic_andLeavesNoTmpBehind() {
+        val file = temp.newFile("config.json")
+        val store = DesktopSettingsStore(file)
+
+        assertTrue(store.save(DesktopSettings(devPhoneIp = "1.1.1.1")))
+        assertTrue(store.save(DesktopSettings(devPhoneIp = "2.2.2.2")))
+
+        assertEquals("2.2.2.2", DesktopSettingsStore(file).load().devPhoneIp)
+        val tmp = java.io.File(file.parentFile, file.name + ".tmp")
+        assertFalse("atomic write must not leave .tmp behind", tmp.exists())
+    }
+
+    /** 原子写失败时也要清理 tmp，并且回报原因。 */
+    @Test
+    fun save_cleansUpTmpWhenMoveFails() {
+        val dir = temp.newFolder("blocked2")
+        val file = java.io.File(dir, "sub/config.json")
+        // 用一个文件占住父目录位置：mkdirs 失败、tmp 也写不进去
+        java.io.File(dir, "sub").writeText("occupied")
+        val errors = mutableListOf<String>()
+
+        val ok = DesktopSettingsStore(file).save(DesktopSettings()) { errors.add(it) }
+
+        assertFalse(ok)
+        assertNotNull(errors.firstOrNull())
+        assertFalse(
+            "失败不应留 .tmp 残留",
+            java.io.File(dir, "sub/config.json.tmp").exists(),
+        )
+    }
+
     @Test
     fun load_readsTheDocumentedKeysFromHandwrittenJson() {
         // 手写（而非 save 产出）的配置文件也必须能读——用户会直接编辑它

@@ -2,6 +2,8 @@ package com.dilinkauto.desktop.deploy
 
 import com.dilinkauto.desktop.DesktopConfig
 import com.dilinkauto.protocol.VdDeploy
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -13,6 +15,9 @@ import java.util.concurrent.CopyOnWriteArrayList
  *
  * 注入假 [AdbRunner] + 假时钟：CI 上不会装 adb，也不该起真机进程；同时假时钟让
  * "等旧引擎退出"这段真实要 3 秒的轮询在测试里瞬时完成。
+ *
+ * [AdbDeployer.deploy] 是挂起函数（audit D-M6：部署必须可取消、且用 [runBlocking]
+ * 驱动而不是内部再包一层 runBlocking），所以用例统一在 `runBlocking` 里调。
  */
 class AdbDeployerTest {
 
@@ -75,10 +80,10 @@ class AdbDeployerTest {
     )
 
     private fun deployer(runner: FakeRunner, time: FakeTime = FakeTime()) =
-        AdbDeployer(runner = runner, sleep = { time.sleep(it) }, now = { time.now() })
+        AdbDeployer(runner = runner, now = { time.now() }, sleep = { time.sleep(it) })
 
     @Test
-    fun `正常流程按 connect - kill - 探活 - 前台启动 的顺序执行`() {
+    fun `正常流程按 connect - kill - 探活 - 前台启动 的顺序执行`() = runBlocking {
         val runner = FakeRunner()
         val logs = mutableListOf<String>()
 
@@ -96,7 +101,7 @@ class AdbDeployerTest {
     }
 
     @Test
-    fun `connect 失败即中止，不会去 kill 或启动`() {
+    fun `connect 失败即中止，不会去 kill 或启动`() = runBlocking {
         val runner = FakeRunner(connectResult = false)
 
         val ok = deployer(runner).deploy(config(), 5555, VdDeploy.JAR_PATH) {}
@@ -107,7 +112,7 @@ class AdbDeployerTest {
     }
 
     @Test
-    fun `必须连续两次判定退出才认账`() {
+    fun `必须连续两次判定退出才认账`() = runBlocking {
         // 第一次探活仍报存活（上一次传输抖动/进程正在退出），后两次才报已退出
         val probes = ArrayDeque(listOf(true, false, false))
         val runner = FakeRunner(probeAlive = { probes.removeFirstOrNull() ?: false })
@@ -118,7 +123,7 @@ class AdbDeployerTest {
     }
 
     @Test
-    fun `旧引擎迟迟不退时会补一次强制 kill 再启动`() {
+    fun `旧引擎迟迟不退时会补一次强制 kill 再启动`() = runBlocking {
         // 探活永远报存活 → 等到超时 → 走 stopCommand 兜底
         val runner = FakeRunner(probeAlive = { true })
 
@@ -135,5 +140,61 @@ class AdbDeployerTest {
         val runner = FakeRunner()
         deployer(runner).close()
         assertEquals(1, runner.killAllCalled)
+    }
+
+    /**
+     * D-M6：两轮部署必须串行。
+     *
+     * "会话中途 restart"时旧的部署协程可能还在对**共享的** runner 跑命令 —— 旧协程
+     * 杀 adb 进程 / 新协程已经起了自己的进程，两个引擎同时抢 9638/9639。Mutex 让
+     * 同一时刻只有一轮部署在跑。
+     */
+    @Test
+    fun `并发部署被串行化`() = runBlocking {
+        val runner = FakeRunner()
+        val overlap = java.util.concurrent.atomic.AtomicInteger(0)
+        val maxOverlap = java.util.concurrent.atomic.AtomicInteger(0)
+        val deployer = AdbDeployer(
+            runner = runner,
+            now = { 0L },
+            sleep = { ms ->
+                // 在"等待"里检测并发：只要有两轮部署同时在 sleep，就说明没串起来
+                overlap.incrementAndGet()
+                maxOverlap.updateAndGet { maxOf(it, overlap.get()) }
+                kotlinx.coroutines.delay(20)
+                overlap.decrementAndGet()
+            },
+        )
+
+        val a = launch { deployer.deploy(config(), 5555, VdDeploy.JAR_PATH) {} }
+        val b = launch { deployer.deploy(config(), 5555, VdDeploy.JAR_PATH) {} }
+        a.join(); b.join()
+
+        assertEquals("不得有两轮部署同时在跑", 1, maxOverlap.get())
+    }
+
+    /**
+     * D-M6：部署序列必须可取消。
+     *
+     * 此前内部包 `runBlocking { vdRunDeploySequence(sleep = Thread.sleep) }`——部署
+     * 一次性跑完，调用方取消它要等整段结束（最坏 6s+，且期间共享 runner 上的命令
+     * 继续跑）。现在 sleep seam 是挂起的，取消应该在 await 点上生效。
+     */
+    @Test
+    fun `部署序列可被取消`() = runBlocking {
+        val runner = FakeRunner(probeAlive = { true })
+        // 真 sleep（不推进假时钟）→ 序列一直卡在"等旧引擎退出"
+        val deployer = AdbDeployer(runner = runner, sleep = { kotlinx.coroutines.delay(50) })
+
+        val job = launch { deployer.deploy(config(), 5555, VdDeploy.JAR_PATH) {} }
+        kotlinx.coroutines.delay(300) // 让序列跑起来（正卡在等旧引擎退出）
+        job.cancel()
+        kotlinx.coroutines.withTimeout(2_000) { job.join() }
+
+        // 取消后不应走到最后一步（启动引擎）
+        assertTrue(
+            "取消后不应继续启动引擎: ${runner.shellCommands()}",
+            runner.shellCommands().none { it.contains("app_process") },
+        )
     }
 }

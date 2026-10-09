@@ -322,6 +322,37 @@ class DesktopConnectionServiceTest {
             scope.cancel()
         }
     }
+
+    /**
+     * D-L3：[stop] 必须等 teardown 真的跑完再返回。
+     *
+     * 旧实现只 complete 了三个 await 信号，teardown 仍在 IO 协程上异步续跑 ——
+     * [DesktopApp.closeSession] 紧接着停解码器的顺序事实上不成立（会话协程可能
+     * 还在往已关闭的连接上派发帧）。这里断言 stop() 返回后 teardown 已收尾。
+     */
+    @Test
+    fun stop_awaitsTeardownBeforeReturning() = runBlocking {
+        val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        val phone = FakePhone(scope, controlPort, videoPort, inputPort)
+        phone.start()
+
+        val service = DesktopConnectionService(scope, config())
+        val sessionJob = scope.launch { service.runSession() }
+        try {
+            withTimeout(5_000) { phone.handshakeRequest.await() }
+            withTimeout(5_000) { while (service.state != SessionState.STREAMING) delay(10) }
+
+            service.stop()
+
+            // teardown 的最后一步就是把状态置 DISCONNECTED —— 它已同步完成
+            assertEquals(SessionState.DISCONNECTED, service.state)
+            assertFalse("teardown 后输入通道应被摘除", service.inputSender.isConnected)
+        } finally {
+            phone.stop()
+            sessionJob.cancel()
+            scope.cancel()
+        }
+    }
 }
 
 /**
