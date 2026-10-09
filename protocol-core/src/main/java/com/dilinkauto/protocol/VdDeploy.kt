@@ -110,8 +110,22 @@ object VdDeploy {
         // With truncation the LAST restart's process — which often dies before its
         // first stdout flush — erases the FIRST failure's diagnostic output,
         // leaving a 0-byte log. Append preserves every run's output in order.
-        return "CLASSPATH=$jarPath ${prefix}app_process / $MAIN_CLASS $args >>$logPath 2>&1$amp"
+        //
+        // 路径一律经 [shellQuote]（audit WIN-09）：`jarPath` 来自**对端**（握手响应的
+        // `vdServerJarPath`），原样拼进设备侧 shell 就是把"对端可控字符串"喂给
+        // `sh -c`（执行身份 shell）。三条部署路径最后都是 shell，所以单引号在这里
+        // 是通用且必要的。`logPath` 目前只来自本端常量，同样加上以免日后被人接到参数上。
+        return "CLASSPATH=${shellQuote(jarPath)} ${prefix}app_process / $MAIN_CLASS $args " +
+            ">>${shellQuote(logPath)} 2>&1$amp"
     }
+
+    /**
+     * POSIX shell 单引号引用（audit WIN-09）。
+     *
+     * 单引号内除 `'` 本身外不解释任何字符，所以只需把内嵌的 `'` 拆成 `'\''`
+     * （闭合 → 转义单引号 → 重新打开）。用于任何"字符串要进设备侧 shell"的位置。
+     */
+    fun shellQuote(text: String): String = "'" + text.replace("'", "'\\''") + "'"
 
     /**
      * A fully-assembled VD-server deploy plan: the argv tail, the kill command,

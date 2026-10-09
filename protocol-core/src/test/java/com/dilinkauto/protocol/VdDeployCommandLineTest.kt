@@ -11,6 +11,8 @@ import org.junit.Test
  * `exec` so the engine stays attached to the ADB stream. Both MUST append
  * (>>) so a reconnect storm does not erase the first failure's diagnostic
  * output — regressing to `>` produced a 0-byte log on the phone path.
+ *
+ * 两条路径的路径参数都必须被 shell 引用住（WIN-09）：`jarPath` 取自对端握手响应。
  */
 class VdDeployCommandLineTest {
 
@@ -24,7 +26,7 @@ class VdDeployCommandLineTest {
 
         assertTrue(
             "background path must start with setsid so the engine detaches from the parent sh",
-            cmd.startsWith("CLASSPATH=$jar setsid app_process ")
+            cmd.startsWith("CLASSPATH='$jar' setsid app_process ")
         )
         assertTrue(
             "background path must end with ' &' to actually background",
@@ -32,7 +34,7 @@ class VdDeployCommandLineTest {
         )
         assertTrue(
             "background path must append (>>) so reconnect storms do not erase prior output",
-            " >>$log 2>&1" in cmd
+            " >>'$log' 2>&1" in cmd
         )
         assertTrue(
             "background path must NOT use exec (exec + & lets the parent sh exit and Shizuku reap the group)",
@@ -46,7 +48,7 @@ class VdDeployCommandLineTest {
 
         assertTrue(
             "foreground path must start with exec so app_process replaces the ADB shell",
-            cmd.startsWith("CLASSPATH=$jar exec app_process ")
+            cmd.startsWith("CLASSPATH='$jar' exec app_process ")
         )
         assertEquals(
             "foreground path must not background with &",
@@ -54,7 +56,31 @@ class VdDeployCommandLineTest {
         )
         assertTrue(
             "foreground path must append (>>) too",
-            " >>$log 2>&1" in cmd
+            " >>'$log' 2>&1" in cmd
+        )
+    }
+
+    @Test
+    fun peerSuppliedJarPathCannotBreakOutOfTheShellWord() {
+        val evil = "/sdcard/x.jar; pkill -f com.dilinkauto.vd; echo 'pwned'"
+
+        val cmd = VdDeploy.commandLine(evil, log, args, background = true)
+
+        assertEquals(
+            "整条命令行必须只剩固定骨架，对端字符串只出现在被引用住的 CLASSPATH 词里",
+            "CLASSPATH=${VdDeploy.shellQuote(evil)} setsid app_process / " +
+                "${VdDeploy.MAIN_CLASS} $args >>${VdDeploy.shellQuote(log)} 2>&1 &",
+            cmd,
+        )
+    }
+
+    @Test
+    fun shellQuote_escapesEmbeddedSingleQuotes() {
+        assertEquals("'abc'", VdDeploy.shellQuote("abc"))
+        assertEquals("''", VdDeploy.shellQuote(""))
+        assertEquals(
+            "'/sdcard/it'\\''s.jar'",
+            VdDeploy.shellQuote("/sdcard/it's.jar")
         )
     }
 
