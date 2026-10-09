@@ -2,14 +2,16 @@
 
 ## Overview
 
-DiLink-Auto is a five-module Gradle project that mirrors a phone's VirtualDisplay onto a BYD DiLink car head unit over WiFi. The phone runs the launcher apps on a shell-UID VirtualDisplay; the VD server encodes the rendered frames to H.264 and streams them directly to the car. The phone is a pure orchestrator — it does not relay video or touch.
+DiLink-Auto is a six-module Gradle project that mirrors a phone's VirtualDisplay onto a BYD DiLink car head unit over WiFi. The phone runs the launcher apps on a shell-UID VirtualDisplay; the VD server encodes the rendered frames to H.264 and streams them directly to the receiver. The phone is a pure orchestrator — it does not relay video or touch. The receiver itself is replaceable: the car app (`app-server`) and the Windows desktop client (`app-desktop`) speak the same protocol over the same three ports.
 
 ```
 DiLink-Auto/
-├── protocol/        Android library -- shared by all three apps (Gradle module)        minSdk 26
-├── app-client/      Android application -- runs on the phone                            minSdk 29
-├── app-server/      Android application -- runs on the car                              minSdk 26
-├── vd-server/       Android library -- shell-privileged process, compiled to a JAR      minSdk 29
+├── protocol-core/   Pure JVM library -- framing/messages/constants/VD deploy sequence  (no Android)
+├── protocol/        Android library -- shared by all three Android apps (Gradle module) minSdk 26
+├── app-client/      Android application -- runs on the phone                           minSdk 29
+├── app-server/      Android application -- runs on the car                             minSdk 26
+├── app-desktop/     Kotlin/JVM + Compose Desktop -- runs on Windows                    JDK 17
+├── vd-server/       Android library -- shell-privileged process, compiled to a JAR     minSdk 29
 └── docs/            documentation
 ```
 
@@ -17,7 +19,19 @@ Tested against a BYD Qin PLUS DM-i 2023 Champion 55KM Leading trim — a DiLink 
 
 ## Virtual Display Architecture
 
-The **phone** creates a VirtualDisplay at the car's viewport resolution and a shell-UID process (`vd-server`) that owns the encoder. The VD server binds `9638` (video) and `9639` (input) directly; the car connects to those ports on the phone's IP and exchanges H.264 + touch with the VD server, with no phone-app relay in the hot path. The phone app's role is orchestration: handshake, VD lifecycle (the `VD_PORTS_BOUND` control message), and car-log routing. `VirtualDisplayClient` on the phone is lifecycle-only — it owns the localhost command channel, not video or touch.
+The **phone** creates a VirtualDisplay at the car's viewport resolution and a shell-UID process (`vd-server`) that owns the encoder. The VD server binds `9638` (video) and `9639` (input) directly; the receiver connects to those ports on the phone's IP and exchanges H.264 + touch with the VD server, with no phone-app relay in the hot path. The phone app's role is orchestration: handshake, VD lifecycle (the `VD_PORTS_BOUND` control message), and car-log routing. `VirtualDisplayClient` on the phone is lifecycle-only — it owns the localhost command channel, not video or touch.
+
+**Receiver is replaceable.** Nothing in that contract is car-specific: the handshake (`HandshakeRequest`/`HandshakeResponse`), the three ports (9637 control+data, 9638 video, 9639 input) and the deploy sequence are protocol, not platform. `app-desktop` is a second receiver that speaks the same bytes:
+
+```
+Phone (app-client)                        Receiver (app-server OR app-desktop)
+  ConnectionService  9637 <-- handshake --->  connection state machine
+  VD server      --- 9638 -- H.264 ------>    decoder -> SurfaceView / Swing canvas
+                 --- 9639 -- touch <------    touch encoder (mouse or car panel)
+                   19647 <-- lifecycle ----   (phone-local only)
+```
+
+Who deploys the VD server depends on the phone: with Shizuku the phone does it itself; otherwise `HandshakeResponse.connectionMethod` tells the receiver to do it over ADB (the car uses USB/TCP ADB, the desktop shells out to the local `adb.exe`). Both receivers stop at the same place — `exec app_process` must stay attached to a live shell stream, because adbd reaps the engine the moment that stream closes.
 
 A separate lifecycle channel on `localhost:19647` carries `MSG_DISPLAY_READY` / `MSG_STACK_EMPTY` / `CMD_STOP` between the phone and the VD server. The VD server reverse-connects to the phone on this port (NIO, non-blocking).
 
@@ -82,6 +96,24 @@ Earlier releases routed video through the phone app: VD server wrote frames to l
 
 ## Module Responsibilities
 
+### protocol-core (Pure JVM Library)
+
+Everything in the protocol that does not touch Android. Three platforms share it: the car app (`app-server`), the Windows receiver (`app-desktop`) and — through `:protocol`'s `api(project(":protocol-core"))` — the phone app and the VD server. Keeping it Android-free is what makes `app-desktop` possible at all, and it is the reason the pure logic (framing, sequencing, deploy command lines, black-screen policy) can be unit-tested without a device.
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| Connection | `Connection.kt` | TCP connection with heartbeat/watchdog (10s), bounded write queue (`sendDispatcher` = `Dispatchers.IO.limitedParallelism(1)` → strict send ordering), inline INPUT/CONTROL dispatch so touch and commands keep their order, async dispatch only for DATA |
+| NioReader | `NioReader.kt` | Selector-based non-blocking reader with grow-on-demand buffer and explicit EOF/close handling |
+| FrameCodec | `FrameCodec.kt` | Binary framing (`HEADER_SIZE = 6`, 128MB payload cap), `ThreadLocal` header buffer for the hot path |
+| Messages | `Messages.kt` | Serializable data classes (handshake, app list, touch, video config) |
+| VdDeploy | `VdDeploy.kt` | `app_process` kill/launch command builders, liveness probes, `stopCommand` (SIGTERM → 1s → SIGKILL in one shell line), `shellQuote` for peer-supplied paths |
+| VdDeployArgs | `VdDeployArgs.kt` | `app_process` argv tail (shared by all three paths), encode cap 1920x1080, DPI override range `120..480` + `coerceDpiOverride` |
+| VdDeploySequence | `VdDeploySequence.kt` | The single definition of "kill → wait until it is really gone (two consecutive GONE probes; UNKNOWN accepted immediately; force-kill on timeout) → launch" |
+| BlackScreenDetector | `BlackScreenDetector.kt` | Sustained-black-screen policy shared by the car decoder and the desktop pipeline: a run of tiny I-frames means the encoder produces nothing. Alerts after N frames, escalates only after a sustained window (a short burst during warm-up is normal). Clock is injected |
+| H264NalParser | `H264NalParser.kt` | NAL walker — `isKeyFrame` (type 5) drives "drop P-frames until the first IDR" |
+| VideoConfig | `VideoConfig.kt` | `TARGET_FPS = 24`, `DEFAULT_BITRATE`, `calculateOptimalDpi(width, height, reportedDpi)` |
+| PlatformLog / ThreadPriority | `PlatformLog.kt`, `ThreadPriority.kt` | Platform hooks so the shared code can log and set thread priority without importing `android.util.Log` |
+
 ### protocol (Android Library, minSdk 26)
 
 Shared by all three apps. Zero UI dependencies. Owns the wire format, the ADB client, and the cross-module constants that used to diverge across files (`AppPrefs`, `AppTargets`, `VdDeploy`, `VdDeployArgs`, `WifiGatewayIp`, `ImeRestore`).
@@ -141,6 +173,23 @@ Parallel connection model: WiFi control (9637) + WiFi direct video/input (9638/9
 | CarCrashHandler | `CarCrashHandler.kt` | Uncaught exception handler. Saves a crash report to `filesDir/crash-pending.log`; flushed to the phone via `carLogSend` on the next successful connection |
 | CarTheme | `ui/theme/CarTheme.kt` | Dark color scheme, tokenized colors (`onSurfaceVariant` replaces `Color.Gray` / `0xFF888888`), labels floored to 14sp |
 | MainActivity | `MainActivity.kt` | Fullscreen immersive, USB intent forwarding, rotation re-handshake (`onCarViewportChanged`) |
+
+### app-desktop (Windows Receiver, JDK 17)
+
+A second receiver for the same protocol, written in Kotlin/JVM with Compose Desktop 1.6.2 (`jpackage` app-image via `:app-desktop:createDistributable`). It connects directly to the phone's 9637/9638/9639, decodes with FFmpeg (JavaCV) and paints into a Swing canvas embedded through `SwingPanel`. Config and logs live in `%APPDATA%\DiLinkAuto` (override with `DILINK_DESKTOP_HOME`).
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| DesktopMain | `DesktopMain.kt` | Entry point: config/log wiring, `--probe` mode (link verification without decode/render), window mode. `PlatformLog.sink` forwards WARN+ only — `NioReader`'s per-poll DEBUG logging would drown the session log |
+| DesktopApp | `DesktopApp.kt` | Composition root and session-generation owner. All lifecycle work is serialized on one thread; `stop()` is awaitable (the caller is about to `exitProcess`). Session-end signals are identity-guarded so "apply & reconnect" cannot close the window; sustained black screen triggers at most 2 automatic reconnects per process |
+| DesktopConnectionService | `DesktopConnectionService.kt` | Session state machine `IDLE → CONNECTING → HANDSHAKING → WAITING_VD → STREAMING`; opens control+data, handshake, waits for `VD_PORTS_BOUND` (with timeout — the phone never reports a deploy failure), then connects video/input directly to the VD server |
+| VideoDecodePipeline | `video/VideoDecodePipeline.kt` | `FFmpegFrameGrabber` in raw Annex B mode (`maximumSize = 0` disables seek emulation, which hangs forever on a live stream), CONFIG replay + wait-for-IDR on rebuild, D3D11VA hardware decode with a "started but produced nothing" watchdog → permanent fallback to software, sustained-black-screen detection |
+| FeedGate / VideoStreamPipe | `video/FeedGate.kt`, `video/VideoStreamPipe.kt` | Gate drops frames until SPS/PPS and then until the first IDR; the pipe is a bounded queue that drops the oldest chunk under backpressure |
+| SwingVideoView | `ui/SwingVideoView.kt` | Letterbox painter + mouse→normalized-touch mapping. Copies every delivered frame into its own buffer: JavaCV reuses one `BufferedImage` for all frames, so handing the reference to an asynchronous repaint would tear |
+| DesktopWindow | `ui/DesktopWindow.kt` | Window shell: nav rail (mirror / apps / display) + main view. The video `SwingPanel` is composed **only** on the mirror page — AWT components always draw above Compose content |
+| AdbDeployer / AdbDeploy / ProcessAdbRunner | `deploy/*` | No-Shizuku path: `adb.exe connect` → shared `vdRunDeploySequence` → foreground `exec app_process`. Held `adb shell` processes are the engine's liveness anchor; a JVM shutdown hook is the last-resort reaper |
+| DesktopSettings / JsonConfig | `config/*` | `config.json` with the same keys as the Android `SharedPreferences` (`AppPrefs`), plus `startup_hwaccel` / `keep_awake`; hand-written JSON is tolerated (type mismatch → default, DPI coerced into the protocol range) |
+| KeepAwake | `display/KeepAwake.kt` | `kernel32!SetThreadExecutionState` through JNA on a dedicated thread; degrades to a no-op off Windows |
 
 ### vd-server (Shell-Privileged Process, minSdk 29)
 

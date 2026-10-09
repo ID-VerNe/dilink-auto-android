@@ -90,6 +90,27 @@ client 和 server 都加了 `values-zh-rCN` / `values-zh`。这是面向中国�
 - **`CarConnectionService.rehandshakeForBlackScreen()`**:检测到持续黑屏后,通过重新握手让手机重建 VD。`blackScreenRecoveryInFlight` 闩锁确保每次会话最多触发一次。
 - **`scripts/verify-blackscreen-fix.sh`**:自动化日志验证脚本,检查 VD 泄漏、cleanup 幂等、黑屏自愈、停机路径。
 
+### 11. Windows 接收端 `:app-desktop`(v0.18.0-dev-13 起)
+
+车机之外,同一套协议还支持用 **Windows 桌面程序**当接收端:手机画面镜像到 PC 窗口,鼠标即触摸。模块在 `app-desktop/`(Kotlin/JVM + Compose Desktop 1.6.2,JDK 17),协议实现复用 `protocol-core/` —— 手机侧零改动。
+
+- **链路**:桌面端直连手机的 **9637(控制+数据)/ 9638(视频)/ 9639(输入)** 三条 TCP,与车机端完全一致,不经中继。
+- **部署分流**:握手响应里的 `connectionMethod` 决定谁部署 VD server —— 手机有 Shizuku 就自己起;没有则由桌面端用本机 `adb.exe` 部署(`connect` → 杀旧引擎**并等它真的退出** → `exec app_process` 前台启动),需要 `config.json` 里 `"dev_mode": true` 显式同意(否则会终止会话并说明原因)。
+- **解码**:JavaCV/FFmpeg 软解 + D3D11VA 硬解(启动失败或"起来但零帧"自动回退软解);解码器重建时重放 CONFIG 并等下一个 IDR。
+- **界面**:左侧导航栏三页 —— 镜像 / 应用(启动器) / 显示(DPI 覆盖、硬解开关、「应用并重连」、本机常亮、手机物理屏开关)。视频画面用 Swing `JPanel` 承载(见 `SwingVideoView`),所以只在"镜像"页组合。
+- **自愈**:持续 10 秒黑屏(编码器/VD 卡死但 TCP 仍通)会自动重连,每进程最多 2 次 —— 手机合法地停在暗色界面时不会陷入重连风暴。
+- **配置与日志**:`%APPDATA%\DiLinkAuto`(`config.json` / `desktop.log`),可用环境变量 `DILINK_DESKTOP_HOME` 覆盖;`DILINK_ADB` 可指定 adb 路径。
+
+```bash
+# 免安装 app-image(自带精简 JRE):复制 build/compose/binaries/main/app/DiLinkAuto 整个目录到没装过 JDK 的机器即可双击运行
+./gradlew :app-desktop:createDistributable
+
+# 无窗口探针:只验链路(握手/VD/帧率),不解码不渲染;无 Shizuku 时需 DILINK_DEV_MODE=1 才走 ADB 部署
+app-desktop --probe
+```
+
+> 状态:Shizuku 路径与车机端同源;**ADB 部署路径尚未真机验证**(待办见 `.plan/windows-client-plan.md`)。
+
 ---
 
 ## 当前功能状态
@@ -108,7 +129,8 @@ client 和 server 都加了 `values-zh-rCN` / `values-zh`。这是面向中国�
 - 简体中文 + 8 种其他语言(英、葡、俄、白俄、法、哈、乌、乌兹)
 - 直连 VD 架构:手机不做中继,视频/触摸直通
 - VD 泄漏修复:两阶段优雅停机、清理幂等 guard、VD 退出等待 —— 每次重连不再泄漏 VirtualDisplay
-- 黑屏自愈:车机端检测到持续 5 秒以上黑屏后自动重建 VD(重握手)
+- 黑屏自愈:车机端检测到持续 5 秒以上黑屏后自动重建 VD(重握手);持续黑屏判定已上移到 `protocol-core`,Windows 接收端用同一套判据
+- Windows 接收端(`app-desktop`):镜像窗口 + 鼠标触摸 + 应用启动器 + DPI/硬解面板 + adb 部署,`jpackage` 出免安装 app-image
 
 **已移除(相对 upstream):**
 - 通知转发(手机通知 → 车机)—— 导航栏通知按钮、通知列表、相关协议消息全部删除
@@ -179,13 +201,15 @@ client 和 server 都加了 `values-zh-rCN` / `values-zh`。这是面向中国�
 
 ## 项目结构
 
-手机 APK(`app-client`)内嵌车机 APK(`app-server`)和 VD server JAR(`vd-server`)。装手机应用时一切就绪。
+手机 APK(`app-client`)内嵌车机 APK(`app-server`)和 VD server JAR(`vd-server`)。装手机应用时一切就绪。接收端可替换:同一份协议既能跑在车机上(`app-server`),也能跑在 Windows 上(`app-desktop`)。
 
 ```
 DiLink-Auto/
+├── protocol-core/  纯 JVM 共享库(帧/消息/协议常量/VD 部署序列,三端共用,无 Android 依赖)
 ├── protocol/       共享库(framing、消息、发现、USB/TCP ADB)
 ├── app-client/     手机 APK —— 编排、VD 部署、车机自更新、应用允许列表
 ├── app-server/     车机 APK —— UI、连接状态机、视频解码器
+├── app-desktop/    Windows 接收端 —— 镜像窗口、FFmpeg 解码、adb 部署、jpackage 打包
 ├── vd-server/      VirtualDisplay server(编译成 JAR,手机部署)
 ├── docs/           文档(多语言入口)
 └── gradle/         构建系统
@@ -193,9 +217,11 @@ DiLink-Auto/
 
 | 模块 | 角色 | minSdk |
 |------|------|--------|
+| `protocol-core` | 纯 JVM 共享协议库(Connection/NioReader/FrameCodec/Messages/VdDeploy/VdDeploySequence/BlackScreenDetector) | — |
 | `protocol` | 共享协议库(UsbAdbConnection、AdbProtocol、VideoConfig、NioReader、FrameCodec) | 26 |
 | `app-client` | 手机应用(ConnectionService、VD 部署、车机自更新、FileLog、AllowlistScreen) | 29 |
 | `app-server` | 车机应用(CarConnectionService、VideoDecoder、CarShell、HomeScreen、PersistentNavBar) | 26 |
+| `app-desktop` | Windows 接收端(DesktopApp、DesktopConnectionService、VideoDecodePipeline、SwingVideoView) | — |
 | `vd-server` | Shell 权限进程(PipelineServer、TouchInjector、GlPipeline、DisplayPowerController) | — |
 
 ---

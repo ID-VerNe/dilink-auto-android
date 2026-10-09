@@ -13,18 +13,23 @@
 | [Protocol Specification](./protocol.md) | 开发者 | 线格式、消息类型(`VD_PORTS_BOUND`、`dpiOverride`)、端口分配 |
 | [Client (Phone) App](./client.md) | 开发者 | ConnectionService 编排器、VD 部署、车机自更新、应用允许列表 |
 | [Server (Car) App](./server.md) | 开发者 | 状态机、SurfaceView 解码器、三键导航栏、DPI 覆盖 |
+| [桌面接收端审计](./audit-desktop.md) | 开发者 | `:app-desktop` 的代码审计与修复状态(15 项 `WIN-*`) |
 | [Progress Tracker](./progress.md) | 贡献者 | 功能状态、里程碑、fork 后的技术演进 |
+
+> Windows 接收端(`app-desktop/`)暂未单独成文档:模块说明、链路与打包命令见根目录 [README.md](../README.md) 的「Windows 接收端」一节,链路与设计决策见 [architecture.md](./architecture.md)。
 
 ## 与 upstream 的差异
 
 本 fork 相对 [andersonlucasg3/dilink-auto-android](https://github.com/andersonlucasg3/dilink-auto-android) 的主要技术路线(详见各文档):
 
-- **直连 VD 架构**:VD Server 直接绑定 9638/9639 端口与车机对话,手机端不做视频/触摸中继。
+- **直连 VD 架构**:VD Server 直接绑定 9638/9639 端口与接收端对话,手机端不做视频/触摸中继。
+- **接收端可替换**:同一份协议跑在车机(`app-server`)或 Windows(`app-desktop`);纯 JVM 的部分抽到 `protocol-core`,三端共用。
 - **DiLink 4.0 低配车机适配**:编码尺寸 cap 1920x1080、码率 4Mbps、24fps、TextureView → SurfaceView、线程优先级、图标缓存清理等九项优化。
 - **API 28 车机兼容**:移除 API 29+ 的硬件解码器 picker,minSdk 提到 26。
 - **导航栏重设计**:精简为 Eject / Home / Back 三键;通知转发、最近任务栏、时钟、网络信息全部移除。
 - **应用允许列表 + 应用置顶**:手机端选择推送到车机的应用,车机端长按置顶。
 - **车机端启动 DPI 覆盖**:解决 1280x800 默认 DPI 偏小。
+- **持续黑屏自愈**:判据在 `protocol-core`(`BlackScreenDetector`),车机端重握手、桌面端自动重连(有次数上限)。
 - **简体中文**:client 和 server 都加了 `values-zh-rCN` / `values-zh`。
 
 ## 已移除的功能(相对 upstream)
