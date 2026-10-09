@@ -74,11 +74,15 @@ internal class DisplayPowerController(
      *
      * Runs unconditionally on teardown (the caller re-powers the panel
      * separately) and is idempotent. Each setting is restored from the snapshot
-     * taken in [saveCurrentIme]. The old code skipped `screen_off_timeout`
-     * whenever the snapshot equalled `2147483647` — but because the snapshot was
-     * taken *after* [VirtualDisplayCreator] had already written that sentinel,
-     * the skip fired on every session and the user's real timeout was lost
-     * forever. Validity, not equality-with-our-own-sentinel, is the right test.
+     * taken in [saveCurrentIme].
+     *
+     * S-M10: `screen_off_timeout` is special. When the previous session was killed
+     * abnormally (SIGKILL / `Runtime.halt(1)` — both reachable, see the watchdog and
+     * the car's teardown), the setting still holds the sentinel we wrote, so the
+     * snapshot is *our own sentinel* rather than the user's value. Restoring it would
+     * keep the phone awake forever and be inherited by every later session. The
+     * sentinel is therefore treated as "no valid snapshot" and replaced with the
+     * documented default (60s) instead — see [SessionScreenTimeout].
      */
     fun restoreIme() {
         val ime = savedDefaultIme
@@ -88,7 +92,11 @@ internal class DisplayPowerController(
                 PipeLog.log("Restored original IME: $ime")
             } catch (_: Exception) {}
         }
-        restoreSetting("screen_off_timeout", savedScreenOffTimeout)
+        val timeout = savedScreenOffTimeout
+        restoreSetting("screen_off_timeout", SessionScreenTimeout.valueToRestore(timeout))
+        if (SessionScreenTimeout.isSentinel(timeout)) {
+            PipeLog.log("screen_off_timeout snapshot was our own sentinel (previous session was killed) — falling back to ${SessionScreenTimeout.DEFAULT_TIMEOUT_MS}ms")
+        }
         restoreSetting("lift_wakeup_enabled", savedLiftWakeup)
         restoreSetting("proximity_wakeup_enabled", savedProximityWakeup)
     }

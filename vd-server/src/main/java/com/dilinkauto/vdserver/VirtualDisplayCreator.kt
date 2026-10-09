@@ -61,10 +61,14 @@ internal class VirtualDisplayCreator(
      * Ordering matters and used to be inverted: this method used to call
      * `configureDisplayEnvironment()` itself, but [PipelineServer.createVirtualDisplay]
      * snapshotted the originals *afterwards*, so `settings get system
-     * screen_off_timeout` read back the `2147483647` this class had just written
-     * (visible in vd-server.log as `get ... -> out='2147483647'`). The restore
-     * path then treated that as "already the sentinel, nothing to do" and the
-     * setting was never put back.
+     * screen_off_timeout` read back the [SessionScreenTimeout.SESSION_TIMEOUT_SENTINEL]
+     * this class had just written (visible in vd-server.log as
+     * `get ... -> out='2147483647'`). The restore path then treated that as
+     * "already the sentinel, nothing to do" and the setting was never put back.
+     *
+     * The snapshot-before-write order is still the primary defence; the sentinel is
+     * additionally rejected by `SessionScreenTimeout.valueToRestore` (S-M10) for the
+     * case where the previous session was killed before it could restore anything.
      */
     fun create(surface: Surface): VirtualDisplay? {
         var vd: VirtualDisplay? = createViaDisplayManagerGlobal(surface)
@@ -179,7 +183,10 @@ internal class VirtualDisplayCreator(
             log("Configured iPad-like letterbox style: aspectRatio=1.6, cornerRadius=24")
         } catch (_: Exception) {}
         try {
-            execShell("settings put system screen_off_timeout 2147483647"); log("Screen timeout disabled")
+            // 2147483647 = "永不息屏"哨兵，常量集中在 SessionScreenTimeout（audit S-M10）：
+            // DisplayPowerController 读快照/恢复时必须能认出我们自己写的这个值。上次会话
+            // 被 SIGKILL / Runtime.halt(1) 异常杀死时，settings 里留着的就是它。
+            execShell("settings put system screen_off_timeout ${SessionScreenTimeout.SESSION_TIMEOUT_SENTINEL}"); log("Screen timeout disabled")
             execShell("settings put system lift_wakeup_enabled 0")
             execShell("settings put system proximity_wakeup_enabled 0")
         } catch (_: Exception) {}

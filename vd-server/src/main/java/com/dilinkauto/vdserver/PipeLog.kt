@@ -38,7 +38,19 @@ internal object ShellExec {
     /** Write `cmd\n` to the persistent shell's stdin and flush. */
     fun execShell(shellInput: OutputStream?, cmd: String) {
         PipeLog.log("sh> $cmd")
-        try { shellInput?.let { it.write("$cmd\n".toByteArray()); it.flush() } }
+        try {
+            // S-L3: this stream is shared by TouchInjector / DisplayPowerController /
+            // CarCommandRouter from three different threads. Without the lock a write
+            // longer than PIPE_BUF (4096) can interleave with another thread's command
+            // and corrupt both lines — the shell then executes a mash-up of two commands.
+            // flush is inside the lock so readers never see a partial line.
+            shellInput?.let { out ->
+                synchronized(out) {
+                    out.write("$cmd\n".toByteArray())
+                    out.flush()
+                }
+            }
+        }
         catch (e: Exception) { PipeLog.err("sh> write failed: ${e.message} (cmd=$cmd)") }
     }
 

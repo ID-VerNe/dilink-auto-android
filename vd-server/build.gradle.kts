@@ -19,6 +19,14 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+
+    testOptions {
+        // Same as app-client / app-server: unit tests that load a class whose body
+        // references framework types (e.g. PipelineFpsCoercionTest calling
+        // PipelineServer.coerceFps) must not blow up with "Method ... not mocked"
+        // on the mockable android.jar. app-client/app-server already set this.
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 dependencies {

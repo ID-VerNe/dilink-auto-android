@@ -1,9 +1,13 @@
 package com.dilinkauto.vdserver
 
 import com.dilinkauto.protocol.AppTargets
+import com.dilinkauto.protocol.AppUninstalledMessage
 import com.dilinkauto.protocol.ControlMsg
 import com.dilinkauto.protocol.FrameCodec
 import com.dilinkauto.protocol.LaunchAppMessage
+import com.dilinkauto.protocol.VdDeploy
+import com.dilinkauto.protocol.requireComponentName
+import com.dilinkauto.protocol.requirePackageName
 
 /**
  * Everything the car can ask for over `Channel.CONTROL`, plus the display
@@ -34,8 +38,20 @@ internal class CarCommandRouter(
             ControlMsg.GO_BACK -> { exec("input -d ${displayId()} keyevent 4"); checkStackEmpty() }
             ControlMsg.GO_HOME -> { exec("input -d ${displayId()} keyevent 3"); checkStackEmpty() }
             ControlMsg.GO_RECENT -> { exec("input -d ${displayId()} keyevent 187"); checkStackEmpty() }
-            ControlMsg.APP_UNINSTALL -> exec("pm uninstall ${String(f.payload, Charsets.UTF_8)}")
-            ControlMsg.APP_INFO -> { val pkg = String(f.payload, Charsets.UTF_8); val s = execOut("cmd package resolve-activity --brief -a android.settings.APPLICATION_DETAILS_SETTINGS com.android.settings")?.trim(); if (!s.isNullOrEmpty()) exec("am start --display ${displayId()} -n $s -d \"package:$pkg\"") else exec("am start --display ${displayId()} -a android.settings.APPLICATION_DETAILS_SETTINGS -d \"package:$pkg\"") }
+            ControlMsg.APP_UNINSTALL -> {
+                // S-02: the payload is interpolated into a shell line running as
+                // shell UID (audit S-02). LaunchAppMessage/AppUninstalledMessage
+                // validate the shape at the decoder; quote it too, so the shell
+                // word boundary is explicit even for a conforming name.
+                val pkg = AppUninstalledMessage.decode(f.payload).packageName
+                exec("pm uninstall ${VdDeploy.shellQuote(pkg)}")
+            }
+            ControlMsg.APP_INFO -> {
+                val pkg = String(f.payload, Charsets.UTF_8)
+                val safePkg = try { requirePackageName(pkg) } catch (e: Exception) { PipeLog.err("APP_INFO: ${e.message}"); return }
+                val s = execOut("cmd package resolve-activity --brief -a android.settings.APPLICATION_DETAILS_SETTINGS com.android.settings")?.trim()
+                if (!s.isNullOrEmpty()) exec("am start --display ${displayId()} -n $s -d ${VdDeploy.shellQuote("package:$safePkg")}") else exec("am start --display ${displayId()} -a android.settings.APPLICATION_DETAILS_SETTINGS -d ${VdDeploy.shellQuote("package:$safePkg")}")
+            }
             // 手动开关手机物理屏（payload: 1 字节，0=熄屏 1=亮屏）。
             // 默认连上即自动熄屏（bindAndAccept），这条只用于中途手动干预；
             // 空 payload 按"熄屏"处理，避免对端漏填载荷时误把屏幕点亮。
@@ -49,17 +65,29 @@ internal class CarCommandRouter(
 
     private fun launchApp(pkg: String) {
         try {
-            PipeLog.log("launchApp: pkg=$pkg display=${displayId()}")
-            val raw = execOut("cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.LAUNCHER $pkg 2>/dev/null | tail -1")?.trim()
+            // S-02: pkg is peer-controlled (the car) and reaches `sh -c` as shell
+            // UID. Validate the shape here as well as at the decoder, and
+            // shell-quote every interpolation. The resolve-activity *output* is
+            // validated as a component before it is used in `am start -n`.
+            val safePkg = requirePackageName(pkg)
+            val quotedPkg = VdDeploy.shellQuote(safePkg)
+            PipeLog.log("launchApp: pkg=$safePkg display=${displayId()}")
+            val raw = execOut("cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.LAUNCHER $quotedPkg 2>/dev/null | tail -1")?.trim()
             // resolve-activity 失败时会返回 "No activity found" 之类的文本，不是组件名；
             // 只有形如 "pkg/activity" 且不含空格的输出才可信，否则回退到隐式 intent。
             val component = raw?.takeIf { it.contains('/') && !it.contains(' ') }
             val out = if (component != null) {
-                PipeLog.log("launchApp: resolved component=$component")
-                execOut("am start --display ${displayId()} -n $component")
+                val safeComponent = try { requireComponentName(component) } catch (e: Exception) {
+                    PipeLog.err("launchApp: rejecting non-component resolve output")
+                    null
+                }
+                if (safeComponent != null) {
+                    PipeLog.log("launchApp: resolved component=$safeComponent")
+                    execOut("am start --display ${displayId()} -n ${VdDeploy.shellQuote(safeComponent)}")
+                } else null
             } else {
                 PipeLog.log("launchApp: resolve raw='${raw ?: "<null>"}' not a component — fallback to implicit intent")
-                execOut("am start --display ${displayId()} -a android.intent.action.MAIN -c android.intent.category.LAUNCHER $pkg")
+                execOut("am start --display ${displayId()} -a android.intent.action.MAIN -c android.intent.category.LAUNCHER $quotedPkg")
             }
             // 同步执行并记录 am start 的完整输出（成功是 "Starting: Intent ..."，失败会带 Error/Exception）
             PipeLog.log("launchApp: am start result='${out?.trim()?.replace(Regex("\\s+"), " ") ?: "<no output>"}'")

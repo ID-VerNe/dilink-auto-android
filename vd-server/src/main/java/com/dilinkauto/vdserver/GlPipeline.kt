@@ -23,8 +23,9 @@ import java.util.concurrent.locks.LockSupport
  * MediaCodec encoder's input surface.
  *
  * All EGL/GL state lives on the pipeline thread — created in
- * [initEglAndSurfaceTexture], used in [pipelineLoop], torn down by the
- * caller. The pipeline samples the SurfaceTexture at [fps] (paced by
+ * [initEglAndSurfaceTexture], used in [pipelineLoop], and torn down by that same
+ * thread (audit S-M8: cross-thread eglDestroy* on a context made current elsewhere
+ * is a crash, not a leak). [cleanup] is what the pipeline thread's finally calls. The pipeline samples the SurfaceTexture at [fps] (paced by
  * [frameIntervalNanos]) and writes each encoded frame to the car video
  * channel. Adaptive bitrate drops bandwidth when the car's socket backs up
  * and recovers it after a sustained clean interval.
@@ -52,6 +53,9 @@ internal class GlPipeline(
 
     private var vdInputSurface: Surface? = null
     private var stTexture: android.graphics.SurfaceTexture? = null
+
+    /** S-M8: guards [cleanup] so EGL handles are destroyed at most once. */
+    private val glTornDown = AtomicBoolean(false)
 
     /** The encoder surface, supplied by the caller before [initEglAndSurfaceTexture]. */
     var encoderSurface: Surface? = null
@@ -190,13 +194,24 @@ internal class GlPipeline(
     private fun createProgram(): Int { val vs = loadShader(GLES20.GL_VERTEX_SHADER, "attribute vec4 aPosition;attribute vec2 aTexCoord;varying vec2 vTexCoord;void main(){gl_Position=aPosition;vTexCoord=aTexCoord;}"); val fs = loadShader(GLES20.GL_FRAGMENT_SHADER, "#extension GL_OES_EGL_image_external:require\nprecision mediump float;varying vec2 vTexCoord;uniform samplerExternalOES sTexture;void main(){gl_FragColor=texture2D(sTexture,vTexCoord);}"); return GLES20.glCreateProgram().also { GLES20.glAttachShader(it, vs); GLES20.glAttachShader(it, fs); GLES20.glLinkProgram(it) } }
     private fun loadShader(type: Int, src: String): Int = GLES20.glCreateShader(type).also { GLES20.glShaderSource(it, src); GLES20.glCompileShader(it) }
 
-    /** Tear down EGL/GL resources. Idempotent. */
+    /**
+     * Tear down EGL/GL resources. Idempotent.
+     *
+     * S-M8: must be called from the Pipeline thread — the EGL context was made current
+     * there in [initEglAndSurfaceTexture], and the encoder may still be running its
+     * native path. `PipelineServer.cleanup()` therefore never calls this directly; it
+     * signals the pipeline thread to exit and this runs in that thread's own finally
+     * (see `PipelineServer.releaseGlResources`). The guard below keeps a double call —
+     * pipeline-thread finally plus a late stray caller — from destroying handles twice.
+     */
     fun cleanup() {
+        if (!glTornDown.compareAndSet(false, true)) return
         val d = eglDisplay; val s = eglSurface; val c = eglContext
         if (d != null) EGL14.eglMakeCurrent(d, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
         if (d != null && s != null) EGL14.eglDestroySurface(d, s)
         if (d != null && c != null) EGL14.eglDestroyContext(d, c)
-        vdInputSurface?.release()
-        stTexture?.release()
+        eglDisplay = null; eglSurface = null; eglContext = null
+        vdInputSurface?.release(); vdInputSurface = null
+        stTexture?.release(); stTexture = null
     }
 }

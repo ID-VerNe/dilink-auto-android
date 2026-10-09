@@ -12,6 +12,7 @@ import java.nio.ByteBuffer
 import java.nio.channels.ServerSocketChannel
 import java.nio.channels.SocketChannel
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.LockSupport
 
@@ -30,18 +31,52 @@ import java.util.concurrent.locks.LockSupport
  * This class owns: process lifecycle, encoder setup, socket bind/accept, the
  * lifecycle/touch reader threads, the watchdog, and cleanup ordering. It runs
  * as shell via `app_process`.
+ *
+ * Threading contract (audit S-06 / S-M8 / S-M9):
+ *  - The pipeline thread is a **daemon** and is the only thread allowed to touch
+ *    EGL/GL — the context was made current there. It waits for its go-ahead in
+ *    bounded `parkNanos` slices so a failed `bindAndAccept` cannot park it
+ *    forever and leave a zombie shell-UID process holding the VirtualDisplay and
+ *    both binds.
+ *  - `cleanup()` runs on main / Lifecycle / TouchReader / watchdog. It *requests*
+ *    the pipeline thread's exit (`running=false` + `unpark` + bounded join) and
+ *    never destroys EGL itself; the pipeline thread's own `finally` does that,
+ *    guarded by `GlPipeline.glTornDown`.
+ *  - `inputSurfaceReady` is counted down in a `finally` on the pipeline thread and
+ *    awaited with a timeout on the main thread, and the watchdog is armed only
+ *    after that await — so an EGL/GL init failure can no longer wedge the main
+ *    thread while leaving `running` true (which the watchdog could not act on).
  */
 class PipelineServer(
     private val displayWidth: Int, private val displayHeight: Int, private val dpi: Int,
     private val phoneHost: String, private val encodeWidth: Int, private val encodeHeight: Int,
-    private val fps: Int, private val bitrate: Int = BITRATE
+    fps: Int, private val bitrate: Int = BITRATE,
+    /**
+     * S-01: receiver IP to pin 9638/9639 accepts to. null = accept any peer
+     * (legacy behaviour for deployers that cannot determine their own outbound
+     * address). The engine runs as shell UID with otherwise unauthenticated
+     * ports, so anything that CAN determine it must pass it.
+     */
+    private val carHost: String? = null
 ) {
-    private val frameIntervalNanos = 1_000_000_000L / fps
+    /**
+     * S-L2：fps 来自 argv，可能是遗留/被手改的 pref（含 0）。`1_000_000_000L / 0`
+     * 会在构造器里抛 ArithmeticException，进程连 bind 都没到就死，所以先钳进
+     * protocol-core 里唯一的那份 FPS 边界（[VideoConfig.MIN_FPS]/[VideoConfig.MAX_FPS]）。
+     */
+    private val fps = coerceFps(fps)
+    // `this.fps` is deliberate: inside a property initializer the bare name `fps`
+    // still resolves to the constructor parameter (uncoerced), which would reintroduce
+    // the divide-by-zero this guard exists to prevent.
+    private val frameIntervalNanos = 1_000_000_000L / this.fps
     @Volatile private var running = true
     private val cleanedUp = AtomicBoolean(false)
     private var displayId = -1
     private var virtualDisplay: VirtualDisplay? = null
     private var encoder: MediaCodec? = null
+
+    /** Pipeline 线程引用：cleanup() 靠它 unpark + 有界 join（S-06/S-M8）。 */
+    @Volatile private var pipelineThread: Thread? = null
 
     private val shell = PersistentShell()
 
@@ -90,6 +125,23 @@ class PipelineServer(
         private const val WATCHDOG_GRACE_MS = 3000L
         private const val SOCKET_BUF_BYTES = Connection.SOCKET_BUF_BYTES // single source: protocol-core
 
+        /** S-M9：主线程等 EGL/GL 初始化的上限。超时即致命，绝不久久挂起。 */
+        private const val INPUT_SURFACE_READY_TIMEOUT_SECONDS = 10L
+
+        /**
+         * S-06：Pipeline 线程等主线程建 VD/accept 的 park 粒度。
+         *
+         * 原来是无限期的 `LockSupport.park()`：没人 unpark 时永久挂住，而 running=false
+         * 对已 park 的线程毫无作用。改成 parkNanos 循环后最坏一个轮询周期即可退出。
+         */
+        private const val PARK_POLL_NANOS = 100_000_000L
+
+        /** S-M8：cleanup() 等 Pipeline 线程退出的上限；超时不阻塞，宁可泄漏 EGL。 */
+        private const val PIPELINE_JOIN_TIMEOUT_MS = 2000L
+
+        /** S-L2：把任意 fps（含 0/负数/荒谬值）钳进 [VideoConfig.MIN_FPS]..[VideoConfig.MAX_FPS]。 */
+        fun coerceFps(fps: Int): Int = fps.coerceIn(VideoConfig.MIN_FPS, VideoConfig.MAX_FPS)
+
         @JvmStatic fun main(args: Array<String>) {
             AndroidPlatformHooks.install()
             val w = args.getOrNull(0)?.toInt() ?: 1408; val h = args.getOrNull(1)?.toInt() ?: 792
@@ -97,8 +149,13 @@ class PipelineServer(
             val ew = args.getOrNull(4)?.toInt() ?: w; val eh = args.getOrNull(5)?.toInt() ?: h
             val f = args.getOrNull(6)?.toInt() ?: VideoConfig.TARGET_FPS
             val br = args.getOrNull(7)?.toInt() ?: BITRATE
-            log("Starting: VD=${w}x${h} @${d}dpi, encode=${ew}x${eh}, phoneHost=$ph, fps=$f, bitrate=${br/1_000_000}M")
-            PipelineServer(w, h, d, ph, ew, eh, f, br).run()
+            // S-01: peer pinning. The engine runs as shell UID and binds
+            // 0.0.0.0:9638/9639 with no other authentication, so the deployer
+            // passes the receiver IP it is serving; accepts from any other host
+            // are refused. `-`/absent keeps the legacy accept-any behaviour.
+            val carHost = args.getOrNull(8)?.takeIf { it.isNotBlank() && it != VdDeployArgs.CAR_HOST_ANY }
+            log("Starting: VD=${w}x${h} @${d}dpi, encode=${ew}x${eh}, phoneHost=$ph, fps=$f, bitrate=${br/1_000_000}M, carHost=${carHost ?: "ANY"}")
+            PipelineServer(w, h, d, ph, ew, eh, f, br, carHost).run()
         }
         private fun log(msg: String) = PipeLog.log(msg)
         private fun err(msg: String) = PipeLog.err(msg)
@@ -106,7 +163,6 @@ class PipelineServer(
 
     fun run() {
         Runtime.getRuntime().addShutdownHook(Thread({ cleanup() }, "ShutdownHook"))
-        startWatchdog()
         try {
             touchInjector.initInputManager()
             shell.start()
@@ -120,9 +176,27 @@ class PipelineServer(
                 frameIntervalNanos, bitrate
             ).also { it.encoderSurface = encoderSurface }
 
-            // Start pipeline thread — it initializes EGL/GL and signals when VD input surface is ready
-            val pipelineThread = Thread({ runPipeline() }, "Pipeline").apply { start() }
-            try { inputSurfaceReady.await() } catch (_: InterruptedException) { return }
+            // Start pipeline thread — it initializes EGL/GL and signals when VD input surface is ready.
+            //
+            // S-06: must be a daemon. It used to be a plain thread, so a pipeline thread
+            // parked in LockSupport.park() forever (see runPipeline) kept the shell-UID
+            // JVM — and with it the VirtualDisplay and both 0.0.0.0 binds — alive.
+            val t = Thread({ runPipeline() }, "Pipeline").apply { isDaemon = true }
+            pipelineThread = t
+            t.start()
+            // S-M9: bounded wait. runPipeline countDown()s in a finally, so an EGL/GL init
+            // failure surfaces here as `false` instead of parking the main thread forever
+            // while running stayed true and the watchdog's outer loop never exited.
+            val ready = try { inputSurfaceReady.await(INPUT_SURFACE_READY_TIMEOUT_SECONDS, TimeUnit.SECONDS) }
+                catch (_: InterruptedException) { false }
+            if (!ready) {
+                running = false
+                err("Fatal: EGL/GL init did not signal within ${INPUT_SURFACE_READY_TIMEOUT_SECONDS}s")
+                return
+            }
+            // S-M9: arm the watchdog only now, i.e. after the main thread is guaranteed to
+            // be unblocked. Armed before the await it could only observe running=true.
+            startWatchdog()
             if (!createVirtualDisplay()) { running = false; err("Fatal: failed to create VD"); return }
             val conns = bindAndAccept() ?: run { running = false; return }
             startLifecycleReader(conns.phoneChannel)
@@ -130,8 +204,8 @@ class PipelineServer(
             lifecycle.start()
             // Signal pipeline to begin rendering with the car video channel
             carVideoChannel = conns.carVideo
-            LockSupport.unpark(pipelineThread)
-            try { pipelineThread.join() } catch (_: InterruptedException) {}
+            LockSupport.unpark(t)
+            try { t.join() } catch (_: InterruptedException) {}
         } finally {
             cleanup()
         }
@@ -158,9 +232,9 @@ class PipelineServer(
         val vdSurf = vdInputSurface ?: return false
         // Snapshot the system state we are about to change — BEFORE changing it.
         // This used to run after VirtualDisplayCreator.create(), which itself
-        // wrote screen_off_timeout=2147483647 / lift_wakeup=0 / proximity=0, so
-        // the "original" snapshot captured our own writes and restoreIme() could
-        // never put the user's real values back.
+        // wrote screen_off_timeout=SessionScreenTimeout.SESSION_TIMEOUT_SENTINEL /
+        // lift_wakeup=0 / proximity=0, so the "original" snapshot captured our own
+        // writes and restoreIme() could never put the user's real values back.
         displayController.saveCurrentIme()
         virtualDisplay = vdCreator.create(vdSurf)
         if (virtualDisplay == null) return false
@@ -183,32 +257,43 @@ class PipelineServer(
             inputServer = ServerSocketChannel.open(); inputServer.configureBlocking(false); inputServer.socket().reuseAddress = true
             inputServer.socket().bind(InetSocketAddress("0.0.0.0", Ports.INPUT_PORT)); log("Input on :${Ports.INPUT_PORT}")
         } catch (e: Exception) { err("Bind: ${e.message}"); return null }
-        val phoneChannel = connectToPhoneHost() ?: run { try { videoServer.close() } catch (_: Exception) {}; try { inputServer.close() } catch (_: Exception) {}; return null }
-        try { sendDisplayReady(phoneChannel); log("Display ready sent") } catch (e: Exception) { err("Display ready: ${e.message}"); try { phoneChannel.close() } catch (_: Exception) {}; try { videoServer.close() } catch (_: Exception) {}; try { inputServer.close() } catch (_: Exception) {}; return null }
-        lifecycle.channel = phoneChannel
-        shell.exec("input keyevent 224"); log("Waking up device to ensure VD activities resume")
-        shell.exec("am start --display $displayId -a android.intent.action.MAIN -c android.intent.category.HOME"); log("Home launched")
-        carCommands.moveTopApp(0, displayId)
-        // 校验 DTA 是否挂在 display 层树内（Flyme 偶发 reparent 事务丢失 → 0 层黑屏），必要时旋转往返修复
-        vdCreator.ensureDtaAttached()
-        // Physical panel power-off happens *after* the car connects — see below.
-        val carVideo = acceptCarChannel(videoServer, 30000) ?: run { err("Car video timeout"); try { phoneChannel.close() } catch (_: Exception) {}; return null }
-        val carInput = acceptCarChannel(inputServer, 30000) ?: run { err("Car input timeout"); try { phoneChannel.close() } catch (_: Exception) {}; try { carVideo.close() } catch (_: Exception) {}; return null }
-        try { videoServer.close() } catch (_: Exception) {}; try { inputServer.close() } catch (_: Exception) {}
-        log("Car connected: video=${carVideo.remoteAddress} input=${carInput.remoteAddress}")
-        // Power the physical panel off only now — after the car holds both channels.
+        // S-06: the two listening sockets are closed in ONE finally around the whole body.
         //
-        // This used to run *before* the accepts, i.e. possibly facing a 30s
-        // accept timeout, which produced two failure modes:
-        //  - a slow car found the phone already dark, so the user stared at a
-        //    black phone before anything was actually broken;
-        //  - being killed during that window meant cleanup() had to re-power a
-        //    panel we had switched off for a session that never started, and any
-        //    interruption of cleanup left it off permanently.
-        // Now the panel only goes dark once a live stream exists to replace it,
-        // and a car that fails to connect never costs the user their screen.
-        displayController.setPhysicalDisplayPower(false)
-        return ConnectionSet(carVideo, carInput, phoneChannel)
+        // They used to be closed per-branch, and the accept-timeout branches only closed
+        // the phone channel. A 30s video/input timeout therefore returned null with
+        // 0.0.0.0:9638 and 0.0.0.0:9639 still bound by a zombie shell-UID process —
+        // which also still held the VirtualDisplay and the applied panel/letterbox
+        // state — so the next session could not bind and only a force-stop helped.
+        try {
+            val phoneChannel = connectToPhoneHost() ?: return null
+            try { sendDisplayReady(phoneChannel); log("Display ready sent") } catch (e: Exception) { err("Display ready: ${e.message}"); try { phoneChannel.close() } catch (_: Exception) {}; return null }
+            lifecycle.channel = phoneChannel
+            shell.exec("input keyevent 224"); log("Waking up device to ensure VD activities resume")
+            shell.exec("am start --display $displayId -a android.intent.action.MAIN -c android.intent.category.HOME"); log("Home launched")
+            carCommands.moveTopApp(0, displayId)
+            // 校验 DTA 是否挂在 display 层树内（Flyme 偶发 reparent 事务丢失 → 0 层黑屏），必要时旋转往返修复
+            vdCreator.ensureDtaAttached()
+            // Physical panel power-off happens *after* the car connects — see below.
+            val carVideo = acceptCarChannel(videoServer, 30000) ?: run { err("Car video timeout"); try { phoneChannel.close() } catch (_: Exception) {}; return null }
+            val carInput = acceptCarChannel(inputServer, 30000) ?: run { err("Car input timeout"); try { phoneChannel.close() } catch (_: Exception) {}; try { carVideo.close() } catch (_: Exception) {}; return null }
+            log("Car connected: video=${carVideo.remoteAddress} input=${carInput.remoteAddress}")
+            // Power the physical panel off only now — after the car holds both channels.
+            //
+            // This used to run *before* the accepts, i.e. possibly facing a 30s
+            // accept timeout, which produced two failure modes:
+            //  - a slow car found the phone already dark, so the user stared at a
+            //    black phone before anything was actually broken;
+            //  - being killed during that window meant cleanup() had to re-power a
+            //    panel we had switched off for a session that never started, and any
+            //    interruption of cleanup left it off permanently.
+            // Now the panel only goes dark once a live stream exists to replace it,
+            // and a car that fails to connect never costs the user their screen.
+            displayController.setPhysicalDisplayPower(false)
+            return ConnectionSet(carVideo, carInput, phoneChannel)
+        } finally {
+            try { videoServer.close() } catch (_: Exception) {}
+            try { inputServer.close() } catch (_: Exception) {}
+        }
     }
 
     private fun connectToPhoneHost(): SocketChannel? {
@@ -235,8 +320,40 @@ class PipelineServer(
 
     private fun acceptCarChannel(server: ServerSocketChannel, timeoutMs: Int): SocketChannel? {
         val deadline = System.currentTimeMillis() + timeoutMs
-        while (running && System.currentTimeMillis() < deadline) { val a = server.accept(); if (a != null) { a.configureBlocking(false); val s = a.socket(); s.sendBufferSize = SOCKET_BUF_BYTES; s.receiveBufferSize = SOCKET_BUF_BYTES; s.tcpNoDelay = true; return a }; Thread.sleep(50) }
+        while (running && System.currentTimeMillis() < deadline) {
+            val a = server.accept()
+            if (a != null) {
+                // S-01: refuse peers that are not the receiver we are serving. The
+                // first accept used to win unconditionally, so any host on the
+                // phone's WiFi could drive touch injection and am start/pm
+                // uninstall as shell UID. A refused peer is closed and we keep
+                // waiting for the real one until the timeout.
+                if (!isAllowedPeer(a)) {
+                    err("Refused car channel from ${a.remoteAddress} (expected ${carHost ?: "ANY"})")
+                    try { a.close() } catch (_: Exception) {}
+                    continue
+                }
+                a.configureBlocking(false)
+                val s = a.socket()
+                s.sendBufferSize = SOCKET_BUF_BYTES
+                s.receiveBufferSize = SOCKET_BUF_BYTES
+                s.tcpNoDelay = true
+                return a
+            }
+            Thread.sleep(50)
+        }
         return null
+    }
+
+    /** Host part of the accepted socket's remote address, or null when unknown. */
+    private fun remoteHostOf(ch: SocketChannel): String? = try {
+        (ch.remoteAddress as? InetSocketAddress)?.address?.hostAddress
+    } catch (_: Exception) { null }
+
+    private fun isAllowedPeer(ch: SocketChannel): Boolean {
+        val expected = carHost ?: return true // no pinning requested
+        val actual = remoteHostOf(ch) ?: return false
+        return actual == expected
     }
 
     // ── Pipeline thread ──
@@ -246,16 +363,77 @@ class PipelineServer(
             // Encoder + GL pipeline thread; mark urgent so background threads
             // (LifeWriter, watchdog) don't preempt the encode path on A53.
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
-            glPipeline.initEglAndSurfaceTexture()
-            vdInputSurface = glPipeline.vdSurface()
-            inputSurfaceReady.countDown()
-            // Wait for main thread to create VD, accept connections, and set carVideoChannel
-            while (carVideoChannel == null && running) LockSupport.park()
-            if (!running) return
-            val enc = encoder ?: return
-            glPipeline.pipelineLoop(enc, carVideoChannel!!) { running }
+            var eglReady = false
+            try {
+                glPipeline.initEglAndSurfaceTexture()
+                vdInputSurface = glPipeline.vdSurface()
+                eglReady = true
+            } finally {
+                // S-M9: countDown moved into the finally. It only used to run on the success
+                // path, so an EGL/GL init exception left the main thread in a forever await()
+                // with running==true — the one combination the watchdog cannot act on.
+                inputSurfaceReady.countDown()
+            }
+            if (eglReady) {
+                // Wait for main thread to create VD, accept connections, and set carVideoChannel.
+                //
+                // S-06: this was an unbounded LockSupport.park() with nobody to unpark it on
+                // the failure paths (run() only unparks after a successful bindAndAccept).
+                // running=false does not wake a parked thread, so the thread — and the whole
+                // shell-UID process, since it was not a daemon — stayed alive forever holding
+                // the VirtualDisplay and both binds. Now it parks in bounded slices and
+                // re-checks running; cleanup() additionally unparks explicitly.
+                while (carVideoChannel == null && running) LockSupport.parkNanos(PARK_POLL_NANOS)
+                val ch = carVideoChannel
+                val enc = encoder
+                if (running && ch != null && enc != null) glPipeline.pipelineLoop(enc, ch) { running }
+            }
         } catch (e: Exception) { err("Pipeline: ${e.message}"); e.printStackTrace() }
+        finally {
+            // S-M8: EGL/GL teardown belongs to THIS thread — the EGL context was made
+            // current here, and the encoder may still be inside dequeueOutputBuffer.
+            // cleanup() on main/Lifecycle/TouchReader/watchdog can only request the exit
+            // (running=false + unpark + bounded join); it never destroys EGL itself.
+            releaseGlResources()
+        }
         log("Pipeline exited")
+    }
+
+    /**
+     * S-M8：销毁 GL/EGL 资源（幂等），且**只能**在 Pipeline 线程执行。
+     *
+     * 之前 `cleanup()` 从任意调用方线程（main / Lifecycle / TouchReader / Watchdog）
+     * 直接 `glPipeline.cleanup()`：对一条 EGL context 由别的线程 makeCurrent 的线程
+     * 做 eglDestroySurface/eglDestroyContext 属于跨线程 GL teardown，会和编码器的
+     * native 调用打架。非属主线程调用这里只做"请求已发出"的记录，真正的销毁由
+     * [runPipeline] 的 finally 完成；Pipeline 线程已退出时它当然也已经做完了。
+     */
+    private fun releaseGlResources() {
+        if (!::glPipeline.isInitialized) return
+        val owner = pipelineThread
+        if (Thread.currentThread() !== owner) {
+            if (owner != null && owner.isAlive) {
+                err("GL teardown deferred to the Pipeline thread (still alive) — EGL may leak if it never exits")
+            }
+            return
+        }
+        try { glPipeline.cleanup() } catch (e: Exception) { err("GL cleanup: ${e.message}") }
+    }
+
+    /**
+     * S-06/S-M8：请求 Pipeline 线程退出并等待它（有界）。
+     *
+     * `running=false` + 显式 unpark 是唤醒 parkNanos 循环的那一对：只有 run() 在成功
+     * 路径 unpark 过一次，bindAndAccept 失败时没人 unpark。join 设上限是为了不在
+     * cleanup 里永久阻塞 —— 线程卡在 native MediaCodec 调用里时，宁可泄漏 EGL 也不能
+     * 把 panel 恢复一起拖死（那正是 watchdog 存在的原因）。
+     */
+    private fun signalPipelineStop() {
+        running = false
+        val t = pipelineThread ?: return
+        LockSupport.unpark(t)
+        try { t.join(PIPELINE_JOIN_TIMEOUT_MS) } catch (_: InterruptedException) { Thread.currentThread().interrupt() }
+        if (t.isAlive) err("Pipeline thread did not exit within ${PIPELINE_JOIN_TIMEOUT_MS}ms — GL/encoder teardown skipped")
     }
 
     // ── Lifecycle + Touch ──
@@ -374,9 +552,18 @@ class PipelineServer(
         lifecycle.stop()
         // Now kill the shell
         shell.close()
-        // GL/EGL cleanup
-        if (::glPipeline.isInitialized) glPipeline.cleanup()
+        // S-M8/S-06: ask the pipeline thread to exit (running=false + unpark) and wait for it
+        // (bounded) BEFORE touching the encoder — the render loop may still be inside a
+        // native dequeueOutputBuffer/eglSwapBuffers call, which is what used to race
+        // cleanup() here.
+        signalPipelineStop()
         encoder?.let { try { it.stop() } catch (_: Exception) {}; try { it.release() } catch (_: Exception) {} }
+        // S-M8: the encoder's input Surface used to be leaked — releasing the codec does not
+        // release the Surface we handed it, so every session burned one for nothing.
+        encoderSurface?.let { try { it.release() } catch (_: Exception) {} }
+        // S-M8: EGL/GL is torn down by the pipeline thread itself (releaseGlResources);
+        // signalPipelineStop above is how this thread asks for it.
+        releaseGlResources()
         virtualDisplay?.let { try { it.release() } catch (_: Exception) {} }
         log("Cleanup complete")
     }
