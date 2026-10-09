@@ -3,9 +3,11 @@ package com.dilinkauto.server.decoder
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.os.Process
+import android.os.SystemClock
 
 import android.util.Log
 import android.view.Surface
+import com.dilinkauto.protocol.BlackScreenDetector
 import com.dilinkauto.protocol.H264NalParser
 import com.dilinkauto.protocol.VideoConfig
 import java.util.concurrent.ArrayBlockingQueue
@@ -83,8 +85,12 @@ class VideoDecoder {
     private var keyFramesFed = 0L
     private var keyFramesDropped = 0L
 
-    // 黑屏检测策略已抽至 BlackScreenDetector（可脱离 MediaCodec 单测）。
-    private val blackScreen = BlackScreenDetector().apply {
+    // 黑屏检测策略在 protocol-core（车机端 VideoDecoder 与桌面端 VideoDecodePipeline
+    // 共用一套判据，可脱离 MediaCodec 单测）。车机端沿用 elapsedRealtime（含休眠），
+    // 桌面端用默认的 System.nanoTime。
+    private val blackScreen = BlackScreenDetector(
+        clock = { SystemClock.elapsedRealtime() },
+    ).apply {
         sustainMs = BLACK_SCREEN_SUSTAIN_MS
     }
 

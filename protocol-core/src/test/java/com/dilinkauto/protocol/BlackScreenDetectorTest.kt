@@ -1,4 +1,4 @@
-package com.dilinkauto.server.decoder
+package com.dilinkauto.protocol
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -6,13 +6,11 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Locks the black-screen policy extracted from [VideoDecoder]
- * (docs/audit-srp-dry.md SRP-3).
+ * 钉住 [BlackScreenDetector] 的持续黑屏策略（车机端 `VideoDecoder` 与桌面端
+ * `VideoDecodePipeline` 共用，原先只在车机侧被覆盖）。
  *
- * The behaviour under test existed before this extraction with no coverage at
- * all, so these cases double as the regression net the extraction was supposed
- * to enable. The clock is injected, making the sustained-window timing
- * deterministic rather than wall-clock dependent.
+ * 这套行为在抽取之前完全没有测试，所以这些用例同时充当"抽取本该带来的回归网"。
+ * 时钟是注入的：持续窗口的时序是确定性的，不依赖墙上时钟。
  */
 class BlackScreenDetectorTest {
 
@@ -148,5 +146,36 @@ class BlackScreenDetectorTest {
         val d = detector(alertStreak = 1)
         d.onFrame(true, tiny(), 0)
         assertTrue(d.isAlerted())
+    }
+
+    /**
+     * 默认时钟（`System.nanoTime()`）也必须可用：桌面端不注入时钟，
+     * 这里确认调用默认参数不会抛异常且行为与传时钟一致。
+     */
+    @Test
+    fun defaultClockIsUsableWithoutInjection() {
+        var fired = 0
+        val d = BlackScreenDetector(alertStreak = 1).apply {
+            setSustainWindow(0L)
+            onSustainedBlackScreen = { fired++ }
+        }
+        d.onFrame(isKeyFrame = true, size = 200)
+        assertTrue(d.isAlerted())
+        assertEquals(1, fired)
+    }
+
+    /** [BlackScreenDetector.setSustainWindow] 与直接赋值等价（会话窗口变更用）。 */
+    @Test
+    fun setSustainWindowReplacesPlainAssignment() {
+        var fired = 0
+        val d = BlackScreenDetector(alertStreak = 1).apply {
+            onSustainedBlackScreen = { fired++ }
+        }
+        d.setSustainWindow(500L)
+        d.onFrame(true, tiny(), 0)
+        d.onFrame(true, tiny(), 499)
+        assertEquals(0, fired)
+        d.onFrame(true, tiny(), 500)
+        assertEquals(1, fired)
     }
 }
