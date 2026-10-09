@@ -51,12 +51,7 @@ class TcpAdbConnection(
                 val msg = readMessage()
                 when (msg.command) {
                     AdbProtocol.A_CNXN -> {
-                        val data = msg.data
-                        if (data != null && data.size >= 8) {
-                            val peerMax = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN).getInt(4)
-                            maxPayload = minOf(peerMax, AdbProtocol.MAX_PAYLOAD)
-                        }
-                        if (maxPayload < 1) maxPayload = AdbProtocol.MAX_PAYLOAD
+                        maxPayload = negotiateMaxPayload(msg.data)
                         return true
                     }
                     AdbProtocol.A_AUTH -> {
@@ -159,41 +154,8 @@ class TcpAdbConnection(
     data class AdbMessage(val command: Int, val arg0: Int, val arg1: Int, val data: ByteArray?)
 
     private fun readMessage(): AdbMessage {
-        val header = ByteArray(AdbProtocol.HEADER_SIZE)
-        readFully(header)
-        // Shared 24-byte header parser (also used by UsbAdbConnection). Unlike the
-        // previous inline parse, it validates magic == command ^ 0xFFFFFFFF, the
-        // negotiated data length ceiling, and this path now fails fast on a
-        // malformed header instead of accepting it.
-        val parsed = AdbProtocol.parseHeader(header)
-            ?: throw IOException("Malformed ADB header (bad magic or oversized data_len)")
-        val command = parsed[0]
-        val arg0 = parsed[1]
-        val arg1 = parsed[2]
-        val dataLen = parsed[3]
-        val dataCrc = parsed[4]
-        val data = if (dataLen > 0) {
-            val d = ByteArray(dataLen)
-            readFully(d)
-            // The CRC has always been parsed; verifying it turns silent WiFi
-            // corruption of the JAR push / shell output into a hard failure
-            // instead of a mis-parsed stream.
-            if (dataLen > 0 && AdbProtocol.checksum(d) != dataCrc) {
-                throw IOException("ADB payload CRC mismatch (len=$dataLen)")
-            }
-            d
-        } else null
-        return AdbMessage(command, arg0, arg1, data)
-    }
-
-    private fun readFully(buf: ByteArray) {
-        var off = 0
         val inp = socket?.getInputStream() ?: throw IllegalStateException("Not connected")
-        while (off < buf.size) {
-            val n = inp.read(buf, off, buf.size - off)
-            if (n < 0) throw java.io.EOFException("ADB connection closed")
-            off += n
-        }
+        return readMessageFrom(inp)
     }
 
     private val nextLocalId = java.util.concurrent.atomic.AtomicInteger(1)
@@ -221,6 +183,52 @@ class TcpAdbConnection(
 
         /** SHA-1 fingerprint of a DER-encoded public key (delegates to AdbCrypto). */
         fun fingerprint(der: ByteArray): String = AdbCrypto.fingerprint(der)
+
+        /**
+         * Negotiate the max payload from a peer's CNXN banner (pure, injectable).
+         * Behavior-identical to the previously inline connect() logic, lifted so
+         * it can be unit-tested without a socket.
+         */
+        internal fun negotiateMaxPayload(cnxnData: ByteArray?): Int {
+            var m = AdbProtocol.MAX_PAYLOAD
+            if (cnxnData != null && cnxnData.size >= 8) {
+                val peerMax = ByteBuffer.wrap(cnxnData).order(ByteOrder.LITTLE_ENDIAN).getInt(4)
+                m = minOf(peerMax, AdbProtocol.MAX_PAYLOAD)
+            }
+            return if (m < 1) AdbProtocol.MAX_PAYLOAD else m
+        }
+
+        /**
+         * Read + parse one ADB message from [inp] (pure over an InputStream, no
+         * socket). Fails fast on bad magic / oversized data_len (parseHeader) and
+         * on a payload CRC mismatch. Behavior-identical to the instance
+         * readMessage(), which now delegates here.
+         */
+        internal fun readMessageFrom(inp: java.io.InputStream): AdbMessage {
+            val header = readFullyFrom(inp, ByteArray(AdbProtocol.HEADER_SIZE))
+            val parsed = AdbProtocol.parseHeader(header)
+                ?: throw IOException("Malformed ADB header (bad magic or oversized data_len)")
+            val dataLen = parsed[3]
+            val dataCrc = parsed[4]
+            val data = if (dataLen > 0) {
+                val d = readFullyFrom(inp, ByteArray(dataLen))
+                if (AdbProtocol.checksum(d) != dataCrc) {
+                    throw IOException("ADB payload CRC mismatch (len=$dataLen)")
+                }
+                d
+            } else null
+            return AdbMessage(parsed[0], parsed[1], parsed[2], data)
+        }
+
+        private fun readFullyFrom(inp: java.io.InputStream, buf: ByteArray): ByteArray {
+            var off = 0
+            while (off < buf.size) {
+                val n = inp.read(buf, off, buf.size - off)
+                if (n < 0) throw java.io.EOFException("ADB connection closed")
+                off += n
+            }
+            return buf
+        }
     }
 
     private fun getOrCreateKeyPair(): KeyPair {

@@ -144,8 +144,16 @@ final class AdbCrypto {
         struct.put(rrLE);
         struct.putInt(e.intValue());
 
-        String base64 = android.util.Base64.encodeToString(struct.array(), android.util.Base64.NO_WRAP);
         // ADB requires the public-key string to be NUL-terminated.
+        //
+        // NOTE (testability, behaviour-preserving): this used to call
+        // android.util.Base64.encodeToString(..., NO_WRAP), which returns null
+        // under the mockable-android unit-test jar and made the whole ANDROID_PUBKEY
+        // struct encoding unassertable. java.util.Base64 standard base64 (with
+        // padding — the struct is 524 bytes = 3*174 + 2, so there is exactly one
+        // trailing '=') is byte-for-byte identical to Android's NO_WRAP output.
+        // java.util.Base64 is available from API 26 (module minSdk).
+        String base64 = java.util.Base64.getEncoder().encodeToString(struct.array());
         return (base64 + " DiLinkAuto@car\0").getBytes();
     }
 

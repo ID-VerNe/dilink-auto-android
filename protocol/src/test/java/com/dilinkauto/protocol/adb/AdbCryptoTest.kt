@@ -101,14 +101,40 @@ class AdbCryptoTest {
 
     @Test
     fun `build auth reply second token is public key`() {
-        // 第二次 token → 返回公钥（NUL 结尾）。mockable jar 下 android.util.Base64 返回 null，
-        // 故 base64 主体为 "null"；这里只锁 NUL 结尾契约（对将来改用 java.util.Base64 也成立）。
+        // 第二次 token → 返回公钥（NUL 结尾）。encodePublicKey 现用 java.util.Base64（见 KDoc），
+        // 结构由 encodePublicKeyRoundTripsTheAndroidPubkeyStruct 细验；这里锁 authType 与 NUL 结尾契约。
         val token = ByteArray(20) { it.toByte() }
         val reply = AdbCrypto.buildAuthReply(AdbProtocol.AUTH_TOKEN, token, keyPair, true)!!
         assertEquals(AdbProtocol.AUTH_RSAPUBLICKEY, reply.authType)
         val text = String(reply.payload)
         assertTrue("公钥串必须以 NUL 结尾（ADB 协议要求）", text.endsWith(" DiLinkAuto@car\u0000"))
         assertTrue("不应是旧的尾空格形态", !text.endsWith(" DiLinkAuto@car "))
+    }
+
+    @Test
+    fun `encode public key round trips the android pubkey struct`() {
+        // 切到 java.util.Base64 后，可在 JVM 上完整验证 ANDROID_PUBKEY 结构（此前 android.util.Base64 返回 null 无法验证）。
+        val rsa = keyPair.public as java.security.interfaces.RSAPublicKey
+        val bytes = AdbCrypto.encodePublicKey(keyPair.public)
+        val text = String(bytes)
+        assertTrue("必须以 ' DiLinkAuto@car\\0' 结尾（NUL 结尾契约）", text.endsWith(" DiLinkAuto@car\u0000"))
+
+        val b64 = text.substring(0, text.indexOf(' '))          // base64 本体不含空格
+        assertTrue("标准 base64 带 padding（与 Android NO_WRAP 字节一致）", b64.endsWith("="))
+        val struct = java.util.Base64.getDecoder().decode(b64)
+        assertEquals("4+4+256+256+4", 524, struct.size)
+
+        val bb = java.nio.ByteBuffer.wrap(struct).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        assertEquals(64, bb.getInt())            // modulus words = 256/4
+        bb.getInt()                              // n0inv（Montgomery 参数，此处跳过）
+        val modulusLE = ByteArray(256); bb.get(modulusLE)
+        val rrLE = ByteArray(256); bb.get(rrLE)
+        val exponent = bb.getInt()
+
+        val modulus = java.math.BigInteger(1, modulusLE.reversedArray()) // 小端反转成大端
+        assertEquals(rsa.modulus, modulus)
+        assertEquals(rsa.publicExponent.toLong(), exponent.toLong())
+        assertTrue("rr 段应是 Montgomery 值（非全零）", rrLE.any { it != 0.toByte() })
     }
 
     @Test
