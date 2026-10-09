@@ -63,6 +63,54 @@ private fun ByteBuffer.require(n: Int) {
     if (remaining() < n) throw ProtocolDecodeException("Need $n bytes, have ${remaining()}")
 }
 
+/**
+ * Android package name / component shape check shared by the peers.
+ *
+ * Payloads that reach this validator end up interpolated into `am start` /
+ * `pm uninstall` shell lines on the phone (shell UID), so the whitelist must
+ * exclude every shell metacharacter — `;` `$` backtick quote whitespace `|`
+ * `&` `>` `<` `(` `)` — not merely "looks like a package". A component is
+ * `pkg/.Activity` (the class half may contain `$` for nested classes).
+ *
+ * Public (not internal) because the shell-quoting call sites live in other
+ * modules — vd-server runs as shell UID and is exactly where these must hold.
+ */
+val PACKAGE_NAME_REGEX = Regex("^[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)*$")
+val COMPONENT_REGEX = Regex("^[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)*/[A-Za-z0-9_.$]+$")
+
+/** Throws [ProtocolDecodeException] unless [name] is a syntactically safe package name. */
+fun requirePackageName(name: String): String {
+    if (name.length > 255 || !PACKAGE_NAME_REGEX.matches(name)) {
+        throw ProtocolDecodeException("Illegal package name: ${name.length} chars")
+    }
+    return name
+}
+
+/** Throws [ProtocolDecodeException] unless [component] is a syntactically safe component. */
+fun requireComponentName(component: String): String {
+    if (component.length > 512 || !COMPONENT_REGEX.matches(component)) {
+        throw ProtocolDecodeException("Illegal component name")
+    }
+    return component
+}
+
+/**
+ * Encode-side guard for 2-byte length prefixes: a UTF-8 payload >= 64KB used to
+ * wrap negative through [java.nio.ByteBuffer.putShort] and desynchronise the
+ * peer's parser. Fail loudly at the encoder instead.
+ */
+private fun requireUtf8Prefix(value: String) {
+    val size = value.toByteArray(Charsets.UTF_8).size
+    require(size <= 0xFFFF) { "UTF-8 payload too long for a 16-bit prefix: $size" }
+}
+
+private fun ByteBuffer.putUtf8(value: String) {
+    requireUtf8Prefix(value)
+    val bytes = value.toByteArray(Charsets.UTF_8)
+    putShort(bytes.size.toShort())
+    put(bytes)
+}
+
 // ─── Handshake ───
 
 data class HandshakeRequest(
@@ -96,8 +144,7 @@ data class HandshakeRequest(
         val buf = ByteBuffer.allocate(4 + 2 + nameBytes.size + 4 + 4 + 4 + 1 + 4 + 4 + 4 + 2 + verNameBytes.size + 4 + 4)
             .order(ByteOrder.BIG_ENDIAN)
         buf.putInt(protocolVersion)
-        buf.putShort(nameBytes.size.toShort())
-        buf.put(nameBytes)
+        buf.putUtf8(deviceName)
         buf.putInt(screenWidth)
         buf.putInt(screenHeight)
         buf.putInt(supportedFeatures)
@@ -105,8 +152,7 @@ data class HandshakeRequest(
         buf.putInt(screenDpi)
         buf.putInt(appVersionCode)
         buf.putInt(targetFps)
-        buf.putShort(verNameBytes.size.toShort())
-        buf.put(verNameBytes)
+        buf.putUtf8(appVersionName)
         buf.putInt(dpiOverride)
         buf.putInt(bitrate)
         return buf.array()
@@ -115,6 +161,7 @@ data class HandshakeRequest(
     companion object {
         fun decode(data: ByteArray): HandshakeRequest {
             val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
+            buf.require(4)
             val version = buf.getInt()
             val deviceName = buf.readShortLengthPrefixed()
             val request = HandshakeRequest(
@@ -227,14 +274,12 @@ data class HandshakeResponse(
             .order(ByteOrder.BIG_ENDIAN)
         buf.putInt(protocolVersion)
         buf.put(if (accepted) 1.toByte() else 0.toByte())
-        buf.putShort(nameBytes.size.toShort())
-        buf.put(nameBytes)
+        buf.putUtf8(deviceName)
         buf.putInt(displayWidth)
         buf.putInt(displayHeight)
         buf.putInt(virtualDisplayId)
         buf.putInt(adbPort)
-        buf.putShort(jarPathBytes.size.toShort())
-        buf.put(jarPathBytes)
+        buf.putUtf8(vdServerJarPath)
         buf.put(connectionMethod)
         buf.putInt(vdDpi)
         buf.putInt(vdWidth)
@@ -245,6 +290,7 @@ data class HandshakeResponse(
     companion object {
         fun decode(data: ByteArray): HandshakeResponse {
             val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
+            buf.require(4 + 1)
             val version = buf.getInt()
             val accepted = buf.get() != 0.toByte()
             val deviceName = buf.readShortLengthPrefixed()
@@ -374,13 +420,21 @@ enum class AppCategory(val id: Byte) {
     OTHER(3);
 
     companion object {
-        fun fromId(id: Byte): AppCategory = entries.find { it.id == id } ?: OTHER
+        /**
+         * Unknown ids are corruption, not "OTHER": silently coercing hides a
+         * malformed frame and desynchronises the rest of the parse.
+         */
+        fun fromId(id: Byte): AppCategory = entries.find { it.id == id }
+            ?: throw ProtocolDecodeException("Unknown AppCategory id: $id")
     }
 }
 
 data class AppListMessage(val apps: List<AppInfo>) {
     fun encode(): ByteArray {
         val appBuffers = apps.map { app ->
+            requireUtf8Prefix(app.packageName)
+            requireUtf8Prefix(app.appName)
+            requireUtf8Prefix(app.iconHash)
             val pkgBytes = app.packageName.toByteArray(Charsets.UTF_8)
             val nameBytes = app.appName.toByteArray(Charsets.UTF_8)
             val iconBytes = app.iconPng
@@ -399,6 +453,7 @@ data class AppListMessage(val apps: List<AppInfo>) {
                 .array()
         }
         val totalSize = 2 + appBuffers.sumOf { it.size }
+        require(apps.size <= 0xFFFF) { "AppList count too large for a 16-bit prefix: ${apps.size}" }
         val buf = ByteBuffer.allocate(totalSize).order(ByteOrder.BIG_ENDIAN)
         buf.putShort(apps.size.toShort())
         appBuffers.forEach { buf.put(it) }
@@ -408,13 +463,20 @@ data class AppListMessage(val apps: List<AppInfo>) {
     companion object {
         fun decode(data: ByteArray): AppListMessage {
             val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
+            buf.require(2)
             val count = buf.getShort().toInt() and 0xFFFF
             val apps = (0 until count).map {
                 val pkg = buf.readShortLengthPrefixed()
                 val name = buf.readShortLengthPrefixed()
+                buf.require(1)
                 val category = AppCategory.fromId(buf.get())
-                val iconSize = if (buf.remaining() >= 4) buf.getInt() else 0
-                val iconPng = if (iconSize > 0 && buf.remaining() >= iconSize) buf.readBytes(iconSize) else ByteArray(0)
+                buf.require(4)
+                val iconSize = buf.getInt()
+                if (iconSize < 0) throw ProtocolDecodeException("Negative icon size: $iconSize")
+                // Truncated icon must fail the decode: silently dropping it made
+                // the next readShortLengthPrefixedOrEmpty() consume icon bytes as
+                // the hash length, caching a garbage iconHash under a real key.
+                val iconPng = if (iconSize > 0) buf.readBytes(iconSize) else ByteArray(0)
                 val iconHash = buf.readShortLengthPrefixedOrEmpty() // optional trailing field
                 AppInfo(
                     packageName = pkg,
@@ -439,6 +501,7 @@ data class MediaMetadata(
 ) {
     fun encode(): ByteArray {
         val fields = listOf(title, artist, album)
+        fields.forEach { requireUtf8Prefix(it) }
         val fieldBytes = fields.map { it.toByteArray(Charsets.UTF_8) }
         val totalSize = fieldBytes.sumOf { 2 + it.size } + 8
         val buf = ByteBuffer.allocate(totalSize).order(ByteOrder.BIG_ENDIAN)
@@ -453,10 +516,14 @@ data class MediaMetadata(
     companion object {
         fun decode(data: ByteArray): MediaMetadata {
             val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
+            val title = buf.readShortLengthPrefixed()
+            val artist = buf.readShortLengthPrefixed()
+            val album = buf.readShortLengthPrefixed()
+            buf.require(8)
             return MediaMetadata(
-                title = buf.readShortLengthPrefixed(),
-                artist = buf.readShortLengthPrefixed(),
-                album = buf.readShortLengthPrefixed(),
+                title = title,
+                artist = artist,
+                album = album,
                 durationMs = buf.getLong()
             )
         }
@@ -493,7 +560,9 @@ enum class MediaAction(val id: Byte) {
     PLAY(0), PAUSE(1), NEXT(2), PREVIOUS(3), SEEK(4);
 
     companion object {
-        fun fromId(id: Byte): MediaAction = entries.find { it.id == id } ?: PLAY
+        /** Unknown ids are corruption — the old `?: PLAY` started playback on a typo. */
+        fun fromId(id: Byte): MediaAction = entries.find { it.id == id }
+            ?: throw ProtocolDecodeException("Unknown MediaAction id: $id")
     }
 }
 
@@ -503,7 +572,14 @@ data class LaunchAppMessage(val packageName: String) {
     fun encode(): ByteArray = packageName.toByteArray(Charsets.UTF_8)
 
     companion object {
-        fun decode(data: ByteArray) = LaunchAppMessage(String(data, Charsets.UTF_8))
+        /**
+         * The payload is interpolated into `am start` / `pm uninstall` shell
+         * lines running as shell UID on the phone, so it is validated at the
+         * decoder boundary — the shell-quoting at the call sites is defence in
+         * depth, not the only gate.
+         */
+        fun decode(data: ByteArray): LaunchAppMessage =
+            LaunchAppMessage(requirePackageName(String(data, Charsets.UTF_8)))
     }
 }
 
@@ -514,7 +590,8 @@ data class AppUninstalledMessage(val packageName: String) {
     fun encode(): ByteArray = packageName.toByteArray(Charsets.UTF_8)
 
     companion object {
-        fun decode(data: ByteArray) = AppUninstalledMessage(String(data, Charsets.UTF_8))
+        fun decode(data: ByteArray): AppUninstalledMessage =
+            AppUninstalledMessage(requirePackageName(String(data, Charsets.UTF_8)))
     }
 }
 
@@ -531,6 +608,9 @@ data class AppInfoDataMessage(
         val pkgBytes = packageName.toByteArray(Charsets.UTF_8)
         val nameBytes = appName.toByteArray(Charsets.UTF_8)
         val verBytes = versionName.toByteArray(Charsets.UTF_8)
+        requireUtf8Prefix(packageName)
+        requireUtf8Prefix(appName)
+        requireUtf8Prefix(versionName)
         val buf = java.nio.ByteBuffer.allocate(
             2 + pkgBytes.size + 2 + nameBytes.size + 2 + verBytes.size + 8 + 8 + 4
         )
@@ -546,10 +626,14 @@ data class AppInfoDataMessage(
     companion object {
         fun decode(data: ByteArray): AppInfoDataMessage {
             val buf = java.nio.ByteBuffer.wrap(data)
+            val packageName = buf.readShortLengthPrefixed()
+            val appName = buf.readShortLengthPrefixed()
+            val versionName = buf.readShortLengthPrefixed()
+            buf.require(8 + 8 + 4)
             return AppInfoDataMessage(
-                packageName = buf.readShortLengthPrefixed(),
-                appName = buf.readShortLengthPrefixed(),
-                versionName = buf.readShortLengthPrefixed(),
+                packageName = packageName,
+                appName = appName,
+                versionName = versionName,
                 versionCode = buf.long,
                 installTime = buf.long,
                 targetSdk = buf.int

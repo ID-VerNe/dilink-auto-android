@@ -32,18 +32,34 @@ object ImeRestore {
      * The three shell commands that restore [ime] as the system default IME.
      * Returned as a list for callers that execute each command separately
      * (the VD server's persistent shell).
+     *
+     * [ime] comes from `Settings.Secure.DEFAULT_INPUT_METHOD` (system-supplied,
+     * not peer-controlled), but it is interpolated into `sh` lines — a malicious
+     * installed IME whose id carried shell metacharacters would inject. Validate
+     * the id shape here and shell-quote it.
      */
-    fun imeRestoreCommands(ime: String): List<String> = listOf(
-        "ime enable $ime",
-        "ime set $ime",
-        "settings put secure default_input_method $ime"
-    )
+    fun imeRestoreCommands(ime: String): List<String> {
+        val safe = requireSafeImeId(ime)
+        return listOf(
+            "ime enable ${VdDeploy.shellQuote(safe)}",
+            "ime set ${VdDeploy.shellQuote(safe)}",
+            "settings put secure default_input_method ${VdDeploy.shellQuote(safe)}"
+        )
+    }
 
     /**
      * The same three commands joined as a single shell line, with stderr
      * suppressed on the last command. For callers that run one Shizuku
      * `execAndWait` (the phone-side restorer).
      */
-    fun imeRestoreCommandLine(ime: String): String =
-        "ime enable $ime; ime set $ime; settings put secure default_input_method $ime 2>/dev/null"
+    fun imeRestoreCommandLine(ime: String): String {
+        val safe = VdDeploy.shellQuote(requireSafeImeId(ime))
+        return "ime enable $safe; ime set $safe; settings put secure default_input_method $safe 2>/dev/null"
+    }
+
+    /** IME ids are `pkg/.ImeService` — anything outside that shape is rejected. */
+    private fun requireSafeImeId(ime: String): String {
+        require(COMPONENT_REGEX.matches(ime)) { "Unsafe IME id: ${ime.length} chars" }
+        return ime
+    }
 }

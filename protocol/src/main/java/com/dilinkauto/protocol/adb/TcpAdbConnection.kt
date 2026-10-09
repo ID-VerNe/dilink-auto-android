@@ -162,17 +162,25 @@ class TcpAdbConnection(
         val header = ByteArray(AdbProtocol.HEADER_SIZE)
         readFully(header)
         // Shared 24-byte header parser (also used by UsbAdbConnection). Unlike the
-        // previous inline parse, it validates magic == command ^ 0xFFFFFFFF and
-        // this path now fails fast on a malformed header instead of accepting it.
+        // previous inline parse, it validates magic == command ^ 0xFFFFFFFF, the
+        // negotiated data length ceiling, and this path now fails fast on a
+        // malformed header instead of accepting it.
         val parsed = AdbProtocol.parseHeader(header)
-            ?: throw IOException("Malformed ADB header (bad magic)")
+            ?: throw IOException("Malformed ADB header (bad magic or oversized data_len)")
         val command = parsed[0]
         val arg0 = parsed[1]
         val arg1 = parsed[2]
         val dataLen = parsed[3]
+        val dataCrc = parsed[4]
         val data = if (dataLen > 0) {
             val d = ByteArray(dataLen)
             readFully(d)
+            // The CRC has always been parsed; verifying it turns silent WiFi
+            // corruption of the JAR push / shell output into a hard failure
+            // instead of a mis-parsed stream.
+            if (dataLen > 0 && AdbProtocol.checksum(d) != dataCrc) {
+                throw IOException("ADB payload CRC mismatch (len=$dataLen)")
+            }
             d
         } else null
         return AdbMessage(command, arg0, arg1, data)

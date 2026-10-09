@@ -22,7 +22,15 @@ import kotlin.Throws
 class NioReader(
     private val channel: SocketChannel,
     initialCapacity: Int = DEFAULT_CAPACITY,
-    private val selectTimeoutMs: Long = 500 // reduced from 16ms — select() wakes on data anyway
+    private val selectTimeoutMs: Long = 500, // reduced from 16ms — select() wakes on data anyway
+    /**
+     * Fail a read that stalls *mid-frame*: partial bytes already arrived, then the
+     * peer went silent (half-open TCP, killed app). A clean wait at a frame
+     * boundary (touch link with an idle user, no partial data) is NOT timed out —
+     * that is normal and must not tear down a live session.
+     * 0 disables the deadline.
+     */
+    private val readStallTimeoutMs: Long = 0
 ) {
 
     init {
@@ -89,6 +97,7 @@ class NioReader(
             if (n == 0) {
                 // No data available — log periodically, then wait for data
                 // using Selector (instant wakeup).
+                checkStallDeadline(needed)
                 noDataCount++
                 if (noDataCount % 100 == 1L) {
                     PlatformLog.d("NioReader", "no data #$noDataCount: needed=$needed remaining=${buf.remaining()} capacity=${buf.capacity()}")
@@ -96,10 +105,19 @@ class NioReader(
                 yield() // cooperate with coroutine cancellation
                 if (!coroutineContext.isActive) return false
                 if (!awaitReadable()) return false
+            } else {
+                lastReadAt = System.currentTimeMillis()
             }
         }
         return true
     }
+
+    /**
+     * Drop back to the default buffer once a large frame has been fully consumed.
+     * Called at frame boundaries by the codec paths via [maybeShrink]; without it
+     * one large frame pins its buffer for the rest of the session.
+     */
+    internal fun maybeShrink() = shrinkIfOversized()
 
     // ── Blocking read API (for non-coroutine callers like vd-server) ──
 
@@ -148,9 +166,37 @@ class NioReader(
             if (n == -1) return false
             if (n == 0) {
                 if (!awaitReadable()) return false
+                checkStallDeadline(needed)
+            } else {
+                lastReadAt = System.currentTimeMillis()
             }
         }
         return true
+    }
+
+    /**
+     * Mid-frame stall detection: only fires when partial frame bytes are buffered
+     * and no new data arrived for [readStallTimeoutMs]. A peer waiting at a clean
+     * frame boundary (touch link, idle user) keeps its session — see the KDoc on
+     * [readStallTimeoutMs].
+     */
+    private fun checkStallDeadline(needed: Int) {
+        if (readStallTimeoutMs <= 0) return
+        if (buf.remaining() == 0) {
+            lastReadAt = 0L // at a frame boundary: normal idle, arm nothing
+            return
+        }
+        val now = System.currentTimeMillis()
+        if (lastReadAt == 0L) {
+            lastReadAt = now
+            return
+        }
+        if (now - lastReadAt > readStallTimeoutMs) {
+            throw IOException(
+                "Peer stalled mid-frame: ${buf.remaining()} buffered of $needed, " +
+                    "no data for ${now - lastReadAt}ms (timeout=${readStallTimeoutMs}ms)"
+            )
+        }
     }
 
     // ── Shared fill primitives (used by both the coroutine and blocking loops) ──
@@ -186,13 +232,35 @@ class NioReader(
      * Grow the internal buffer if a single read unit exceeds capacity.
      * Shared by [fillOrEof] and [fillOrEofBlocking] so the grow policy lives
      * in one place — previously the same 5-line block was duplicated.
+     *
+     * [MAX_READ_UNIT] is a hard ceiling: without it a single (possibly hostile)
+     * declared frame length allocates a buffer of that exact size, and the buffer
+     * was never shrunk afterwards, inflating the reader for the whole session.
+     * A legitimate read unit never exceeds [FrameCodec.MAX_PAYLOAD_SIZE] plus
+     * the 6-byte header. Callers (FrameCodec) reject oversized frames before
+     * this point; this is the backstop when they don't.
      */
     private fun growIfNeeded(needed: Int) {
+        if (needed > MAX_READ_UNIT) {
+            throw IOException("Read unit too large: $needed > $MAX_READ_UNIT")
+        }
         if (needed > buf.capacity()) {
-            val newBuf = ByteBuffer.allocate(needed + GROW_PADDING)
+            val newBuf = ByteBuffer.allocate(minOf(needed + GROW_PADDING, MAX_READ_UNIT))
             newBuf.order(ByteOrder.BIG_ENDIAN)
             newBuf.put(buf) // copy remaining unread data
             newBuf.flip()
+            buf = newBuf
+        }
+    }
+
+    /**
+     * Release oversized buffers back to the default capacity after a large frame
+     * has been consumed, so one big frame doesn't pin memory for the session.
+     */
+    private fun shrinkIfOversized() {
+        if (buf.capacity() > DEFAULT_CAPACITY * 4 && buf.remaining() == 0) {
+            val newBuf = ByteBuffer.allocate(DEFAULT_CAPACITY)
+            newBuf.order(ByteOrder.BIG_ENDIAN)
             buf = newBuf
         }
     }
@@ -212,9 +280,18 @@ class NioReader(
     }
 
     private var noDataCount = 0L
+    private var lastReadAt = 0L
 
     companion object {
         const val DEFAULT_CAPACITY = 131072 // 128KB — reduced for low-end devices
         private const val GROW_PADDING = 4096
+
+        /**
+         * Hard ceiling for a single read unit (6-byte header + payload). Frames
+         * larger than [FrameCodec.MAX_PAYLOAD_SIZE] are rejected by the codec
+         * before reaching the reader; this backstop keeps a buggy or hostile
+         * caller from allocating an arbitrarily large buffer via growIfNeeded.
+         */
+        internal val MAX_READ_UNIT: Int = FrameCodec.HEADER_SIZE + FrameCodec.MAX_PAYLOAD_SIZE
     }
 }

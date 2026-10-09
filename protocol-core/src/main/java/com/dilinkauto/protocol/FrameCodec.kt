@@ -19,15 +19,24 @@ import java.util.concurrent.locks.LockSupport
  * │ Payload     (N bytes)                   │  Message-specific data
  * └─────────────────────────────────────────┘
  *
- * Maximum payload size: [MAX_PAYLOAD_SIZE] (128 MB) — a defensive cap, not a
- * target. Real payloads top out at ~1-2 MB (H.264 keyframes at 1080p). This is
- * separate from ADB's 256 KB transfer limit (`AdbProtocol.MAX_PAYLOAD`), which
- * only applies inside the ADB stream, not to this TCP framing.
+ * Maximum payload size: [MAX_PAYLOAD_SIZE] — a defensive cap, not a target.
+ * Real payloads top out at ~1-2 MB (H.264 keyframes at 1080p). This is separate
+ * from ADB's 256 KB transfer limit (`AdbProtocol.MAX_PAYLOAD`), which only
+ * applies inside the ADB stream, not to this TCP framing.
+ *
+ * 128 MB was far above anything the stream legitimately carries while letting a
+ * 7-byte malicious header force ~256 MB of allocation (payload ByteArray plus
+ * the NioReader's grow-on-demand buffer) on the phone and on the shell-UID
+ * vd-server. 16 MB leaves 8x headroom over a 1080p keyframe and makes the same
+ * attack a 32 MB event that both sides survive.
  */
 object FrameCodec {
 
     const val HEADER_SIZE = 6 // 4 (length) + 1 (channel) + 1 (type)
-    const val MAX_PAYLOAD_SIZE = 128 * 1024 * 1024 // 128 MB
+    const val MAX_PAYLOAD_SIZE = 16 * 1024 * 1024 // 16 MB
+
+    /** Frames above this size log a warning; a 1080p keyframe is ~1 MB. */
+    private const val LARGE_FRAME_LOG_THRESHOLD = 8 * 1024 * 1024
 
     data class Frame(
         val channel: Byte,
@@ -180,9 +189,13 @@ object FrameCodec {
      */
     fun readFrameBlocking(reader: NioReader): Frame? = readFrameCore(
         readLength = { reader.readIntOrNullBlocking() },
-        readBytes = { count -> ByteArray(count).also { reader.readFullyBlocking(it) } }
+        readBytes = { count ->
+            ByteArray(count).also {
+                reader.readFullyBlocking(it)
+                reader.maybeShrink()
+            }
+        }
     )
-
     /**
      * Read a frame from a non-blocking NIO reader. Returns null on EOF.
      *
@@ -197,14 +210,16 @@ object FrameCodec {
         val channelId = reader.readByte()
         val msgType = reader.readByte()
 
-        // Log large frames (potential corruption indicator)
-        if (payloadSize > 100_000) {
+        // A frame this large is legal (1080p keyframes reach ~1 MB) but a good
+        // corruption indicator; log it once per stream instead of on every GOP.
+        if (payloadSize > LARGE_FRAME_LOG_THRESHOLD) {
             PlatformLog.w("FrameCodec", "Large frame: ch=$channelId type=0x${msgType.toString(16)} payload=$payloadSize bytes")
         }
 
         val payload = if (payloadSize > 0) {
             ByteArray(payloadSize).also { reader.readFully(it) }
         } else null
+        reader.maybeShrink()
         return finishFrame(payloadSize, channelId, msgType, payload)
     }
 

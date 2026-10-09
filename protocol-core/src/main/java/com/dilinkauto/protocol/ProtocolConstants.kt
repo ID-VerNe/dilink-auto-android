@@ -11,6 +11,20 @@ package com.dilinkauto.protocol
 
 const val PROTOCOL_VERSION = 1
 
+/**
+ * Reject peers announcing an incompatible wire version instead of decoding
+ * trailing fields at the wrong offsets (the field used to be carried and
+ * ignored by all three consumers).
+ *
+ * @throws ProtocolDecodeException when [version] is not exactly [PROTOCOL_VERSION].
+ */
+fun requireSupportedProtocolVersion(version: Int): Int {
+    if (version != PROTOCOL_VERSION) {
+        throw ProtocolDecodeException("Unsupported protocol version: $version (expected $PROTOCOL_VERSION)")
+    }
+    return version
+}
+
 const val DISPLAY_MODE_MIRROR: Byte = 0
 const val DISPLAY_MODE_VIRTUAL: Byte = 1
 

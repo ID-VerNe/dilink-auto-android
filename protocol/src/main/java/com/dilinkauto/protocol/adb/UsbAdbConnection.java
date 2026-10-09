@@ -437,6 +437,7 @@ public class UsbAdbConnection {
             int arg0 = header[1];
             int arg1 = header[2];
             int dataLen = header[3];
+            int dataCrc = header[4];
 
             // Read data payload if present
             byte[] data = null;
@@ -452,6 +453,13 @@ public class UsbAdbConnection {
                 }
                 if (dataRead < dataLen) {
                     logW("Incomplete data: got " + dataRead + "/" + dataLen);
+                    continue;
+                }
+                // USB is a wire protocol and rarely corrupts, but the CRC was
+                // already parsed and never checked — verify so a flaky cable or
+                // a hostile device cannot silently mis-parse the stream.
+                if (AdbProtocol.checksum(data) != dataCrc) {
+                    logW("ADB payload CRC mismatch (len=" + dataLen + "), discarding");
                     continue;
                 }
             }
@@ -567,30 +575,37 @@ public class UsbAdbConnection {
     }
 
     private KeyPair getOrCreateKeyPair() {
-        // Priority order for key storage (most persistent first):
-        // 1. /sdcard/DiLinkAuto/ — survives app reinstalls, updates, and data clears
-        // 2. getExternalFilesDir — survives app updates but cleared on full uninstall
-        // 3. getFilesDir — cleared on any reinstall (last resort)
-        File sdcardDir = new File(android.os.Environment.getExternalStorageDirectory(), "DiLinkAuto");
-        log("Key storage check: sdcard=" + sdcardDir.getAbsolutePath() + " exists=" + sdcardDir.exists() + " canWrite=" + sdcardDir.canWrite());
-        sdcardDir.mkdirs();
-
+        // Priority order for key storage (most private first):
+        // 1. getFilesDir — app-private, not readable by co-installed apps
+        // 2. getExternalFilesDir — app-private on modern Android, survives updates
+        // 3. /sdcard/DiLinkAuto/ — WORLD-READABLE shared storage. This key
+        //    authenticates the car to the phone's ADB daemon and the phone keeps
+        //    trusting it after "always allow", so a co-installed app holding
+        //    READ_EXTERNAL_STORAGE could steal it and gain shell-UID access to
+        //    the phone. Only used as an explicit opt-in for cross-device key
+        //    portability (an operator who placed a key there manually), never
+        //    chosen automatically.
         File extDir = context.getExternalFilesDir(null);
-        log("Key storage check: extFilesDir=" + (extDir != null ? extDir.getAbsolutePath() : "null") + " canWrite=" + (extDir != null && extDir.canWrite()));
-        log("Key storage check: filesDir=" + context.getFilesDir().getAbsolutePath());
+        File sdcardDir = new File(android.os.Environment.getExternalStorageDirectory(), "DiLinkAuto");
+        log("Key storage check: filesDir=" + context.getFilesDir().getAbsolutePath()
+            + " extFilesDir=" + (extDir != null ? extDir.getAbsolutePath() : "null")
+            + " canWrite=" + (extDir != null && extDir.canWrite())
+            + " sdcard=" + sdcardDir.getAbsolutePath() + " exists=" + sdcardDir.exists());
 
-        File keyDir;
-        if (sdcardDir.canWrite()) {
-            keyDir = sdcardDir;
-            log("Using sdcard for key storage: " + keyDir.getAbsolutePath());
-        } else {
+        File keyDir = context.getFilesDir();
+        if (keyDir == null || !keyDir.canWrite()) {
             keyDir = extDir;
             if (keyDir == null || !keyDir.canWrite()) {
-                keyDir = context.getFilesDir();
-                logW("Both sdcard and externalFilesDir unavailable, using filesDir");
+                logW("filesDir and externalFilesDir unavailable");
+                keyDir = null;
             } else {
                 log("Using externalFilesDir for key storage: " + keyDir.getAbsolutePath());
             }
+        } else {
+            log("Using filesDir for key storage: " + keyDir.getAbsolutePath());
+        }
+        if (keyDir == null) {
+            throw new RuntimeException("No writable private storage for the ADB key pair");
         }
         keyDir.mkdirs();
         File privFile = new File(keyDir, KEY_FILE);

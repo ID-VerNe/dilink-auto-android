@@ -1,6 +1,8 @@
 package com.dilinkauto.protocol
 
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.IOException
 import java.net.InetSocketAddress
 import java.nio.ByteBuffer
@@ -35,7 +37,14 @@ class Connection(
         actualRecvBuf = sock.receiveBufferSize
     }
 
-    private val reader = NioReader(channel)
+    // The stall deadline covers connections without a heartbeat/watchdog (the
+    // direct video and input sockets): a peer that connects, sends a partial
+    // frame and goes silent no longer pins the reader forever. Idle-at-boundary
+    // (touch link with no user input) is deliberately not timed out.
+    private val reader = NioReader(
+        channel = channel,
+        readStallTimeoutMs = HEARTBEAT_TIMEOUT_MS
+    )
     private val connected = AtomicBoolean(true)
 
     // Write queue: bounded coroutine channel, drained by dedicated writer coroutine.
@@ -58,10 +67,18 @@ class Connection(
     @kotlin.OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
     private val sendDispatcher = Dispatchers.IO.limitedParallelism(1)
 
+    /**
+     * 入队互斥:limitedParallelism(1) 只串行化"派发",不串行化"挂起"。
+     * 队列满时首个协程挂在 `writeQueue.send`,单线程派发器随即运行下一个协程,
+     * 后帧反而先入队 —— 恰好在链路拥塞(注释声称要保护的场景)下乱序。
+     * 用锁把"入队"这段临界区钉住:后到的协程阻塞在 acquire,先到的先入队。
+     */
+    private val sendMutex = Mutex()
+
     private val frameListeners = ConcurrentHashMap<Byte, (FrameCodec.Frame) -> Unit>()
-    private var disconnectListener: (() -> Unit)? = null
-    private var logListener: ((String) -> Unit)? = null
-    private var disconnectReason: String = "unknown"
+    @Volatile private var disconnectListener: (() -> Unit)? = null
+    @Volatile private var logListener: ((String) -> Unit)? = null
+    @Volatile private var disconnectReason: String = "unknown"
 
     private var readerJob: Job? = null
     private var writerJob: Job? = null
@@ -120,9 +137,34 @@ class Connection(
                             frame.channel == Channel.INPUT ||
                             frame.channel == Channel.CONTROL
                         ) {
-                            listener.invoke(frame)
+                            // A listener that throws must not kill the reader coroutine:
+                            // decoders may raise ProtocolDecodeException (not a
+                            // ProtocolException) and BufferUnderflowException on
+                            // malformed peer payloads, and a SupervisorJob scope has
+                            // no handler for them — the socket would sit open until
+                            // the watchdog timed out. Fail the connection instead.
+                            try {
+                                listener.invoke(frame)
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Throwable) {
+                                disconnectReason = "frame handler (ch=${frame.channel}, type=0x${Integer.toHexString(frame.messageType.toInt() and 0xFF)}): ${e.javaClass.simpleName}: ${e.message}"
+                                log(disconnectReason)
+                                if (connected.get()) disconnect()
+                                break
+                            }
                         } else {
-                            scope.launch { listener.invoke(frame) }
+                            scope.launch {
+                                try {
+                                    listener.invoke(frame)
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (e: Throwable) {
+                                    disconnectReason = "frame handler (ch=${frame.channel}, type=0x${Integer.toHexString(frame.messageType.toInt() and 0xFF)}): ${e.javaClass.simpleName}: ${e.message}"
+                                    log(disconnectReason)
+                                    if (connected.get()) disconnect()
+                                }
+                            }
                         }
                     }
                 }
@@ -134,6 +176,17 @@ class Connection(
                 if (connected.get()) disconnect()
             } catch (e: ProtocolException) {
                 disconnectReason = "reader: ProtocolException: ${e.message}"
+                log(disconnectReason)
+                if (connected.get()) disconnect()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                // ProtocolDecodeException, BufferUnderflowException, and anything a
+                // future decoder raises are NOT IOException/ProtocolException, so the
+                // three catches above never saw them: they escaped into an unhandled
+                // coroutine exception (no CoroutineExceptionHandler exists anywhere in
+                // this repo) and killed the process on a single malformed frame.
+                disconnectReason = "reader: ${e.javaClass.simpleName}: ${e.message}"
                 log(disconnectReason)
                 if (connected.get()) disconnect()
             }
@@ -185,8 +238,10 @@ class Connection(
                     if (!connected.get()) break
                     try {
                         enqueueFrame(FrameCodec.Frame(Channel.CONTROL, ControlMsg.HEARTBEAT, ByteArray(0)))
-                    } catch (e: IOException) {
-                        disconnectReason = "heartbeat: IOException: ${e.message}"
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Throwable) {
+                        disconnectReason = "heartbeat: ${e.javaClass.simpleName}: ${e.message}"
                         log(disconnectReason)
                         disconnect()
                         break
@@ -266,10 +321,20 @@ class Connection(
         // Public senders run on arbitrary threads (UI, service scope, etc).
         // Route through the scope so the suspending enqueueFrame can apply
         // backpressure without forcing every caller to be a suspend function.
-        // 走单线程派发器（而不是裸 scope）以保证入队顺序 == 调用顺序，见 sendDispatcher。
+        // 走单线程派发器（而不是裸 scope）以保证入队顺序 == 调用顺序，见 sendDispatcher；
+        // sendMutex 保证队列满(挂起)时顺序仍然成立。
         if (!connected.get()) throw IOException("Not connected")
         scope.launch(sendDispatcher) {
-            try { enqueueFrame(frame) } catch (_: IOException) { /* disconnected */ }
+            try {
+                sendMutex.withLock { enqueueFrame(frame) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                // disconnect() closes the writeQueue between the connected check and
+                // send(); that surfaces as ClosedSendChannelException (an
+                // IllegalStateException, NOT an IOException) — catching only
+                // IOException let it escape into an unhandled coroutine exception.
+            }
         }
     }
 
@@ -302,9 +367,25 @@ class Connection(
             } else disconnectReason
             log("disconnect() reason=$caller")
             readerJob?.cancel()
-            writerJob?.cancel()
             heartbeatJob?.cancel()
             watchdogJob?.cancel()
+            if (disconnectReason.startsWith("reader: EOF")) {
+                // Graceful peer close (DISCONNECT then FIN): frames already queued
+                // — e.g. our DISCONNECT_ACK — are still deliverable for a short
+                // window. Cancelling the writer and closing the socket instantly
+                // (the old behaviour) silently dropped them. Give the writer
+                // FLUSH_GRACE_MS to drain, then finish the teardown.
+                scope.launch {
+                    delay(FLUSH_GRACE_MS)
+                    writerJob?.cancel()
+                    writeQueue.close()
+                    reader.close()
+                    try { channel.close() } catch (_: Exception) {}
+                    try { disconnectListener?.invoke() } catch (_: Exception) {}
+                }
+                return
+            }
+            writerJob?.cancel()
             writeQueue.close()
             reader.close()
             try { channel.close() } catch (_: Exception) {}
@@ -315,6 +396,10 @@ class Connection(
     companion object {
         private const val HEARTBEAT_INTERVAL_MS = 3000L
         private const val HEARTBEAT_TIMEOUT_MS = 10000L
+        private const val CONNECT_TIMEOUT_MS = 10000L
+
+        /** Grace period for the writer to drain queued frames on a graceful peer close. */
+        private const val FLUSH_GRACE_MS = 500L
 
         /**
          * TCP send/receive buffer request (256KB). Raised above the OS default
@@ -325,12 +410,29 @@ class Connection(
         const val SOCKET_BUF_BYTES = 262144
 
         suspend fun connect(host: String, port: Int, scope: CoroutineScope): Connection =
+            connect(host, port, scope, CONNECT_TIMEOUT_MS)
+
+        /**
+         * @param timeoutMs deadline for the TCP handshake. A black-holed SYN used
+         *   to spin `finishConnect()` forever (only the desktop's wrapper had a
+         *   timeout); now the channel is closed and the connect fails.
+         */
+        suspend fun connect(
+            host: String,
+            port: Int,
+            scope: CoroutineScope,
+            timeoutMs: Long = CONNECT_TIMEOUT_MS
+        ): Connection =
             withContext(Dispatchers.IO) {
                 val channel = SocketChannel.open()
                 try {
                     channel.configureBlocking(false)
                     channel.connect(InetSocketAddress(host, port))
+                    val deadline = System.currentTimeMillis() + timeoutMs
                     while (!channel.finishConnect()) {
+                        if (System.currentTimeMillis() > deadline) {
+                            throw IOException("Connect to $host:$port timed out after ${timeoutMs}ms")
+                        }
                         delay(50)
                     }
                     Connection(channel, scope)

@@ -126,15 +126,35 @@ object Discovery {
             override fun onDiscoveryStarted(serviceType: String) {}
 
             override fun onServiceFound(serviceInfo: NsdServiceInfo) {
+                // Only trust our own service name: NSD's service-type discovery
+                // returns every responder advertising `_dilinkauto._tcp`, and an
+                // impostor on the same LAN was previously resolved and shown to
+                // the user as a connection target (the car has no other
+                // authentication, so this is the first gate).
+                if (serviceInfo.serviceName != SERVICE_NAME) {
+                    android.util.Log.w(
+                        "Discovery",
+                        "Ignoring foreign mDNS responder: '${serviceInfo.serviceName}'"
+                    )
+                    return
+                }
                 // Resolve the service to get IP and port
                 nsdManager.resolveService(serviceInfo, object : NsdManager.ResolveListener {
                     override fun onResolveFailed(info: NsdServiceInfo, errorCode: Int) {}
 
                     override fun onServiceResolved(info: NsdServiceInfo) {
+                        val host = info.host?.hostAddress ?: return
+                        // A resolved port outside the protocol's known range is
+                        // another impostor tell — drop instead of offering it.
+                        val port = info.port
+                        if (port !in 1..65535) {
+                            android.util.Log.w("Discovery", "Ignoring service with invalid port: $port")
+                            return
+                        }
                         val service = DiscoveredService(
                             name = info.serviceName,
-                            host = info.host?.hostAddress ?: return,
-                            port = info.port,
+                            host = host,
+                            port = port,
                             deviceName = info.attributes["device"]
                                 ?.let { String(it) } ?: "Unknown"
                         )

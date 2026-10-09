@@ -153,6 +153,10 @@ object VdDeploy {
      * @param encodeHeight encoder height (clamped to 1080 by VdDeployArgs).
      * @param fps        target frame rate.
      * @param background when true, the launch command backgrounds the server.
+     * @param carHost   receiver IP the engine pins its 9638/9639 accepts to
+     *                  (audit S-01). [VdDeployArgs.CAR_HOST_ANY] keeps the
+     *                  legacy accept-any behaviour for deploy sites that cannot
+     *                  determine their own outbound address.
      */
     fun buildDeployPlan(
         jarPath: String,
@@ -165,9 +169,12 @@ object VdDeploy {
         phoneHost: String,
         fps: Int,
         bitrate: Int = VideoConfig.DEFAULT_BITRATE,
-        background: Boolean
+        background: Boolean,
+        carHost: String = VdDeployArgs.CAR_HOST_ANY
     ): DeployPlan {
-        val args = VdDeployArgs.format(vdWidth, vdHeight, dpi, phoneHost, encodeWidth, encodeHeight, fps, bitrate)
+        val args = VdDeployArgs.format(
+            vdWidth, vdHeight, dpi, phoneHost, encodeWidth, encodeHeight, fps, bitrate, carHost
+        )
         return DeployPlan(
             args = args,
             killCommand = killCommand,

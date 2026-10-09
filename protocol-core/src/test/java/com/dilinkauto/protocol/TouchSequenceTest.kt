@@ -228,30 +228,30 @@ class TouchSequenceTest {
     }
 
     @Test
-    fun testStress_MoreThanMaxPointers_DemonstratesArrayOutOfBoundsAndStateJammed() {
-        // PipelineServer has MAX_POINTERS = 10
-        val sm = PipelineServerTouchStateMachine(maxPointers = 10)
-
-        // Press pointers 0 through 9 (10 pointers)
-        for (i in 0 until 10) {
-            val ok = sm.injectTouch(action = 0, ptr = i, x = i * 10, y = i * 10, pressure = 1f, now = 1000L + i * 10)
-            assertTrue("Pointer $i down should succeed", ok)
-        }
-        assertEquals(10, sm.activePointers.size)
-
-        // Now press 11th pointer (pointer 10)
-        val ok11 = sm.injectTouch(action = 0, ptr = 10, x = 100, y = 100, pressure = 1f, now = 1200L)
-        assertFalse("11th pointer must fail due to ArrayIndexOutOfBoundsException in propsPool[10]", ok11)
-        assertTrue("Exception must be ArrayIndexOutOfBoundsException", sm.lastException is ArrayIndexOutOfBoundsException)
-
-        // Notice that activePointers now has 11 entries!
-        assertEquals(11, sm.activePointers.size)
-
-        // Now attempt to lift pointer 0:
-        val okRelease0 = sm.injectTouch(action = 2, ptr = 0, x = 0, y = 0, pressure = 1f, now = 1300L)
-        // CRITICAL BUG OBSERVATION: okRelease0 FAILS because pts.size is 11, so propsPool[10] throws before activePointers.remove(ptr)
-        assertFalse("Release fails because propsPool throws on index 10 before activePointers.remove", okRelease0)
-        // Pointer 0 is NOT removed!
-        assertTrue("Pointer 0 is permanently stuck in activePointers", sm.activePointers.containsKey(0))
+    fun testStress_MoreThanMaxPointers_IsValidWireData_InjectorMustCap() {
+        // The wire format has no pointer-count limit (TouchMoveBatch accepts up
+        // to 255); the 10-pointer cap belongs to the injection side. Before the
+        // S-09 fix, vd-server's TouchInjector let >10 pointers overflow its
+        // fixed propsPool and swallowed the ArrayIndexOutOfBoundsException,
+        // jamming touch for the rest of the session — the old version of this
+        // test asserted exactly that jam as "expected".
+        //
+        // Now: TouchInjector caps activePointers (vd-server PointerCapTest, 8
+        // cases) and rejects out-of-range pointer ids before pool indexing.
+        // What remains true at the protocol layer is that an 11-pointer batch is
+        // still well-formed wire data — the receiver must cap, not the wire.
+        val batch = TouchMoveBatch((0..10).map { i ->
+            TouchEvent(
+                action = InputMsg.TOUCH_MOVE,
+                pointerId = i,
+                x = i / 11f,
+                y = i / 11f,
+                pressure = 1f,
+                timestamp = 1200L + i
+            )
+        })
+        val decoded = TouchMoveBatch.decode(batch.encode())
+        assertEquals(11, decoded.pointers.size)
+        assertEquals(10, decoded.pointers.last().pointerId)
     }
 }

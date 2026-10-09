@@ -30,11 +30,14 @@ object SettingsFormat {
      * rounded half-up to two decimals; the trailing zeros are dropped so a whole
      * value never renders as `"4.0M"`.
      *
-     * @param bps bitrate in bits per second; expected non-negative
+     * @param bps bitrate in bits per second; negatives are clamped to 0 rather
+     *   than rendered as nonsense (`"-1.-5M"` from `-500_000`), so a corrupted
+     *   persisted value still produces a sane label
      */
     fun formatBitrateMbps(bps: Int): String {
-        val whole = bps / 1_000_000
-        val thousandths = (bps % 1_000_000) / 1_000          // 0..999
+        val safe = bps.coerceAtLeast(0)
+        val whole = safe / 1_000_000
+        val thousandths = (safe % 1_000_000) / 1_000          // 0..999
         if (thousandths == 0) return "${whole}M"
 
         val hundredths = (thousandths + 5) / 10              // round to 2 dp, 0..100
