@@ -86,7 +86,14 @@ internal class ProbeRunner(
             throw IOException("未设 DILINK_DEV_MODE=1，无法部署 VD server")
         }
         val jarPath = response.vdServerJarPath.ifBlank { VdDeploy.JAR_PATH }
-        val deployed = deployer.deploy(config, response.adbPort, jarPath) { log.info("adb", it) }
+        val deployed = deployer.deploy(
+            config = config,
+            adbPort = response.adbPort,
+            jarPath = jarPath,
+            log = { log.info("adb", it) },
+            phoneVdWidth = response.vdWidth,
+            phoneVdHeight = response.vdHeight,
+        )
         if (!deployed) {
             throw IOException("ADB 部署 VD server 失败 —— 详见上面的 adb 日志")
         }

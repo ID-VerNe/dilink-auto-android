@@ -57,7 +57,9 @@ enum class DesktopView { MIRROR, APPS, DISPLAY }
  *
  * [DesktopApp.Session.sessionEnded] 变为 true 时自动关窗退出（手机断开/会话出错时
  * 不留一个空窗口）。这个信号只由**没有被下一代顶替**的会话发出，所以"应用并重连"
- * 不会误关窗口（audit WIN-04，判据在 [DesktopApp]）。
+ * 不会误关窗口（audit WIN-04，判据在 [DesktopApp]）；且只由**到过 STREAMING** 的
+ * 会话发出 —— 启动失败（手机端未启动、连接被拒）时窗口保留，用户可点
+ * 「应用并重连」重试（2026-10-09：否则双击 exe 3 秒即整窗退出，形同闪退）。
  *
  * 导航三键与车机端 `PersistentNavBar` 语义一致，但走输入口发
  * [com.dilinkauto.protocol.ControlMsg]：主页 = GO_HOME、返回 = GO_BACK、最近 = GO_RECENT。
@@ -155,7 +157,14 @@ fun DesktopWindow(app: DesktopApp, onClose: () -> Unit) {
                 when (view) {
                     DesktopView.APPS -> AppGridView(
                         apps = appList,
-                        onLaunch = { session?.launchApp(it) },
+                        onLaunch = { pkg ->
+                            session?.launchApp(pkg)
+                            // 点击后自动切回"镜像"页：启动命令走输入通道到手机侧
+                            // vd-server，app 出现在镜像里而不是本页 —— 留在本页就是
+                            // "点了没反应"的体感（2026-10-09 实测：用户点高德后以为
+                            // 失败，手动切到镜像页才发现早已成功）。
+                            view = DesktopView.MIRROR
+                        },
                         modifier = Modifier.fillMaxSize().background(Palette.Backdrop),
                     )
 

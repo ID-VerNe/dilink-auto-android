@@ -129,4 +129,34 @@ class AdbDeployTest {
         val plan = AdbDeploy.plan(config(), jarPath = "   ")
         assertTrue(plan.launchCommand.contains("CLASSPATH=${VdDeploy.shellQuote(VdDeploy.JAR_PATH)}"))
     }
+
+    /**
+     * 2026-10-09 IME 裁切实锤：VD 尺寸必须用手机握手响应下发的值（VdDimensions
+     * 按手机真实物理长边放大的结果），本端视口只是编码尺寸。此前按视口 1280x720
+     * 建 VD，微信键道键盘行（硬编码手机物理宽 1368px）被切 88px，且与 DPI 无关。
+     */
+    @Test
+    fun `plan 手机下发 VD 尺寸时命令行头部采用之而编码尺寸保持视口`() {
+        val plan = AdbDeploy.plan(config(width = 1280, height = 720), phoneVdWidth = 3192, phoneVdHeight = 1794)
+
+        // argv 头两位 = VD 尺寸（VirtualDisplayCreator 用），必须不是视口
+        assertTrue("VD 尺寸应为手机下发值: ${plan.args}", plan.args.startsWith("3192 1794 "))
+        // 编码尺寸仍是本端视口（argv 第 5/6 位）：VD=3192x1794 encode=1280x720
+        val parts = plan.args.split(" ")
+        assertEquals("1280", parts[4])
+        assertEquals("720", parts[5])
+    }
+
+    @Test
+    fun `plan 手机 VD 尺寸为奇数时偶数对齐`() {
+        val plan = AdbDeploy.plan(config(), phoneVdWidth = 3193, phoneVdHeight = 1795)
+        assertTrue("应偶数对齐: ${plan.args}", plan.args.startsWith("3192 1794 "))
+    }
+
+    @Test
+    fun `plan 手机未下发 VD 尺寸时回退视口`() {
+        // 旧版手机（trailing 字段缺失解码为 0）→ 保持旧行为
+        val plan = AdbDeploy.plan(config(width = 1280, height = 720), phoneVdWidth = 0, phoneVdHeight = 0)
+        assertTrue("应回退视口: ${plan.args}", plan.args.startsWith("1280 720 "))
+    }
 }

@@ -202,12 +202,28 @@ data class HandshakeResponse(
     val adbPort: Int = Ports.ADB_PORT,
     val vdServerJarPath: String = "",
     val connectionMethod: Byte = CONNECTION_METHOD_USB_ADB,
-    val vdDpi: Int = VideoConfig.VIRTUAL_DISPLAY_DPI
+    val vdDpi: Int = VideoConfig.VIRTUAL_DISPLAY_DPI,
+    /**
+     * Phone-side recommended VirtualDisplay size (trailing fields, 0 = not
+     * provided by older phones). This is [VdDimensions.compute]'s output: the
+     * car viewport anti-crop scaled up to the phone's REAL physical long edge
+     * so a Chinese-ROM IME, which hardcodes its width to the phone's physical
+     * pixel width regardless of density, renders fully inside the VD.
+     *
+     * Deploy sites without shell access to the phone (the desktop ADB path)
+     * MUST use these dims for the VirtualDisplay when > 0 — the desktop's own
+     * viewport is the *encoder* size, not the VD size. Sizing the VD from the
+     * viewport (1280x720) is what left the IME keyboard 1368px wide on a
+     * 1280px canvas (chopped right edge, 2026-10-09). The phone's Shizuku
+     * path already deployed with these values directly.
+     */
+    val vdWidth: Int = 0,
+    val vdHeight: Int = 0
 ) {
     fun encode(): ByteArray {
         val nameBytes = deviceName.toByteArray(Charsets.UTF_8)
         val jarPathBytes = vdServerJarPath.toByteArray(Charsets.UTF_8)
-        val buf = ByteBuffer.allocate(4 + 1 + 2 + nameBytes.size + 4 + 4 + 4 + 4 + 2 + jarPathBytes.size + 1 + 4)
+        val buf = ByteBuffer.allocate(4 + 1 + 2 + nameBytes.size + 4 + 4 + 4 + 4 + 2 + jarPathBytes.size + 1 + 4 + 4 + 4)
             .order(ByteOrder.BIG_ENDIAN)
         buf.putInt(protocolVersion)
         buf.put(if (accepted) 1.toByte() else 0.toByte())
@@ -221,6 +237,8 @@ data class HandshakeResponse(
         buf.put(jarPathBytes)
         buf.put(connectionMethod)
         buf.putInt(vdDpi)
+        buf.putInt(vdWidth)
+        buf.putInt(vdHeight)
         return buf.array()
     }
 
@@ -237,6 +255,8 @@ data class HandshakeResponse(
             val jarPath = buf.readShortLengthPrefixedOrEmpty() // optional trailing field
             val connMethod = if (buf.hasRemaining()) buf.get() else CONNECTION_METHOD_USB_ADB
             val vdDpi = if (buf.remaining() >= 4) buf.getInt() else VideoConfig.VIRTUAL_DISPLAY_DPI
+            val vdW = if (buf.remaining() >= 4) buf.getInt() else 0
+            val vdH = if (buf.remaining() >= 4) buf.getInt() else 0
             return HandshakeResponse(
                 protocolVersion = version,
                 accepted = accepted,
@@ -247,7 +267,9 @@ data class HandshakeResponse(
                 adbPort = adbP,
                 vdServerJarPath = jarPath,
                 connectionMethod = connMethod,
-                vdDpi = vdDpi
+                vdDpi = vdDpi,
+                vdWidth = vdW,
+                vdHeight = vdH
             )
         }
     }

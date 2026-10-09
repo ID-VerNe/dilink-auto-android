@@ -44,6 +44,8 @@ import java.util.concurrent.atomic.AtomicInteger
  * 三处"会话生命周期"的约定（都是踩过坑的，改动前先读）：
  *  - 会话结束信号只由**未被下一代顶替**的那一代发出（audit WIN-04）：
  *    [closeSession] 先摘 `_session`，协程侧再比对身份，避免"应用并重连"误关窗口；
+ *  - 且只由**到过 STREAMING** 的会话发出（2026-10-09）：启动失败（连接被拒、
+ *    部署失败）不关窗 —— 用户还没看到任何画面就整窗退出，等于"闪退"；
  *  - 部署失败/等待 VD 超时都会**终止会话**而不是静默挂着（audit WIN-06）；
  *  - 持续黑屏最多自动重连 [MAX_BLACK_SCREEN_RECONNECTS] 次（audit WIN-07）。
  *
@@ -203,9 +205,12 @@ class DesktopApp(
         val sessionEnded = MutableStateFlow(false)
         val stateFlow = MutableStateFlow(SessionState.IDLE)
         val hardwareFlow = MutableStateFlow(hwaccel)
+        // 本会话是否真正到过 STREAMING —— "断开自动关窗"的豁免判据（见下方协程）。
+        val reachedStreaming = java.util.concurrent.atomic.AtomicBoolean(false)
         service.onStateChanged = { state ->
             log.info("state", "$state")
             stateFlow.value = state
+            if (state == SessionState.STREAMING) reachedStreaming.set(true)
             // 只有真正开始推流才申请常亮；断开即释放，避免"连不上却一直亮着"。
             when (state) {
                 SessionState.STREAMING -> applyKeepAwake()
@@ -254,7 +259,12 @@ class DesktopApp(
             // 代际守卫（audit WIN-04）：只有**仍未被下一代顶替**的会话才把"结束"发给窗口。
             // 「应用并重连」会先结束旧代、再建新代，旧代那个 true 落在 UI 还在收集它的时候
             // 就会把窗口关掉退出 —— 正常断连（_session 仍是这一代）才该关窗。
-            if (_session.value === session) sessionEnded.value = true
+            //
+            // 启动失败豁免（2026-10-09 真机）：**从未到过 STREAMING** 的会话断开不关窗。
+            // 否则"双击 exe 时手机端 app 还没启动" → Connection refused → 3 秒即整窗退出，
+            // 用户视角就是"闪退"（实测 desktop.log 09:23:37 全程）。窗口留着停在
+            // DISCONNECTED，用户开好手机端后点「应用并重连」即可。
+            if (_session.value === session && reachedStreaming.get()) sessionEnded.value = true
         }
 
         this.scope = scope
@@ -298,7 +308,14 @@ class DesktopApp(
             throw IOException("未开启 dev_mode，无法部署 VD server（无 Shizuku）")
         }
         val jarPath = response.vdServerJarPath.ifBlank { VdDeploy.JAR_PATH }
-        val deployed = adbDeployer.deploy(config, response.adbPort, jarPath) { log.info("adb", it) }
+        val deployed = adbDeployer.deploy(
+            config = config,
+            adbPort = response.adbPort,
+            jarPath = jarPath,
+            log = { log.info("adb", it) },
+            phoneVdWidth = response.vdWidth,
+            phoneVdHeight = response.vdHeight,
+        )
         if (!deployed) {
             throw IOException(
                 "ADB 部署 VD server 失败（详见上面的 adb 日志）—— " +

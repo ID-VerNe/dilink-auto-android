@@ -37,8 +37,18 @@ class AdbDeployer(
      * 但**不要**反复重试 —— 失败原因（没装 adb / 没开无线调试 / 不同网段）重试也不会变。
      *
      * @param jarPath 手机侧 vd-server.jar 的路径，取自握手响应的 `vdServerJarPath`。
+     * @param phoneVdWidth 手机侧握手响应建议的 VirtualDisplay 宽（防 IME 裁切）；
+     *   0 = 旧版手机未下发，回退视口尺寸。见 [AdbDeploy.plan]。
+     * @param phoneVdHeight 同上，高。
      */
-    fun deploy(config: DesktopConfig, adbPort: Int, jarPath: String, log: (String) -> Unit): Boolean {
+    fun deploy(
+        config: DesktopConfig,
+        adbPort: Int,
+        jarPath: String,
+        phoneVdWidth: Int = 0,
+        phoneVdHeight: Int = 0,
+        log: (String) -> Unit,
+    ): Boolean {
         val serial = AdbDeploy.serial(config.phoneHost, adbPort)
         log("ADB 部署：connect $serial")
         val connected = runner.run(
@@ -52,7 +62,7 @@ class AdbDeployer(
             return false
         }
 
-        val plan = AdbDeploy.plan(config, jarPath = jarPath)
+        val plan = AdbDeploy.plan(config, jarPath = jarPath, phoneVdWidth = phoneVdWidth, phoneVdHeight = phoneVdHeight)
         log("ADB 部署：kill 旧引擎")
 
         val executor = object : VdDeployExecutor {

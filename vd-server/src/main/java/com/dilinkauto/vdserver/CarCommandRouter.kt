@@ -1,5 +1,6 @@
 package com.dilinkauto.vdserver
 
+import com.dilinkauto.protocol.AppTargets
 import com.dilinkauto.protocol.ControlMsg
 import com.dilinkauto.protocol.FrameCodec
 import com.dilinkauto.protocol.LaunchAppMessage
@@ -99,11 +100,21 @@ internal class CarCommandRouter(
             val match = Regex("ActivityRecord\\{[^ ]+ [^ ]+ ([^/ ]+/[^ } ]+) t(\\d+)\\}").find(sec)
             val topComponent = match?.groupValues?.get(1)
             val taskId = match?.groupValues?.get(2)
-            if (topComponent != null && taskId != null && !topComponent.contains("launcher", true) && !topComponent.contains("systemui", true)) {
+            // 跳过自家控制端：DiLinkAuto 自己的 Activity 搬进 VD 没有镜像价值
+            // （用户在车机上看到"镜像的是镜像工具本身"），且它一旦成为 VD 上
+            // resumed 的 Activity 就踩 "no focused window" 输入派发超时 → ANR
+            // 弹窗；真机 2026-10-09：用户点 ANR 弹窗的"关闭应用"，顺带杀死整个
+            // 服务进程，全部连接断开（用户视角 = "点主页立马闪退"）。
+            // launcher / systemui 原本就跳过（搬了会遮挡用户 app）。
+            val isSelf = topComponent != null && topComponent.startsWith(SELF_PACKAGE + "/")
+            val skip = topComponent == null || taskId == null ||
+                topComponent.contains("launcher", true) ||
+                topComponent.contains("systemui", true) || isSelf
+            if (!skip) {
                 PipeLog.log("Moving app $topComponent (Task $taskId) from display $fromDisplay to $toDisplay")
                 exec("am display move-stack $taskId $toDisplay")
             } else {
-                PipeLog.log("moveTopApp: nothing to move (top=${topComponent ?: "<none>"}, task=${taskId ?: "-"})")
+                PipeLog.log("moveTopApp: nothing to move (top=${topComponent ?: "<none>"}, task=${taskId ?: "-"}, self=$isSelf)")
             }
         } catch (e: Exception) {
             PipeLog.err("Failed to move app: ${e.message}")
@@ -123,5 +134,14 @@ internal class CarCommandRouter(
         if (start < 0) return null
         val next = dump.indexOf("Display #", start + marker.length)
         return if (next >= 0) dump.substring(start, next) else dump.substring(start)
+    }
+
+    private companion object {
+        /**
+         * 手机控制端包名，从跨模块常量派生（见 [AppTargets] 的说明：applicationId
+         * 变更时集中在这里改，不在各模块散落硬编码）。[moveTopApp] 用它跳过
+         * 把控制端自身搬进 VD —— 理由见那段的注释。
+         */
+        val SELF_PACKAGE = AppTargets.PHONE_MAIN_ACTIVITY.substringBefore('/')
     }
 }

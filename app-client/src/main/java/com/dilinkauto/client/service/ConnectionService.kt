@@ -12,8 +12,11 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.util.DisplayMetrics
+import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import com.dilinkauto.client.ClientApp
 import com.dilinkauto.client.FileLog
@@ -42,8 +45,45 @@ class ConnectionService : Service() {
     private lateinit var carAppInstaller: CarAppInstaller
     private lateinit var appListBuilder: AppListBuilder
     private lateinit var displayRestorer: PhoneDisplayRestorer
-    private lateinit var assetDeployer: AssetDeployer
-    private lateinit var notifier: com.dilinkauto.protocol.ForegroundNotifier
+
+    /**
+     * 内嵌资产（vd-server.jar / app-server.apk）的部署器。
+     *
+     * **必须是 `by lazy`**：[deployAssets] 在 onCreate 早期就把它交给工作协程
+     * （`serviceScope.launch(Dispatchers.IO)`），而 onCreate 的主线程路径还要跑完
+     * 设备信息、IME 缓存等 IO 才轮到赋值 —— `lateinit` 版本在真机上被 worker
+     * 线程抢先访问，服务崩溃重启（2026-10-09 实测）。与 [notifier] 是同一次
+     * DRY 重构留下的同族问题，修法保持一致。
+     */
+    private val assetDeployer: AssetDeployer by lazy { AssetDeployer(applicationContext.assets) }
+
+    /**
+     * 前台通知 + wake lock 门面（DRY-6，与车机端共享）。
+     *
+     * **必须是 `by lazy`，不能是 `lateinit`**：`onCreate` 在初始化其余字段之前就会调
+     * [acquireWakeLock]（真机实测，2026-10-09），`lateinit` 版本会让服务一创建即抛
+     * `UninitializedPropertyAccessException`，AMS 随后把重启排到 30 分钟后 —— 表现为
+     * "装上后毫无反应"。lazy 把构造时机绑定到首次访问，访问顺序不再是隐式契约。
+     * 构造块只捕获参数、不做 Android API 调用（见 [ForegroundNotifier]），
+     * 首次访问时 Service 必已 attach，`getString` 可用。
+     */
+    private val notifier: com.dilinkauto.protocol.ForegroundNotifier by lazy {
+        // Stop action 是手机侧独有的；车机端没有面向用户的停止入口。
+        ForegroundNotifier(
+            context = this,
+            channelId = ClientApp.CHANNEL_SERVICE,
+            notificationId = NOTIFICATION_ID,
+            wakeLockTag = "DiLinkAuto::ConnectionService",
+            title = getString(R.string.notification_title),
+            text = { ctx, res -> ctx.getString(res) },
+            extraAction = ForegroundNotifier.stopAction(
+                iconRes = android.R.drawable.ic_media_pause,
+                label = getString(R.string.notification_action_stop),
+                serviceClass = ConnectionService::class.java,
+                action = ACTION_STOP
+            )
+        )
+    }
 
     enum class State { IDLE, WAITING, CONNECTED, STREAMING }
 
@@ -74,23 +114,6 @@ class ConnectionService : Service() {
         // No scope passed: the restorer owns a process-lifetime scope so a
         // Service.onDestroy() mid-restore cannot skip `cmd display power-on`.
         displayRestorer = PhoneDisplayRestorer(applicationContext)
-        assetDeployer = AssetDeployer(applicationContext.assets)
-        // Foreground plumbing shared with the car service (DRY-6). Only the
-        // Stop action is phone-specific; the car has no user-facing stop.
-        notifier = ForegroundNotifier(
-            context = this,
-            channelId = ClientApp.CHANNEL_SERVICE,
-            notificationId = NOTIFICATION_ID,
-            wakeLockTag = "DiLinkAuto::ConnectionService",
-            title = getString(R.string.notification_title),
-            text = { ctx, res -> ctx.getString(res) },
-            extraAction = ForegroundNotifier.stopAction(
-                iconRes = android.R.drawable.ic_media_pause,
-                label = getString(R.string.notification_action_stop),
-                serviceClass = ConnectionService::class.java,
-                action = ACTION_STOP
-            )
-        )
     }
 
     private fun cacheDefaultIme() {
@@ -274,6 +297,16 @@ class ConnectionService : Service() {
                 // Allowlist screen changed the selection — re-send so the car grid updates live.
                 appListBuilder.sendAppList(controlConnection)
             }
+            // START_STICKY 的系统重启以 **intent=null** 重新投递 onStartCommand。
+            // 此前没有 null 分支：AMS 重启进程后服务再也不会回到监听态（真机
+            // 2026-10-09 实测：08:42:12 进程被重启，日志只有设备信息 + 资产部署，
+            // 没有 "Listening for car connection"，9637-9639 全部无监听，直到
+            // 用户手动重开 app）。行为与 ACTION_START 等价；isActive 防重入。
+            null -> {
+                FileLog.i(TAG, "onStartCommand with null intent — system restart, resuming service")
+                startForeground(NOTIFICATION_ID, buildNotification(R.string.notification_waiting))
+                if (connectionLoopJob?.isActive != true) startConnectionLoop()
+            }
         }
         return START_STICKY
     }
@@ -367,6 +400,39 @@ class ConnectionService : Service() {
         }
     }
 
+    /**
+     * Real physical pixel size of the default display, bypassing compatibility
+     * scaling.
+     *
+     * **Why not `resources.displayMetrics`:** when the app is subject to
+     * screen-compat mode Android scales the reported metrics — the 2026-10-09
+     * test phone (real 1368x3192 @560dpi) reports a 2992px long edge there.
+     * Sizing the VD from it left the IME, whose width Chinese ROMs hardcode to
+     * the *true* physical width (and which ignores VD density entirely), 200px
+     * (~6.7%) wider than the VD at every DPI setting — the chopped-keyboard
+     * bug. `maximumWindowMetrics` (API 30+) / `getRealMetrics` (API 29) report
+     * the untouched physical size.
+     */
+    private fun realDisplaySize(): Pair<Int, Int> {
+        val wm = getSystemService(WindowManager::class.java)
+        if (wm != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val bounds = wm.maximumWindowMetrics.bounds
+            return bounds.width() to bounds.height()
+        }
+        @Suppress("DEPRECATION")
+        val display = wm?.defaultDisplay
+        if (display != null) {
+            val dm = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            display.getRealMetrics(dm)
+            return dm.widthPixels to dm.heightPixels
+        }
+        // No default display: fall back to compat metrics rather than crash
+        // the handshake — a slightly narrow VD degrades gracefully (cropped
+        // IME), an exception here kills the whole connection.
+        return resources.displayMetrics.let { it.widthPixels to it.heightPixels }
+    }
+
     private fun handleHandshake(request: HandshakeRequest) {
         val conn = controlConnection ?: return
         FileLog.i(TAG, "Car display: ${request.screenWidth}x${request.screenHeight} @${request.screenDpi}dpi fps=${request.targetFps} bitrate=${request.bitrate}")
@@ -392,10 +458,11 @@ class ConnectionService : Service() {
 
         // Create VD at car viewport size. The DPI/size computation (anti-crop
         // scale for Chinese-ROM IME hardcoding + DPI override vs. auto) lives
-        // in VdDimensions; see it for the rationale.
-        val dm = resources.displayMetrics
-        val (vdWidth, vdHeight, displayDpi) = VdDimensions.compute(request, dm)
-        FileLog.i(TAG, "VD: ${vdWidth}x${vdHeight} @${displayDpi}dpi (car reported ${request.screenDpi}dpi, override=${request.dpiOverride}, auto-calibrated optimal touch scale)")
+        // in VdDimensions (protocol-core); see it for the rationale. The phone
+        // side MUST be the real physical size — see [realDisplaySize].
+        val (phoneRealW, phoneRealH) = realDisplaySize()
+        val (vdWidth, vdHeight, displayDpi) = VdDimensions.compute(request, phoneRealW, phoneRealH)
+        FileLog.i(TAG, "VD: ${vdWidth}x${vdHeight} @${displayDpi}dpi (car ${request.screenWidth}x${request.screenHeight} @${request.screenDpi}dpi, phone real ${phoneRealW}x${phoneRealH}, override=${request.dpiOverride})")
 
         // Open lifecycle channel if not already open (survives re-handshakes)
         if (vdClient == null) {
@@ -440,7 +507,12 @@ class ConnectionService : Service() {
             adbPort = Ports.ADB_PORT,
             vdServerJarPath = vdJarPath,
             connectionMethod = connMethod,
-            vdDpi = displayDpi
+            vdDpi = displayDpi,
+            // 让无 Shizuku 的部署端（桌面 ADB 路径）也能用放大的 VD 尺寸防 IME
+            // 裁切——桌面自己的视口是编码尺寸，不是 VD 尺寸（2026-10-09 实锤：
+            // 桌面按 1280x720 建 VD，IME 1368px 键盘行被切 88px）。
+            vdWidth = vdWidth,
+            vdHeight = vdHeight
         )
         handshakeJob?.cancel()
         handshakeJob = serviceScope.launch(Dispatchers.IO) {

@@ -95,7 +95,9 @@ class MessagesTest {
             adbPort = 5555,
             vdServerJarPath = "/data/local/tmp/vd-server.jar",
             connectionMethod = CONNECTION_METHOD_USB_ADB,
-            vdDpi = 160
+            vdDpi = 160,
+            vdWidth = 3192,
+            vdHeight = 1794
         )
         val encoded = original.encode()
         val decoded = HandshakeResponse.decode(encoded)
@@ -110,6 +112,33 @@ class MessagesTest {
         assertEquals(original.vdServerJarPath, decoded.vdServerJarPath)
         assertEquals(original.connectionMethod, decoded.connectionMethod)
         assertEquals(original.vdDpi, decoded.vdDpi)
+        assertEquals(original.vdWidth, decoded.vdWidth)
+        assertEquals(original.vdHeight, decoded.vdHeight)
+    }
+
+    /**
+     * 旧对端兼容：payload 在 vdDpi 之后截断（老手机没编 vdWidth/vdHeight 字段）
+     * 时必须解出 0，而不是抛 BufferUnderflow。桌面部署路径以 0 为"回退本端视口"
+     * 的信号，见 AdbDeploy.plan。
+     */
+    @Test
+    fun testHandshakeResponseTrailingVdDimsDefaultToZeroOnLegacyPayload() {
+        val full = HandshakeResponse(
+            accepted = true,
+            deviceName = "OldPhone",
+            displayWidth = 1280,
+            displayHeight = 720,
+            vdDpi = 200,
+            vdWidth = 3192,
+            vdHeight = 1794
+        ).encode()
+        // 截到 vdDpi 字段末尾（丢弃 vdWidth/vdHeight）
+        val legacy = full.copyOfRange(0, full.size - 8)
+        val decoded = HandshakeResponse.decode(legacy)
+
+        assertEquals(200, decoded.vdDpi)
+        assertEquals(0, decoded.vdWidth)
+        assertEquals(0, decoded.vdHeight)
     }
 
     @Test

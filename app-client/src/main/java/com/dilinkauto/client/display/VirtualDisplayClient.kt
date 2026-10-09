@@ -9,6 +9,9 @@ import java.net.InetSocketAddress
 import java.nio.ByteBuffer
 import java.nio.channels.ServerSocketChannel
 import java.nio.channels.SocketChannel
+import java.util.concurrent.Callable
+import java.util.concurrent.FutureTask
+import java.util.concurrent.TimeUnit
 
 /**
  * Lifecycle channel to the VD server process running as shell UID.
@@ -160,6 +163,17 @@ class VirtualDisplayClient(
      * `readLifecycleCommands()` treats the resulting EOF/IOException exactly
      * like CMD_STOP (sets running=false → finally cleanup()), so the teardown
      * still happens; the caller just must not assume it was graceful.
+     *
+     * ── 为什么内部换成工作线程写 ──
+     * **主线程不能做 socket 写**：Android 会抛 `NetworkOnMainThreadException`。
+     * 真机 2026-10-09 实测每次 `cleanupSession()` 都抛（它跑在 `Dispatchers.Main`），
+     * 优雅 CMD_STOP **从未真正发出过**，每次都靠通道 EOF 或 shell kill 兜底 ——
+     * 日志里的 "NetworkOnMainThreadException" 就是它。
+     *
+     * 换线程而不是把调用方改成 suspend：`disconnect()` 必须在写之后**同步**执行
+     * （它释放 19647 的 ServerSocketChannel，re-handshake 路径紧接着就要重新
+     * bind），投递到异步 scope 会引入端口占用竞态。写线程用 `Future.get(timeout)`
+     * 同步汇合，对调用方保持"返回即已发出（或已失败）"的原语义。
      */
     fun stopVdServer(): Boolean {
         val ch = channel
@@ -167,21 +181,40 @@ class VirtualDisplayClient(
             FileLog.d(TAG, "stopVdServer: no lifecycle channel (displayId=$displayId) — engine will be stopped by the shell kill instead")
             return false
         }
-        return try {
-            synchronized(writeLock) {
-                writeBuf.clear()
-                writeBuf.put(VdLifecycle.CMD_STOP.toByte())
-                writeBuf.flip()
-                FrameCodec.writeAll(ch, writeBuf)
+        val write = FutureTask(Callable {
+            try {
+                synchronized(writeLock) {
+                    writeBuf.clear()
+                    writeBuf.put(VdLifecycle.CMD_STOP.toByte())
+                    writeBuf.flip()
+                    FrameCodec.writeAll(ch, writeBuf)
+                }
+                FileLog.i(TAG, "Sent CMD_STOP to VD server")
+                true
+            } catch (e: Exception) {
+                // Was `Failed to send CMD_STOP: null` in every teardown: writeAll's
+                // exception message is null on a closed socket, so the log looked
+                // like a no-op even though the graceful stop had already failed and
+                // the caller was about to escalate to pkill.
+                FileLog.w(TAG, "Failed to send CMD_STOP (${ch.isOpen}), falling back to shell kill: ${e.javaClass.simpleName}: ${e.message}")
+                false
             }
-            FileLog.i(TAG, "Sent CMD_STOP to VD server")
-            true
-        } catch (e: Exception) {
-            // Was `Failed to send CMD_STOP: null` in every teardown: writeAll's
-            // exception message is null on a closed socket, so the log looked
-            // like a no-op even though the graceful stop had already failed and
-            // the caller was about to escalate to pkill.
-            FileLog.w(TAG, "Failed to send CMD_STOP (${ch.isOpen}), falling back to shell kill: ${e.javaClass.simpleName}: ${e.message}")
+        })
+        val worker = Thread(write, "vd-cmd-stop").apply { isDaemon = true }
+        worker.start()
+        return try {
+            // 正常 1 字节写 <1ms；上限只兜底"对端 TCP 缓冲满"的病态场景
+            // （writeAll 自身有 5s deadline，超时后它自己收敛，不取消它）。
+            write.get(STOP_WRITE_JOIN_MS, TimeUnit.MILLISECONDS)
+        } catch (e: java.util.concurrent.TimeoutException) {
+            FileLog.w(TAG, "CMD_STOP write still blocked after ${STOP_WRITE_JOIN_MS}ms (send buffer full?) — channel close will unblock it")
+            false
+        } catch (e: java.util.concurrent.ExecutionException) {
+            // Callable 全路径自带 catch，这里只防御 JVM 级异常（OOM 等）。
+            FileLog.w(TAG, "CMD_STOP write task aborted: ${e.cause?.javaClass?.simpleName}")
+            false
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
             false
         }
     }
@@ -205,5 +238,12 @@ class VirtualDisplayClient(
         const val SERVER_PORT = com.dilinkauto.protocol.Ports.LIFECYCLE_PORT
         // Lifecycle wire constants (MSG_DISPLAY_READY / MSG_STACK_EMPTY / CMD_STOP)
         // live in com.dilinkauto.protocol.VdLifecycle — shared with vd-server.
+
+        /**
+         * [stopVdServer] 等待写线程汇合的毫秒上限。见该方法的线程说明：
+         * 等待只为把"写失败/缓冲满"与"写成功"区分开，超时后放行调用方
+         * （随之而来的 `disconnect()` 关 channel 会让写线程立即收敛）。
+         */
+        private const val STOP_WRITE_JOIN_MS = 1000L
     }
 }

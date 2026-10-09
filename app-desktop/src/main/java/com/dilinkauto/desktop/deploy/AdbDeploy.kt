@@ -2,6 +2,7 @@ package com.dilinkauto.desktop.deploy
 
 import com.dilinkauto.desktop.DesktopConfig
 import com.dilinkauto.desktop.HandshakeFactory
+import com.dilinkauto.protocol.DimAlign
 import com.dilinkauto.protocol.Ports
 import com.dilinkauto.protocol.VdDeploy
 import com.dilinkauto.protocol.VdDeployArgs
@@ -34,9 +35,15 @@ object AdbDeploy {
     /**
      * 构造 VD server 的部署计划。
      *
-     * 视口用握手时的偶数对齐结果（H.264 编码器要求偶数边长），DPI 见 [resolveDpi]。
-     * `phoneHost` 固定 127.0.0.1：VD server 与手机 app 同机，推流目标就是本机回环
-     * （与车机端 `VdServerDeployer` 一致）。
+     * **VD 尺寸 ≠ 编码尺寸**：编码尺寸（encodeWidth/Height）用本端视口（H.264
+     * 偶数对齐后），这是流的真实分辨率；而 VirtualDisplay 尺寸必须用手机侧
+     * 握手响应下发的 [phoneVdWidth]/[phoneVdHeight]（`VdDimensions.compute`
+     * 的输出——车机视口按手机真实物理长边放大的结果，防 Chinese-ROM IME 把
+     * 键盘按物理像素宽渲染到更窄的画布上）。2026-10-09 实锤：按视口 1280x720
+     * 建 VD 时，微信键道键盘行宽 1368px 被切 88px，且与 DPI 无关。两个字段
+     * 为 0（旧版手机不下发）时退回视口尺寸，保持旧行为。
+     * `phoneHost` 固定 127.0.0.1：VD server 与手机 app 同机，推流目标就是本机
+     * 回环（与车机端 `VdServerDeployer` 一致）。
      *
      * `background = false` 是硬约束：只有 `exec app_process` 才能让 adb shell 流
      * 在引擎存活期间保持附着；`&` 后台化会被 adbd 回收，表现为日志 0 字节、进程秒死。
@@ -47,17 +54,22 @@ object AdbDeploy {
     fun plan(
         config: DesktopConfig,
         jarPath: String = VdDeploy.JAR_PATH,
+        phoneVdWidth: Int = 0,
+        phoneVdHeight: Int = 0,
     ): VdDeploy.DeployPlan {
-        val width = HandshakeFactory.evenAlign(config.viewportWidth)
-        val height = HandshakeFactory.evenAlign(config.viewportHeight)
+        val encodeWidth = HandshakeFactory.evenAlign(config.viewportWidth)
+        val encodeHeight = HandshakeFactory.evenAlign(config.viewportHeight)
+        // 手机下发的 VD 尺寸优先（防 IME 裁切）；0/负值时退回视口。
+        val vdWidth = if (phoneVdWidth > 0) DimAlign.even(phoneVdWidth) else encodeWidth
+        val vdHeight = if (phoneVdHeight > 0) DimAlign.even(phoneVdHeight) else encodeHeight
         return VdDeploy.buildDeployPlan(
             jarPath = jarPath.ifBlank { VdDeploy.JAR_PATH },
             logPath = VdDeploy.LOG_PATH,
-            vdWidth = width,
-            vdHeight = height,
-            dpi = resolveDpi(config, width, height),
-            encodeWidth = width,
-            encodeHeight = height,
+            vdWidth = vdWidth,
+            vdHeight = vdHeight,
+            dpi = resolveDpi(config, vdWidth, vdHeight),
+            encodeWidth = encodeWidth,
+            encodeHeight = encodeHeight,
             phoneHost = "127.0.0.1",
             fps = config.targetFps,
             bitrate = config.bitrate,

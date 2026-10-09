@@ -66,7 +66,13 @@ class BlackScreenDetector(
             // 正常大小的 I 帧清空 streak 并重新武装升级。
             alerted = false
             tinyKeyframeStreak = 0
-            blackSinceMs = 0L
+            // 必须写 null，不能写 0L：nowMs 是进程相对时钟（桌面端 nanoTime、
+            // 车机端 elapsedRealtime 都是"开机/启动后的毫秒数"，量级数分钟起步），
+            // 0L 会让**紧跟着正常帧的那一帧微小关键帧**立即满足 `nowMs - 0 >= sustainMs`
+            // ——每次"正常帧 → 单帧微小"都误报"持续黑屏"。真机 2026-10-09 实测：
+            // 桌面端日志原话"连续 1 个微小关键帧且已持续 10000ms"，驱动 WIN-07
+            // 每 ~14s 一轮的重连风暴，两次自愈预算在没有真故障时就被烧光。
+            blackSinceMs = null
             recoveryFired = false
             return
         }

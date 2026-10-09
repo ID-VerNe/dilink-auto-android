@@ -92,10 +92,11 @@ Locates the car's ADB-over-WiFi service (port `5555`) for the "Install on Car" f
 
 ### VdDimensions
 
-Pure viewport math for the phone-side VirtualDisplay created in response to a `HandshakeRequest`. Extracted from `handleHandshake` so the rules can be read and tested without the rest of the handshake's side effects.
+Pure viewport math for the phone-side VirtualDisplay created in response to a `HandshakeRequest`. Lives in **protocol-core** (moved from app-client on 2026-10-09) so the rules can be read and tested as plain JVM code — the caller passes the phone's real physical pixel size, no Android types involved.
 
 - VD width/height start from the car viewport, even-aligned (H.264 needs even dimensions).
-- **Anti-crop scale**: if the car viewport is narrower than the phone's physical width, the VD is scaled up to match. Many Chinese ROMs (Meizu, Xiaomi) hardcode IME width to the physical display width; a narrower VD chops the keyboard horizontally. Scaling preserves the car's aspect ratio while satisfying the OS width requirement.
+- **Anti-crop scale**: if the car viewport is narrower than the phone's physical width (orientation-resolved: a portrait phone's long edge acts as the width for a landscape car), the VD is scaled up to match. Many Chinese ROMs (Meizu, Xiaomi) hardcode IME width to the physical display width, and the IME width does not follow VD density; a narrower VD chops the keyboard horizontally no matter what DPI is negotiated. Scaling preserves the car's aspect ratio while satisfying the OS width requirement.
+- **Real physical metrics only**: the phone size must come from `WindowManager.maximumWindowMetrics` (API 30+) / `Display.getRealMetrics` (API 29) — `resources.displayMetrics` reports compat-scaled values in screen-compat mode (Meizu 20 Inf: reports 2992 for a physically 3192px screen), which left the IME 200px (~6.7%) wider than the VD at every DPI setting.
 - **DPI**: a car-side `dpiOverride` (coerced to `[120, 480]` via `VdDeployArgs.coerceDpiOverride`) bypasses the portrait-app-safe cap; otherwise `VideoConfig.calculateOptimalDpi` auto-calibrates for a ~380dp logical width in landscape.
 - Returns `(vdWidth, vdHeight, dpi)` for the VD deploy args and the `VirtualDisplay` creation.
 

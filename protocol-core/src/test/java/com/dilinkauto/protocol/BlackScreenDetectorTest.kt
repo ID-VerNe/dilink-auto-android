@@ -117,6 +117,62 @@ class BlackScreenDetectorTest {
         assertEquals(1, fired)
     }
 
+    /**
+     * 回归（2026-10-09 真机）：正常帧之后的**第一帧**微小关键帧不得升级。
+     *
+     * 原实现把正常帧分支的 `blackSinceMs` 写成 `0L` 哨兵。真实时钟从不是 0
+     * 附近的小值 —— 桌面端用 `System.nanoTime()/1e6`、车机端用
+     * `SystemClock.elapsedRealtime()`，都是"进程/开机后的毫秒数"，随便就是
+     * 千万量级 —— 于是 `nowMs - 0 >= sustainMs` 对紧随其后的一帧立刻成立，
+     * 每轮"正常帧 → 单帧微小"都误报持续黑屏。真机日志原话：
+     * "连续 1 个微小关键帧且已持续 10000ms"。
+     *
+     * 所以本用例的关键是**大基线时钟**：`[nonKeyFramesAreIgnoredEntirely]` 等
+     * 既有用例都从 0 起步，恰好掩盖了这个缺陷。
+     */
+    @Test
+    fun singleTinyKeyframeAfterNormalFrameMustNotEscalateOnARealClock() {
+        var fired = 0
+        val d = detector(alertStreak = 3, sustainMs = 10_000L).apply {
+            onSustainedBlackScreen = { fired++ }
+        }
+        // 进程已运行 4 小时 —— nanoTime / elapsedRealtime 的真实量级。
+        val base = 4L * 60 * 60 * 1000
+        d.onFrame(true, 8192, base)             // normal frame
+        d.onFrame(true, tiny(), base + 33)      // 1st tiny frame of a new streak
+        assertEquals("a single tiny keyframe right after a normal frame must not escalate", 0, fired)
+        d.onFrame(true, tiny(), base + 2033)
+        assertEquals("still well under the 10s window", 0, fired)
+        d.onFrame(true, tiny(), base + 10_033)  // genuinely 10s of black
+        assertEquals(1, fired)
+    }
+
+    /**
+     * 大时钟下的完整生命周期：正常帧 → 短暂黑（不升级）→ 恢复正常 → 再黑白
+     * 并真正满窗（升级一次）。修复前的 `0L` 哨兵会在第一个短暂黑处就升级。
+     */
+    @Test
+    fun briefBlackFlashesOnARealClockOnlyEscalateWhenTheyActuallySustain() {
+        var fired = 0
+        val d = detector(alertStreak = 2, sustainMs = 5000L).apply {
+            onSustainedBlackScreen = { fired++ }
+        }
+        val base = 36L * 60 * 60 * 1000        // 36h uptime
+        d.onFrame(true, 8192, base)
+        // 一次 2 秒的短暂黑屏（正常帧间隔中的静止画面）。
+        d.onFrame(true, tiny(), base + 100)
+        d.onFrame(true, tiny(), base + 2100)
+        assertEquals(0, fired)
+        // 画面恢复。
+        d.onFrame(true, 8192, base + 2200)
+        // 又黑，这次满 5 秒。
+        d.onFrame(true, tiny(), base + 2300)
+        d.onFrame(true, tiny(), base + 5000)
+        assertEquals(0, fired)
+        d.onFrame(true, tiny(), base + 7400)   // 2300 + 5000 = 7300
+        assertEquals(1, fired)
+    }
+
     @Test
     fun resetReArmsEverythingIncludingTheEscalationLatch() {
         var fired = 0
