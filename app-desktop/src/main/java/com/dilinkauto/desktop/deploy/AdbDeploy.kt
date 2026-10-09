@@ -4,6 +4,8 @@ import com.dilinkauto.desktop.DesktopConfig
 import com.dilinkauto.desktop.HandshakeFactory
 import com.dilinkauto.protocol.Ports
 import com.dilinkauto.protocol.VdDeploy
+import com.dilinkauto.protocol.VdDeployArgs
+import com.dilinkauto.protocol.VideoConfig
 
 /**
  * ADB 部署路径的纯命令拼装（Phase 5c）。
@@ -32,9 +34,9 @@ object AdbDeploy {
     /**
      * 构造 VD server 的部署计划。
      *
-     * 视口用握手时的偶数对齐结果（H.264 编码器要求偶数边长），DPI 优先用
-     * 握手里的 `dpiOverride`。`phoneHost` 固定 127.0.0.1：VD server 与手机 app
-     * 同机，推流目标就是本机回环（与车机端 `VdServerDeployer` 一致）。
+     * 视口用握手时的偶数对齐结果（H.264 编码器要求偶数边长），DPI 见 [resolveDpi]。
+     * `phoneHost` 固定 127.0.0.1：VD server 与手机 app 同机，推流目标就是本机回环
+     * （与车机端 `VdServerDeployer` 一致）。
      *
      * `background = false` 是硬约束：只有 `exec app_process` 才能让 adb shell 流
      * 在引擎存活期间保持附着；`&` 后台化会被 adbd 回收，表现为日志 0 字节、进程秒死。
@@ -44,7 +46,6 @@ object AdbDeploy {
      */
     fun plan(
         config: DesktopConfig,
-        dpi: Int = resolveDpi(config),
         jarPath: String = VdDeploy.JAR_PATH,
     ): VdDeploy.DeployPlan {
         val width = HandshakeFactory.evenAlign(config.viewportWidth)
@@ -54,7 +55,7 @@ object AdbDeploy {
             logPath = VdDeploy.LOG_PATH,
             vdWidth = width,
             vdHeight = height,
-            dpi = dpi,
+            dpi = resolveDpi(config, width, height),
             encodeWidth = width,
             encodeHeight = height,
             phoneHost = "127.0.0.1",
@@ -64,7 +65,20 @@ object AdbDeploy {
         )
     }
 
-    /** 握手里的 `dpiOverride` 优先；为 0（自动）时用报给手机的 `screenDpi`。 */
-    fun resolveDpi(config: DesktopConfig): Int =
-        if (config.dpiOverride > 0) config.dpiOverride else config.screenDpi
+    /**
+     * 本次部署用的 DPI。
+     *
+     * 握手里的 `dpiOverride` 优先，且**按协议区间夹紧**（[VdDeployArgs.coerceDpiOverride]）：
+     * 桌面端以前直通不夹紧，同一个 UI 值在 Shizuku 路径落到 480、在 ADB 路径原样发 640
+     * （audit WIN-08）。为 0（自动）时用 [VideoConfig.calculateOptimalDpi] —— 与手机侧
+     * `VdDimensions` 的自动标定同一个函数，而不是直接拿 `screenDpi` 顶上去。
+     */
+    fun resolveDpi(config: DesktopConfig, vdWidth: Int, vdHeight: Int): Int {
+        val override = VdDeployArgs.coerceDpiOverride(config.dpiOverride)
+        return if (override > 0) {
+            override
+        } else {
+            VideoConfig.calculateOptimalDpi(vdWidth, vdHeight, config.screenDpi)
+        }
+    }
 }

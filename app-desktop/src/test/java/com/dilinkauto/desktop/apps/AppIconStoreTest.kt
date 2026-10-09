@@ -58,7 +58,7 @@ class AppIconStoreTest {
     }
 
     @Test
-    fun removeAndClear_dropEntries() {
+    fun remove_dropsOnlyThatEntry() {
         val store = AppIconStore()
         store.put("com.example.a", TestIcons.pngBytes())
         store.put("com.example.b", TestIcons.pngBytes())
@@ -67,9 +67,5 @@ class AppIconStoreTest {
         store.remove("com.example.a")
         assertNull(store.get("com.example.a"))
         assertNotNull(store.get("com.example.b"))
-
-        store.clear()
-        assertEquals(0, store.size)
-        assertNull(store.get("com.example.b"))
     }
 }

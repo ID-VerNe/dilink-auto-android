@@ -3,6 +3,7 @@ package com.dilinkauto.desktop.deploy
 import com.dilinkauto.desktop.DesktopConfig
 import com.dilinkauto.protocol.Ports
 import com.dilinkauto.protocol.VdDeploy
+import com.dilinkauto.protocol.VdDeployArgs
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -49,11 +50,39 @@ class AdbDeployTest {
     }
 
     @Test
-    fun `resolveDpi 在 override 为正时优先用它`() {
-        assertEquals(160, AdbDeploy.resolveDpi(config(dpiOverride = 0, screenDpi = 160)))
-        assertEquals(240, AdbDeploy.resolveDpi(config(dpiOverride = 240, screenDpi = 160)))
-        // 负数等同自动，退回 screenDpi
-        assertEquals(160, AdbDeploy.resolveDpi(config(dpiOverride = -1, screenDpi = 160)))
+    fun `resolveDpi override 为正时优先用它`() {
+        assertEquals(160, AdbDeploy.resolveDpi(config(dpiOverride = 0, screenDpi = 160), 1280, 720))
+        assertEquals(240, AdbDeploy.resolveDpi(config(dpiOverride = 240, screenDpi = 160), 1280, 720))
+        // 负数等同自动（与手机侧 coerceDpiOverride 同语义）
+        assertEquals(160, AdbDeploy.resolveDpi(config(dpiOverride = -1, screenDpi = 160), 1280, 720))
+    }
+
+    /**
+     * WIN-08：overrides 必须按协议区间（[VdDeployArgs] 的 120..480）夹紧。
+     * 此前直通不夹紧 —— 同一个 UI 值在 Shizuku 路径落到 480、在 ADB 路径原样发 640。
+     */
+    @Test
+    fun `resolveDpi 把 override 夹进协议区间`() {
+        assertEquals(
+            VdDeployArgs.DPI_OVERRIDE_MAX,
+            AdbDeploy.resolveDpi(config(dpiOverride = 640), 1280, 720),
+        )
+        assertEquals(
+            VdDeployArgs.DPI_OVERRIDE_MIN,
+            AdbDeploy.resolveDpi(config(dpiOverride = 50), 1280, 720),
+        )
+    }
+
+    /**
+     * WIN-08：自动（0）时用 [VideoConfig.calculateOptimalDpi] 按视口标定，
+     * 而不是把 `screenDpi` 原样顶上去 —— 与手机侧 `VdDimensions` 同一个函数。
+     */
+    @Test
+    fun `resolveDpi 自动时按视口标定`() {
+        // 1280x720 横屏、上报 160 → 落在 120..320 内取 min(160, maxSafe=160)
+        assertEquals(160, AdbDeploy.resolveDpi(config(dpiOverride = 0, screenDpi = 160), 1280, 720))
+        // 1920x1080 且手机没报 DPI → 黄金比例 (1080*0.52*160)/385 ≈ 233
+        assertEquals(233, AdbDeploy.resolveDpi(config(dpiOverride = 0, screenDpi = 0), 1920, 1080))
     }
 
     @Test
@@ -76,8 +105,15 @@ class AdbDeployTest {
 
         // VD server 与手机 app 同机，推流目标是回环（与车机端一致）
         assertTrue("推流地址应为 127.0.0.1: ${plan.args}", plan.args.contains(" 127.0.0.1 "))
-        assertTrue("应使用默认 jar: ${plan.launchCommand}", plan.launchCommand.contains("CLASSPATH=${VdDeploy.JAR_PATH}"))
-        assertTrue("日志应指向设备侧: ${plan.launchCommand}", plan.launchCommand.contains(VdDeploy.LOG_PATH))
+        // 路径一律 shell 引用（WIN-09）
+        assertTrue(
+            "应使用默认 jar（且被引用）: ${plan.launchCommand}",
+            plan.launchCommand.contains("CLASSPATH=${VdDeploy.shellQuote(VdDeploy.JAR_PATH)}"),
+        )
+        assertTrue(
+            "日志应指向设备侧（且被引用）: ${plan.launchCommand}",
+            plan.launchCommand.contains(VdDeploy.shellQuote(VdDeploy.LOG_PATH)),
+        )
         assertTrue("应含主类: ${plan.launchCommand}", plan.launchCommand.contains(VdDeploy.MAIN_CLASS))
     }
 
@@ -85,12 +121,12 @@ class AdbDeployTest {
     fun `plan 用握手响应里的 jar 路径`() {
         val jar = "/sdcard/DiLinkAuto/vd-server.jar"
         val plan = AdbDeploy.plan(config(), jarPath = jar)
-        assertTrue(plan.launchCommand.contains("CLASSPATH=$jar"))
+        assertTrue(plan.launchCommand.contains("CLASSPATH=${VdDeploy.shellQuote(jar)}"))
     }
 
     @Test
     fun `plan 对空 jar 路径回退到默认`() {
         val plan = AdbDeploy.plan(config(), jarPath = "   ")
-        assertTrue(plan.launchCommand.contains("CLASSPATH=${VdDeploy.JAR_PATH}"))
+        assertTrue(plan.launchCommand.contains("CLASSPATH=${VdDeploy.shellQuote(VdDeploy.JAR_PATH)}"))
     }
 }

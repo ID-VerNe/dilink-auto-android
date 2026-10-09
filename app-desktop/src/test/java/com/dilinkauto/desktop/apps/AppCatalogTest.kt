@@ -90,15 +90,4 @@ class AppCatalogTest {
 
         assertSame(before, catalog.apps.value)
     }
-
-    @Test
-    fun clear_emptiesList() {
-        val catalog = AppCatalog()
-        catalog.onAppList(AppListMessage(listOf(app("com.a", iconPng = TestIcons.pngBytes()))))
-        assertTrue(catalog.apps.value.isNotEmpty())
-
-        catalog.clear()
-
-        assertTrue(catalog.apps.value.isEmpty())
-    }
 }

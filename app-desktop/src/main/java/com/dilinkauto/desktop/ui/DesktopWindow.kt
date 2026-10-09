@@ -52,8 +52,12 @@ enum class DesktopView { MIRROR, APPS, DISPLAY }
  * 那里，UI 只负责"读状态、调方法"。会话代（[DesktopApp.Session]）变化时，
  * 视频组件按 generation 重建。
  *
+ * **视频面板只在"镜像"页组合**（audit WIN-01）：AWT 组件恒在 Compose 内容之上，
+ * 常驻组合会让「应用」「显示」两页被它盖住。
+ *
  * [DesktopApp.Session.sessionEnded] 变为 true 时自动关窗退出（手机断开/会话出错时
- * 不留一个空窗口）。
+ * 不留一个空窗口）。这个信号只由**没有被下一代顶替**的会话发出，所以"应用并重连"
+ * 不会误关窗口（audit WIN-04，判据在 [DesktopApp]）。
  *
  * 导航三键与车机端 `PersistentNavBar` 语义一致，但走输入口发
  * [com.dilinkauto.protocol.ControlMsg]：主页 = GO_HOME、返回 = GO_BACK、最近 = GO_RECENT。
@@ -67,13 +71,22 @@ fun DesktopWindow(app: DesktopApp, onClose: () -> Unit) {
     val appList by (session?.apps ?: NoApps).collectAsState()
 
     var view by remember { mutableStateOf(DesktopView.MIRROR) }
-    val windowState = rememberWindowState(size = DpSize(app.viewportWidth.dp, app.viewportHeight.dp))
+    // 窗口宽度额外加上导航栏（audit WIN-14）：视频面板占的是"窗口宽 − 导航栏宽"，
+    // 只有把导航栏算进去，这块区域才与握手视口同比例，画面不出现上下黑边。
+    val windowState = rememberWindowState(
+        size = DpSize(app.viewportWidth.dp + RAIL_WIDTH, app.viewportHeight.dp),
+    )
     var fullscreen by remember { mutableStateOf(false) }
-    val screens = remember { Screens.list() }
+    // 每次进入"显示"页重新枚举显示器（audit WIN-11）：拔插外接屏后列表要能刷出来；
+    // 只在首次组合时枚举一次的话，用户不重启应用就看不到新屏。
+    val screens = remember(view) { if (view == DesktopView.DISPLAY) Screens.list() else emptyList() }
 
     // 手机物理屏的"意图"状态。连上后 vd-server 会自动熄屏，所以每一代会话都从
     // "已熄屏"起步 —— 用 generation 当 key，重连后自动归位，不会留下上一代的残影。
     var phoneScreenOn by remember(session?.generation) { mutableStateOf(false) }
+
+    // 命令没进入输入通道时的提示（audit WIN-12）：此时开关不翻转，但要让用户知道原因。
+    var phoneScreenHint by remember(session?.generation) { mutableStateOf<String?>(null) }
 
     LaunchedEffect(ended) {
         if (ended) onClose()
@@ -114,9 +127,21 @@ fun DesktopWindow(app: DesktopApp, onClose: () -> Unit) {
                         style = TextStyle(color = Palette.TextDim, fontSize = 14.sp),
                         modifier = Modifier.align(Alignment.Center),
                     )
-                } else {
-                    // 镜像常驻组合：切到其它页时也不卸载 SwingPanel ——
-                    // 反复摘挂会让 Swing 组件失去父容器、画面尺寸抖动。
+                } else if (view == DesktopView.MIRROR) {
+                    // 只在"镜像"页组合视频面板（audit WIN-01）。
+                    //
+                    // AWT 组件恒在 Compose 内容之上，而 `SwingPanel` 的 background
+                    // 是画在它自己那层 JPanel 上的（容器不透明，`setBackground` 见
+                    // 1.6.2 的 `SwingPanel$5`），所以"把 videoView.isVisible 置 false"
+                    // 治不了遮挡 —— 黑 JPanel 还在。唯一可靠的做法是这一页之外
+                    // **根本不组合** SwingPanel。
+                    //
+                    // 摘挂是安全的：AWT 的 `Container.addImpl` 在 add 时会把组件从
+                    // 旧父容器移走（自动 reparent），`FocusSwitcher` 也不注册全局
+                    // 监听器（均以字节码核对过），因此不存在"失去父容器"或泄漏。
+                    // 不组合期间 `videoView.setFrame` 只是 repaint 空转，回到本页
+                    // 立刻显示最近一帧。
+                    //
                     // key(generation)：重连后换的是新的 videoView，必须让 SwingPanel 重建。
                     key(current.generation) {
                         SwingPanel(
@@ -144,6 +169,7 @@ fun DesktopWindow(app: DesktopApp, onClose: () -> Unit) {
                             keepAwake = keepAwake,
                             keepAwakeSupported = app.keepAwakeSupported,
                             phoneScreenOn = phoneScreenOn,
+                            phoneScreenHint = phoneScreenHint,
                             phoneScreenEnabled = current != null,
                         ),
                         onToggleFullscreen = ::setFullscreen,
@@ -154,8 +180,15 @@ fun DesktopWindow(app: DesktopApp, onClose: () -> Unit) {
                         },
                         onToggleKeepAwake = { app.setKeepAwake(it) },
                         onTogglePhoneScreen = { on ->
-                            phoneScreenOn = on
-                            session?.setDisplayPower(on)
+                            // 命令真的进了输入通道才翻转本地开关（audit WIN-12）：
+                            // 输入口未连上时 setDisplayPower 返回 false，若照翻，
+                            // 显示的"意图"就会与手机的真实状态长期不一致。
+                            if (session?.setDisplayPower(on) == true) {
+                                phoneScreenOn = on
+                                phoneScreenHint = null
+                            } else {
+                                phoneScreenHint = "开关未变：输入口尚未连上，请稍后重试"
+                            }
                         },
                         onApplyAndReconnect = { dpi, hwaccel ->
                             app.restart(dpiOverride = dpi, hwaccelEnabled = hwaccel)

@@ -96,7 +96,7 @@ class DesktopConnectionService(
             }
 
             setState(SessionState.WAITING_VD)
-            vdPortsBound.await()
+            awaitVdPortsBound()
             log("VD ports bound — connecting video(${config.videoPort}) / input(${config.inputPort})")
 
             setState(SessionState.STREAMING)
@@ -109,6 +109,30 @@ class DesktopConnectionService(
             log("session error: ${e.message}")
         } finally {
             teardown()
+        }
+    }
+
+    /**
+     * 等手机回 `VD_PORTS_BOUND`，**带超时**（audit WIN-06）。
+     *
+     * 手机侧只在**成功**时回这条（`app-client` 的 `handleHandshake` 在 display ready
+     * 时才发），部署失败没有任何回报，而控制口心跳会一直把 TCP 保活 —— 没有超时就会
+     * 永久停在 `WAITING_VD`，UI 上只有一句"正在连接 …"，看不出是在重试还是已经死了。
+     *
+     * 超时必须转成普通 [IOException]：`TimeoutCancellationException` 是
+     * `CancellationException` 的子类，会被 [runSession] 原样抛出，上层就再也收不到
+     * "会话结束"这个信号了。
+     */
+    private suspend fun awaitVdPortsBound() {
+        try {
+            withTimeout(VD_READY_TIMEOUT_MS) { vdPortsBound.await() }
+        } catch (e: TimeoutCancellationException) {
+            throw IOException(
+                "等待手机侧 VD 就绪超时（${VD_READY_TIMEOUT_MS / 1000}s）—— " +
+                    "手机侧只在成功绑定后才回 VD_PORTS_BOUND：请确认 Shizuku 可用" +
+                    "（否则需在 config.json 里设 \"dev_mode\": true 由本端用 adb 部署），" +
+                    "并检查手机侧 ${com.dilinkauto.protocol.VdDeploy.LOG_PATH}",
+            )
         }
     }
 
@@ -219,5 +243,16 @@ class DesktopConnectionService(
 
     private fun log(message: String) {
         onLog?.invoke(message)
+    }
+
+    private companion object {
+        /**
+         * 等 VD 就绪的上限（audit WIN-06）。
+         *
+         * 要覆盖"本端 adb 部署（connect + kill/wait + launch 几条命令，各带超时）
+         * → 手机起 VD → 编码器就绪"的总耗时，所以取 30s 而不是连接超时那种秒级值；
+         * 又要远小于"永久卡住"，让失败尽早变成一条可读的原因。
+         */
+        const val VD_READY_TIMEOUT_MS = 30_000L
     }
 }

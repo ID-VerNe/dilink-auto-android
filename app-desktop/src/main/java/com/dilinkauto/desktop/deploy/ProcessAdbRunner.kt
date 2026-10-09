@@ -1,5 +1,6 @@
 package com.dilinkauto.desktop.deploy
 
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 
@@ -9,6 +10,8 @@ import java.util.concurrent.TimeUnit
  * `waitForExit = false` 的进程（VD server 的 launch）会被一直持有，直到
  * [killAll] —— 这不是资源泄漏，而是协议要求：本地 adb 进程一退出，设备侧的
  * shell 流就断，`exec app_process` 起来的引擎会被 adbd 回收。
+ *
+ * JVM 退出时还有一道兜底（companion 里的 shutdown hook，audit WIN-03）。
  */
 class ProcessAdbRunner(
     private val adbPath: String = defaultAdbPath(),
@@ -49,6 +52,27 @@ class ProcessAdbRunner(
         streams.clear()
     }
 
+    /**
+     * 测试可见（audit WIN-15）：当前被持有、等待 [killAll] 的常驻进程快照。
+     *
+     * "持有的进程就是设备侧引擎的存活锚点"这条协议约定（见类 KDoc）没法用公共
+     * API 观察 —— 这里给测试一条只读支路，生产代码不要调用。
+     */
+    internal fun heldProcesses(): List<Process> = streams.toList()
+
+    /**
+     * 退出兜底：destroy 之后短暂等待每个进程真的消失。
+     *
+     * shutdown hook 一返回就允许 JVM 结束，而 [Process.destroy] 是异步的 ——
+     * 不等一下的话 adb.exe 可能比 JVM 活得久，那这道保险就等于没做（audit WIN-03）。
+     */
+    private fun killAllAndAwait(graceMs: Long) {
+        val held = streams.toList()
+        streams.clear()
+        held.forEach { runCatching { it.destroy() } }
+        held.forEach { runCatching { it.waitFor(graceMs, TimeUnit.MILLISECONDS) } }
+    }
+
     private fun drain(process: Process, onOutput: (String) -> Unit) {
         val reader = process.inputStream.bufferedReader()
         while (true) {
@@ -61,5 +85,24 @@ class ProcessAdbRunner(
         /** 允许用 `DILINK_ADB` 指定 adb 路径（SDK 没进 PATH 时最省事）。 */
         fun defaultAdbPath(): String =
             System.getenv("DILINK_ADB")?.takeIf { it.isNotBlank() } ?: "adb"
+
+        /** 已创建的实例（每个进程 1–2 个：DesktopApp / ProbeRunner 各一个）。 */
+        private val live = ConcurrentHashMap.newKeySet<ProcessAdbRunner>()
+
+        /** 兜底时等 adb.exe 退出的宽限时间。 */
+        private const val EXIT_GRACE_MS = 500L
+
+        init {
+            // JVM 退出兜底（audit WIN-03）：被持有的 adb.exe 在 Windows 上不随父进程退出，
+            // 而它顶着设备侧的 shell 流与 `exec app_process` 起的引擎。主路径仍是
+            // [AdbDeployer.close]（会话真正结束时调用），这里只处理"收尾被截断"的情况。
+            Runtime.getRuntime().addShutdownHook(
+                Thread({ live.forEach { runCatching { it.killAllAndAwait(EXIT_GRACE_MS) } } }, "adb-reaper"),
+            )
+        }
+    }
+
+    init {
+        live += this
     }
 }

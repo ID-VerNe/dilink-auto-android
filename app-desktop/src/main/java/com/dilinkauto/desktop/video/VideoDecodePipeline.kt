@@ -1,5 +1,6 @@
 package com.dilinkauto.desktop.video
 
+import com.dilinkauto.protocol.BlackScreenDetector
 import com.dilinkauto.protocol.FrameCodec
 import com.dilinkauto.protocol.H264NalParser
 import com.dilinkauto.protocol.VideoMsg
@@ -23,16 +24,36 @@ import java.util.concurrent.atomic.AtomicLong
  * [HardwareDecodeWatchdog] 判定"起来了但一帧都出不来"，则本次运行内永久回退软解
  * ——硬解失败通常是驱动/机器不支持，重试也不会好。
  *
+ * 持续黑屏（WIN-07）：与车机端共用 protocol-core 的 [BlackScreenDetector]，
+ * 命中后经 [onSustainedBlackScreen] 交给上层（桌面端的选择是"重建一代会话"）。
+ *
  * 职责边界（SRP）：本类只管"字节 → 图像"，不碰网络、不碰窗口；输出交给上层。
  * 线程约定：[feed] 由网络线程调用，[start]/[stop] 由控制线程调用，其余都在解码线程上。
+ * [onImage] 的投递是**借用语义**（回调返回即失效），见该字段的 KDoc。
  */
 class VideoDecodePipeline(
     /** 硬解加速器名（FFmpeg 的 `-hwaccel` 取值，如 "d3d11va"）；null = 纯软解。 */
     private val hwaccel: String? = null,
 ) {
-    /** 解码线程回调，每个解码出的画面调用一次。 */
+    /**
+     * 解码线程回调，每个解码出的画面调用一次。
+     *
+     * **契约**：回调返回前必须完成对这张图的消费（拷贝 / 编码 / 决定怎么画）——
+     * `Java2DFrameConverter` 对所有帧**复用同一张** `BufferedImage`（javap 反汇编
+     * javacv 1.5.10 证实），回调返回后它随时会被下一帧覆盖。要跨帧持有请自己拷贝
+     * （audit WIN-05；`SwingVideoView.setFrame` 就是这么做的）。
+     */
     var onImage: ((BufferedImage) -> Unit)? = null
     var onLog: ((String) -> Unit)? = null
+
+    /**
+     * 码流**持续**黑屏时触发一次（audit WIN-07）。
+     *
+     * 判据与车机端共用 protocol-core 的 [BlackScreenDetector]：编码器对接近纯色的
+     * 画面会输出极小的 I 帧，连续多个极小关键帧 + 持续满窗口 = 编码器/VirtualDisplay
+     * 卡死（TCP 仍通，所以不会有断开事件）。在**喂帧线程**上触发，实现方不得阻塞。
+     */
+    var onSustainedBlackScreen: (() -> Unit)? = null
 
     val framesDecoded = AtomicLong()
     val decoderRebuilds = AtomicLong()
@@ -51,6 +72,14 @@ class VideoDecodePipeline(
     /** 硬解起不来的判定器；只有配置了 [hwaccel] 时才参与。 */
     private val hardwareWatchdog = HardwareDecodeWatchdog()
 
+    /**
+     * 持续黑屏判定器。探测方法与车机端完全一致，只有持续窗口不同
+     * （[BLACK_SCREEN_SUSTAIN_MS] 比 protocol-core 的默认值长，见那里的说明）。
+     */
+    private val blackScreen = BlackScreenDetector().apply {
+        setSustainWindow(BLACK_SCREEN_SUSTAIN_MS)
+    }
+
     /** 最近一次收到的 CONFIG，供解码器重建时重放。 */
     @Volatile
     private var config: ByteArray? = null
@@ -64,6 +93,18 @@ class VideoDecodePipeline(
     @Volatile
     private var running = false
     private var decodeThread: Thread? = null
+
+    init {
+        // 检测器的升级出口在构造时绑一次（不像车机端那样每帧设/清）：
+        // 出口字段只有这一处写，喂帧路径就只剩一次 onFrame 调用。
+        blackScreen.onSustainedBlackScreen = {
+            log(
+                "疑似持续黑屏：连续 ${blackScreen.streak()} 个微小关键帧且已持续 " +
+                    "${blackScreen.sustainMs}ms（编码器或 VirtualDisplay 可能已卡死）",
+            )
+            onSustainedBlackScreen?.invoke()
+        }
+    }
 
     fun start() {
         if (running) return
@@ -83,7 +124,11 @@ class VideoDecodePipeline(
             config = frame.payload
             g.onConfig(frame.payload)
         } else {
-            g.onFrame(frame.payload, H264NalParser.isKeyFrame(frame.payload))
+            val isKeyFrame = H264NalParser.isKeyFrame(frame.payload)
+            g.onFrame(frame.payload, isKeyFrame)
+            // 持续黑屏判定与车机端同源（audit WIN-07）。放在喂帧路径上：这里本来就在
+            // 逐帧解析 NAL 头，顺带一次整数比较，比另起线程便宜。
+            blackScreen.onFrame(isKeyFrame, frame.payload.size)
         }
         checkHardwareFallback()
     }
@@ -215,6 +260,15 @@ class VideoDecodePipeline(
     companion object {
         /** Windows 上的 D3D11 硬解加速器名（FFmpeg 的 `-hwaccel` 取值）。 */
         const val HWACCEL_D3D11VA = "d3d11va"
+
+        /**
+         * 桌面端的持续黑屏窗口（audit WIN-07）。
+         *
+         * 比 protocol-core 的默认值（3s，车机端在用）长得多：桌面端命中后做的是
+         * **重连**，而重连本身要中断画面数秒。用户把手机停在一个暗色界面、或视频
+         * 暂停在全黑画面，同样会持续输出极小 I 帧 —— 长窗口让这类合法场景基本不命中。
+         */
+        const val BLACK_SCREEN_SUSTAIN_MS = 10_000L
 
         private const val STOP_JOIN_TIMEOUT_MS = 2_000L
         private const val REBUILD_BACKOFF_MS = 500L

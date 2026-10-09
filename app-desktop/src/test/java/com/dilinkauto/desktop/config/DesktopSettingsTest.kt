@@ -1,5 +1,6 @@
 package com.dilinkauto.desktop.config
 
+import com.dilinkauto.protocol.VdDeployArgs
 import com.dilinkauto.protocol.VideoConfig
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -100,7 +101,8 @@ class DesktopSettingsTest {
                 DesktopSettings.KEY_STARTUP_BITRATE to 1L,
             )
         )
-        assertEquals(640, s.startupDpi)
+        // DPI 按协议区间夹紧（WIN-08）：上限是 VdDeployArgs.DPI_OVERRIDE_MAX，不是本端自定的 640
+        assertEquals(VdDeployArgs.DPI_OVERRIDE_MAX, s.startupDpi)
         assertEquals(60, s.startupFps)
         assertEquals(500_000, s.startupBitrate)
     }

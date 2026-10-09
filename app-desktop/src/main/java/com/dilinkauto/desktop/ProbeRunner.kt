@@ -11,6 +11,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import java.io.IOException
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -24,6 +25,16 @@ internal class ProbeRunner(
     private val config: DesktopConfig,
     private val log: DesktopLog,
 ) {
+
+    /**
+     * **会话级持有**的 adb 部署器（audit WIN-02）。
+     *
+     * [AdbDeployer] 持有的本地 `adb shell` 进程**就是**设备侧引擎的存活锚点
+     * （见 `AdbRunner` 的硬约束注释），`close()` 一调即等于杀引擎。此前它在
+     * `deploy()` 返回时就被 `finally` 关掉 —— 而那一刻 VD server 刚启动，于是
+     * 引擎在绑定 9638/9639 之前被回收，探针的 ADB 分支 100% 不可用。
+     */
+    private val deployer = AdbDeployer()
 
     fun run() {
         val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -54,6 +65,9 @@ internal class ProbeRunner(
             runBlocking { service.runSession() }
         } catch (e: Exception) {
             log.error("session", "会话异常: ${e.message}")
+        } finally {
+            // 只有会话真正结束才释放 adb（audit WIN-02）——提前关会杀掉刚启动的引擎。
+            deployer.close()
         }
         log.info("session", "会话结束，收到视频帧总数=${frameCount.get()}")
         scope.cancel()
@@ -62,20 +76,19 @@ internal class ProbeRunner(
     /**
      * 探针模式没有配置面板，ADB 部署只能用环境变量 `DILINK_DEV_MODE=1` 显式开启
      * —— 不默认动用户的 adb（可能连到别的设备上）。
+     *
+     * 失败一律抛出终止会话（audit WIN-06）：手机侧只在成功时回 `VD_PORTS_BOUND`，
+     * 静默返回会让探针一直挂在那里打印 `fps=0`，看不出原因。
      */
     private suspend fun deployVdServer(response: HandshakeResponse) {
         if (System.getenv("DILINK_DEV_MODE") != "1") {
             log.warn(TAG, "手机无 Shizuku，且未设 DILINK_DEV_MODE=1 —— 无法部署 VD server")
-            return
+            throw IOException("未设 DILINK_DEV_MODE=1，无法部署 VD server")
         }
-        val deployer = AdbDeployer()
-        try {
-            val jarPath = response.vdServerJarPath.ifBlank { VdDeploy.JAR_PATH }
-            deployer.deploy(config, response.adbPort, jarPath) { log.info("adb", it) }
-        } finally {
-            // 探针模式没有会话级的收尾钩子，这里等会话结束后由 JVM 退出时释放；
-            // 显式关闭以免长驻 adb 进程把 shell 流挂着（会挡住手机侧回收 VD）。
-            deployer.close()
+        val jarPath = response.vdServerJarPath.ifBlank { VdDeploy.JAR_PATH }
+        val deployed = deployer.deploy(config, response.adbPort, jarPath) { log.info("adb", it) }
+        if (!deployed) {
+            throw IOException("ADB 部署 VD server 失败 —— 详见上面的 adb 日志")
         }
     }
 

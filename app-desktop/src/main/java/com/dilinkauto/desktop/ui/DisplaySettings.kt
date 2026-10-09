@@ -24,6 +24,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.dilinkauto.desktop.display.DesktopScreen
+import com.dilinkauto.protocol.VdDeployArgs
 
 /**
  * 显示面板要展示的全部状态。
@@ -44,6 +45,8 @@ data class DisplayPanelState(
     val keepAwakeSupported: Boolean,
     /** 手机**物理**屏的期望状态（连上后 vd-server 默认已熄屏，这里是"让它亮/灭"的意图）。 */
     val phoneScreenOn: Boolean,
+    /** 命令没进入输入通道时的提示（audit WIN-12）；null = 无需提示。 */
+    val phoneScreenHint: String? = null,
     /** 是否有活动会话可以下达屏幕电源命令（无会话时禁用开关）。 */
     val phoneScreenEnabled: Boolean,
 )
@@ -98,7 +101,7 @@ internal fun DisplaySettingsView(
 
         Spacer(Modifier.height(6.dp))
         SectionTitle("画质（改动需重连）")
-        Body("DPI 覆盖（0 = 手机自动标定）")
+        Body("DPI 覆盖（0 = 手机自动标定；有效范围 ${VdDeployArgs.DPI_OVERRIDE_MIN}–${VdDeployArgs.DPI_OVERRIDE_MAX}，越界会被夹紧）")
         BasicTextField(
             value = dpiText,
             onValueChange = { input -> dpiText = input.filter(Char::isDigit).take(3) },
@@ -151,5 +154,6 @@ internal fun DisplaySettingsView(
             onCheckedChange = onTogglePhoneScreen,
         )
         Body("连上后手机会自动熄屏；此开关用于中途手动点亮/熄灭（走输入口命令）。")
+        state.phoneScreenHint?.let { Body(it) }
     }
 }

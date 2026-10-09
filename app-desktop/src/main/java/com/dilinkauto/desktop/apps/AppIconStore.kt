@@ -45,9 +45,8 @@ class AppIconStore(
         icons.remove(packageName)
     }
 
-    fun clear() {
-        icons.clear()
-    }
+    // 没有 clear()：跨会话清缓存靠新建 store 实例（每代 AppCatalog 新的一个，
+    // 见 AppCatalog 的 KDoc）。此前那个只被测试调用的 clear() 已删（audit WIN-10）。
 
     /** 当前缓存的图标数（供日志/测试断言用）。 */
     val size: Int get() = icons.size

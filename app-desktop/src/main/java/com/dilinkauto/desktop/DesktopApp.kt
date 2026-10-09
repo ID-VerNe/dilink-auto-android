@@ -13,6 +13,7 @@ import com.dilinkauto.desktop.video.FrameDumper
 import com.dilinkauto.desktop.video.VideoDecodePipeline
 import com.dilinkauto.protocol.HandshakeResponse
 import com.dilinkauto.protocol.VdDeploy
+import com.dilinkauto.protocol.VdDeployArgs
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -22,8 +23,11 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.io.File
+import java.io.IOException
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * 窗口模式的运行时编排（组合根）。
@@ -34,7 +38,14 @@ import java.util.concurrent.atomic.AtomicBoolean
  * [Session.generation] 判断"画面组件要不要换"。
  *
  * 生命周期操作全部串行在一根专用线程上（[lifecycle]）：`stop()` 里会 join 解码
- * 线程，放在 UI 线程上点一下"应用"就会卡住窗口。
+ * 线程，放在 UI 线程上点一下"应用"就会卡住窗口。窗口关闭时的 [stop] 是**可等待**的
+ * ——调用方紧接着就 `exitProcess(0)`（audit WIN-03）。
+ *
+ * 三处"会话生命周期"的约定（都是踩过坑的，改动前先读）：
+ *  - 会话结束信号只由**未被下一代顶替**的那一代发出（audit WIN-04）：
+ *    [closeSession] 先摘 `_session`，协程侧再比对身份，避免"应用并重连"误关窗口；
+ *  - 部署失败/等待 VD 超时都会**终止会话**而不是静默挂着（audit WIN-06）；
+ *  - 持续黑屏最多自动重连 [MAX_BLACK_SCREEN_RECONNECTS] 次（audit WIN-07）。
  *
  * 职责边界：本类只管"把 [DesktopConnectionService] / [VideoDecodePipeline] /
  * [AppCatalog] / 窗口组件接起来"，协议、解码、渲染各自在自己的类里。
@@ -107,6 +118,14 @@ class DesktopApp(
     }
     private val stopped = AtomicBoolean(false)
 
+    /**
+     * 本进程内已自动发起的"持续黑屏重连"次数（audit WIN-07）。
+     *
+     * 全局计数而不是按会话：检测器的"只升级一次"闩锁每个新会话都会重置，
+     * 手机**合法地**显示暗色/黑屏时会一路重连下去。见 [onSustainedBlackScreen]。
+     */
+    private val blackScreenReconnects = AtomicInteger(0)
+
     private var scope: CoroutineScope? = null
     private var service: DesktopConnectionService? = null
     private var pipeline: VideoDecodePipeline? = null
@@ -123,7 +142,9 @@ class DesktopApp(
      */
     fun restart(dpiOverride: Int?, hwaccelEnabled: Boolean?) = lifecycle.execute {
         val next = settings.copy(
-            startupDpi = dpiOverride?.coerceIn(0, DesktopSettings.MAX_DPI) ?: settings.startupDpi,
+            // DPI 按协议区间夹紧（audit WIN-08）：区间单点定义在 VdDeployArgs，
+            // 桌面端此前自己夹 0..640，与手机侧 120..480 不一致。
+            startupDpi = dpiOverride?.let(VdDeployArgs::coerceDpiOverride) ?: settings.startupDpi,
             startupHwaccel = hwaccelEnabled ?: settings.startupHwaccel,
         )
         settings = next
@@ -145,12 +166,18 @@ class DesktopApp(
     }
 
     /** 关闭窗口时的收尾：停会话（触发手机回收 VD）→ 停解码 → 关闭所有后台资源。 */
-    fun stop() = lifecycle.execute {
-        if (!stopped.compareAndSet(false, true)) return@execute
-        closeSession()
-        keepAwake.close()
+    fun stop() {
+        // 可等待的收尾（audit WIN-03）：调用方（DesktopMain）紧接着就 exitProcess(0)，
+        // 异步提交会让 closeSession()（含解码线程 join，最坏 2s）与 adb 子进程清理
+        // 被 JVM 退出截断。注意：本方法不得在 [lifecycle] 线程上调用（会自等）。
+        val done = lifecycle.submit {
+            if (stopped.compareAndSet(false, true)) {
+                closeSession()
+                keepAwake.close()
+            }
+        }
+        runCatching { done.get(STOP_TIMEOUT_MS, TimeUnit.MILLISECONDS) }
         lifecycle.shutdown()
-        Unit
     }
 
     // ─── 会话代管理 ───
@@ -199,6 +226,8 @@ class DesktopApp(
                 videoView.setFrame(image)
                 dumper.maybeDump(image, framesDecoded.get())
             }
+            // WIN-07：码流持续黑屏（编码器卡死但 TCP 仍通）时升级到自动重连。
+            onSustainedBlackScreen = { onSustainedBlackScreen() }
         }
         service.onVideoFrame = { pipeline.feed(it) }
         pipeline.start()
@@ -222,7 +251,10 @@ class DesktopApp(
             service.runSession()
             log.info("session", "已结束（解码帧总数=${pipeline.framesDecoded.get()}）")
             keepAwake.disable()
-            sessionEnded.value = true
+            // 代际守卫（audit WIN-04）：只有**仍未被下一代顶替**的会话才把"结束"发给窗口。
+            // 「应用并重连」会先结束旧代、再建新代，旧代那个 true 落在 UI 还在收集它的时候
+            // 就会把窗口关掉退出 —— 正常断连（_session 仍是这一代）才该关窗。
+            if (_session.value === session) sessionEnded.value = true
         }
 
         this.scope = scope
@@ -233,6 +265,9 @@ class DesktopApp(
 
     private fun closeSession() {
         if (service == null && pipeline == null && scope == null) return
+        // 先摘掉"当前代"（audit WIN-04）：UI 立刻停止收集旧代的 sessionEnded，
+        // 与协程侧的代际守卫一起把误关窗的窗口压到最小。
+        _session.value = null
         // 顺序：先停会话（手机侧据此回收 VD），再停解码，最后收掉 adb 与协程域。
         runCatching { service?.stop() }
         runCatching { pipeline?.stop() }
@@ -242,25 +277,34 @@ class DesktopApp(
         service = null
         pipeline = null
         scope = null
-        _session.value = null
     }
 
     /**
      * Phase 5c：手机侧没有 Shizuku，VD server 转由本端部署。
      *
      * `dev_mode` 是关键闸门：没有它就不该悄悄调用户的 adb（可能连到别的设备上）。
+     *
+     * 部署失败必须**抛出去终止会话**（audit WIN-06）：手机侧只在成功时回
+     * `VD_PORTS_BOUND`，失败没有任何回报 —— 悄悄 return 会让会话与 UI 一起
+     * 停在"正在连接 …"，看不出是在重试还是已经死了。
      */
     private suspend fun deployVdServer(response: HandshakeResponse) {
         if (!settings.devMode) {
             log.warn(
                 TAG,
                 "手机无 Shizuku（method=${response.connectionMethod}）且未开启 dev_mode —— " +
-                    "无法部署 VD server，会话会停在等待 VD。请在 ${configFile.name} 里设 \"dev_mode\": true",
+                    "无法部署 VD server。请在 ${configFile.name} 里设 \"dev_mode\": true",
             )
-            return
+            throw IOException("未开启 dev_mode，无法部署 VD server（无 Shizuku）")
         }
         val jarPath = response.vdServerJarPath.ifBlank { VdDeploy.JAR_PATH }
-        adbDeployer.deploy(config, response.adbPort, jarPath) { log.info("adb", it) }
+        val deployed = adbDeployer.deploy(config, response.adbPort, jarPath) { log.info("adb", it) }
+        if (!deployed) {
+            throw IOException(
+                "ADB 部署 VD server 失败（详见上面的 adb 日志）—— " +
+                    "请确认手机已开「无线调试」、与 PC 同网段，且 PC 上有 adb.exe",
+            )
+        }
     }
 
     private fun applyKeepAwake() {
@@ -271,7 +315,39 @@ class DesktopApp(
         }
     }
 
+    /**
+     * 持续黑屏的升级动作（audit WIN-07）。
+     *
+     * 判据在 [VideoDecodePipeline]（与车机端共用 protocol-core 的 `BlackScreenDetector`）；
+     * 这里决定"怎么办"：**重新建一代会话**。`restart()` 会重新握手，而手机侧
+     * `handleHandshake` 每次都会拆掉旧 VirtualDisplay 再建新的 —— 这正是编码器/VD
+     * 卡死真正需要的那一步，桌面端自己没有重建 VD 的能力（只管收流）。
+     *
+     * 为什么要全局预算：手机**合法地**停在暗色界面（或全黑画面）同样会持续输出极小
+     * I 帧，而检测器的"只升级一次"闩锁是**按会话**重置的 —— 只靠它就会变成重连风暴。
+     * 预算用完后只记日志，把决定权交回用户（「显示」页的"应用并重连"）。
+     */
+    private fun onSustainedBlackScreen() {
+        val attempt = blackScreenReconnects.incrementAndGet()
+        if (attempt > MAX_BLACK_SCREEN_RECONNECTS) {
+            log.warn(
+                TAG,
+                "疑似持续黑屏：本进程内已自动重连 $MAX_BLACK_SCREEN_RECONNECTS 次，不再自动重试 —— " +
+                    "若画面确实卡住，请在「显示」页点「应用并重连」",
+            )
+            return
+        }
+        log.warn(TAG, "疑似持续黑屏：自动重连（第 $attempt/$MAX_BLACK_SCREEN_RECONNECTS 次）")
+        restart(dpiOverride = null, hwaccelEnabled = null)
+    }
+
     private companion object {
         const val TAG = "app"
+
+        /** [stop] 等待收尾的上限：解码线程 join 最坏 2s，再加 adb 子进程回收（audit WIN-03）。 */
+        const val STOP_TIMEOUT_MS = 5_000L
+
+        /** 本进程内允许自动发起的"持续黑屏重连"次数（audit WIN-07）。 */
+        const val MAX_BLACK_SCREEN_RECONNECTS = 2
     }
 }

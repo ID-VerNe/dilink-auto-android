@@ -1,6 +1,7 @@
 package com.dilinkauto.desktop.config
 
 import com.dilinkauto.protocol.AppPrefs
+import com.dilinkauto.protocol.VdDeployArgs
 import com.dilinkauto.protocol.VideoConfig
 
 /**
@@ -13,7 +14,7 @@ import com.dilinkauto.protocol.VideoConfig
  * |---|---|---|
  * | `dev_phone_ip` | 手机 IP | 命令行没传 IP 时的默认值 |
  * | `dev_mode` | 开发者模式 | Phase 5c 的 ADB 部署路径开关 |
- * | `startup_dpi` | 强制 DPI（0=自动） | 握手时的 `dpiOverride` |
+ * | `startup_dpi` | 强制 DPI（0=自动，或 120..480） | 握手时的 `dpiOverride` |
  * | `startup_fps` | 目标帧率 | 握手时的 `targetFps` |
  * | `startup_bitrate` | 目标码率 | 握手时的 `bitrate` |
  * | `startup_hwaccel` | 是否用 D3D11VA 硬解 | 解码管线构造参数（Phase 5b） |
@@ -58,9 +59,11 @@ data class DesktopSettings(
         const val KEY_STARTUP_HWACCEL = "startup_hwaccel"
         const val KEY_KEEP_AWAKE = "keep_awake"
 
-        /** DPI 合法区间：与手机侧 `VideoConfig` 的可接受范围一致，越界直接夹紧。 */
-        const val MAX_DPI = 640
-        private val DPI_RANGE = 0..MAX_DPI
+        /**
+         * DPI 覆盖的合法区间**单点定义在 protocol-core**（[VdDeployArgs]）：0 = 手机
+         * 自动标定，正数按 120..480 夹紧。桌面端此前自己写了一份 0..640，与协议不一致
+         * —— 同一个值在 Shizuku 路径落到 480、在 ADB 路径原样发 640（audit WIN-08）。
+         */
         private val FPS_RANGE = 5..60
         private val BITRATE_RANGE = 500_000..50_000_000
 
@@ -75,7 +78,9 @@ data class DesktopSettings(
             return DesktopSettings(
                 devPhoneIp = (values[KEY_DEV_PHONE_IP] as? String)?.trim().orEmpty(),
                 devMode = (values[KEY_DEV_MODE] as? Boolean) ?: defaults.devMode,
-                startupDpi = intValue(values[KEY_STARTUP_DPI], defaults.startupDpi).coerceIn(DPI_RANGE),
+                startupDpi = VdDeployArgs.coerceDpiOverride(
+                    intValue(values[KEY_STARTUP_DPI], defaults.startupDpi),
+                ),
                 startupFps = intValue(values[KEY_STARTUP_FPS], defaults.startupFps).coerceIn(FPS_RANGE),
                 startupBitrate = intValue(values[KEY_STARTUP_BITRATE], defaults.startupBitrate)
                     .coerceIn(BITRATE_RANGE),

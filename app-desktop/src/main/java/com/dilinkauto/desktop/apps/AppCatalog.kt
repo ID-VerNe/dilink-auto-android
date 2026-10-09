@@ -61,9 +61,6 @@ class AppCatalog(
         if (next.size != current.size) _apps.value = next
     }
 
-    /** 清空列表与图标缓存（会话切换时用）。 */
-    fun clear() {
-        icons.clear()
-        if (_apps.value.isNotEmpty()) _apps.value = emptyList()
-    }
+    // 会话切换不需要"清空"这一动作：DesktopApp.openSession() 每代新建一个 AppCatalog
+    // （图标缓存随之丢弃）。此前这里有个 clear() 从未被生产路径调用，已删（audit WIN-10）。
 }
