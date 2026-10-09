@@ -2,7 +2,6 @@ package com.dilinkauto.server.ui.screen
 
 import android.graphics.SurfaceTexture
 import android.view.MotionEvent
-import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
@@ -33,6 +32,11 @@ import com.dilinkauto.server.service.CarConnectionService
  * rendering with zero keyframe loss. handleDisconnect/shutdown owns the final
  * decoder stop.
  *
+ * Both callbacks are deliberately thin (audit S-M3): they forward to
+ * `CarConnectionService.onMirrorSurfaceCreated/Destroyed`, which hand the work
+ * to a service-side single-thread executor — MediaCodec create/configure must
+ * not run on the main thread that delivers these callbacks.
+ *
  * The persistent nav bar is a sibling (not overlapping) this composable in both
  * landscape and portrait layouts (MainActivity CarShell), so SurfaceView's
  * default z-order — surface below the window hierarchy — renders the nav bar
@@ -45,21 +49,12 @@ fun MirrorContent(service: CarConnectionService, visible: Boolean = true) {
             SurfaceView(context).apply {
                 holder.addCallback(object : SurfaceHolder.Callback {
                     override fun surfaceCreated(holder: SurfaceHolder) {
-                        val surface = holder.surface
-                        service.log("[MirrorScreen] SurfaceView surface created, decoder.isRunning=${service.videoDecoder.isRunning}")
-                        if (service.videoDecoder.isRunning) {
-                            // Decoder already running (survived a navigation hide/show
-                            // or early start on offscreen surface). Switch surface
-                            // without restarting — zero frame loss, zero keyframe drops.
-                            service.videoDecoder.switchSurface(surface)
-                            service.releaseOffscreenSurface()
-                            service.log("[MirrorScreen] Decoder surface switched to SurfaceView (no restart)")
-                        } else {
-                            // First start — decoder hasn't been created yet
-                            service.videoDecoder.start(surface, service.vdWidth, service.vdHeight, service.targetFps)
-                            service.releaseOffscreenSurface()
-                            service.log("[MirrorScreen] Decoder started on SurfaceView surface")
-                        }
+                        // Deliberately thin (audit S-M3): the callback fires on the
+                        // main thread and MediaCodec create/configure is expensive
+                        // enough to be visible as jank on the 8x A53 head unit.
+                        // The service hands the Surface to its single decoder
+                        // thread, which owns start/switchSurface.
+                        service.onMirrorSurfaceCreated(holder.surface)
                     }
 
                     override fun surfaceChanged(
@@ -79,8 +74,7 @@ fun MirrorContent(service: CarConnectionService, visible: Boolean = true) {
                         // drop the keyframe cache and require a fresh IDR. Just gate
                         // the render flag off; surfaceCreated will re-attach a new
                         // surface via setOutputSurface.
-                        service.videoDecoder.invalidateSurface()
-                        service.log("[MirrorScreen] SurfaceView surface destroyed — decoder stays running, render gated off")
+                        service.onMirrorSurfaceDestroyed()
                     }
                 })
 

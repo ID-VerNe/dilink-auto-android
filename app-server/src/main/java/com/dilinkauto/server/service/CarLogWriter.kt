@@ -52,6 +52,22 @@ internal class CarLogWriter(
     /** Release builds default to off; the phone toggles via LOG_TOGGLE. */
     fun setEnabled(value: Boolean) { enabled = value }
 
+    /**
+     * Start of a new session: drop anything buffered from the previous one.
+     *
+     * The offline buffer is only meaningful for the session that produced it —
+     * carrying 10k lines of a previous session's disconnect context into the
+     * next one wastes memory on a 4GB device and flushes stale context on
+     * reconnect (audit S-L4). Called by [CarConnectionService.startConnection].
+     *
+     * Deliberately does NOT clear [logQueue]: lines still queued there belong
+     * to the teardown that just finished and are worth shipping.
+     */
+    fun beginSession() {
+        while (true) { if (buffer.poll() == null) break }
+        bufferCount.set(0)
+    }
+
     /** Idempotent — safe to call from [CarConnectionService.onCreate]. */
     fun start() {
         if (started) return
@@ -102,6 +118,20 @@ internal class CarLogWriter(
         logQueue.offer(LogEntry(msg, level))
     }
 
-    /** Cancel the writer coroutine. Called from [CarConnectionService.shutdown]. */
-    fun shutdown() { writerJob.cancel() }
+    /**
+     * Cancel the writer coroutine and close the queue. Called from
+     * [CarConnectionService.shutdown].
+     *
+     * The queue must be closed, not just the job cancelled: a consumer parked
+     * in `take()` on cancel never drains, and an unclosed queue keeps every
+     * entry it holds alive for the rest of the process (audit S-L4).
+     */
+    fun shutdown() {
+        writerJob.cancel()
+        logQueue.close()
+        // Drop anything still buffered — the writer is gone, so flushing is
+        // impossible and the entries would otherwise pin memory forever.
+        while (true) { if (buffer.poll() == null) break }
+        bufferCount.set(0)
+    }
 }

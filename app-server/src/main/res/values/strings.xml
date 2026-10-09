@@ -122,6 +122,8 @@
     <string name="status_waiting_video">Waiting for video stream…</string>
     <string name="status_no_adb">Connect phone to car USB port</string>
     <string name="status_no_phone_ip">Could not determine phone IP address</string>
+    <string name="status_blank_host">Enter a phone address first</string>
+    <string name="status_bad_port">Port must be 1–65535</string>
 
     <!-- App Context Actions -->
     <string name="action_uninstall">Uninstall</string>
