@@ -18,8 +18,8 @@
 | [全项目安全审计](./audit-project-2026-10-09.md) | 开发者 | 5 agent 并行的全仓审计:威胁模型、六类系统根因(`S-A`~`S-F`)、CRITICAL/HIGH 明细与修复状态 |
 | [SRP / DRY 审计](./audit-srp-dry.md) | 开发者 | 第二轮 SRP/DRY 审计(~90 项,2026-10-08) |
 | [SRP / DRY 审计 Round 3](./audit-srp-dry-round3.md) | 开发者 | 第三轮 49 项的修复 pass(R3-SRP-01 / R3-SRP-02 为部分落地);`R3-*` 编号在代码注释中被多处引用 |
-| [UI / UX 审计](./audit-ui-ux.md) | 开发者 | 15 项无障碍 / 一致性问题及其修复 pass(2026-10-08) |
-| [桌面接收端审计](./audit-desktop.md) | 开发者 | `:app-desktop` 的代码审计与修复状态(15 项 `WIN-*`) |
+| [UI / UX 审计](./audit-ui-ux.md) | 开发者 | 15 项无障碍 / 一致性问题及其修复 pass(2026-10-08);**15 项全部闭环**(见报告尾注) |
+| [桌面接收端审计](./audit-desktop.md) | 开发者 | `:app-desktop` 的代码审计与修复状态(15 项 `WIN-*`);**15 项全部闭环**(见报告 §7) |
 | [功能提案:双模接收端](./FEATURE_DUAL_MODE_RECEIVER.md) | 开发者 | 接收端「模式」按钮提案(车机反向控制 / 代理转发);设计 + 可测核心已落地,上层接线与真机验证待办 |
 
 > Windows 接收端(`app-desktop/`)暂未单独成文档:模块说明、链路与打包命令见根目录 [README.md](../README.md) 的「Windows 接收端」一节,链路与设计决策见 [architecture.md](./architecture.md)。
@@ -36,7 +36,7 @@
 - **应用允许列表 + 应用置顶**:手机端选择推送到车机的应用,车机端长按置顶。
 - **车机端启动 DPI 覆盖**:解决 1280x800 默认 DPI 偏小。
 - **持续黑屏自愈**:判据在 `protocol-core`(`BlackScreenDetector`),车机端重握手、桌面端自动重连(有次数上限)。
-- **全模块单元测试**:6 个模块均有 `src/test`(此前 `vd-server` / `protocol` 为零覆盖),JUnit4 + kotlinx-coroutines-test,578 个 `@Test` 用例;其中 2026-10 的补齐与 seam 批次新增 24 个文件、183 个用例;清单与锁定的跨模块不变量见 [IMPLEMENTATION_REPORT_TESTING.md](./IMPLEMENTATION_REPORT_TESTING.md)。
+- **全模块单元测试**:6 个模块均有 `src/test`(此前 `vd-server` / `protocol` 为零覆盖),JUnit4 + kotlinx-coroutines-test,**611 个 `@Test` 用例 / 86 个测试文件**(Android 模块按 debug+release 双变体合计执行 862 个,2026-10-10 全绿);其中 2026-10 的补齐与 seam 批次新增 24 个文件、183 个用例,后续实机回归轮再增 4 个(`ShellSyncPointTest` / `StopRequestTest` / `EncoderCandidateOrderTest` / `RecentsParserTest`);清单与锁定的跨模块不变量见 [IMPLEMENTATION_REPORT_TESTING.md](./IMPLEMENTATION_REPORT_TESTING.md)。
 - **安全加固**:协议不再无条件信任对端(畸形帧不再杀进程、payload 上限 128MB → 16MB)、VD 通道鉴权、`VdDeploy` shell 引用、桌面端部署入参校验、release keystore 移出仓库;报告见 [audit-project-2026-10-09.md](./audit-project-2026-10-09.md)。
 - **简体中文**:client 和 server 都加了 `values-zh-rCN` / `values-zh`。
 

@@ -92,7 +92,7 @@ client 和 server 都加了 `values-zh-rCN` / `values-zh`。这是面向中国�
 - **`VideoDecoder.onSustainedBlackScreen`**:持续黑屏检测 —— 仅在连续 3 秒以上微小关键帧后才触发,3 帧的短暂黑帧(启动/重建时的正常瞬态)不会触发重连风暴。判定现由 `protocol-core` 的 `BlackScreenDetector` 承载(`BLACK_SCREEN_SUSTAIN_MS = 3000`),车机与桌面共用。
 - **`CarConnectionService.rehandshakeForBlackScreen()`**:检测到持续黑屏后,通过重新握手让手机重建 VD。`blackScreenRecoveryInFlight` 闩锁确保每次会话最多触发一次。
 - **`scripts/verify-blackscreen-fix.sh`**:自动化日志验证脚本,检查 VD 泄漏、cleanup 幂等、黑屏自愈、停机路径。
-- **`scripts/e2e-reconnect-cleanup.sh` / `scripts/verify-reconnect-cleanup.sh`**:**「应用并重连 + 关窗」收尾清理的端到端实机回归**(2026-10-10 MI 9 全流程自动化):预检 → 构建门 → APK 内嵌 dex 符号校验 → 装包重启 → 起桌面端 → UI 驱动重连/关窗 → 设备终态断言 → 日志离线断言(探针跃迁 ALIVE→GONE、必须「引擎已优雅退出」且无「强制 kill」、耗时 < 12s 预算、`__DILINK_SYNC__` 排水回显、`Cleanup complete`、`screen_off_timeout` 恢复非哨兵、二次握手)。
+- **`scripts/e2e-reconnect-cleanup.sh` / `scripts/verify-reconnect-cleanup.sh`**:**「应用并重连 + 关窗」收尾清理的端到端实机回归**(2026-10-10 MI 9 全流程自动化):预检 → 构建门 → APK 内嵌 dex 符号校验 → 装包重启 → 起桌面端 → UI 驱动重连/关窗 → 设备终态断言 → 日志离线断言(探针跃迁 ALIVE→GONE、必须「引擎已优雅退出」且无「强制 kill」、耗时 < 12s 预算、`__DILINK_SYNC__` 排水回显、`Cleanup complete`、`screen_off_timeout` 恢复非哨兵、二次握手)。**已实测(2026-10-10 终轮):32 项全过 / 0 失败 / 2m48s**。
 
 ### 11. Windows 接收端 `:app-desktop`(v0.18.0-dev-13 起)
 
