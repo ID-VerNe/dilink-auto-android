@@ -6,7 +6,7 @@
 
 实测车型:**比亚迪 秦PLUS DM-i 2023款 冠军版 55KM 领先型**。该款车机是 DiLink 4.0 低配方案 —— 骁龙 439(8x Cortex-A53 全小核、Adreno 505)、4GB RAM、16GB eMMC、1280x800 屏、仅 2.4GHz WiFi、Android 9 / API 28、H.264 硬件解码上限 1080p。本 fork 的性能调优全部围绕这套硬件展开。
 
-当前版本:**0.18.0-dev-13**。
+当前版本:**0.18.0-dev-13**(`versionCode 58`)。
 
 原本要解决的矛盾是:手机(小米 HyperOS 国行版等)装不了 Android Auto,而车机只支持 Android Auto —— 中间没有桥。DiLink-Auto 对任何 Android 10+ 手机都通用,有没有 Google 服务都行。
 
@@ -68,7 +68,7 @@ client 和 server 都加了 `values-zh-rCN` / `values-zh`。这是面向中国�
 
 最近一轮 4-agent 并行审计后的 DRY/SRP pass:跨模块共享常量(`AppPrefs`、`AppTargets`、`VdDeploy`、`VdDeployArgs`、`WifiGatewayIp`)、协作者提取(`ApkInstaller`、`AppListBuilder`、`AppVersion`、`CarLogWriter`、`CarTouchSender`、`HandshakeFactory`、`VdServerDeployer`、`PhoneDisplayRestorer`、`VdDimensions` 等)、大文件拆分(`CarConnectionService` 1237 → 1137 行)。DPI 范围 `120..480` 和 `app_process` argv tail 在 phone 和 car 之间共享同一份 `VdDeployArgs`。
 
-第三轮 SRP/DRY 审计(`docs/audit-srp-dry-round3.md`,49 项)已全部落地,其中第二轮遗留的 `CarConnectionService` 实际行数为 **1237**(README 曾误记为 1137),本轮降至 **1206**;`ConnectionService` 752 → 728,`PipelineServer` 523 → 383(抽出 `PersistentShell`/`CarCommandRouter`/`LifecycleWriter`),`AppListBuilder` 108 → 80。
+第三轮 SRP/DRY 审计(`docs/audit-srp-dry-round3.md`,49 项)的修复 pass 已基本全部落地(其中 R3-SRP-01 / R3-SRP-02 为部分落地,见报告 §6「未闭环项说明」),其中第二轮遗留的 `CarConnectionService` 实际行数为 **1237**(README 曾误记为 1137),本轮降至 **1206**;`ConnectionService` 752 → 728,`PipelineServer` 523 → 383(抽出 `PersistentShell`/`CarCommandRouter`/`LifecycleWriter`),`AppListBuilder` 108 → 80。
 
 ### 10. VD 泄漏修复 + 清理幂等 + 黑屏自愈(v0.18.0-dev-13)
 
@@ -86,7 +86,7 @@ client 和 server 都加了 `values-zh-rCN` / `values-zh`。这是面向中国�
 - **`PipelineServer.cleanup()` 重排序**:先重置全局 window/rotation 状态,再移回前台 app,再恢复面板/IME,最后释放线程/GL/编码器/VD。
 - **`VirtualDisplayCreator.create()` 拆分**:`create()` 不再调用 `configureDisplayEnvironment()`,新增 `configureEnvironment()` 方法 —— 必须在 `saveCurrentIme()` 快照**之后**调用,否则快照捕获的是自己的写入值。
 - **`DisplayPowerController.restoreSetting()`**:写入前验证值合理性(非空、非 null/undefined、数字 > 0),防止写入哨兵值。
-- **`VideoDecoder.onSustainedBlackScreen`**:持续黑屏检测 —— 仅在连续 5 秒以上微小关键帧后才触发,3 帧的短暂黑帧(启动/重建时的正常瞬态)不会触发重连风暴。
+- **`VideoDecoder.onSustainedBlackScreen`**:持续黑屏检测 —— 仅在连续 3 秒以上微小关键帧后才触发,3 帧的短暂黑帧(启动/重建时的正常瞬态)不会触发重连风暴。判定现由 `protocol-core` 的 `BlackScreenDetector` 承载(`BLACK_SCREEN_SUSTAIN_MS = 3000`),车机与桌面共用。
 - **`CarConnectionService.rehandshakeForBlackScreen()`**:检测到持续黑屏后,通过重新握手让手机重建 VD。`blackScreenRecoveryInFlight` 闩锁确保每次会话最多触发一次。
 - **`scripts/verify-blackscreen-fix.sh`**:自动化日志验证脚本,检查 VD 泄漏、cleanup 幂等、黑屏自愈、停机路径。
 
@@ -111,6 +111,22 @@ app-desktop --probe
 
 > 状态:Shizuku 路径与车机端同源;**ADB 部署路径尚未真机验证**(待办见 `.plan/windows-client-plan.md`)。
 
+### 12. 单元测试与安全加固(v0.18.0-dev-13 之后)
+
+**测试覆盖**:此前两个模块完全没有测试源集(`vd-server` 无 `src/test`、`protocol` 的 `src/test` 为空)。`8157c86` 起给 6 个模块补齐 JUnit4 单元测试 —— 新增 18 个测试文件、139 个用例,覆盖此前零覆盖的最高风险纯逻辑面(协议帧、ADB 加解密基元、VD 部署参数、自适应码率、shell 引用门、版本门槛、安装状态分类、崩溃报告格式),全部离线 Gradle 实测通过。之后又落地一组"为可测性重构"(5 个提交:`1b6092c` / `6d25390` / `fa00527` / `bbd6fe0` / `5d576e8`,均行为不变)再增 44 个用例(首批 139 + seam 批次 44 = 183)。当前 `src/test` 共 84 个文件、578 个 `@Test` 用例。测试栈是 JUnit4 + kotlinx-coroutines-test,**没有引入 Robolectric / Mockito / MockK**,Android 模块靠 `isReturnDefaultValues=true` 加手写假件。清单、锁定的跨模块不变量、遗留隐患见 [docs/IMPLEMENTATION_REPORT_TESTING.md](./docs/IMPLEMENTATION_REPORT_TESTING.md)。
+
+**协议层对端加固**(`a7d2b72`):此前每个 socket peer 都被当作自己人 —— 一个 6 字节的畸形帧就能杀死手机进程或 shell UID 的 VD server。现在五个解码器的裸 `getX()` 前都有 `require()` 预检;reader 协程改为捕获 `Throwable`、记录原因后断开,而不是让进程死掉;`MAX_PAYLOAD_SIZE` 从 128MB 降到 16MB,`NioReader` 缓冲有硬上限并在帧边界回收。
+
+**VD 通道鉴权**(`8601fb1`):VD server 的 9638/9639 原先对任意主机开放,同 WiFi 下的任何人都能以 shell UID 驱动触摸注入和 `am start` / `pm uninstall`。现在只接受正在服务的接收端发起的连接,被拒绝的对端会被关闭并继续等待真正的对端。
+
+**shell 引用**(`5eae3e7`):`VdDeploy` 命令行统一走 `shellQuote`,对端可控字符串不再裸进 `sh`。
+
+**桌面端**(`1f6836a`):把握手响应里的 `adbPort` / `jarPath` 直接用于部署(等于让任意对端执行任意代码)改为先校验;adb 子进程不再泄漏。
+
+**车机会话**(`bc2634c` / `35d7821`):会话改用 generation 闩锁,`cleanupGuard` 不再被"网络变化"路径提前消耗;黑屏自愈不再把解码器 `stop()`(停掉后没人重启它,恢复路径必然永久黑屏)。
+
+**发布供应链**:release keystore 曾入库,已改为只引用不提交、签名密钥走 CI secret(git 历史待清理);CI 不再在 self-hosted runner 上跑 PR 代码(`9517205`),也不再产出 unsigned / 被过度裁剪的 APK 与孤儿产物(`efde81f`)。
+
 ---
 
 ## 当前功能状态
@@ -129,7 +145,7 @@ app-desktop --probe
 - 简体中文 + 8 种其他语言(英、葡、俄、白俄、法、哈、乌、乌兹)
 - 直连 VD 架构:手机不做中继,视频/触摸直通
 - VD 泄漏修复:两阶段优雅停机、清理幂等 guard、VD 退出等待 —— 每次重连不再泄漏 VirtualDisplay
-- 黑屏自愈:车机端检测到持续 5 秒以上黑屏后自动重建 VD(重握手);持续黑屏判定已上移到 `protocol-core`,Windows 接收端用同一套判据
+- 黑屏自愈:车机端检测到持续 3 秒以上黑屏后触发重建 VD(重握手);持续黑屏判定已上移到 `protocol-core`,Windows 接收端用同一套判据(10 秒窗口)。恢复路径原先会 `stop()` 解码器却没人重启它,反而把屏幕永久留在黑屏 —— 已修(`35d7821`)
 - Windows 接收端(`app-desktop`):镜像窗口 + 鼠标触摸 + 应用启动器 + DPI/硬解面板 + adb 部署,`jpackage` 出免安装 app-image
 
 **已移除(相对 upstream):**
@@ -150,6 +166,8 @@ app-desktop --probe
 - 流式延迟在负载下约 100-200ms。
 - 部分应用不铺满屏幕(信箱化/仅竖屏)。DiLink-Auto 把横屏虚拟显示器镜像到车机,不支持横屏方向的应用会出现黑边 —— 这由应用自身决定,镜像侧无法解决。
 - API 26-28 车机上,若 DisplayControl 反射失败,`cmd display power-on/off` shell 回退也是 API 29+,物理面板可能无法恢复(会打日志,不再静默)。
+- 安装进度在中文等非英文界面语言下不显示 —— `InstallStatus.parse` 只按英文子串分类安装状态串,而状态串本身是本地化文案;中文界面下全部落入 `IDLE`,阶段勾选与错误颜色都不出现。已用测试固定现状,未修(`docs/IMPLEMENTATION_REPORT_TESTING.md` C-6)。
+- 车机应用首装在极端版本号下可能被跳过 —— 车机未安装时 `readInstalledVersion` 返回 `"0"`,若内嵌 `versionName` 也是 `0` / `0.0` / `0.0.0` 这种形式,比较结果会被判"已最新"而跳过首装。当前 `versionName` 为 `0.18.0-dev-13`,不触发(同上 C-5)。
 
 ---
 
@@ -211,6 +229,7 @@ DiLink-Auto/
 ├── app-server/     车机 APK —— UI、连接状态机、视频解码器
 ├── app-desktop/    Windows 接收端 —— 镜像窗口、FFmpeg 解码、adb 部署、jpackage 打包
 ├── vd-server/      VirtualDisplay server(编译成 JAR,手机部署)
+├── scripts/        脚本(黑屏修复日志验证等)
 ├── docs/           文档(多语言入口)
 └── gradle/         构建系统
 ```
@@ -234,21 +253,25 @@ DiLink-Auto/
 
 # APK 位置:
 # app-client/build/outputs/apk/debug/app-client-debug.apk  (手机端,内嵌车机 APK)
+
+# 单元测试(6 个模块,JUnit4 + kotlinx-coroutines-test,无 Robolectric/Mockito/MockK)
+./gradlew :protocol-core:test :protocol:test :vd-server:test :app-desktop:test
+./gradlew :app-client:testDebugUnitTest :app-server:testDebugUnitTest
 ```
 
-要求:JDK 17、Android SDK 34。release 构建需要 `RELEASE_KEYSTORE_PASSWORD` / `RELEASE_KEY_PASSWORD` 环境变量,否则生成 unsigned APK。
+要求:JDK 17、Android SDK 34。release 构建需要 `RELEASE_KEYSTORE_PASSWORD` / `RELEASE_KEY_PASSWORD` 环境变量(`RELEASE_KEYSTORE_FILE` / `RELEASE_KEY_ALIAS` 可选);缺任一必需变量都会在配置阶段直接失败,不再像过去那样静默产出装不上、也覆盖不了正式版的 unsigned APK。keystore 本身不入库,只以引用方式使用。
 
 ---
 
 ## 文档
 
-完整文档(setup、architecture、protocol、client、server、progress)入口在 [docs/README.md](./docs/README.md)。本 fork 的文档以英文为主,与根目录中文 README 互补。
+完整文档(setup、architecture、protocol、client、server、progress)入口在 [docs/README.md](./docs/README.md),该索引与全部文档均与本 fork 同步更新。语言分工:核心六篇(Setup / Architecture / Protocol / Client / Server / Progress)是英文,`audit-*` 与 `IMPLEMENTATION_REPORT_TESTING` 等审计 / 测试报告是中文;docs/README.md 本身是中文的开发者索引,与本节互补。
 
 ---
 
 ## 贡献
 
-PR 欢迎。本 fork 在 `main` 分支上开发(不再使用 upstream 的 git-flow develop 分支模型)。提交前请确认 `./gradlew :app-client:assembleDebug` 通过。
+PR 欢迎。本 fork 在 `main` 分支上开发(不再使用 upstream 的 git-flow develop 分支模型)。提交前请确认上面的 `./gradlew :app-client:assembleDebug` 与单元测试命令均通过。
 
 ---
 

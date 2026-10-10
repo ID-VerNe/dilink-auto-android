@@ -2,10 +2,10 @@
 
 ## Prerequisites
 
-- **Phone:** Any Android 10+ device with USB Debugging enabled
+- **Phone:** Any Android 10+ device (`minSdk 29`) with USB Debugging enabled
 - **Car:** BYD DiLink 3.0+ head unit running Android 8.0+ (API 26+). The car app targets `minSdk 26`; the protocol shared library has the same floor. Tested car: BYD Qin PLUS DM-i 2023 Champion 55KM Leading trim — DiLink 4.0 low-spec head unit (Snapdragon 439, 1280x800, Android 9 / API 28, 2.4GHz-only WiFi, H.264 hardware decode capped at 1080p). Other DiLink 3.0+ units should work but are not regularly exercised.
 - **USB cable:** Phone to car USB port (only required for the USB ADB track; the WiFi track is cable-free)
-- **Development:** Android Studio or Gradle, JDK 17
+- **Development:** Android Studio or Gradle, JDK 17, Android SDK Platform 34 (`compileSdk 34`)
 
 **No internet connection is required** — DiLink-Auto streams over your phone's WiFi hotspot (the car connects directly to the phone). An internet connection is only needed for the apps running on your phone (e.g., maps, music), not for DiLink-Auto itself.
 
@@ -85,7 +85,7 @@ What this means in practice:
 
 The `buildVdServer` task compiles `vd-server/` to `vd-server.dex`, packages it as `vd-server.jar`, and copies it into `app-client/src/main/assets/`. The `embedServerApk` task bundles `app-server.apk` into the client assets the same way. Only the phone APK needs to be installed manually — the car APK and VD server jar are pushed/embedded automatically.
 
-Release builds require the `RELEASE_KEYSTORE_PASSWORD` and `RELEASE_KEY_PASSWORD` environment variables to be set.
+Release builds require the `RELEASE_KEYSTORE_PASSWORD` and `RELEASE_KEY_PASSWORD` environment variables to be set; if either is missing the build fails immediately instead of producing an unsigned APK. The keystore itself is never committed — it lives only in CI secrets. Current version: `0.18.0-dev-13` (versionCode 58).
 
 ## How It Works
 
@@ -98,7 +98,7 @@ When the phone connects to the car:
 5. **Three-connection setup:** after handshake the car opens video (`9638`) and input (`9639`) connections; the VD server reverse-connects to the phone on localhost:`19647` for the lifecycle channel.
 6. **Phone deploys VD server** — extracts `vd-server.jar` to `/sdcard/DiLinkAuto/`, starts `app_process` as shell UID with the VD dimensions, DPI, encode dims, and FPS as args.
 7. **VD server creates the VirtualDisplay** at the negotiated DPI (Auto or override) and runs the GL pipeline: frame clock → GL render → encoder drain → TCP write, all on a single thread with `System.nanoTime()` / `LockSupport.parkNanos()` timing.
-8. **Video streams** over WiFi TCP on port `9638` — H.264 Main profile, 4 Mbps CBR, 24 fps, encode dimensions capped at 1920x1080. Adaptive bitrate falls back in 0.5 Mbps steps down to a 1.5 Mbps floor with a 2s recovery window.
+8. **Video streams** over WiFi TCP on port `9638` — H.264 Main profile, 4 Mbps CBR, 24 fps, encode dimensions capped at 1920x1080. Adaptive bitrate drops to 75% (never below a 1.5 Mbps floor) when the car stops draining, then climbs back in 0.5 Mbps steps after each 2s of clean writes.
 
 Port reference: `9637` control+data, `9638` video, `9639` touch input, `19647` lifecycle (VD server → phone localhost), `5555` ADB TCP.
 
@@ -128,7 +128,8 @@ If the dialog appears on the first connection after updating, check "Always allo
 - The VD server may need a moment to start — wait 5-10 seconds after connecting
 - On API 26-28 cars, `cmd display power-on/off` shell fallback is unavailable (API 29+ only); a DisplayControl reflection failure means the physical panel is not restored and the failure is now logged rather than silently masked. Check the log for `DisplayControl` errors.
 - Check `/sdcard/DiLinkAuto/client.log` for diagnostic information
-- **Sustained black screen (>5s)**: The car app now detects this automatically and requests a VD rebuild from the phone via re-handshake. Look for `[BLACK] requesting VD rebuild via re-handshake` in the logs. This should self-heal without manual intervention.
+- **If the VD server fails to launch** (e.g. Shizuku died mid-deploy), the phone now reports the failure honestly and ends the session instead of showing a false "started" state — look for `VD server launch failed` in `client.log`, restore Shizuku (or use the USB ADB track), and reconnect
+- **Sustained black screen (>3s)**: The car app now detects this automatically and requests a VD rebuild from the phone via re-handshake. Look for `[BLACK] requesting VD rebuild via re-handshake` in the logs. This should self-heal without manual intervention. The sustain window lives in `protocol-core` (`BlackScreenDetector.BLACK_SCREEN_SUSTAIN_MS = 3000`), shared with the Windows receiver (which uses a 10s window).
 
 ### Rotation causes a black screen mid-session
 
@@ -136,7 +137,7 @@ A race used to leave the decoder unable to restart after rotation: `onCarViewpor
 
 ### Connection drops
 
-- Reconnect attempts no longer kill an active session — the WiFi gateway retry loop stops after 3 consecutive ADB failures, and TCP ADB reconnects on phone IP change rather than tearing down the running stream.
+- Reconnect attempts no longer kill an active session — the car stops retrying after 3 consecutive no-ADB attempts (log: `No ADB after 3 attempts — stopping reconnect`), and TCP ADB reconnects on phone IP change rather than tearing down the running stream.
 - If persistent, check `/sdcard/DiLinkAuto/client.log` for "Network lost" entries.
 - **VD leak on reconnect**: Fixed in v0.18.0-dev-13. The old `pkill -9` skipped the JVM shutdown hook, so `PipelineServer.cleanup()` never ran — leaking a VirtualDisplay per reconnect and keeping the physical panel powered off. Now uses a two-stage stop (SIGTERM → wait → SIGKILL), waits for the old engine to exit before launching a replacement, and a cleanup idempotency guard prevents duplicate teardown. To verify the fix, use `scripts/verify-blackscreen-fix.sh` on a share-logs zip.
 
@@ -160,7 +161,7 @@ This is normal. DiLink-Auto mirrors apps onto a landscape virtual display that m
 - VD server logs: `/data/local/tmp/vd-server.log` (on phone, readable via ADB)
 - Car logs: routed to the phone's `client.log` via the protocol DATA channel (tag: `CarLog`)
 - Pull logs: `adb shell "cat /sdcard/DiLinkAuto/client.log"`
-- A debug diagnostic log toggle lives in Settings; when off, zero disk writes occur. It propagates to the car via the `LOG_TOGGLE` data message. Defaults: ON for debug/pre-release builds, OFF for release; the user choice persists.
+- The **Diagnostic logs** toggle lives in **Settings → Debug**. When off, no log lines are written to disk. The choice propagates to the car over the live control connection via the `LOG_TOGGLE` data message, so the car-side log relay (`carLogEnabled`) follows the phone's setting. Defaults: ON for debug/pre-release builds, OFF for release; once you toggle it, your choice persists.
 
 ## Verifying VD Leak Fix
 
@@ -172,10 +173,14 @@ bash scripts/verify-blackscreen-fix.sh /tmp/vdcheck
 ```
 
 The script checks:
-- **VD leak**: VD start count vs cleanup complete count (should be equal)
+- **VD leak**: VD start count vs cleanup complete count (should be equal); it also prints the displayId sequence, which should not keep climbing across reconnects
 - **Cleanup idempotency**: disconnect count vs "Force-waking physical display" count (should be ~1:1)
+- **Shizuku restore**: any `Shizuku display restore failed: Job was cancelled` line is flagged — a cancelled restore means the physical panel may have been left off
+- **Screen-timeout pollution**: the last `screen_off_timeout` write should not be the `2147483647` sentinel
 - **Black screen self-heal**: sustained black detection vs VD rebuild trigger
-- **Stop path audit**: CMD_STOP success/failure counts, VD exit probe results
+- **Stop path audit**: CMD_STOP success/failure counts, VD exit probe results, and "still alive after" timeout hits
+
+If `client.log` is missing (already rotated), the script falls back to the largest rotated `client-*.log` in the directory.
 
 Exit code 0 = all checks passed; 1 = one or more checks failed.
 

@@ -9,13 +9,15 @@
 
 | 模块 | 新增测试文件 | 覆盖的生产对象 | 用例数 |
 |---|---|---|---|
-| `:protocol` | `AdbProtocolTest`, `AdbCryptoTest` | ADB 帧头/magic/校验和/round-trip/常量；`bigIntToLEPadded`/`SHA1_DIGEST_INFO`/`fingerprint`/`signAuthToken`/`buildAuthReply` | 27 |
-| `:protocol-core` | `VideoConfigTest`, `VdDeployArgsFormatTest`, `ImeRestoreGuardTest`, `H264NalParserRefIdcTest`, `AsyncLogQueueTest`, `VdDeployConstantsTest`, `WifiGatewayIpTest` | `calculateOptimalDpi` 各分支；`VdDeployArgs.format` 布局/等比钳制/bitrate 边界；`shouldRestoreIme`；H264 `nal_ref_idc` 还原；`AsyncLogQueue` 溢出/FIFO/挂起/close；kill/stop/probe 命令逐字锁；网关 IP 字节序 | 33 |
-| `:vd-server` | `AdaptiveBitrateEdgeTest`, `DisplayPowerControllerRestoreTest`, `TouchInjectorFallbackTest`, `CarCommandRouterDispatchTest` | 自适应码率阈值边界/截断/sync latch；S-M10 哨兵回落 `restoreIme`；touch 归一化缩放+shell 回退；S-02 shell 引用/`am/pm/input` 命令路由/`SET_DISPLAY_POWER` | 27 |
-| `:app-client` | `VersioningTest`, `AppCategorizerTest`, `InstallStatusTest` | 版本 parse/compare（含哨兵/SNAPSHOT 边界）；app 分类有序关键字；安装状态串分类 + 阶段索引（含本地化漏判 hazard） | 41 |
+| `:protocol` | `AdbProtocolTest`, `AdbCryptoTest` | ADB 帧头/magic/校验和/round-trip/常量；`bigIntToLEPadded`/`SHA1_DIGEST_INFO`/`fingerprint`/`signAuthToken`/`buildAuthReply` | 25 |
+| `:protocol-core` | `VideoConfigTest`, `VdDeployArgsFormatTest`, `ImeRestoreGuardTest`, `H264NalParserRefIdcTest`, `AsyncLogQueueTest`, `VdDeployConstantsTest`, `WifiGatewayIpTest` | `calculateOptimalDpi` 各分支；`VdDeployArgs.format` 布局/等比钳制/bitrate 边界；`shouldRestoreIme`；H264 `nal_ref_idc` 还原；`AsyncLogQueue` 溢出/FIFO/挂起/close；kill/stop/probe 命令逐字锁；网关 IP 字节序 | 34 |
+| `:vd-server` | `AdaptiveBitrateEdgeTest`, `DisplayPowerControllerRestoreTest`, `TouchInjectorFallbackTest`, `CarCommandRouterDispatchTest` | 自适应码率阈值边界/截断/sync latch；S-M10 哨兵回落 `restoreIme`；touch 归一化缩放+shell 回退；S-02 shell 引用/`am/pm/input` 命令路由/`SET_DISPLAY_POWER` | 28 |
+| `:app-client` | `VersioningTest`, `AppCategorizerTest`, `InstallStatusTest` | 版本 parse/compare（含哨兵/SNAPSHOT 边界）；app 分类有序关键字；安装状态串分类 + 阶段索引（含本地化漏判 hazard） | 38 |
 | `:app-server` | `WifiGatewayProbeTest`, `CarCrashReportTest` | 网关查找取不到回落；崩溃报告格式契约（头/时间戳/线程/堆栈/Process State/Caused by/Suppressed） | 8 |
 | `:app-desktop` | `HandshakeFactoryTest`, `DesktopConfigTest` | 握手字段映射 + `evenAlign`（下限2、负值兜底）；配置默认值须来自协议常量 + `copy` 只改命名字段 | 6 |
-| 合计 | **18 个新文件** | | **约 142** |
+| 合计 | **18 个新文件** | | **139** |
+
+> 计数口径：以上为逐文件 `@Test` 注解实测计数（2026-10-10 复核），部分方法内含多断言。首批 139 + 后续 seam 批次 44 = 全批新增 **183**。
 
 ### build.gradle.kts 变更
 - `:protocol`：新增 `testOptions { unitTests.isReturnDefaultValues = true }` + `testImplementation("junit:junit:4.13.2")`（此前本模块**零测试源集**）。
@@ -55,8 +57,9 @@
 - ✅ **CarConnectionService** 提取 `reconnectBackoffMs`/`iconBudgetAccepts`（纯函数）：从未测的重连退避公式纳入回归。`6d25390`
 - ✅ **Connection** `start()` 注入 `heartbeatIntervalMs`/`heartbeatTimeoutMs`（默认仍 3s/10s）：心跳自动 ACK / 看门狗踢静默对端 / 活跃链路不误杀。`fa00527`
 - ✅ **AssetDeployer** `AssetSource` seam（`AssetManager` 是 final 无法子类）：vd-server.jar 的 CRC 新鲜度门 extract/ensureCurrent 全分支（含 A-L15 回退、tmp 不残留）。`bbd6fe0`
+- ✅ **CarConnectionService 安装流 `CarInstaller` seam**（app-client）：提取 `CarInstaller` 接口 + 纯函数 `parseInstalledVersion`，安装状态机（connect → 授权等待 → 版本判定 → 推送 install）全分支可测。`5d576e8`
 
-净增：以上 6 个约 +31 个测试方法；连同首批 148 个，合计 **约 179 个新测试方法**，全 6 模块离线 gradle 实测通过。
+净增：以上 7 个 seam 约 +44 个测试方法（含 `AdbCryptoTest` 追加用例）；连同首批 139 个，合计 **183 个新测试方法**，全 6 模块离线 gradle 实测通过。
 
 
 遵循"低风险、行为不变、配回归测试"原则，按 6 份审计报告的 refactor 清单推进：
@@ -68,4 +71,4 @@
 - `:vd-server`：`VirtualDisplayCreator.dtaAttached`、`GlPipeline.writeFrame`、`LifecycleWriter.encode`、`PipelineServer.displayReadyBytes/isAllowedPeer`（internal 化/提取）。
 
 ## 6. 结论
-已把此前**零覆盖或弱覆盖**的最高风险纯逻辑面（协议帧、加解密基元、部署参数、码率控制、shell 注入门、版本门槛、状态分类、崩溃格式、跨模块常量契约）用**约 142 个实测通过的测试**锁死，并为多处真实缺陷留下可执行的回归护栏与修复建议。后续按 §5 的 seam 清单继续深化，可在不改动对外行为的前提下把剩余分支/状态机逐一纳入回归网。
+已把此前**零覆盖或弱覆盖**的最高风险纯逻辑面（协议帧、加解密基元、部署参数、码率控制、shell 注入门、版本门槛、状态分类、崩溃格式、跨模块常量契约）用**183 个实测通过的测试**（首批 139 + seam 批次 44）锁死，并为多处真实缺陷留下可执行的回归护栏与修复建议。后续按 §5 的 seam 清单继续深化，可在不改动对外行为的前提下把剩余分支/状态机逐一纳入回归网。

@@ -12,9 +12,9 @@ DiLink-Auto uses a custom binary protocol over **3 dedicated TCP connections** b
 | **Lifecycle** | 19647 | VD server -> Phone (localhost) | Display ready / stack empty / stop signals |
 | **ADB TCP** | 5555 | Car -> Phone (or Phone -> Car for dadb) | Persistent single-socket ADB for shell commands and car APK install |
 
-The VD server binds the video and input ports directly on `0.0.0.0:9638` and `0.0.0.0:9639`, so video frames and touch events flow directly between the VD server and the car without phone-side relaying. The phone app is not on the video or input data path.
+The VD server binds the video and input ports directly on `0.0.0.0:9638` and `0.0.0.0:9639`, so video frames and touch events flow directly between the VD server and the car without phone-side relaying. The phone app is not on the video or input data path. A deploy site that knows its own outbound address can pass a receiver IP in the trailing `CAR_HOST` argv slot (`VdDeployArgs.CAR_HOST_ANY` = `-` keeps the accept-any behaviour), which pins those two accepts to the peer the engine actually serves.
 
-The control connection (9637) is established first and carries the handshake, heartbeat, app commands, and the DATA channel (app list, car logs, media metadata). After handshake the phone deploys the VD server, which binds 9638/9639 and reverse-connects to the phone on `localhost:19647`. When the VD server signals display-ready on the lifecycle channel, the phone sends `VD_PORTS_BOUND` to the car on the control connection; only then does the car open video (9638) and input (9639) connections to the VD server. Heartbeat/watchdog runs only on the control connection; video and input have no heartbeat overhead. Any connection dying cascades to full session teardown.
+The control connection (9637) is established first and carries the handshake, heartbeat, app commands, and the DATA channel (app list, car logs, media metadata). After handshake the phone deploys the VD server, which binds 9638/9639 and reverse-connects to the phone on `localhost:19647`. When the VD server signals display-ready on the lifecycle channel, the phone sends `VD_PORTS_BOUND` to the car on the control connection; only then does the car open video (9638) and input (9639) connections to the VD server. Heartbeat/watchdog runs only on the control connection; video and input have no heartbeat overhead, but every connection still inherits the reader's mid-frame stall deadline (see [NioReader stalls](#wire-format)). Any connection dying cascades to full session teardown.
 
 The lifecycle channel on `localhost:19647` is documented in [client.md](./client.md). It uses a small fixed message set (`MSG_DISPLAY_READY`, `MSG_STACK_EMPTY`, `CMD_STOP`) and is the only channel the VD server reverse-initiates to the phone.
 
@@ -28,13 +28,19 @@ The lifecycle channel on `localhost:19647` is documented in [client.md](./client
 +-----------------+------------+--------------+-----------------+
 ```
 
-- **Frame Length**: `uint32` big-endian. Value = `2 + payload_size` (does not include the 4-byte length field itself).
-- **Max payload**: 128 MB (`FrameCodec.MAX_PAYLOAD_SIZE`).
+- **Frame Length**: `uint32` big-endian. Value = `2 + payload_size` (does not include the 4-byte length field itself). A declared length below `2` is rejected (`Frame too small`).
+- **Max payload**: 16 MB (`FrameCodec.MAX_PAYLOAD_SIZE`). The old 128 MB value let a 7-byte header force ~256 MB of allocation (payload `ByteArray` plus the `NioReader` grow-on-demand buffer) on the phone and on the shell-UID vd-server; 16 MB leaves 8x headroom over a 1080p keyframe and turns the same hostile header into a 32 MB event that both sides survive.
 - **Header overhead**: 6 bytes per frame (`FrameCodec.HEADER_SIZE`).
-- **Header encoding**: big-endian. The `FrameCodec` encodes the length as 4 big-endian bytes followed by the 1-byte channel ID and 1-byte message type. A `ThreadLocal` 6-byte header buffer avoids per-frame allocation.
-- **Write path**: a single dedicated writer coroutine drains a bounded `Channel<Frame>` of size 64 with `BufferOverflow.SUSPEND`, so a slow TCP consumer applies backpressure to readers instead of growing unbounded. Gathering writes (`channel.write(ByteBuffer[])`) combine header + payload into one syscall.
-- **Read path**: `FrameCodec.readFrame(NioReader)` for coroutine callers (phone, car) and `FrameCodec.readFrameBlocking(NioReader)` for non-coroutine callers (VD server). Both share the same payload-size validation.
-- **Write timeout**: `FrameCodec.writeAll` throws if no progress is made for 5 seconds (send buffer full / peer not reading).
+- **Header encoding**: big-endian. `FrameCodec.encodeHeaderInto` is the single definition of the 6-byte layout, shared by `writeFrame`, `writeFrameToChannel` and the `Connection` write coroutine; a `ThreadLocal` 6-byte header buffer avoids per-frame allocation.
+- **Write path**: a single dedicated writer coroutine drains a bounded `Channel<Frame>` of size 64 with `BufferOverflow.SUSPEND`, so a slow TCP consumer applies backpressure to readers instead of growing unbounded. Gathering writes (`channel.write(ByteBuffer[])`) combine header + payload into one syscall. Enqueue order is pinned by a single-thread `sendDispatcher` plus a `sendMutex`: without the lock, `limitedParallelism(1)` serialises dispatch but not suspension, so a full queue reordered touch DOWN/MOVE/UP exactly when the link was congested.
+- **Read path**: `FrameCodec.readFrame(NioReader)` (suspend) for coroutine callers (phone, car); `FrameCodec.readFrame(InputStream)` and `FrameCodec.readFrameBlocking(NioReader)` for blocking callers (VD server). The two blocking variants share one `readFrameCore` skeleton, and every path validates the declared payload size through the same `validatePayloadSize` before allocating anything.
+- **Reader buffer ceiling**: `NioReader.MAX_READ_UNIT` = `HEADER_SIZE + MAX_PAYLOAD_SIZE` is a hard ceiling for a single grow; `maybeShrink()` at each frame boundary drops an oversized buffer back to `DEFAULT_CAPACITY` (128 KB) so one big frame does not pin memory for the session.
+- **NioReader stalls**: `readStallTimeoutMs` (10 s on every `Connection`) fails a read that stalls *mid-frame* — partial bytes already buffered, then silence (half-open TCP, killed peer). An idle wait at a clean frame boundary (touch link with no user input) deliberately arms nothing and is never timed out.
+- **Write timeout**: `FrameCodec.writeAll` throws if no progress is made for 5 seconds (send buffer full / peer not reading). The `Connection` writer coroutine has no deadline of its own — the watchdog owns dead connections.
+- **Graceful close**: a clean peer EOF (`reader: EOF`) flushes already-queued frames for `FLUSH_GRACE_MS` (500 ms) before the writer is cancelled and the socket closed, so a `DISCONNECT` followed by FIN still delivers queued replies.
+- **Connect deadline**: `Connection.connect` fails after `CONNECT_TIMEOUT_MS` (10 s) instead of spinning `finishConnect()` forever on a black-holed SYN.
+- **Version check**: `requireSupportedProtocolVersion` rejects any `protocolVersion` != `PROTOCOL_VERSION` with `ProtocolDecodeException`. The field used to be carried and never validated, which decoded trailing fields at the wrong offsets.
+- **Large-frame logging**: frames above 8 MB log one warning per stream (a 1080p keyframe is ~1 MB). The previous 100 KB threshold logged once per GOP on both ends.
 
 ## Channels
 
@@ -46,7 +52,7 @@ The lifecycle channel on `localhost:19647` is documented in [client.md](./client
 | 3 | DATA | Control (9637) | Bidirectional | App list, app info data, car logs, media metadata, log toggle |
 | 4 | INPUT | Input (9639) | Car -> VD server | Touch events (batched MOVE for multi-touch) |
 
-The DATA channel multiplexes on the same TCP socket as CONTROL. Video frames are dispatched inline on the reader thread for low latency; DATA and CONTROL frames are dispatched to a coroutine scope so heavy processing (e.g., app list decode) does not block the reader from draining TCP.
+The DATA channel multiplexes on the same TCP socket as CONTROL. VIDEO, INPUT and CONTROL frames are dispatched inline on the reader thread for low latency and for arrival order (touch DOWN/MOVE/UP and navigation commands are order-sensitive); only DATA is dispatched to a coroutine scope, because app-list decode is the one heavy handler that must not stop the reader draining TCP. A frame listener that throws (a decoder raising `ProtocolDecodeException` or `BufferUnderflowException` on a malformed peer payload) fails the connection with a logged reason instead of killing the reader coroutine — there is no `CoroutineExceptionHandler` anywhere in this repo.
 
 ## Control Channel (0x00)
 
@@ -67,10 +73,15 @@ The DATA channel multiplexes on the same TCP socket as CONTROL. Video frames are
 | appVersionName len   | int16  |  version name string length
 | appVersionName       | UTF-8  |  car app version name
 | dpiOverride          | int32  |  trailing field, default 0
+| bitrate              | int32  |  trailing field, target bitrate in bps, default 0
 +----------------------+--------+
 ```
 
+Both trailing fields are appended after `appVersionName` and decode as `0` when absent, so older peers interoperate: a missing `dpiOverride` means auto-calibrate, a missing `bitrate` means the 4 Mbps default.
+
 `dpiOverride` is a trailing field. `0` means auto-calibrate via `VideoConfig.calculateOptimalDpi` (the portrait-app-safe cap). A non-zero value in `[120, 480]` bypasses the cap and is used verbatim, fixing "UI too small" for landscape apps at the cost of squeezing portrait-only apps. The decoder's remaining-bytes guard reads `0` when the field is absent, so older car peers that do not send it decode as auto. The car coerces input through `VdDeployArgs.coerceDpiOverride` so the phone and car agree on what counts as a valid override.
+
+`bitrate` is the receiver's requested encoder bitrate in bps (e.g. 2_000_000, 4_000_000), `0` = `VideoConfig.DEFAULT_BITRATE` (4 Mbps). It rides through `VdDeployArgs.format` into the VD argv, where it is validated against the deliberately wider deploy range `VideoConfig.INPUT_MIN_BITRATE..INPUT_MAX_BITRATE` (0.5-20 Mbps) and falls back to the default when out of range. Both senders (car `buildHandshakeRequest`, desktop `HandshakeFactory.build`) assemble the message through `HandshakeRequest.builder()`; the builder does not align dimensions, because alignment direction is sender-specific and load-bearing (desktop floors to even, the car widens its nav bar by one pixel so the viewport lands even).
 
 ### HANDSHAKE_RESPONSE (0x02) -- Phone -> Car
 
@@ -88,12 +99,20 @@ The DATA channel multiplexes on the same TCP socket as CONTROL. Video frames are
 | vdServerJarPath      | UTF-8  |  path to deployed VD JAR (e.g. /sdcard/DiLinkAuto/vd-server.jar)
 | connectionMethod     | byte   |  0=USB_ADB, 1=WIFI_ADB, 2=SHIZUKU
 | vdDpi                | int32  |  DPI the VD will use (auto or override)
+| vdWidth              | int32  |  trailing field, recommended VD width, 0 = not provided
+| vdHeight             | int32  |  trailing field, recommended VD height, 0 = not provided
 +----------------------+--------+
 ```
+
+`vdWidth` / `vdHeight` are trailing fields carrying the phone-side recommended VirtualDisplay size — the output of `VdDimensions.compute`, which even-aligns the car viewport and then scales it up to the phone's **real physical** long edge. A Chinese-ROM IME hardcodes its width to the phone's physical pixel width regardless of VD density, so a viewport-sized VD crops the keyboard no matter what DPI is negotiated (a 1280 px canvas with a 1368 px keyboard chops the right edge).
+
+`0` means an older phone did not send the field. Deploy sites with no shell access to the phone — the desktop ADB path — MUST use these dims for the VirtualDisplay when they are `> 0`; the desktop's own viewport is the *encoder* size, not the VD size. The phone-side metrics must come from real physical display metrics (`WindowManager.maximumWindowMetrics` / `Display.getRealMetrics`), never `resources.displayMetrics`, which reports compat-scaled values in screen-compat mode.
 
 ### HEARTBEAT (0x03) / HEARTBEAT_ACK (0x04) -- Control connection only
 
 Empty payload. Sent every 3 seconds on the control connection. If no frame is received within 10 seconds, the connection is considered dead (watchdog timeout). Video and input connections have no heartbeat. The reader enqueues `HEARTBEAT_ACK` inline (no separate coroutine) so heartbeat acks cannot be starved by a busy writer queue.
+
+The intervals are injectable: `Connection.start(enableHeartbeat, heartbeatIntervalMs, heartbeatTimeoutMs)` defaults to `HEARTBEAT_INTERVAL_MS` (3000) and `HEARTBEAT_TIMEOUT_MS` (10000), so the tuning is testable without a socket. The watchdog ticks on `heartbeatIntervalMs` and tears the connection down when `now - lastFrameReceivedAt > heartbeatTimeoutMs`. Both jobs are cancelled by `disconnect()` and are only started when `enableHeartbeat` is true; the reader's separate mid-frame stall deadline (`readStallTimeoutMs`, also 10 s) covers the connections that have no watchdog at all.
 
 ### DISCONNECT (0x05) -- Bidirectional
 
@@ -135,7 +154,7 @@ Payload: UTF-8 package name. Car requests the phone to uninstall the given packa
 
 ### GO_RECENT (0x1F) -- Car -> Phone
 
-Empty payload. Triggers the recent-apps view on the virtual display.
+Empty payload. Triggers the recent-apps view on the virtual display (vd-server runs `input -d <id> keyevent 187` and then re-checks for an empty stack).
 
 ### VD_SERVER_READY (0x20)
 
@@ -144,6 +163,10 @@ Defined in `MessageType.kt` as a Car -> Phone signal, but unused in the current 
 ### VD_PORTS_BOUND (0x31) -- Phone -> Car
 
 Empty payload. Sent after the VD server has bound the video (9638) and input (9639) ports and signaled display-ready on the lifecycle channel. The car waits for this message before calling `connectVideoAndInput(phoneHost)`, which opens the video and input TCP connections directly to the VD server. This gate prevents the car from connecting to ports that the VD server has not yet bound, which was a race in earlier versions.
+
+### SET_DISPLAY_POWER (0x32) -- Car/PC -> Phone (control channel)
+
+1-byte payload: a non-zero first byte = screen on, `0` or an empty payload = screen off (an empty payload deliberately means off, so a peer that forgets the field cannot accidentally light the panel). Routed by the vd-server's `handleCarCommand` to `DisplayPowerController.setPhysicalDisplayPower` — the same path as `GO_HOME`, so app-client is not involved. The vd-server powers the phone's physical panel off by default once it holds video + input, and restores it on disconnect; this message hands the mid-session manual toggle to the user.
 
 ## Video Channel (0x01)
 
@@ -158,12 +181,16 @@ H.264 NAL units representing a video frame.
 **Encoding parameters** (set by VD server `PipelineServer`):
 - Codec: H.264/AVC
 - Profile: Main
-- Resolution: encode dimensions capped at 1920x1080 (`VdDeployArgs.MAX_ENCODE_WIDTH/HEIGHT`), decoupled from VD dimensions via the `EW EH` args. The VD stays scaled-up to preserve the IME-crop fix; the encoder uses car-reported dims clamped to 1080p. Without this cap, phones with >1080p output trigger software decode on low-spec car SoCs (e.g., Snapdragon 439) and drop to single-digit fps.
-- Bitrate: 4 Mbps CBR (`PipelineServer.BITRATE = 4_000_000`). Adaptive fallback: floor 1.5 Mbps, 2s recovery window, 0.5 Mbps steps.
-- Frame rate: 24 fps (`VideoConfig.TARGET_FPS = 24`). Car requests this via `targetFps` in handshake.
+- Resolution: encode dimensions proportionally scaled down to fit inside 1920x1080 (`VdDeployArgs.MAX_ENCODE_WIDTH/HEIGHT`), decoupled from VD dimensions via the `EW EH` args. The VD stays scaled-up to preserve the IME-crop fix; the encoder uses car-reported dims clamped to 1080p. Scaling is aspect-preserving (the old per-axis clamp turned a 1080x2152 portrait viewport into a square 1080x1080). Without the cap, phones with >1080p output trigger software decode on low-spec car SoCs (e.g., Snapdragon 439) and drop to single-digit fps.
+- Bitrate: 4 Mbps CBR (`VideoConfig.DEFAULT_BITRATE`, `PipelineServer.BITRATE`). Receiver-requested via `HandshakeRequest.bitrate`; deploy-argv validation range 0.5-20 Mbps (`INPUT_MIN_BITRATE`..`INPUT_MAX_BITRATE`), settings-UI range 1-12 Mbps. Adaptive fallback: floor 1.5 Mbps (`VideoConfig.ADAPTIVE_MIN_BITRATE`), drop to 75% of current on a stalled decoder, recovery with a 2 s window and 0.5 Mbps steps.
+- Frame rate: 24 fps (`VideoConfig.TARGET_FPS = 24`). Car requests this via `targetFps` in handshake; settings UI accepts 10-60.
 - Frame interval: `1000 / 24` ~= 42 ms (`VideoConfig.FRAME_INTERVAL_MS`). Used as the max wait for video-path loops (encoder drain, SurfaceScaler redraw).
 - IDR interval: 1 second (`PipelineServer.I_FRAME_INTERVAL = 1`).
 - SurfaceScaler: periodic re-draw every `FRAME_INTERVAL_MS` ensures encoder output on static content.
+
+**Keyframe identification**: `H264NalParser.isKeyFrame` (protocol-core) is the single definition shared by the car decoder and the Windows pipeline: it scans only the first ~1 KB of a frame for a 3-byte (`00 00 01`) or 4-byte (`00 00 00 01`) Annex B start code and tests `nal_header & 0x1F == 5` — the type mask, not the whole byte, because a real encoder emits `0x65` (`nal_ref_idc = 3`).
+
+**Black-screen detection**: `BlackScreenDetector` lives in `:protocol-core` and is shared by the car decoder and the Windows `VideoDecodePipeline` — both ends face the same encoder failure (TCP alive, receiver parked on the last frame), so the policy has one definition. An encoder producing nothing emits very small I-frames, so a streak of keyframes below `keyframeMaxBytes` (2 KB) means the stream is black. Reaction is deliberately asymmetric: `alertStreak` (3) tiny keyframes only set a log flag, and `onSustainedBlackScreen` fires once the streak lasts `BLACK_SCREEN_SUSTAIN_MS` (3 s default; the receivers override it) — app/VD warm-up bursts are normal, and escalating on those is the reconnect storm that leaked VirtualDisplays. The monotonic clock is injected (`clock`), so protocol-core stays Android-free, and the escalation is latched to once per session until `reset()`.
 
 ## Data Channel (0x03)
 
@@ -235,6 +262,17 @@ UTF-8 text line. Car routes all logs (including VideoDecoder and UsbAdbConnectio
 
 1-byte payload (0 or 1). Toggles car-side logging. Defaults: ON for debug/pre-release builds, OFF for release. The user choice persists. When off, zero disk writes occur on the car.
 
+### Decoding contract (all payloads)
+
+Every fixed-size read is preceded by a remaining-bytes check and every length prefix is read as **unsigned** (a `0x8004` short used to become `-32764` and throw `NegativeArraySizeException`). Violations raise `ProtocolDecodeException` — never an unchecked `BufferUnderflowException` — so `Connection`'s reader can catch it, log the reason and disconnect, instead of the exception escaping into an unhandled coroutine and killing the process.
+
+- Optional trailing fields use a lenient read that returns `""` / `0` rather than throwing, so a peer that omits them still decodes.
+- A declared `iconSize` that exceeds the remaining bytes **fails** the decode: silently dropping the icon made the next `iconHash` length consume icon bytes and cache a garbage hash under a real key.
+- Unknown `AppCategory` / `MediaAction` ids throw instead of coercing to `OTHER` / `PLAY` — a peer typo used to silently start playback.
+- 2-byte UTF-8 prefixes are encode-side guarded: a payload >= 64 KB used to wrap negative and desynchronise the peer's parser.
+- `LAUNCH_APP` / `APP_UNINSTALL` payloads are validated at the decoder boundary by `requirePackageName` / `requireComponentName` (`PACKAGE_NAME_REGEX` / `COMPONENT_REGEX` exclude every shell metacharacter — `;` `$` backtick quote whitespace `|` `&` `>` `<` `(` `)`), because the payload is interpolated into `am start` / `pm uninstall` shell lines running as shell UID. Shell quoting at the call sites is defence in depth, not the only gate.
+- `AppInfoDataMessage` requires the trailing `8 + 8 + 4` bytes before reading them.
+
 ## Input Channel (0x04)
 
 ### TOUCH_DOWN (0x01) -- Car -> VD server
@@ -276,6 +314,8 @@ Single-pointer up event. Same `TouchEvent` payload format as TOUCH_DOWN.
 
 Batched MOVE events -- all active pointers in one message. Each pointer is 24 bytes (no per-pointer action byte). Reduces syscalls for multi-touch gestures.
 
+The `count` byte is the wire contract, so the frame protocol accepts up to 255 pointers. The **receiver** caps them: `TouchInjector.MAX_POINTERS` is 10, matching the wire encoder's emitted `pointerId` range (`0..MAX_POINTERS-1`), and `PointerCap` evicts the lowest entries rather than letting an over-full batch jam injection for the rest of the session. The wire must not enforce the cap — it is the injector's table size, not a protocol limit — and `TouchSequenceTest` pins that split, while `PointerCapTest` pins the two bounds staying in step.
+
 ### KEY_EVENT (0x10) -- Car -> VD server
 
 Key event (e.g., media keys, navigation keys). Reserved for future use.
@@ -286,9 +326,11 @@ Internal to the phone: the VD server reverse-connects to the phone app on `local
 
 | Value | Direction | Meaning |
 |-------|-----------|---------|
-| `0x10` (`MSG_DISPLAY_READY`) | VD server -> Phone | VirtualDisplay is up and the VD server has bound 9638/9639. Triggers the phone to send `VD_PORTS_BOUND` to the car. |
-| `0x11` (`MSG_STACK_EMPTY`) | VD server -> Phone | No activities on the VD after GO_BACK. Triggers the phone to send `VD_STACK_EMPTY` to the car. |
+| `0x10` (`MSG_DISPLAY_READY`) | VD server -> Phone | VirtualDisplay is up and the VD server has bound 9638/9639. Payload: 4-byte `displayId`, then 1 flags byte (bit0 = direct touch injection). Triggers the phone to send `VD_PORTS_BOUND` to the car. |
+| `0x11` (`MSG_STACK_EMPTY`) | VD server -> Phone | No activities on the VD after GO_BACK. No payload — length byte only. Triggers the phone to send `VD_STACK_EMPTY` to the car. |
 | `0xFF` (`CMD_STOP`) | Phone -> VD server | Stop the VD server process. |
+
+These values deliberately overlap `ControlMsg`'s numbering (0x10 = `LAUNCH_APP`, 0x11 = `GO_HOME`) and are a **separate numbering space**: the lifecycle channel exchanges raw bytes, not `FrameCodec` frames, and a future `ControlMsg` renumber must never be allowed to move this wire format. Both ends read the values from `VdLifecycle`.
 
 The VD server uses `FrameCodec.readFrameBlocking(NioReader)` and `NioReader.readIntOrNullBlocking()` for its non-coroutine read loop. See [client.md](./client.md) for the orchestrator side.
 
@@ -300,9 +342,22 @@ ADB protocol details (`AdbProtocol.java`):
 - Header: 24 bytes, little-endian (command, arg0, arg1, dataLen, checksum, magic).
 - Commands: `A_CNXN` (0x4e584e43), `A_AUTH` (0x48545541), `A_OPEN` (0x4e45504f), `A_OKAY` (0x59414b4f), `A_CLSE` (0x45534c43), `A_WRTE` (0x45545257).
 - `A_VERSION = 0x01000000`.
-- `MAX_PAYLOAD = 256 KB`. `TcpAdbConnection` negotiates `maxPayload = min(peerMax, 256KB)` from the CNXN response.
-- AUTH: `AUTH_TOKEN` (1) = device sends 20-byte token, `AUTH_SIGNATURE` (2) = host signs with SHA-1 DigestInfo + NONEwithRSA (prehashed, matching AOSP `RSA_sign(NID_sha1)`), `AUTH_RSAPUBLICKEY` (3) = host sends public key for user approval.
-- Key storage: `TcpAdbConnection` writes PEM-format keys (`adbkey` / `adbkey.pub`) in its `keyDir` so dadb can read the same keys.
+- `MAX_PAYLOAD = 256 KB`. `TcpAdbConnection.negotiateMaxPayload` reads the peer's max out of the CNXN banner (little-endian `int` at offset 4) and uses `min(peerMax, 256KB)`; a missing/short banner, a `0` or a negative result falls back to `MAX_PAYLOAD` rather than stalling.
+- `AUTH_TOKEN` (1) = device sends 20-byte token, `AUTH_SIGNATURE` (2) = host signs with SHA-1 DigestInfo + NONEwithRSA (prehashed, matching AOSP `RSA_sign(NID_sha1)`), `AUTH_RSAPUBLICKEY` (3) = host sends public key for user approval.
+- Reply sequencing is fixed and shared: the first `AUTH_TOKEN` is answered with `AUTH_SIGNATURE`, a second one (signature rejected) with `AUTH_RSAPUBLICKEY`. `AdbCrypto` owns this for both transports.
+- Public key: `ANDROID_PUBKEY` struct (modulus words, `n0inv`, little-endian modulus, `rr`, exponent), base64-encoded, then `" DiLinkAuto@car\0"` — NUL-terminated per the ADB spec (the TCP path's old unterminated form was a latent auth-acceptance bug). `AdbCrypto.encodePublicKey` uses `java.util.Base64` (standard alphabet, one `=` padding), which is byte-for-byte identical to Android's `NO_WRAP` output and assertable under the JVM test jar.
+- Fingerprint: SHA-1 over the DER public key, first 4 bytes hex — the format `adb` itself prints. Both transports use SHA-1.
+- Key storage: `TcpAdbConnection` writes PEM-format keys (`adbkey` / `adbkey.pub`) in its `keyDir` so dadb can read the same keys. The car passes an app-private directory (`filesDir/adb_keys`) so the shell-UID phone credential is not exposed to any app holding `READ_EXTERNAL_STORAGE`.
+
+**Hardened read path.** Both the USB and TCP loops read through `TcpAdbConnection.readMessageFrom(InputStream)` / `AdbProtocol.parseHeader`, which rejects a header whose `magic != command ^ 0xFFFFFFFF` and any `data_len` that is negative or above `MAX_PAYLOAD` — an unvalidated `0x7FFFFFFF` made `ByteArray(dataLen)` throw `OutOfMemoryError` (an `Error`, so the callers' `catch (Exception)` never saw it). The payload CRC is now verified on every read, not merely parsed.
+
+**The desktop ADB path is an external `adb.exe`.** The Windows receiver does not implement the ADB protocol itself: it runs `adb connect <phoneHost>:<adbPort>` and `adb -s <serial> shell <command>`, with the launch line coming from the same `VdDeploy.buildDeployPlan` (with `background = false`, so the ADB stream stays attached to the engine). That makes two `HandshakeResponse` fields peer-controlled inputs, so the desktop validates both:
+
+- `adbPort` must be exactly `Ports.ADB_PORT` (the phone always sends it, so the whitelist costs no compatibility). Anything else aborts the session rather than silently connecting to a host:port of the peer's choosing.
+- `vdServerJarPath` must be empty, equal to `VdDeploy.JAR_PATH`, or inside `VdDeploy.DIR_PATH` (and contain no `..`). `shellQuote` only stops a path from *escaping the command*; it cannot stop a peer from choosing *which* code runs on the device as shell UID, so the choice itself is whitelisted.
+- `vdWidth` / `vdHeight` are clamped to `[2, 4096]` and floored to even via `DimAlign.evenMin2` (`DimAlign.even` maps negatives to ~2^31 positive, letting a hostile peer request an arbitrarily large device-side VirtualDisplay).
+
+`adb` is also still used by the phone app (`CarAppInstaller` via dadb) to install the car APK, which is why `adbkey` / `adbkey.pub` stay in a dadb-readable format.
 
 ### VD Server Shell Commands (`VdDeploy`)
 
@@ -312,11 +367,38 @@ All VD server lifecycle commands are defined in `VdDeploy.kt` (protocol module) 
 |---------|-------------|
 | `killCommand` | Graceful kill: `pkill -f [P]ipelineServer 2>/dev/null` (SIGTERM, lets JVM shutdown hook run) |
 | `killCommandForce` | Force kill: `pkill -9 -f [P]ipelineServer 2>/dev/null` (SIGKILL, skips shutdown hook) |
-| `stopCommand` | Two-stage stop: `pkill -f [P]ipelineServer; sleep 1; pkill -9 -f [P]ipelineServer; exit 0` — SIGTERM → wait → SIGKILL in one shell line so a coroutine cancellation cannot land between signals |
-| `probeCommand` | Liveness probe (output form): prints `Y` if alive, `N` if gone. Uses `pkill -0` (signal 0 = existence check only) |
-| `probeExitCodeCommand` | Liveness probe (exit code form): exit 0 = alive, exit 1 = gone. For callers that only see exit status (car's ADB `shell()` path) |
+| `stopCommand` | Two-stage stop: `pkill -f [P]ipelineServer 2>/dev/null; sleep 1; pkill -9 -f [P]ipelineServer 2>/dev/null; exit 0` — SIGTERM → wait → SIGKILL in one shell line so a coroutine cancellation cannot land between signals |
+| `probeCommand` | Liveness probe (output form): `if pkill -0 -f [P]ipelineServer >/dev/null 2>&1; then echo Y; else echo N; fi` — prints `Y` if alive, `N` if gone. Uses `pkill -0` (signal 0 = existence check only) |
+| `probeExitCodeCommand` | Liveness probe (exit code form): `if pkill -0 -f [P]ipelineServer >/dev/null 2>&1; then exit 0; else exit 1; fi` — exit 0 = alive, exit 1 = gone. For callers that only see exit status (car's ADB `shell()` path) |
 
 **Process pattern**: All patterns use the `[P]ipelineServer` bracket trick. A plain `PipelineServer` pattern makes `pkill -f` match the wrapper shell itself (`sh -c "pkill -f PipelineServer ..."` has that string in its own cmdline), so the shell gets SIGTERM'd mid-script and any subsequent command silently never runs.
+
+### VD Server argv (`VdDeployArgs`)
+
+`PipelineServer.main()` parses `W H DPI PHONE_HOST EW EH FPS [BITRATE] [CAR_HOST]`:
+
+| Slot | Source / clamping |
+|------|-------------------|
+| `W H` | VirtualDisplay dims. Phone-side: `VdDimensions.compute` (car viewport, even-aligned, anti-crop scaled to the phone's physical long edge). Car-side: native car viewport |
+| `DPI` | Auto-calibrated (`VideoConfig.calculateOptimalDpi`) or the car's coerced `dpiOverride` |
+| `PHONE_HOST` | Host the VD server reverse-connects to on `LIFECYCLE_PORT` |
+| `EW EH` | Encoder dims, proportionally scaled to fit 1920x1080, then floored to even |
+| `FPS` | Target frame rate; all pipeline timeouts derive from it |
+| `BITRATE` | bps, validated against `500_000..20_000_000`, out-of-range falls back to 4 Mbps |
+| `CAR_HOST` | Trailing, optional. Dotted-quad IPv4 or hostname; blank or malformed degrades to `-` (= accept any peer) rather than failing the deploy. Pins the engine's 9638/9639 accepts to the receiver it serves |
+
+### Launch command line
+
+`VdDeploy.commandLine(jarPath, logPath, args, background)` produces:
+
+```
+CLASSPATH='<jarPath>' <exec|setsid> app_process / com.dilinkauto.vdserver.PipelineServer <args> >>'<logPath>' 2>&1[ &]
+```
+
+- `background = false` (car USB/TCP-ADB paths) uses `exec`, so `app_process` replaces the caller's shell and stays attached to the ADB stream — the car's `TcpAdbConnection` has no stream-demux reader, and a closing stream kills the engine it just started.
+- `background = true` (phone Shizuku path) uses `setsid ... &`, which is what actually detaches the engine from the parent `sh`'s process group; with plain `exec app_process ... &` Shizuku could reap it, leaving a 0-byte `vd-server.log`.
+- Output is appended (`>>`), never truncated: a reconnect storm runs pkill + restart several times, and truncation lets the last (often short-lived) restart erase the first failure's diagnostics.
+- **Both paths are single-quoted** (`VdDeploy.shellQuote`, embedded `'` escaped as `'\''`) because `jarPath` is peer-controlled — it arrives in `HandshakeResponse.vdServerJarPath` — and the command runs as shell UID. `logPath` is quoted too, so nobody can later wire it to a parameter and reintroduce the hole. The argv tail is numeric/host-shaped only, so it needs no quoting.
 
 ## Constants
 
@@ -329,16 +411,56 @@ LIFECYCLE_PORT        = 19647 (VD server reverse-connects to phone localhost)
 ADB_PORT              = 5555  (standard ADB TCP port)
 TARGET_FPS            = 24
 FRAME_INTERVAL_MS     = 1000 / TARGET_FPS  (~= 42 ms)
-HEARTBEAT_INTERVAL    = 3000 ms  (control connection only)
-HEARTBEAT_TIMEOUT     = 10000 ms (control connection only)
+DEFAULT_BITRATE       = 4000000  (4 Mbps, CBR start bitrate)
+ADAPTIVE_MIN_BITRATE  = 1500000  (runtime adaptive floor)
+BITRATE range (UI)    = 1000000 .. 12000000
+BITRATE range (argv)  = 500000 .. 20000000  (deliberately wider, for hand-edited configs)
+HEARTBEAT_INTERVAL    = 3000 ms  (control connection only, injectable)
+HEARTBEAT_TIMEOUT     = 10000 ms (control connection only, injectable)
+CONNECT_TIMEOUT_MS    = 10000 ms (TCP connect deadline)
+FLUSH_GRACE_MS        = 500 ms  (writer drain on a graceful peer close)
 SOCKET_BUF_BYTES      = 262144   (256 KB requested send/receive buffer)
 WRITE_QUEUE_CAPACITY  = 64       (frames, BufferOverflow.SUSPEND)
-MAX_PAYLOAD_SIZE      = 134,217,728 bytes  (128 MB)
+MAX_PAYLOAD_SIZE      = 16,777,216 bytes  (16 MB, FrameCodec)
 HEADER_SIZE           = 6 bytes  (4 length + 1 channel + 1 type)
+LARGE_FRAME_LOG_THRESHOLD = 8 MB
+NIO_READ_UNIT_MAX     = HEADER_SIZE + MAX_PAYLOAD_SIZE  (reader grow ceiling)
+NIO_BUFFER_CAPACITY   = 131072   (128 KB default read buffer)
+BLACK_SCREEN_SUSTAIN_MS = 3000  (default; receivers override)
+KEYFRAME_MAX_BYTES    = 2048     ("tiny" I-frame threshold for black detection)
+TINY_KEYFRAME_STREAK  = 3        (alert-only threshold)
 SERVICE_TYPE (mDNS)   = "_dilinkauto._tcp."
 SERVICE_NAME (mDNS)   = "DiLink-Auto"
 DISPLAY_MODE_MIRROR   = 0
 DISPLAY_MODE_VIRTUAL  = 1
+```
+
+The single source of the port constants is `Ports` in `:protocol-core`; `Discovery` keeps deprecated aliases that forward to it. mDNS discovery ignores responders whose `serviceName` is not `SERVICE_NAME` and any resolved port outside `1..65535` — an impostor on the same LAN has no other gate.
+
+VD server deploy constants (`VdDeploy`):
+
+```
+MAIN_CLASS      = "com.dilinkauto.vdserver.PipelineServer"
+PROCESS_PATTERN = "[P]ipelineServer"
+DIR_PATH        = "/sdcard/DiLinkAuto"
+JAR_PATH        = "/sdcard/DiLinkAuto/vd-server.jar"
+LOG_PATH        = "/sdcard/DiLinkAuto/vd-server.log"
+MAX_ENCODE_WIDTH  = 1920
+MAX_ENCODE_HEIGHT = 1080
+DPI_OVERRIDE_MIN  = 120
+DPI_OVERRIDE_MAX  = 480
+CAR_HOST_ANY      = "-"
+```
+
+ADB constants (`AdbProtocol`):
+
+```
+HEADER_SIZE   = 24
+A_VERSION     = 0x01000000
+MAX_PAYLOAD   = 262144  (256 KB)
+AUTH_TOKEN    = 1
+AUTH_SIGNATURE = 2
+AUTH_RSAPUBLICKEY = 3
 ```
 
 Feature bitmasks (for `supportedFeatures` in `HandshakeRequest`):
@@ -358,6 +480,23 @@ CONNECTION_METHOD_WIFI_ADB  = 1
 CONNECTION_METHOD_SHIZUKU   = 2
 ```
 
+## Test-Locked Invariants
+
+The cross-endpoint contracts above are pinned by unit tests so a "tidy-up" cannot silently move the wire. The full inventory lives in [IMPLEMENTATION_REPORT_TESTING.md](./IMPLEMENTATION_REPORT_TESTING.md); the protocol-relevant locks are:
+
+| Invariant | Where it is locked |
+|-----------|--------------------|
+| ADB frame: `magic == command ^ 0xFFFFFFFF`, additive checksum, `MAX_PAYLOAD` ceiling accepted by `encode` but rejected by `parseHeader`, CRC verified on read | `protocol/.../adb/AdbProtocolTest`, `TcpAdbConnectionTest` |
+| `AdbCrypto` primitives: `bigIntToLEPadded`, `SHA1_DIGEST_INFO`, NUL-terminated public-key string, SHA-1 fingerprint, `buildAuthReply` sequencing | `protocol/.../adb/AdbCryptoTest` |
+| Handshake round-trips plus legacy-payload truncation for every trailing field (`dpiOverride`, `bitrate`, `vdWidth`/`vdHeight`) | `MessagesTest` |
+| `VdDeploy` kill/stop/probe commands byte-for-byte, `[P]ipelineServer` pattern, `shellQuote`, the exact launch command line, `buildDeployPlan` | `VdDeployConstantsTest`, `VdDeployCommandLineTest` |
+| `VdDeployArgs.format` layout, aspect-preserving clamp, bitrate bounds, `CAR_HOST` sanitisation, `coerceDpiOverride` | `VdDeployArgsFormatTest` |
+| `H264NalParser.isKeyFrame` via `nal_type & 0x1F` on real-encoder `0x65` headers | `H264NalParserRefIdcTest` |
+| `Connection` heartbeat auto-ack, watchdog kicking a silent peer, an active link not being killed, injected intervals | `ConnectionTest`, `ConnectionHeartbeatTest` |
+| Truncated payloads, enum rejection, shell-metacharacter package names, version validation, 16-bit prefix guards | `AuditProtocolFixesTest`, `AdversarialDecodingTest` |
+| `BlackScreenDetector` two-level reaction and injected clock | `BlackScreenDetectorTest` |
+| Port / dimension / bitrate / DPI defaults resolve to the `:protocol-core` constants | per-module config tests |
+
 ## Byte Order
 
-All multi-byte integers and floats in the DiLink-Auto frame protocol are **big-endian**. The ADB protocol (used on port 5555) is **little-endian** per the ADB specification; the two are separate protocols on separate sockets.
+All multi-byte integers and floats in the DiLink-Auto frame protocol are **big-endian** (including the `NioReader` buffer). The ADB protocol (used on port 5555) is **little-endian** per the ADB specification — header fields, the peer's max-payload word in the CNXN banner, and the `ANDROID_PUBKEY` struct are all little-endian; the two are separate protocols on separate sockets.

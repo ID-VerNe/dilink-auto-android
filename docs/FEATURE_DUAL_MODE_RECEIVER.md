@@ -44,7 +44,7 @@ enum class ReceiverMode {
 ## 5. 本回合已交付 vs 待办
 **已交付（本机验证通过）**
 - `protocol-core`：`ScreenMode` + `CaptureModePolicy`（VD 优先 + 息屏→主屏降级阶梯）+ `CaptureModePolicyTest`(6)。
-- 全仓测试覆盖补齐：18 个新测试文件 / ~142 用例全绿（见 `docs/IMPLEMENTATION_REPORT_TESTING.md`）。
+- 全仓测试覆盖补齐：18 个新测试文件 / 139 用例全绿（见 `docs/IMPLEMENTATION_REPORT_TESTING.md`）。同报告 §5 另记录了后续的"为可测性重构"seam（ADB 帧/加解密、`Connection` 心跳可注入、`AssetSource`、`CarInstaller`、重连退避/图标预算纯函数，约 +44 用例，合计 183，全部行为不变）。
 
 **待办（需一次 brainstorm 敲定 UX + 真机验证，不建议盲改主连线）**
 1. 明确"接收服务端"到底是哪一端（`app-desktop` 是纯 JVM 无法 VD/screencast；VD/投屏降级须落在 Android 接收端）与两模式的 UX 文案/入口。

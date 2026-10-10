@@ -8,7 +8,7 @@ Flow:
 
 1. Registers an mDNS service (`_dilinkauto._tcp`) and listens for TCP from the car on port `9637` (control + data, NIO ServerSocketChannel on `0.0.0.0`).
 2. Accepts the control connection, reads `HANDSHAKE_REQUEST` (viewport, `screenDpi`, `appVersionCode`, `appVersionName`, `targetFps`, `dpiOverride`).
-3. Opens a lifecycle ServerSocket on `0.0.0.0:19647` **before** sending `HANDSHAKE_RESPONSE` so the socket is ready when the VD server reverse-connects.
+3. Opens a lifecycle ServerSocket on `127.0.0.1:19647` **before** sending `HANDSHAKE_RESPONSE` so the socket is ready when the VD server reverse-connects.
 4. Sends `HANDSHAKE_RESPONSE` with `deviceName`, `vdServerJarPath`, `connectionMethod` (`CONNECTION_METHOD_SHIZUKU` when Shizuku is authorized, else `CONNECTION_METHOD_USB_ADB`), and the negotiated `vdDpi`.
 5. If Shizuku is available, deploys `vd-server.jar` directly on the phone via `ShizukuManager.execBackground` (`CLASSPATH=... app_process / com.dilinkauto.vdserver.PipelineServer ...`). Otherwise the car deploys the VD server via USB or TCP ADB.
 6. VD server reverse-connects on `localhost:19647`. Phone reads `MSG_DISPLAY_READY` (carries `displayId` + direct-injection flag), then sends `VD_PORTS_BOUND` to the car on the control connection — the car now connects video (`9638`) and input (`9639`) directly to the VD server.
@@ -22,18 +22,20 @@ Flow:
 
 ### ClientApp
 
-`Application` subclass. Creates the notification channel (`dilinkauto_service`), initializes `ShizukuManager` on `onCreate`. Hosts the phone-side `loadIconPng` helper that scales a launcher icon to a given size and PNG-encodes it for the wire payload (no phone-side cache; the car's `AppIconCache` persists icons across sessions).
+`Application` subclass. Creates the notification channel (`dilinkauto_service`), initializes `ShizukuManager` on `onCreate`. Hosts the phone-side `loadIconPng` helper that scales a launcher icon to a given size and PNG-encodes it for the wire payload. Encoded PNGs are memoized in a small `LruCache` (8MB byte budget, key `package|size|changeHash`, audit A-M12) so a re-send of an unchanged icon is a map lookup instead of a fresh raster + PNG compress — the car's own `AppIconCache` is what persists icons across sessions.
 
 ### MainActivity
 
-Entry point. Auto-starts `ConnectionService` when the app is opened (e.g. via car USB ADB `am start`) if onboarding is complete and the service is `IDLE`. Routes between four screens:
+Entry point. Auto-starts `ConnectionService` when the app is opened (e.g. via car USB ADB `am start`) if onboarding is complete, the service is `IDLE`, **and** the user has not explicitly stopped it. Routes between four screens (a single sealed `Screen` state, audit R3-SRP-09, replacing the previous onboarding/settings/allowlist boolean trio):
 
 - **OnboardingScreen** (first launch): 6-step wizard — Welcome, All Files Access, Battery Optimization, Accessibility Service, Car Setup, Done. Each permission step explains what breaks without it and auto-advances on `ON_RESUME` once granted. The Car Setup step shows the live `installStatusFlow` and an install button. Any step can be skipped. There is no Notification Access step.
 - **MainScreen** (subsequent launches): status card, start/stop button, Install on Car card, Share Logs button, Samsung warning card for Galaxy devices that need the Shizuku / wireless-debugging workaround.
 - **SettingsScreen**: permissions status, Debug log toggle, about card.
 - **AllowlistScreen**: phone-side picker for which launcher apps reach the car (see below).
 
-`shareLogs()` calls `FileLog.zipLogs()` and shares the zip via `FileProvider`.
+`shareLogs()` calls `FileLog.zipLogs()` and shares the zip via `FileProvider`. Top-level screen routing, step state and permission polling state live in separate holders (`OnboardingState`, audit R3-SRP-05) rather than in the composables.
+
+**`userStopped` (audit A-L21)** is persisted in the Activity's own prefs file, not kept in memory, on purpose: the path it guards is `PhoneDisplayRestorer` launching `MainActivity` with `FLAG_TURN_SCREEN_ON` after a teardown — a *fresh* Activity instance, so an in-memory flag would already read back as its default. It is what stops a restore-launched recreate from resurrecting a service the user just stopped. The notification's stop action goes straight to `ConnectionService`, which cannot write an Activity-owned flag.
 
 ### ConnectionService
 
@@ -41,17 +43,20 @@ Foreground service (`foregroundServiceType="connectedDevice"`) that orchestrates
 
 - **Control connection (port `9637`)**: NIO TCP accept on `0.0.0.0`. Handles `HANDSHAKE_REQUEST`, heartbeat, and the DATA channel (`APP_LIST`, `APP_UNINSTALLED`, `APP_INFO_DATA`, `CAR_LOG`, `LOG_TOGGLE`). `LAUNCH_APP`, `GO_BACK`, `GO_HOME`, `APP_UNINSTALL`, `APP_INFO` now travel directly car → VD server on port `9639` and are no longer handled here.
 - **Lifecycle channel (port `19647`)**: delegated to `VirtualDisplayClient` (see below). The ServerSocket is opened **before** `HANDSHAKE_RESPONSE` is sent so the VD server's reverse-connect never lands on a closed socket — a regression that previously caused VD startup failures.
-- **`deployAssets()`**: extracts `vd-server.jar` to `/sdcard/DiLinkAuto/` and `app-server.apk` to `filesDir`. CRC-checked; skips re-extraction when the asset matches the on-disk file.
-- **`handleHandshake()`**: computes VD dims via `VdDimensions`, opens the lifecycle ServerSocket (or reuses it across a mid-stream re-handshake), sends `HANDSHAKE_RESPONSE`, then deploys the VD server via Shizuku and waits for `MSG_DISPLAY_READY`. On `MSG_DISPLAY_READY` it sends `VD_PORTS_BOUND`, hands the `displayId` to `InputInjectionService`, flips state to `STREAMING`, and calls `AppListBuilder.sendAppList`.
+- **`deployAssets()`**: extracts `vd-server.jar` to `/sdcard/DiLinkAuto/` and `app-server.apk` to `filesDir` through `AssetDeployer` (see below). CRC-checked; skips the write when the asset already matches the on-disk file. Runs once from `onCreate` and sets `assetsReady`, which `ensureAssetsReady()` polls (up to 5s) before a car install so the install path never races the extraction. Both use the `VdDeploy` absolute-path constants — joining `getExternalStorageDirectory()` with a leading-slash child used to produce a `/storage/emulated/0/sdcard/DiLinkAuto` shadow directory.
+- **`handleHandshake()`**: rejects an unsupported `protocolVersion` at the boundary, computes VD dims via `VdDimensions`, tears down any previous VD (rotation case) under `vdLock`, opens the lifecycle ServerSocket (or reuses it across a mid-stream re-handshake), re-verifies the on-disk jar via `ensureVdServerJarCurrent()`, then sends `HANDSHAKE_RESPONSE`, deploys the VD server via Shizuku and waits for `MSG_DISPLAY_READY`. On `MSG_DISPLAY_READY` it sends `VD_PORTS_BOUND`, hands the `displayId` to `InputInjectionService`, flips state to `STREAMING`, and calls `AppListBuilder.sendAppList`. It runs on `handshakeJob` on `Dispatchers.IO` (audit A-02) — it does disk I/O, a socket bind and package enumeration, all of which used to stall every other frame on the reader coroutine, and a throw used to kill the reader with no disconnect. The whole `vdClient` read-modify-write plus the lifecycle-client creation are serialized by `vdLock` (A-03): two overlapping handshakes (rotation + reconnect) could both pass the null check and both bind 19647, leaking a ServerSocket. The Shizuku decision is snapshotted **once** into `useShizuku` and threaded through both the response's `connectionMethod` and the deploy path (A-L18) — reading `checkPermission()` for the response and `isAvailable` later for the deploy let a binder death between the two say "SHIZUKU" while deploying nothing. The response also carries the scaled `vdWidth`/`vdHeight` so a Shizuku-less deployer (the desktop ADB path) still gets the anti-crop IME fix. A failed VD launch tears the session down instead of logging success (A-M7, see below).
 - **Mid-stream re-handshake**: when the car rotates, it reuses the control TCP connection. `handleHandshake` tears down the old VD (`stopVdServer` + `disconnect`) and deploys a fresh one at the new orientation, leaving the lifecycle ServerSocket open across the swap.
-- **VD exit wait before relaunch**: After killing the old VD server, `ShizukuManager.waitForVdServerExit(VD_EXIT_WAIT_MS)` polls until the process exits before launching the replacement. Two live engines race for the same VirtualDisplay / DTA / 9638-9639 ports; the loser skips `cleanup()` entirely — one leaked VD per reconnect.
-- **Cleanup idempotency guard**: `cleanupGuard` `AtomicBoolean` prevents `cleanupSession()` from running multiple times for a single session. `cleanupSession()` was callable from 7 places (two network callbacks, the listen-loop `finally`, the handshake-failure path, `stopEverything`, and `onDestroy`) with no guard — observed 1 disconnect → 9 "Force-waking physical display" lines. `resetCleanupGuard()` is called before establishing a new session so the next teardown is allowed to run.
+- **VD exit wait before relaunch**: the phone no longer runs its own wait loop. It builds a `VdDeploy.DeployPlan`, supplies a `VdDeployExecutor` (`shellSync` → `ShizukuManager.execAndWait`, `launch` → `execBackground`, `probe` → `ShizukuManager.probeVdServer`) and calls the shared `vdRunDeploySequence` in **protocol-core**, so the phone, the car's USB/TCP ADB paths and the desktop cannot drift on the convergence rule. The sequence is kill → `vdAwaitExit` (3s budget, 150ms poll, two consecutive `GONE` confirmations, `UNKNOWN` accepted immediately so a dead transport never stalls deployment) → on timeout `VdDeploy.stopCommand` (SIGTERM → SIGKILL) and re-wait → launch. `forcedKill` is logged when the graceful path timed out. Two live engines race for the same VirtualDisplay / DTA / 9638-9639 ports; the loser skips `cleanup()` entirely — one leaked VD per reconnect.
+- **Honest deploy status (audit A-M7)**: `VdDeployExecutor.launch` returns the `Boolean` that `ShizukuManager.execBackground` produces. When it is `false` the sequence reports `launched = false`, the service logs the failure, calls `cleanupSession()` and returns — it no longer prints "VD server started" for an engine that never launched. Before this, `execBackground` returned `Unit` and the operator only learned of the failure from the 60s accept timeout.
+- **Cleanup idempotency guard**: two composed guards. **Session generations (audit A-01)**: every accept mints `sessionId = sessionSeq.incrementAndGet()`, publishes it as `activeSessionId`, and calls `resetCleanupGuard(sessionId)`; the listen-loop `finally` then calls `cleanupSession(sessionId)` with the id it captured, and a teardown whose id is no longer active logs `cleanupSession: stale session #n (active #m) — skipping` and returns. Previously a cancelled loop's late `finally` consumed the guard belonging to the **next** generation, so the fresh lifecycle ServerSocket was never closed and the stale VD client kept streaming — the leaked-VD failure mode. The `cleanupGuard` `AtomicBoolean` then caps the run at one teardown per generation; `cleanupSession()` was callable from 7 places (two network callbacks, the listen-loop `finally`, the handshake-failure path, `stopEverything`, and `onDestroy`) with no guard — observed 1 disconnect → 9 "Force-waking physical display" lines. `resetCleanupGuard()` is called when a new session is established (accept / mid-stream re-handshake) and from `stopEverything()`, which must always tear down even if a network callback already did.
+- **`teardownScope` (audit A-04)**: the blocking half of `cleanupSession()` runs on `CoroutineScope(SupervisorJob() + Dispatchers.IO)` — a process-lifetime scope — never on `serviceScope` (which `onDestroy()` cancels before the restore can run) and never on the Main caller (`stopVdServer()` joins a write worker for up to 1s: an ANR-shaped stall per call). Order preserved: graceful `CMD_STOP` → channel close → control disconnect → panel/IME restore.
 - **Smart network callback**: `NetworkRequest.Builder().addTransportType(TRANSPORT_WIFI)` — only reacts to WiFi changes, ignores mobile data fluctuations. `onLost` is debounced 3s (4G hotspot resets can recover immediately); `onAvailable` restarts the listen loop only when `WAITING`. Proactive disconnect on `CONNECTED`/`STREAMING` so the heartbeat timeout does not have to expire.
 - **`ACTION_ALLOWLIST_UPDATED`**: re-sends the app list so the car grid updates live while a session is active.
-- **`ACTION_INSTALL_CAR`**: manual install path; uses `CarIpLocator` to find the car and `CarAppInstaller` to push the APK.
+- **`ACTION_INSTALL_CAR`**: manual install path. `installCarApp` validates an explicit IPv4 literal (rejecting a malformed one), drops a double-tap or re-delivered action through an `installInFlight` `AtomicBoolean` (audit A-M9 — two concurrent flows used to push the same APK to the same remote path), waits on `ensureAssetsReady()`, then hands the whole flow to `CarInstallCoordinator` (see below). The service keeps owning `installStatusFlow`; the coordinator reports through a callback.
 - **Package-removed receiver**: on `ACTION_PACKAGE_REMOVED` (with `EXTRA_REPLACING` filtered out), sends `APP_UNINSTALLED` and re-sends the full app list.
 - **`setLogEnabled(context, enabled)`**: companion entry point called from `SettingsScreen`. Persists to `AppPrefs.LOG_ENABLED` + `LOG_ENABLED_USER_SET`, sets `FileLog.enabled`, and propagates to the car over the live control connection via `DataMsg.LOG_TOGGLE` (1-byte payload).
-- **`cleanupSession()`**: cancels `handshakeJob`, stops/disconnects the VD client, clears `InputInjectionService`'s VD binding, disconnects the control connection, resets icon hashes, and hands the cached IME to `PhoneDisplayRestorer`. Runs on `PhoneDisplayRestorer`'s own process-lifetime scope so it cannot be cancelled by `onDestroy()`.
+- **`cleanupSession()`**: cancels `handshakeJob`, snapshots and clears `vdClient` under `vdLock`, clears `InputInjectionService`'s VD binding, disconnects the control connection, resets icon hashes, returns state to `WAITING`, and hands the cached IME to `PhoneDisplayRestorer`. The state snapshot/clear is synchronous so a concurrent handshake sees the old client gone; everything that can block runs on `teardownScope`.
+- **`CAR_LOG` cap (audit A-05)**: the DATA dispatch is asynchronous and a single peer-controlled log line could be tens of MB, which entered the unbounded `FileLog` queue as a String. Lines are now capped at 8KB — truncated, not dropped, so the rest of the log stays usable — and `FileLog`'s queue is bounded at 2048 entries.
 - **mDNS registration** runs in a background `launch` with a 5s `withTimeoutOrNull` so `NsdManager` cannot hang the listen loop when there is no network.
 - **`FileLog.rotate()`** on `onCreate` — archives the previous session log.
 
@@ -61,30 +66,75 @@ State flow: `IDLE → WAITING → CONNECTED → STREAMING`, exposed via `service
 
 Lifecycle-only. Accepts the VD server's reverse connection on `localhost:19647` (the VD server connects **to** the phone, never the other way around). Takes no `videoConnection`/`controlConnection` params — video and touch are no longer relayed through the phone.
 
-- `startListening(port = SERVER_PORT)`: synchronous `ServerSocketChannel` bind on `0.0.0.0:19647`. Called **before** `HANDSHAKE_RESPONSE` so the socket is open when the VD server connects back.
-- `acceptConnection(port, timeoutMs = 60000)`: non-blocking accept loop. First byte must be `MSG_DISPLAY_READY` (carries `displayId: Int` + `directInjection: Byte` flag). On success, sets `isConnected`, fires `onDisplayReady` (which `ConnectionService` uses to send `VD_PORTS_BOUND`), and starts the command relay.
+- `startListening(port = SERVER_PORT)`: synchronous `ServerSocketChannel` bind on `127.0.0.1:19647`. Called **before** `HANDSHAKE_RESPONSE` so the socket is open when the VD server connects back. Bound to **loopback, not `0.0.0.0`** (audit A-M10): the channel is localhost-only by design, and the first message read after accept carries the `displayId` that touch is injected into — a LAN peer winning the accept race on the wildcard listener could have redirected that.
+- `acceptConnection(port, timeoutMs = 60000)`: non-blocking accept loop that **refuses non-loopback peers** and keeps waiting for the real engine (A-M10). First byte must be `MSG_DISPLAY_READY` (carries `displayId: Int` + `directInjection: Byte` flag). On success, sets `isConnected`, fires `onDisplayReady` (which `ConnectionService` uses to send `VD_PORTS_BOUND`), and starts the command relay. The ServerSocket is closed in a `finally`, so a failed accept leaves nothing bound for the next handshake to inherit.
 - **Command relay** (`Dispatchers.IO`): reads `MSG_STACK_EMPTY` and forwards it via the `onStackEmpty` callback → `ConnectionService` sends `ControlMsg.VD_STACK_EMPTY` to the car.
-- `stopVdServer()`: writes `CMD_STOP` (`0xFF`) to the VD server under `writeLock` for graceful shutdown. **Returns `Boolean`** — `true` when the byte was handed to the socket, `false` when the lifecycle channel is already gone. A `false` return is expected whenever the channel is already closed — the engine's `readLifecycleCommands()` treats the resulting EOF/IOException exactly like `CMD_STOP` (sets `running=false` → `finally cleanup()`), so the teardown still happens; the caller just must not assume it was graceful.
+- `stopVdServer()`: writes `CMD_STOP` (`0xFF`) to the VD server for graceful shutdown. **Returns `Boolean`** — `true` when the byte was handed to the socket, `false` when the lifecycle channel is already gone. A `false` return is expected whenever the channel is already closed — the engine's `readLifecycleCommands()` treats the resulting EOF/IOException exactly like `CMD_STOP` (sets `running=false` → `finally cleanup()`), so the teardown still happens; the caller just must not assume it was graceful. The write itself happens on a short-lived daemon worker joined with `STOP_WRITE_JOIN_MS` (1s): Android throws `NetworkOnMainThreadException` on a socket write from Main, and `cleanupSession()` runs there, so the graceful `CMD_STOP` had never actually been sent on a real device — the log's `NetworkOnMainThreadException` was it. The write is kept *synchronous to the caller* because `disconnect()` (which releases the 19647 `ServerSocketChannel` for the re-handshake's re-bind) must run immediately after it; dispatching both to an async scope would introduce a port-occupation race.
 - `disconnect()`: closes reader, server socket, and channel; resets `displayId = -1`.
 - On disconnect the VD server's own cleanup runs only if it received `CMD_STOP`. If the lifecycle channel breaks first, `PhoneDisplayRestorer` is the safety net (see below).
 
 ### AllowlistScreen
 
-Phone-side picker for which launcher apps the car is allowed to show. The selection lives in `SharedPreferences` (`dilinkauto_allowlist` / `allowed_packages`), read by `AppListBuilder.sendAppList` to filter the wire payload before it reaches the car. Toggling a row writes the prefs, marks `allowlist_configured = true`, and fires `ConnectionService.ACTION_ALLOWLIST_UPDATED` so the running service re-sends the list immediately — the car grid updates live without a reconnect. UI: search box, Select All / Deselect All, per-row Switch, and a counter. Pre-seeded with common map apps on first run (see `AppListBuilder`).
+Phone-side picker for which launcher apps the car is allowed to show. The selection lives in `SharedPreferences` (`dilinkauto_allowlist` / `allowed_packages`), read by `AppListBuilder.sendAppList` to filter the wire payload before it reaches the car. Toggling a row writes the prefs, marks `allowlist_configured = true`, and fires `ConnectionService.ACTION_ALLOWLIST_UPDATED` so the running service re-sends the list immediately — the car grid updates live without a reconnect. It uses plain `startService`, not `startForegroundService` (audit A-L21: the service is already foregrounded, and upgrading would re-arm the 5s `startForeground` contract for an action that posts no notification), and is skipped entirely when the service is `IDLE` — starting it just to refresh a list would resurrect a stopped service in a non-foreground state. UI: search box, Select All / Deselect All, per-row Switch, and a counter. Pre-seeded with common map apps on first run (see `AllowlistSeeder`).
 
 ### AppListBuilder
 
 Builds and sends the car-visible app list on behalf of `ConnectionService`.
 
-- Filters launcher apps by the allowlist (`ALLOWLIST_PACKAGES_KEY`) before going on the wire, shrinking the wire payload and the car's icon-decode work.
-- Skips disabled launcher components (Xiaomi HyperOS disables some without removing the package).
-- Icon data is sent once per package per session — `lastSentIconHash` (keyed on `lastUpdateTime`) suppresses unchanged icons. `resetIconHashes()` forces a full re-send on disconnect or car-app reinstall.
-- `categorizeApp(pkg)` classifies into `AppCategory.NAVIGATION / MUSIC / COMMUNICATION / OTHER` for the car grid.
-- **First-run seeding**: `seedDefaultAllowlist` intersects a hardcoded set of common map packageNames (`com.baidu.BaiduMap`, `com.autonavi.minimap`, `com.google.android.apps.maps`, `com.waze`, `com.soso.map`, `com.tencent.map`, `com.mapabc.mapabc`) with the actually-installed launcher apps and persists the result, so out-of-the-box the car gets a useful grid instead of every installed launcher.
+- Owns only the allowlist filter and the send; list assembly lives in `AppInfoProvider` (query the enabled launcher apps, derive each package's change hash) and icon suppression in `IconHashGate` (audit R3-SRP-18).
+- Filters launcher apps by the allowlist (`ALLOWLIST_PACKAGES_KEY`) before going on the wire, shrinking the wire payload and the car's icon-decode work. A **null** selection (never configured) passes everything through.
+- `filterByAllowlist` first calls `AllowlistSeeder.seedIfNeeded` when `ALLOWLIST_CONFIGURED_KEY` is false, so a stale empty prefs file is seeded exactly once per install.
+- Icon data is sent once per package per session — `IconHashGate.lastSent` (a `ConcurrentHashMap`, keyed on `lastUpdateTime`; made concurrent in audit A-M11 because `reset()` runs on Main while `iconFor()` runs on the list-building IO thread) suppresses unchanged icons. `resetIconHashes()` forces a full re-send on disconnect or car-app reinstall.
+- Categorization is not done here — see `AppCategorizer` below.
+
+### AppCategorizer
+
+`object` classifying an installed package into `AppCategory.NAVIGATION / MUSIC / COMMUNICATION / OTHER` for the car grid. Extracted from `AppListBuilder` (audit S10) so the rules are unit-testable without a `Context` or `PackageManager`. Rules are keyword-based on the package name and **order matters**: a package matching a navigation keyword never reaches the music or communication branches.
+
+**Known limitation:** the keyword set is narrow, so common apps fall into `OTHER` — `com.google.android.youtube` matches nothing. This is a UX gap, not a crash, and it is pinned by `AppCategorizerTest`. A label- or category-aware classifier is the fix.
+
+### AllowlistSeeder
+
+First-run seeding of the car's app allowlist (extracted from `AppListBuilder`, audit SRP-7). `seedIfNeeded(pm, prefs)` intersects `DEFAULT_MAP_PACKAGES` with the launcher apps actually installed (`LauncherApps.queryInstalledPackageNames`) and persists the intersection, marking the allowlist configured. Defaults that are not installed are no-ops, so a user with none of them gets an empty **but configured** allowlist rather than an unconfigured one that re-seeds on every launch. Runs once per install — afterwards the user curates the list, so re-seeding would overwrite their choices.
 
 ### CarAppInstaller
 
-Installs the embedded `app-server.apk` onto the car via `dadb` (ADB-over-WiFi, port `5555`). Owns: ADB key-pair generation (`filesDir/adbkey` + `adbkey.pub`), `Dadb.create()` with a hard 15-second `Future.get` timeout (the blocking socket I/O cannot be interrupted by coroutine cancellation), `pm install -r`, and `am start --activity-clear-task -n com.dilinkauto.server/.MainActivity` (`AppTargets.CAR_MAIN_ACTIVITY`). Status strings flow back to the caller via an `onStatus` callback so the `_installStatusStatic` observable stays in `ConnectionService`. Extracted from the install logic that previously lived in `ConnectionService`.
+Installs the embedded `app-server.apk` onto the car via `dadb` (ADB-over-WiFi, port `5555`). Owns: ADB key-pair generation and `Dadb.create()` with a hard 15-second `Future.get` timeout (the blocking socket I/O cannot be interrupted by coroutine cancellation) — both delegated to `AdbKeyUtil`, whose `ensureAdbKeyPair` self-heals a half-missing key pair (audit A-L24) — `dumpsys package` version read, `pm install -r`, and `am start --activity-clear-task -n com.dilinkauto.server/.MainActivity` (`AppTargets.CAR_MAIN_ACTIVITY`). Status strings flow back to the caller via an `onStatus` callback so `installStatusFlow` stays in `ConnectionService`. It no longer drives the install flow — that is `CarInstallCoordinator` (below). `CarAppInstaller` is the **production `CarInstaller<Dadb>`**.
+
+`parseInstalledVersion(output)` is a pure companion function returning `"0"` — the not-installed sentinel — when `dumpsys` has no `versionName=` line, so the parse is unit-testable without a `Dadb` session. See the known-issue note on that sentinel under `Versioning`.
+
+### CarInstallCoordinator
+
+Drives one car-app install: locate the car, connect over ADB, skip if already current, otherwise push and install. Extracted from `ConnectionService.installCarApp` (audit SRP-2) — that method was ~70 lines of sequencing that belonged to no single connection concern: it neither opens nor tears down the streaming connection, it just runs alongside it and reports progress.
+
+Status is reported through a callback rather than a `StateFlow` so this class has no opinion about how the UI observes it — the service keeps owning `installStatusFlow`. Sequence:
+
+1. Bail out with a "car APK not found" status if `apkFile` does not exist.
+2. Emit "searching" (or "connecting to `<ip>`" when an explicit IP was given).
+3. `resolveCarIp(explicitIp)` — injected, defaults to a `CarIpLocator.probePortSync` check on the explicit IP followed by `CarIpLocator.findCarAdb`.
+4. `installer.connect(carIp)`; `null` means the car is waiting on the ADB authorization prompt, so the status is **kept** on screen (`keepStatus`) instead of being cleared after the usual 5s.
+5. `readInstalledVersion` → `compareVersions(my, installed) <= 0` → "already up-to-date" and stop (the session is still closed in a `finally`).
+6. `pushAndInstall` → on `"Success"` run `onReinstalled` (the service clears its icon hashes) and report the installed version; otherwise report the trimmed failure output.
+7. A thrown exception is reported and the session closed; the 5s auto-clear runs unless `keepStatus`.
+
+All status strings resolve through `context.getString`, null-safe: under the plain-JVM test setup `getString` returns null, so the fallback keeps the state machine unit-testable while production always returns real text.
+
+### CarInstaller (test seam)
+
+`internal interface CarInstaller<S>` — the ADB install seam behind `CarInstallCoordinator`. Generic over the "session" type because the coordinator only passes the handle through `connect → readVersion → pushAndInstall → close` and never calls its methods itself. That is what lets the whole install state machine be driven in a JVM test with a fake session and no real `dadb.Dadb`. The production implementation is `CarAppInstaller` with `S = Dadb`.
+
+### AssetDeployer
+
+Unpacks a bundled asset to disk, skipping the write when the on-disk copy already matches. Extracted from `ConnectionService` (audit DRY-4), where `extractAsset` and `ensureVdServerJarCurrent` each independently implemented the same read-asset → CRC32 → compare → write sequence, so a fix to one silently skipped the other.
+
+- `extract(assetName, target)` → `Result.Current(crc)` when the on-disk CRC already matches (no write, no Shizuku needed), `Result.Written(crc, bytes)` after a fresh write, or `Result.Failed(reason)` prefixed `read:` / `write:`. `mkdirs()` precedes the existence check because `/sdcard/DiLinkAuto` does not exist on a fresh install; an unreadable target falls through and is overwritten rather than failing.
+- `ensureCurrent(assetName, target)` → the CRC of the jar now in place: verified current, freshly written, or the last **usable** on-disk copy when the refresh failed (that copy still runs), or `-1` when there is no usable file and the caller must decide whether to abort. Audit A-L15: both failure branches used to return `-1` unconditionally, which made the "usable value" contract unreachable and every caller's fallback branch dead code.
+- Writes go temp-file + rename so a crash mid-write cannot leave a truncated jar that passes an existence check, with a direct-write fallback when the rename fails (some FUSE-backed volumes). The `finally` deletes the `.tmp` sibling unconditionally (audit A-L16): the fallback write can throw too, and without the delete every failed refresh stranded another `<target>.tmp` on shared storage.
+- Called from two places: `deployAssets()` in `onCreate` (both assets) and `ensureVdServerJarCurrent()` at every handshake, because the deployed jar outlives the process while `deployAssets` runs once — without the re-check `app_process` can silently load a stale engine that still runs and still logs, just running old code.
+
+### AssetSource (test seam)
+
+`internal interface AssetSource { fun read(assetName: String): ByteArray }` — the byte-source seam for `AssetDeployer`. It exists because the production implementation wraps the Android `AssetManager`, which is `final` and therefore cannot be subclassed as a test double. `AssetManagerAssetSource(assets)` is the production form; tests inject a fake so `extract` / `ensureCurrent` — the on-disk `vd-server.jar` CRC-freshness gate — become unit-testable across every branch.
 
 ### CarIpLocator
 
@@ -102,7 +152,9 @@ Pure viewport math for the phone-side VirtualDisplay created in response to a `H
 
 ### InstallStatus
 
-Enum classifying the free-form status string produced by `installCarApp`. Centralizes the `status.contains(...)` parsing so `OnboardingScreen`, `CarInstallCard`, and the install-stage checklist agree on what is in-progress, terminal, or auth-needed. Exposes `stageKeywords` (Searching / Connecting / Checking / Push / Install / Launching) for the stage-progress UIs, `parse(status)`, `stageIndex(status)`, `isInProgress`, and `isTerminal`.
+Enum classifying the free-form status string produced by the install path. Centralizes the `status.contains(...)` parsing so `OnboardingScreen`, `CarInstallCard` (`MainScreen`) and the install-stage checklist (`CarSetupInstallSection`) agree on what is in-progress, terminal, or auth-needed. States: `IDLE, SEARCHING, CONNECTING, CHECKING, PUSHING, INSTALLING, LAUNCHING, AUTH_NEEDED, DONE, ERROR`. Exposes `stageKeywords` (Searching / Connecting / Checking / Push / Install / Launching, each paired with a string-resource id so the UI can resolve it with `stringResource`) for the stage-progress UIs, plus `parse(status)`, `stageIndex(status)`, `isInProgress`, and `isTerminal`.
+
+**Known limitation (C-6):** `parse` classifies by matching **English substrings** of a string that `context.getString` produces. Under any non-English `values-*` locale every status falls through to `IDLE`, so the user sees no progress and no error at all, and the strings the phone itself emits in English — `"not reachable"`, `"Invalid IP: …"`, `"Install already in progress"` — classify as `IDLE` rather than `ERROR`. The fix is a structured status enum (the `InstallStatus` state plus an error id) threaded from `CarInstallCoordinator` to the UI instead of parsing localized text. `InstallStatusTest` pins the current behaviour so the gap is visible rather than silent.
 
 ### PhoneDisplayRestorer
 
@@ -124,24 +176,25 @@ Reads an installed app's version label as a string, with a `versionCode` fallbac
 
 ### Versioning
 
-Semantic-version parsing and comparison for the car-install version check (skip reinstall when the car already has the embedded version). Pure functions so the car-install path and tests can compare versions without pulling in any state machine. Scheme matches the project's tag format: `0.17.0` (release), `0.17.0-dev` (dev, num 0), `0.17.0-dev-02` (dev, num 2). Release > dev of the same base; dev builds order by `devNum`. Non-numeric components coerce to 0 for robustness against malformed wire input.
+Semantic-version parsing and comparison for the car-install version check (skip reinstall when the car already has the embedded version). Pure functions so the car-install path and tests can compare versions without pulling in any state machine. Scheme matches the project's tag format: `0.17.0` (release), `0.17.0-dev` (dev, num 0), `0.17.0-dev-02` (dev, num 2). Release > dev of the same base; dev builds order by `devNum`. Non-numeric components coerce to 0 for robustness against malformed wire input, and a missing component counts as 0. Anything that is not the recognized `-dev[-n]` form (e.g. `-SNAPSHOT`) parses as a release with the whole string as its base.
+
+**Known hazard (C-5):** `CarAppInstaller.readInstalledVersion` returns `"0"` as the not-installed sentinel, and `compareVersions` coerces non-numeric components to 0 — so a peer whose real `versionName` is `0`, `0.0` or `0.0.0` compares **equal** to the sentinel and the install is skipped as "already up-to-date" on what should have been the first install. `-SNAPSHOT` also compares equal to its corresponding release. `VersioningTest` characterizes both cases; the fix is a distinct not-installed sentinel (or a separate "not installed" signal from `dumpsys`) rather than a version that collides with a real one.
 
 ### ShizukuManager
 
-Manages the Shizuku lifecycle and provides shell-level command execution via `IShizukuService.newProcess` (UID 2000). `init(context)` registers binder-received / binder-dead / permission-result listeners. `checkPermission()` caches `isAvailable`. `execAndWait(command)` runs `sh -c` with a 30s deadline (drains stdout + stderr concurrently so a >64KB stderr write cannot deadlock the pipe), returns combined output. `execBackground(command)` is fire-and-forget (used for `app_process` so the server outlives the shell stream). `copyToFile(source, destinationPath)` streams bytes via `cat > 'path'` for paths only shell can reach.
+Manages the Shizuku lifecycle and provides shell-level command execution via `IShizukuService.newProcess` (UID 2000). `init(context)` registers binder-received / binder-dead / permission-result listeners. `checkPermission()` caches `isAvailable`.
 
-**`waitForVdServerExit(timeoutMs)`** — polls until no vd-server process remains, or `timeoutMs` elapses. Uses `VdDeploy.probeCommand` (`pkill -0` existence check) so it needs no `ps`/`pidof`. Used at two points where "the old engine is gone" must be true before proceeding:
+- `execAndWait(command)` runs `sh -c` with a 30s deadline (drains stdout + stderr concurrently so a >64KB stderr write cannot deadlock the pipe) and returns an `ExecResult(stdout, stderr)` — or `null` when Shizuku is unavailable, the binder is dead, or the call fails. The two streams are kept **separate** (audit A-M6): the previous single merged string made the VD-server probe decide ALIVE/GONE from text that could equally have come from stderr, so a probe that merely failed loudly read as "alive". The stderr drain is joined via a sentinel on a bounded queue so the caller can never observe a half-appended buffer, and the FDs are closed only after that.
+- `execBackground(command)` is fire-and-forget (used for `app_process` so the server outlives the shell stream) and **returns `Boolean`** — `false` when Shizuku is unavailable, the binder is dead, or `newProcess` threw. Callers must treat `false` as "the engine never launched" (audit A-M7, see *Honest deploy status* above). The command is passed to `sh -c` verbatim; the caller decides backgrounding (`setsid … &`), and stripping a trailing `&` and re-adding one used to produce `… & &`, a shell syntax error.
+- `probeVdServer()` runs the shared `VdDeploy.probeCommand` (`pkill -0`-style `[P]ipelineServer` existence check — no `ps`/`pidof` needed) and returns `VdProbeResult.ALIVE / GONE / UNKNOWN`, deciding from **stdout only**. This is the Shizuku counterpart of the car/desktop exit-code probe; it deliberately does **not** implement its own wait loop anymore — the convergence rules (two consecutive GONE) live in protocol-core's `vdAwaitExit`. `UNKNOWN` when Shizuku is unavailable or the probe fails, which the deploy sequence treats as "accept the exit" so a dead transport never stalls deployment.
 
-- Before launching a new engine, so two instances never race for the same VirtualDisplay / DTA / 9638-9639 ports.
-- After the graceful stop, to confirm `cleanup()` actually ran before we declare the session torn down.
-
-Returns `true` if no vd-server is running (or Shizuku is unavailable, in which case we cannot verify and report `true` to avoid hanging).
+`execAndWait` is used for `shellSync` and `execBackground` + `probeVdServer` for `launch`/`probe` by the `VdDeployExecutor` in `ConnectionService.startVdServerViaShizuku`. The former `waitForVdServerExit(timeoutMs)` polling helper and the `copyToFile` shell-streaming helper are gone.
 
 ### FileLog
 
 File-based logger that bypasses Android logcat filtering (HyperOS filters `Log.i/d` for non-system apps).
 
-- Writes to `/sdcard/DiLinkAuto/client.log`. Single writer thread drains a lock-free `ConcurrentLinkedQueue`; `SimpleDateFormat` is only touched from the writer thread.
+- Writes to `/sdcard/DiLinkAuto/client.log`. Single writer thread drains the shared `AsyncLogQueue` (`LOG_QUEUE_CAPACITY = 2048`, audit A-05); `SimpleDateFormat` is only touched from the writer thread.
 - `loadEnabled(prefs)`: default ON for debug/pre-release (`BuildConfig.DEBUG`), OFF for release. Once the user explicitly toggles, that choice persists via `AppPrefs.LOG_ENABLED` + `LOG_ENABLED_USER_SET`.
 - `rotate()`: archives the current log as `client-YYYYMMDD-HHmmss.log`, starts fresh, prunes to 9 archived + 1 current.
 - `zipLogs()`: produces `dilinkauto-logs.zip` from all `.log` files in `/sdcard/DiLinkAuto/` and additionally includes `/data/local/tmp/vd-server.log` when it exists — the VD server's own log is part of every Share Logs submission.
@@ -152,6 +205,31 @@ The toggle is in **Settings → Debug**. Toggling it calls `ConnectionService.se
 ### PermissionChecker
 
 Runtime permission checks for the phone UI's onboarding and settings screens. Extracted from `OnboardingScreen` and `SettingsScreen`, which had each check written inline three times (initial read, periodic re-check, and onboarding's `pollPermission` switch). `hasAllFilesAccess()`, `hasBatteryExemption(context, pkg)`, `hasAccessibility(context, pkg)` — all plain `Context` receivers so they can be called from any `@Composable` or coroutine scope.
+
+## Testing
+
+app-client is covered by plain JUnit4 + `kotlinx-coroutines-test` JVM tests (`app-client/src/test/java/com/dilinkauto/client/service/`), run with `./gradlew :app-client:testDebugUnitTest`. No Robolectric/Mockito/MockK — the Android dependencies are either injected through a seam, or made harmless by `testOptions { unitTests.isReturnDefaultValues = true }` plus hand-written fakes (`ContextWrapper(null)`, canned lambdas, a fake `AssetSource` / `CarInstaller`).
+
+The first-pass suite (`VersioningTest`, `AppCategorizerTest`, `InstallStatusTest`) is **38 `@Test` methods** (19 + 8 + 11), as recorded in [./IMPLEMENTATION_REPORT_TESTING.md](./IMPLEMENTATION_REPORT_TESTING.md); the per-file breakdown below is the literal method count.
+
+Later, behaviour-preserving seams added more coverage on top of that:
+
+| Test file | Covers |
+|---|---|
+| `VersioningTest` (19) | `parseVersion` / `compareVersions` — release vs dev ordering, dev numbering, malformed and non-numeric components, ordering axioms, and the zero-sentinel / `-SNAPSHOT` hazards |
+| `AppCategorizerTest` (8) | category ordering and the keyword rules, including apps that fall through to `OTHER` |
+| `InstallStatusTest` (11) | `InstallStatus.parse` / `stageIndex` classification, `isInProgress` / `isTerminal`, and the localized-text hazard |
+| `CarInstallCoordinatorTest` (8) | the whole install state machine through the `CarInstaller` seam — skip when current, push on older, hold the auth-needed message, session always closed, exception path |
+| `CarAppInstallerParseVersionTest` (6) | `parseInstalledVersion` against real `dumpsys package` shapes and the `"0"` sentinel |
+| `AssetDeployerExtractTest` (12) | `extract` / `ensureCurrent` across every branch via a fake `AssetSource` — write, CRC skip, rewrite, mkdirs, read/write failure, A-L15 fallback, and the `.tmp` sibling never surviving any outcome |
+| `AssetCrcPolicyTest` (8) | CRC freshness policy, `usableExistingCrc` edge cases, and the temp-file + rename + fallback write |
+| `IconHashGateTest` (5) | concurrent `iconFor` / `reset` under an 8-thread storm (audit A-M11) |
+| `AdbKeyUtilSelfHealTest` (5) | half-missing key-pair regeneration (audit A-L24) |
+| `CarIpLocatorTest` (7) | car-ADB discovery strategies |
+| `ConnectionServiceInitGuardTest` (4) | init-guard invariants |
+| `AdversarialM2Test` (2) | hostile-input characteristics |
+
+See [./IMPLEMENTATION_REPORT_TESTING.md](./IMPLEMENTATION_REPORT_TESTING.md) for the full-project report (all six modules, the locked cross-module invariants, and the audit findings that were deliberately left in place as characterization tests). The app-client findings recorded there that this document references by id: **C-5** (Versioning zero-sentinel), **C-6** (InstallStatus English-substring classification), and the `AppCategorizer` gap.
 
 ## Permissions Required
 
@@ -176,7 +254,8 @@ Runtime permission checks for the phone UI's onboarding and settings screens. Ex
 - `kotlinx-coroutines`
 - `dev.mobile:dadb:1.2.10` (WiFi ADB for car-app install)
 - `dev.rikka.shizuku:api / aidl / provider:13.1.5`
-- Protocol module (`:protocol`) — shared with the car app and VD server
-- `app-server.apk` and `vd-server.jar` embedded in `app-client/src/main/assets/` by the `embedServerApk` and `buildVdServer` tasks (only the phone APK is installed manually; the car APK and VD JAR are pushed/embedded automatically)
+- Protocol module (`:protocol`) — shared with the car app and VD server (`:protocol` also pulls in the pure-JVM `:protocol-core`)
+- `app-server.apk` and `vd-server.jar` embedded in `app-client/src/main/assets/` by the `embedServerApk` and `buildVdServer` tasks (only the phone APK is installed manually; the car APK and VD JAR are pushed/embedded automatically). `buildVdServer` dexes `:vd-server` + `:protocol` + `:protocol-core` + the Kotlin stdlib and coroutines into a single JAR for `app_process`; `embedServerApk` refuses to ship a stale APK when the server module has not been built.
+- Test: `junit:junit:4.13.2`, `kotlinx-coroutines-test:1.7.3`, and `testOptions { unitTests.isReturnDefaultValues = true }`
 
-Build: Kotlin 1.9.22, Android Gradle Plugin 8.2.2, `compileSdk = 34`, `minSdk = 29` (app-client), JDK 17. Release builds require `RELEASE_KEYSTORE_PASSWORD` and `RELEASE_KEY_PASSWORD` environment variables. See [./setup.md](./setup.md) for build commands and [./architecture.md](./architecture.md) for the cross-module layout.
+Build: Kotlin 1.9.22, Android Gradle Plugin 8.2.2, `compileSdk = 34`, `minSdk = 29` (app-client), JDK 17, current version `0.18.0-dev-13` (`versionCode 58`). Release builds require `RELEASE_KEYSTORE_PASSWORD` and `RELEASE_KEY_PASSWORD` environment variables — without them a release build fails at configuration time rather than silently producing an unsigned APK. See [./setup.md](./setup.md) for build commands and [./architecture.md](./architecture.md) for the cross-module layout.
