@@ -47,6 +47,18 @@
 ```
 
 ## 5. 剩余高价值工作（需"为可测性重构"的 seam，已获授权，列为后续）
+
+### 5.1 已完成（"为可测性重构"seam，全部行为不变 + 配回归测试 + 逐模块验证）
+- ✅ **FeedGate ↔ VideoStreamPipe 不变量**（app-desktop）：满管道"丢最旧"会逐出 FeedGate 刚交付的 CONFIG（静默损坏，已 hazard 固定）+ 重建新管道重放 `initialConfig` 恢复路径。`1b6092c`
+- ✅ **AdbCrypto.encodePublicKey** `android.util.Base64 → java.util.Base64`（字节一致，含 1 个 `=`）：ANDROID_PUBKEY 结构（modulus/exponent/words）现可在 JVM 强校验。`1b6092c`
+- ✅ **TcpAdbConnection** 提取 companion `negotiateMaxPayload`/`readMessageFrom(InputStream)`：无 socket 覆盖 connect 协商 + CRC/坏 magic。`1b6092c`
+- ✅ **CarConnectionService** 提取 `reconnectBackoffMs`/`iconBudgetAccepts`（纯函数）：从未测的重连退避公式纳入回归。`6d25390`
+- ✅ **Connection** `start()` 注入 `heartbeatIntervalMs`/`heartbeatTimeoutMs`（默认仍 3s/10s）：心跳自动 ACK / 看门狗踢静默对端 / 活跃链路不误杀。`fa00527`
+- ✅ **AssetDeployer** `AssetSource` seam（`AssetManager` 是 final 无法子类）：vd-server.jar 的 CRC 新鲜度门 extract/ensureCurrent 全分支（含 A-L15 回退、tmp 不残留）。`bbd6fe0`
+
+净增：以上 6 个约 +31 个测试方法；连同首批 148 个，合计 **约 179 个新测试方法**，全 6 模块离线 gradle 实测通过。
+
+
 遵循"低风险、行为不变、配回归测试"原则，按 6 份审计报告的 refactor 清单推进：
 - `:protocol-core`：`Connection` 心跳/看门狗/优雅 EOF-flush 测试（需把 `HEARTBEAT_*`/`FLUSH_GRACE_MS` 提为可注入参数或 const）。
 - `:protocol`：`TcpAdbConnection` connect 协商/readMessage CRC/shell 闭环（用 `TestSockets` 式假 server harness；建议 extract `negotiateMaxPayload` / `readMessageFrom(InputStream)`，并把 `AdbCrypto.encodePublicKey` 的 `android.util.Base64` 换成 `java.util.Base64`——字节等价）。
