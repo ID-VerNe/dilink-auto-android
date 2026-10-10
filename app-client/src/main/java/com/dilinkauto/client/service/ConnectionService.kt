@@ -84,7 +84,7 @@ class ConnectionService : Service() {
      * 线程抢先访问，服务崩溃重启（2026-10-09 实测）。与 [notifier] 是同一次
      * DRY 重构留下的同族问题，修法保持一致。
      */
-    private val assetDeployer: AssetDeployer by lazy { AssetDeployer(applicationContext.assets) }
+    private val assetDeployer: AssetDeployer by lazy { AssetDeployer(AssetManagerAssetSource(applicationContext.assets)) }
 
     /**
      * 前台通知 + wake lock 门面（DRY-6，与车机端共享）。

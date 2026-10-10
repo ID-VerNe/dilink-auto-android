@@ -19,7 +19,7 @@ import java.util.zip.CRC32
  * once per process, so without this check `app_process` can silently load a
  * stale engine — the app still runs and still logs, it just runs old code.
  */
-internal class AssetDeployer(private val assets: AssetManager) {
+internal class AssetDeployer(private val source: AssetSource) {
 
     /**
      * CRC of the on-disk file if the write happened or the file was already
@@ -42,7 +42,7 @@ internal class AssetDeployer(private val assets: AssetManager) {
      */
     fun extract(assetName: String, target: File): Result {
         val assetBytes = try {
-            assets.open(assetName).use { it.readBytes() }
+            source.read(assetName)
         } catch (e: Exception) {
             FileLog.w(TAG, "Failed to read asset $assetName: ${e.message}")
             return Result.Failed("read: ${e.message}")
@@ -154,4 +154,21 @@ internal class AssetDeployer(private val assets: AssetManager) {
             }
         }
     }
+}
+
+/**
+ * Asset byte-source seam. The production implementation wraps the Android
+ * `AssetManager` (which is `final` and therefore cannot be subclassed as a test
+ * double); tests inject a fake so [AssetDeployer.extract] / [ensureCurrent] —
+ * the on-disk `vd-server.jar` CRC-freshness gate — become unit-testable.
+ */
+internal interface AssetSource {
+    @Throws(Exception::class)
+    fun read(assetName: String): ByteArray
+}
+
+/** Production [AssetSource] over the Android [AssetManager]. */
+internal class AssetManagerAssetSource(private val assets: AssetManager) : AssetSource {
+    override fun read(assetName: String): ByteArray =
+        assets.open(assetName).use { it.readBytes() }
 }
