@@ -1022,7 +1022,7 @@ class CarConnectionService : Service() {
                         // Aggregate cap (audit S-M5): the frame limit is 128MB and
                         // a 4GB car head unit OOMs decoding the whole batch — this
                         // also bounds the eMMC source cache written below.
-                        if (totalIconBytes + app.iconPng.size > MAX_APP_LIST_ICON_BYTES) {
+                        if (!iconBudgetAccepts(totalIconBytes, app.iconPng.size)) {
                             carLogSend("App list: icon budget exhausted after $newIcons icons — skipping the rest", "W")
                             return@launch
                         }
@@ -1453,8 +1453,7 @@ class CarConnectionService : Service() {
 
         scope.launch {
             consecutiveFailures++
-            val backoffMs = if (consecutiveFailures <= 1) 500L
-                else (500L * (1L shl (consecutiveFailures - 1).coerceAtMost(4))).coerceAtMost(8000L)
+            val backoffMs = reconnectBackoffMs(consecutiveFailures)
             carLogSend("Reconnect backoff: ${backoffMs}ms (failures=$consecutiveFailures)")
             delay(backoffMs)
             if (_state.value == State.IDLE && !carPrefs.userDisconnected) {
@@ -1586,6 +1585,18 @@ class CarConnectionService : Service() {
          * and decoded bitmaps. ~60 icons at 1MB each.
          */
         internal const val MAX_APP_LIST_ICON_BYTES = 64L shl 20  // 64 MB
+
+        /**
+         * 重连退避（毫秒）：首次 500，之后翻倍，封顶 8000；位移已 coerce 防止大失败计数溢出。
+         * 与原先内联在 reconnect 处的公式完全一致，提取为纯函数以便单测。
+         */
+        internal fun reconnectBackoffMs(consecutiveFailures: Int): Long =
+            if (consecutiveFailures <= 1) 500L
+            else (500L * (1L shl (consecutiveFailures - 1).coerceAtMost(4))).coerceAtMost(8000L)
+
+        /** 追加 [nextIconBytes] 后是否仍在 [MAX_APP_LIST_ICON_BYTES] 聚合预算内（含边界）。 */
+        internal fun iconBudgetAccepts(totalBytes: Long, nextIconBytes: Int): Boolean =
+            totalBytes + nextIconBytes <= MAX_APP_LIST_ICON_BYTES
 
         /**
          * Max VD rebuilds per session for the black-screen self-heal
