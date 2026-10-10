@@ -98,7 +98,11 @@ class Connection(
     /**
      * Starts reading frames, writing queued frames, heartbeats, and watchdog.
      */
-    fun start(enableHeartbeat: Boolean = true) {
+    fun start(
+        enableHeartbeat: Boolean = true,
+        heartbeatIntervalMs: Long = HEARTBEAT_INTERVAL_MS,
+        heartbeatTimeoutMs: Long = HEARTBEAT_TIMEOUT_MS
+    ) {
         log("Connection started: sendBuf=$actualSendBuf recvBuf=$actualRecvBuf tcpNoDelay=${channel.socket().tcpNoDelay} heartbeat=$enableHeartbeat")
         lastFrameReceivedAt = System.currentTimeMillis()
 
@@ -234,7 +238,7 @@ class Connection(
         if (enableHeartbeat) {
             heartbeatJob = scope.launch(Dispatchers.IO) {
                 while (isActive && connected.get()) {
-                    delay(HEARTBEAT_INTERVAL_MS)
+                    delay(heartbeatIntervalMs)
                     if (!connected.get()) break
                     try {
                         enqueueFrame(FrameCodec.Frame(Channel.CONTROL, ControlMsg.HEARTBEAT, ByteArray(0)))
@@ -251,10 +255,10 @@ class Connection(
 
             watchdogJob = scope.launch(Dispatchers.IO) {
                 while (isActive && connected.get()) {
-                    delay(HEARTBEAT_INTERVAL_MS)
+                    delay(heartbeatIntervalMs)
                     val elapsed = System.currentTimeMillis() - lastFrameReceivedAt
-                    if (elapsed > HEARTBEAT_TIMEOUT_MS) {
-                        disconnectReason = "watchdog: no frame received for ${elapsed}ms (timeout=${HEARTBEAT_TIMEOUT_MS}ms)"
+                    if (elapsed > heartbeatTimeoutMs) {
+                        disconnectReason = "watchdog: no frame received for ${elapsed}ms (timeout=${heartbeatTimeoutMs}ms)"
                         log(disconnectReason)
                         disconnect()
                         break
