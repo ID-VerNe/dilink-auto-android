@@ -51,7 +51,7 @@ internal class DisplayPowerController(
 
     /**
      * Power the physical panel on ([on]=true) or off ([on]=false). Uses
-     * DisplayControl reflection; falls back to `cmd display power-on/off`
+     * DisplayControl reflection; falls back to `cmd display power-reset/off`
      * (API 29+) on failure. On API < 29 the shell fallback is a no-op and
      * the panel cannot be restored here — surfaced via [logErr].
      */
@@ -60,12 +60,19 @@ internal class DisplayPowerController(
             if (!displayControlLoaded) { try { displayControlClass = Class.forName("com.android.server.display.DisplayControl"); displayControlLoaded = true } catch (_: Exception) { try { val clf = Class.forName("dalvik.system.DelegateLastClassLoader").getDeclaredConstructor(String::class.java, String::class.java, ClassLoader::class.java); clf.isAccessible = true; displayControlClass = (clf.newInstance("/system/framework/services.jar", null, ClassLoader.getSystemClassLoader()) as ClassLoader).loadClass("com.android.server.display.DisplayControl"); displayControlLoaded = true } catch (_: Exception) { logErr("DisplayControl load failed") } } }
             val cls = displayControlClass; if (cls != null) { val gid = cls.getDeclaredMethod("getPhysicalDisplayIds").apply { isAccessible = true }; val ids = gid.invoke(null) as LongArray; val sp = cls.getDeclaredMethod("setDisplayPowerMode", android.os.IBinder::class.java, Int::class.javaPrimitiveType).apply { isAccessible = true }; for (id in ids) { sp.invoke(null, cls.getDeclaredMethod("getPhysicalDisplayToken", Long::class.javaPrimitiveType).apply { isAccessible = true }.invoke(null, id), if (on) 2 else 0) } }
         } catch (_: Exception) {
-            // Shell fallback `cmd display power-on/off` was added in API 29; on API 26-28 it
-            // is a no-op (subcommand absent) and the panel will not be restored if the
-            // DisplayControl reflection above also fails. Surface this so the failure is
-            // observable rather than silent.
+            // Shell fallback: `cmd display power-off ID` and `power-reset ID` were
+            // added in API 29; on API 26-28 both subcommands are absent and the
+            // panel will not be restored if the DisplayControl reflection above
+            // also fails. Surface this so the failure is observable.
+            //
+            // 2026-10-10 实机修正：这里原来写的是 `power-on` —— Android 15 实机
+            // `cmd display help` 证明该子命令**不存在**（只有 power-off 和一个
+            // power-reset "Turn the display power to a state the display supposed
+            // to have"）。旧写法报 "Unknown command: power-on"，物理屏一旦被
+            // power-off 就再也点不亮（反射路径失败时兜底彻底失效）。实测
+            // `cmd display power-reset 0` 可点亮物理屏。
             if (android.os.Build.VERSION.SDK_INT < 29) logErr("DisplayControl reflection failed on API < 29; shell fallback (cmd display power) is API 29+ and will NOT restore the panel")
-            try { execShell("cmd display power-${if (on) "on" else "off"} 0") } catch (_: Exception) {}
+            try { execShell(if (on) "cmd display power-reset 0" else "cmd display power-off 0") } catch (_: Exception) {}
         }
     }
 

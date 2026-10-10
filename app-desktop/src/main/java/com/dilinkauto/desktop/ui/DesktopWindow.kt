@@ -13,10 +13,12 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicText
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -25,6 +27,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.awt.ComposeWindow
 import androidx.compose.ui.awt.SwingPanel
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
@@ -33,6 +36,7 @@ import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -40,7 +44,9 @@ import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.WindowPlacement
 import androidx.compose.ui.window.rememberWindowState
 import com.dilinkauto.desktop.DesktopApp
+import com.dilinkauto.desktop.SessionState
 import com.dilinkauto.desktop.display.Screens
+import javax.swing.SwingUtilities
 
 /** 主视图：镜像（手机画面）/ 应用启动器 / 显示设置。 */
 enum class DesktopView { MIRROR, APPS, DISPLAY }
@@ -71,6 +77,11 @@ fun DesktopWindow(app: DesktopApp, onClose: () -> Unit) {
     val keepAwake by app.keepAwakeOn.collectAsState()
     val hardwareInUse by (session?.hardwareDecode ?: NoHardwareDecode).collectAsState()
     val appList by (session?.apps ?: NoApps).collectAsState()
+    // 失败面板（2026-10-10）：runSession 的 catch 把连接被拒/握手被拒/部署失败/
+    // 等待 VD 超时等统一汇聚到 lastError；DISCONNECTED 且未自动关窗时，
+    // 视频区整块换成提示 + 重试按钮（见下方 VideoFailurePanel）。
+    val lastError by (session?.lastError ?: NoLastError).collectAsState()
+    val sessionState by (session?.state ?: NoState).collectAsState()
 
     var view by remember { mutableStateOf(DesktopView.MIRROR) }
     // 窗口宽度额外加上导航栏（audit WIN-14）：视频面板占的是"窗口宽 − 导航栏宽"，
@@ -94,9 +105,57 @@ fun DesktopWindow(app: DesktopApp, onClose: () -> Unit) {
         if (ended) onClose()
     }
 
+    // 退出全屏的尺寸还原要直接操作 AWT 窗口（见 [applyWindowed]），而 F11 的
+    // onKeyEvent 回调不在 FrameWindowScope 里、拿不到 window；由窗口内容在
+    // 组合时用 SideEffect 回填。
+    val composeWindowRef = remember { java.util.concurrent.atomic.AtomicReference<ComposeWindow?>(null) }
+
+    /**
+     * 退出全屏，并把窗口尺寸还原成"视口 + 导航栏"的规范物理尺寸（2026-10-10）。
+     *
+     * 实机铁证：125% 缩放屏上 1720x900 → 全屏 → 还原为 1376x720。诊断打点
+     * （JNA 直读 GetWindowRect + 窗口 user 尺寸，临时，已删）确认的完整机制：
+     *
+     *  1. 退出全屏最终走 JDK 的 `GraphicsDevice.setFullScreenWindow(null)`
+     *     （Window → ComposeWindow → ComposeWindowPanel → ComposeContainer →
+     *     ComposeSceneMediator → WindowSkiaLayerComponent → SkiaLayer →
+     *     FullscreenAdapter → PlatformOperations，逐层核对字节码）；它在
+     *     Compose 里是**异步**执行的（snapshotFlow 收集器下一帧才跑），所以这里
+     *     直接调 JDK 把它变成同步动作（这正是那整条链的全部实现，且 Compose 侧的
+     *     全屏查询都从 JDK 实时状态推导，不会失联）。
+     *  2. JDK 的还原有 bug：把保存的 user 坐标**直接当物理值**应用（native 少乘
+     *     一次 125%）。实测还原后 user=1376x720、物理也=1376x720。
+     *  3. 此时窗口 internal 的 user 尺寸恰好还是 1376x720（规范 dp 值），而 AWT
+     *     对"尺寸未变"的 setSize 整体**短路** —— 直接"设回规范值"是 no-op，native
+     *     停在被写错的物理尺寸上。想靠 WindowState.size 补偿也不行：更新器
+     *     （`Window$5`）固定**先 size 后 placement**且值相等即跳过，尺寸要么在窗口
+     *     仍处全屏时被下发，要么被跳过，最后都被 JDK 的还原覆盖。
+     *
+     * 修复 = 在 EDT 事件队列尾部"先弹再设回"：+1 打破相等、迫使 native 重算
+     * （换算即回到正常 ×1.25 管道，连位置也一并复原），再设回规范值。实测 F11
+     * 往返后物理 (60,60,1720x900) 与初始建窗一致，重复往返稳定。窗口状态交给
+     * 监听器自然回写（数值域一致，更新器再应用时幂等）。
+     */
+    fun applyWindowed() {
+        fullscreen = false
+        windowState.placement = WindowPlacement.Floating
+        val win = composeWindowRef.get() ?: return
+        win.graphicsConfiguration.device.setFullScreenWindow(null)
+        SwingUtilities.invokeLater {
+            val width = app.viewportWidth + RAIL_WIDTH_PX
+            val height = app.viewportHeight
+            win.setSize(width + 1, height + 1)
+            win.setSize(width, height)
+        }
+    }
+
     fun setFullscreen(on: Boolean) {
-        fullscreen = on
-        windowState.placement = if (on) WindowPlacement.Fullscreen else WindowPlacement.Floating
+        if (on) {
+            fullscreen = true
+            windowState.placement = WindowPlacement.Fullscreen
+        } else {
+            applyWindowed()
+        }
     }
 
     Window(
@@ -113,6 +172,8 @@ fun DesktopWindow(app: DesktopApp, onClose: () -> Unit) {
             }
         },
     ) {
+        // 回填窗口引用（见 composeWindowRef / applyWindowed 的注释）。
+        SideEffect { composeWindowRef.set(window) }
         Row(Modifier.fillMaxSize().background(Palette.Backdrop)) {
             NavRail(
                 view = view,
@@ -144,13 +205,28 @@ fun DesktopWindow(app: DesktopApp, onClose: () -> Unit) {
                     // 不组合期间 `videoView.setFrame` 只是 repaint 空转，回到本页
                     // 立刻显示最近一帧。
                     //
-                    // key(generation)：重连后换的是新的 videoView，必须让 SwingPanel 重建。
-                    key(current.generation) {
-                        SwingPanel(
-                            background = Color.Black,
-                            factory = { current.videoView },
-                            modifier = Modifier.fillMaxSize(),
+                    // 失败面板（2026-10-10）：会话异常终止（连接被拒/部署失败/等待
+                    // VD 超时）时视频不会再有新帧 —— 整块换成提示 + 重试。必须
+                    // "不组合 SwingPanel"而不是叠加（AWT 恒在 Compose 之上，WIN-01）。
+                    // `!ended`：到过 STREAMING 的正常结束会随即自动关窗，不进入此
+                    // 分支，避免正常断连瞬间闪一下面板。
+                    val windowFailed = sessionState == SessionState.DISCONNECTED && !ended
+                    if (windowFailed) {
+                        VideoFailurePanel(
+                            error = lastError,
+                            onRetry = { app.restart(dpiOverride = null, hwaccelEnabled = null) },
+                            onReconfigure = { view = DesktopView.DISPLAY },
+                            modifier = Modifier.fillMaxSize().background(Palette.Backdrop),
                         )
+                    } else {
+                        // key(generation)：重连后换的是新的 videoView，必须让 SwingPanel 重建。
+                        key(current.generation) {
+                            SwingPanel(
+                                background = Color.Black,
+                                factory = { current.videoView },
+                                modifier = Modifier.fillMaxSize(),
+                            )
+                        }
                     }
                 }
 
@@ -183,20 +259,21 @@ fun DesktopWindow(app: DesktopApp, onClose: () -> Unit) {
                         ),
                         onToggleFullscreen = ::setFullscreen,
                         onMoveToScreen = { screen ->
-                            // 全屏状态下位置被忽略，先退回浮动窗口再搬。
-                            if (fullscreen) setFullscreen(false)
+                            // 全屏状态下位置被忽略，先退回浮动窗口（并还原规范尺寸）。
+                            if (fullscreen) applyWindowed()
                             window.setLocation(screen.x, screen.y)
-                            // D-L7：只 setLocation 不 setSize 的话，从小屏搬到大屏
-                            // 窗口还是原来大小（浪费屏幕），从大屏搬到小屏则大部分
-                            // 在屏外（用户只看到一角）。按目标屏 bounds 钳制尺寸，
-                            // 留出任务栏余量。极小屏时保证上界不低于下限（coerceIn
-                            // 要求 min <= max）。
+                            // 尺寸语义（2026-10-10 起）：先取规范尺寸（视口 + 导航栏，
+                            // audit WIN-14 —— 视频区才与握手视口同比例），目标屏放不下
+                            // 时按屏 bounds 收缩（audit D-L7 的原意：从大屏搬到小屏不能
+                            // 让窗口大部分留在屏外）。直接 setSize 而不是赋值
+                            // `windowState.size`：后者在"值相等"时不会下发，窗口被用户
+                            // 手动改过尺寸后就搬不回规范尺寸。
                             val maxWidth = maxOf(MIN_MOVED_WINDOW_PX, screen.width - MOVED_WINDOW_MARGIN_PX)
                             val maxHeight = maxOf(MIN_MOVED_WINDOW_PX, screen.height - MOVED_WINDOW_MARGIN_PX)
-                            window.setSize(
-                                window.width.coerceIn(MIN_MOVED_WINDOW_PX, maxWidth),
-                                window.height.coerceIn(MIN_MOVED_WINDOW_PX, maxHeight),
-                            )
+                            val width = minOf(app.viewportWidth + RAIL_WIDTH_PX, maxWidth)
+                            val height = minOf(app.viewportHeight, maxHeight)
+                            window.setSize(width, height)
+                            windowState.size = DpSize(width.dp, height.dp)
                         },
                         onToggleKeepAwake = { app.setKeepAwake(it) },
                         onTogglePhoneScreen = { on ->
@@ -219,6 +296,42 @@ fun DesktopWindow(app: DesktopApp, onClose: () -> Unit) {
                     DesktopView.MIRROR -> Unit
                 }
             }
+        }
+    }
+}
+
+/**
+ * 连接失败面板（2026-10-10）。
+ *
+ * 启动失败（连接被拒 / 握手被拒 / VD 部署失败 / 等待 VD 超时）不关窗
+ * （WIN-06）—— 此前用户看到的是一片空白视频区，既不知道发生了什么，也没
+ * 有就地重试的入口（只能去「显示」页点「应用并重连」）。这里显示
+ * [error]（来自 `DesktopApp.Session.lastError`，由 `runSession` 的 catch
+ * 汇聚）并提供「重试连接」，等价于「应用并重连」但不改任何参数。
+ */
+@Composable
+private fun VideoFailurePanel(
+    error: String?,
+    onRetry: () -> Unit,
+    onReconfigure: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier.padding(24.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        BasicText("连接未建立", style = TextStyle(color = Palette.Text, fontSize = 16.sp))
+        Spacer(Modifier.height(8.dp))
+        BasicText(
+            error ?: "会话已断开",
+            style = TextStyle(color = Palette.TextDim, fontSize = 13.sp, textAlign = TextAlign.Center),
+            modifier = Modifier.widthIn(max = 560.dp),
+        )
+        Spacer(Modifier.height(16.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            ActionButton("重试连接", onClick = onRetry, primary = true)
+            ActionButton("打开显示设置", onClick = onReconfigure)
         }
     }
 }
@@ -274,6 +387,18 @@ private fun RailButton(
 }
 
 private val RAIL_WIDTH = 96.dp
+
+/**
+ * [RAIL_WIDTH] 的 AWT 用户坐标数值（2026-10-10）。
+ *
+ * 供直接对窗口 `setSize` 的场合（[DesktopWindow] 的 `applyWindowed` /
+ * `onMoveToScreen`）使用。数值语义：Compose 对 `WindowState.size` 的下发是
+ * "dp 数值原样当 AWT 用户坐标"（`Windows_desktopKt.setSizeImpl` 字节码：
+ * `window.setSize(size.width.roundToInt(), ...)`，无 density 乘法），所以两者
+ * 同域 —— 初始建窗 `DpSize(1280+96 dp, 720 dp)` 实测即 1720x900 物理（125%
+ * 缩放屏），直接传 dp 数值即可得到同样的物理尺寸。
+ */
+private val RAIL_WIDTH_PX = RAIL_WIDTH.value.toInt()
 
 /** 搬窗口后允许的最小尺寸（audit D-L7）：再小就没法用了。 */
 private const val MIN_MOVED_WINDOW_PX = 480

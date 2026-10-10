@@ -5,8 +5,18 @@ import kotlinx.coroutines.delay
 /**
  * Unified "deploy the vd-server" sequence shared by every deploy site.
  *
- * The sequence itself is: **kill → wait for the old engine to exit (force-kill
- * + re-wait on timeout) → launch**.
+ * The sequence itself is: **graceful stop (stop-request 哨兵文件) → wait for the
+ * old engine to exit → force-kill + re-wait on timeout → launch**.
+ *
+ * 两个入口共用同一条停止实现：[vdRunDeploySequence]（部署新引擎前停旧的）与
+ * [vdStopEngine]（会话收尾——桌面端 `closeSession()` 在杀 adb 锚点前必须先让
+ * 旧引擎退干净，否则 cleanup 被截断）。
+ *
+ * 为什么 grace 用文件而不是 SIGTERM：**Android ART 的 app_process 收 SIGTERM
+ * 直接终止、不执行 JVM shutdown hook**（2026-10-10 MI 9 实测），而
+ * `PipelineServer.cleanup()`（面板/letterbox/IME/screen_off_timeout 恢复）
+ * 只在正常退出路径可靠执行——信号路径会把它整体跳过，这是"每次重连后设备
+ * 状态被污染"的根因。详见 [VdDeploy] 类头"如何停止引擎"。
  *
  * Four sites previously re-implemented this: car USB/TCP ADB
  * (`VdServerDeployer.deploy`), car dev-mode TCP ADB (`deployDirect`), phone
@@ -67,7 +77,7 @@ interface VdDeployExecutor {
 
 /** Outcome of [vdRunDeploySequence]. */
 data class VdDeployOutcome(
-    /** True when the graceful wait timed out and [VdDeploy.stopCommand] was used. */
+    /** True when the graceful wait timed out and [VdDeploy.killCommandForce] was used. */
     val forcedKill: Boolean,
     /** launch() result — see [VdDeployExecutor.launch]. */
     val launched: Boolean,
@@ -77,6 +87,21 @@ data class VdDeployOutcome(
 object VdDeploySequence {
     /** Total wait budget for the old engine to exit, per attempt. */
     const val EXIT_WAIT_TIMEOUT_MS = 3_000L
+
+    /**
+     * Wait budget for the **graceful** stop (stop-request 哨兵) — longer than
+     * [EXIT_WAIT_TIMEOUT_MS] because a graceful exit runs the full
+     * `PipelineServer.cleanup()`.
+     *
+     * 2026-10-10 MI 9 实测（桌面端 + 设备侧轮询双向互证）：从哨兵落地到**进程真的
+     * 消失**需要 **6.1~6.3 秒**，不是早先估计的 2~4 秒 —— 那条估计只看到了
+     * `cleanup()` 内部的 shell 命令，漏掉了 pipeline 线程的有界 join、编码器/VD
+     * 释放，以及手机侧 `ConnectionService` 并发清理抢同一批 display/rotation 锁的
+     * 等待。当时 6 秒预算差 130ms 没等到，每次都补一记 `-9`，把 cleanup 的尾巴
+     * （`screen_off_timeout` 恢复）截掉 —— 这正是"重连后手机面板不恢复"的成因。
+     * 12 秒 = 实测值的约 2 倍余量。
+     */
+    const val GRACEFUL_EXIT_TIMEOUT_MS = 12_000L
 
     /** Poll interval while waiting for the old engine to exit. */
     const val EXIT_WAIT_POLL_MS = 150L
@@ -124,33 +149,61 @@ suspend fun vdAwaitExit(
 }
 
 /**
+ * 停止旧引擎：**哨兵 → 等它优雅退出 → 超时才 -9 兜底**。
+ *
+ * 与 [vdRunDeploySequence]（部署序列）共用同一条实现（2026-10-10 抽出）：
+ * 桌面端 `closeSession()` 在杀 adb 锚点之前也要走这一步 —— **本地 adb shell
+ * 进程就是设备侧引擎的存活锚点，锚点一死引擎被 adbd 回收，`cleanup()`
+ * （面板/IME/screen_off_timeout 恢复）会被截断**（实测：重连/关窗后
+ * `screen_off_timeout` 停在 2147483647 哨兵）。两处的收敛规则（两次连续
+ * GONE 才认账）与兜底（-9）必须一致，所以只此一份。
+ *
+ * @return true = 优雅退出超时、用了强杀（此时 cleanup 被跳过，属可接受的兜底）
+ */
+suspend fun vdStopEngine(
+    executor: VdDeployExecutor,
+    gracefulTimeoutMs: Long = VdDeploySequence.GRACEFUL_EXIT_TIMEOUT_MS,
+    timeoutMs: Long = VdDeploySequence.EXIT_WAIT_TIMEOUT_MS,
+    pollMs: Long = VdDeploySequence.EXIT_WAIT_POLL_MS,
+    now: () -> Long = System::currentTimeMillis,
+    sleep: suspend (Long) -> Unit = { delay(it) },
+): Boolean {
+    executor.shellSync(VdDeploy.gracefulStopCommand)
+    if (vdAwaitExit(executor, gracefulTimeoutMs, pollMs, now = now, sleep = sleep)) return false
+    // 引擎没有响应哨兵（卡死 / 旧版引擎）：-9 强杀兜底。强杀路径接受
+    // cleanup 被跳过的代价——watchdog 与 pre-clean 的兜底另算。
+    executor.shellSync(VdDeploy.killCommandForce)
+    vdAwaitExit(executor, timeoutMs, pollMs, now = now, sleep = sleep)
+    return true
+}
+
+/**
  * The unified deploy sequence:
  *
- *  1. [VdDeploy.DeployPlan.killCommand] — graceful kill of the old engine;
- *  2. [vdAwaitExit] — wait for a real exit; on timeout, [VdDeploy.stopCommand]
- *     (two-stage SIGTERM → SIGKILL) and wait once more;
- *  3. [VdDeploy.DeployPlan.launchCommand] — launch the replacement.
+ *  1. [vdStopEngine] — 哨兵停旧引擎（graceful → 超时强杀），让旧引擎走正常
+ *     退出路径、**把 cleanup 完整跑完**；
+ *  2. [VdDeploy.DeployPlan.launchCommand] — launch the replacement.
+ *
+ * 为什么不用 SIGTERM：**Android ART 的 app_process 收到 SIGTERM 直接终止，
+ * 不执行 JVM shutdown hook**（2026-10-10 MI 9 实测：进程 1 秒内消失、
+ * cleanup 零执行、日志无任何恢复步骤）。cleanup 只在正常退出路径
+ * （`run()` 的 finally）可靠执行，所以"请引擎自己退"必须走哨兵文件而不是信号。
  *
  * Two live engines race for the same VirtualDisplay / DTA / 9638-9639 binds
  * and the loser never runs cleanup() — one leaked VD per reconnect. That is
- * why step 2 exists and why it is shared: a divergence here (see the file doc)
- * is exactly how the leak was re-introduced once before.
+ * why the stop half exists and why it is shared: a divergence here (see the
+ * file doc) is exactly how the leak was re-introduced once before.
  */
 suspend fun vdRunDeploySequence(
     plan: VdDeploy.DeployPlan,
     executor: VdDeployExecutor,
     timeoutMs: Long = VdDeploySequence.EXIT_WAIT_TIMEOUT_MS,
+    gracefulTimeoutMs: Long = VdDeploySequence.GRACEFUL_EXIT_TIMEOUT_MS,
     pollMs: Long = VdDeploySequence.EXIT_WAIT_POLL_MS,
     now: () -> Long = System::currentTimeMillis,
     sleep: suspend (Long) -> Unit = { delay(it) },
 ): VdDeployOutcome {
-    executor.shellSync(plan.killCommand)
-    var forcedKill = false
-    if (!vdAwaitExit(executor, timeoutMs, pollMs, now = now, sleep = sleep)) {
-        forcedKill = true
-        executor.shellSync(VdDeploy.stopCommand)
-        vdAwaitExit(executor, timeoutMs, pollMs, now = now, sleep = sleep)
-    }
+    val forcedKill = vdStopEngine(executor, gracefulTimeoutMs, timeoutMs, pollMs, now = now, sleep = sleep)
     val launched = executor.launch(plan.launchCommand)
     return VdDeployOutcome(forcedKill = forcedKill, launched = launched)
 }

@@ -93,8 +93,7 @@ class AdbDeployTest {
         val plan = AdbDeploy.plan(config(width = 1281, height = 721))
 
         assertTrue("视口未偶数对齐: ${plan.args}", plan.args.startsWith("1280 720 "))
-        assertEquals(VdDeploy.killCommand, plan.killCommand)
-        // 硬约束：前台 exec，绝不能后台化
+        // 停止命令不在 plan 里（由 vdRunDeploySequence 统一走哨兵文件 + -9 兜底）
         assertTrue("应以 exec 前台启动: ${plan.launchCommand}", plan.launchCommand.contains("exec app_process"))
         // 注意不能简单查 "&"：日志重定向 2>&1 本身就含 &，要查后台化后缀 " &"
         assertFalse("不能后台化（行尾不能有 &）: ${plan.launchCommand}", plan.launchCommand.trimEnd().endsWith("&"))

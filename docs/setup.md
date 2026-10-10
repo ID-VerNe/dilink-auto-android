@@ -126,7 +126,7 @@ If the dialog appears on the first connection after updating, check "Always allo
 - Ensure phone and car are on the same network
 - Check that both apps are running (phone shows "Streaming", car shows video)
 - The VD server may need a moment to start — wait 5-10 seconds after connecting
-- On API 26-28 cars, `cmd display power-on/off` shell fallback is unavailable (API 29+ only); a DisplayControl reflection failure means the physical panel is not restored and the failure is now logged rather than silently masked. Check the log for `DisplayControl` errors.
+- On API 26-28, the `cmd display power-reset`/`power-off` shell fallback is unavailable (API 29+ only); a DisplayControl reflection failure means the physical panel is not restored and the failure is now logged rather than silently masked. Check the log for `DisplayControl` errors.
 - Check `/sdcard/DiLinkAuto/client.log` for diagnostic information
 - **If the VD server fails to launch** (e.g. Shizuku died mid-deploy), the phone now reports the failure honestly and ends the session instead of showing a false "started" state — look for `VD server launch failed` in `client.log`, restore Shizuku (or use the USB ADB track), and reconnect
 - **Sustained black screen (>3s)**: The car app now detects this automatically and requests a VD rebuild from the phone via re-handshake. Look for `[BLACK] requesting VD rebuild via re-handshake` in the logs. This should self-heal without manual intervention. The sustain window lives in `protocol-core` (`BlackScreenDetector.BLACK_SCREEN_SUSTAIN_MS = 3000`), shared with the Windows receiver (which uses a 10s window).
@@ -139,7 +139,7 @@ A race used to leave the decoder unable to restart after rotation: `onCarViewpor
 
 - Reconnect attempts no longer kill an active session — the car stops retrying after 3 consecutive no-ADB attempts (log: `No ADB after 3 attempts — stopping reconnect`), and TCP ADB reconnects on phone IP change rather than tearing down the running stream.
 - If persistent, check `/sdcard/DiLinkAuto/client.log` for "Network lost" entries.
-- **VD leak on reconnect**: Fixed in v0.18.0-dev-13. The old `pkill -9` skipped the JVM shutdown hook, so `PipelineServer.cleanup()` never ran — leaking a VirtualDisplay per reconnect and keeping the physical panel powered off. Now uses a two-stage stop (SIGTERM → wait → SIGKILL), waits for the old engine to exit before launching a replacement, and a cleanup idempotency guard prevents duplicate teardown. To verify the fix, use `scripts/verify-blackscreen-fix.sh` on a share-logs zip.
+- **VD leak on reconnect**: Originally fixed in v0.18.0-dev-13, **re-fixed 2026-10-10** after MI 9 measurements showed the original mechanisms could not work on a real device: ART's `app_process` does not run the JVM shutdown hook on SIGTERM (the "two-stage stop" was a plain force kill, `PipelineServer.cleanup()` never ran), and toybox rejects `pkill -0` (both liveness probes always reported GONE, so the "wait for exit" never waited). The stop is now a **stop-request sentinel** (`gracefulStopCommand` writes `/sdcard/DiLinkAuto/stop-request`; the engine's watchdog consumes it and exits through its normal path so the full `cleanup()` runs), the probes use `pgrep -f`, and the deploy sequence waits up to 12s before falling back to `killCommandForce` (MI 9 实测哨兵→进程消失要 6.1~6.3s —— 早先「cleanup 2~4 秒」的估计只看到了 cleanup 内部的 shell 命令，6 秒预算差 130ms 没等到，每次重连都补一记 -9、把 `screen_off_timeout` 恢复截掉). A cleanup idempotency guard still prevents duplicate teardown. To verify the fix, use `scripts/verify-blackscreen-fix.sh` on a share-logs zip.
 
 ### Car app not installing
 
@@ -183,6 +183,10 @@ The script checks:
 If `client.log` is missing (already rotated), the script falls back to the largest rotated `client-*.log` in the directory.
 
 Exit code 0 = all checks passed; 1 = one or more checks failed.
+
+### Verifying reconnect / close cleanup (fully automated, 2026-10-10)
+
+The stop-request sentinel, the 12s graceful-exit budget and the `screen_off_timeout` restore are covered by an **end-to-end regression that drives a real session**: `scripts/e2e-reconnect-cleanup.sh` — build gate (`./gradlew test` + both APKs, asserts 0 test failures) → APK `assets/vd-server.jar` dex symbol check (`ShellSyncPoint` / `__DILINK_SYNC__` / `awaitIdle` / `pgrep -f` / `stop-request`) → install + relaunch the phone app → desktop session with an isolated `DILINK_DESKTOP_HOME` → UI-driven 「显示 → 应用并重连」 and window close → live device assertions (`screen_off_timeout` sentinel 2147483647 in session, restore to the 300000 baseline after cleanup, engine gone) → pulled-log assertions via `scripts/verify-reconnect-cleanup.sh` (probe transitions ALIVE→GONE, 「引擎已优雅退出」 with **no** 「强制 kill」, elapsed < 12s budget, `__DILINK_SYNC__` drain echo, `Cleanup complete`, a second handshake). Needs a phone on ADB plus an **unlocked and idle** Windows desktop — the UI steps move the real mouse and click the window, so nothing else may take focus meanwhile; artifacts under `debug-logs/e2e/<timestamp>/`; exit code 0 = pass. Options: `--skip-build`, `--no-install`, `--serial <adb-serial>`.
 
 ## HyperOS (Xiaomi) Tips
 

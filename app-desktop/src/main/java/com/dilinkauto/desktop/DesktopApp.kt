@@ -22,6 +22,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import java.io.File
 import java.io.IOException
 import java.util.concurrent.Executors
@@ -72,6 +73,8 @@ class DesktopApp(
         val state: StateFlow<SessionState>,
         /** 当前是否真在用硬解；回退软解后变 false（Phase 5b）。 */
         val hardwareDecode: StateFlow<Boolean>,
+        /** 会话异常终止的原因（失败面板显示用，2026-10-10）；取消/正常结束保持 null。 */
+        val lastError: StateFlow<String?>,
         private val input: InputSender,
     ) {
         fun launchApp(packageName: String) = input.launchApp(packageName)
@@ -218,6 +221,9 @@ class DesktopApp(
         val sessionEnded = MutableStateFlow(false)
         val stateFlow = MutableStateFlow(SessionState.IDLE)
         val hardwareFlow = MutableStateFlow(hwaccel)
+        // 失败面板显示用（2026-10-10）：runSession 的 catch 汇聚所有失败原因。
+        val errorFlow = MutableStateFlow<String?>(null)
+        service.onSessionError = { errorFlow.value = it }
         // 本会话是否真正到过 STREAMING —— "断开自动关窗"的豁免判据（见下方协程）。
         val reachedStreaming = java.util.concurrent.atomic.AtomicBoolean(false)
         service.onStateChanged = { state ->
@@ -267,6 +273,7 @@ class DesktopApp(
             sessionEnded = sessionEnded,
             state = stateFlow,
             hardwareDecode = hardwareFlow,
+            lastError = errorFlow,
             input = service.inputSender,
         )
 
@@ -308,9 +315,22 @@ class DesktopApp(
         // 先摘掉"当前代"（audit WIN-04）：UI 立刻停止收集旧代的 sessionEnded，
         // 与协程侧的代际守卫一起把误关窗的窗口压到最小。
         _session.value = null
-        // 顺序：先停会话（手机侧据此回收 VD），再停解码，最后收掉 adb 与协程域。
+        // 顺序：先停会话（手机侧据此回收 VD），再停解码，然后**让设备侧引擎优雅
+        // 退出**，最后收掉 adb 与协程域。
         runCatching { service?.stop() }
         runCatching { pipeline?.stop() }
+        // 设备侧引擎收尾（2026-10-10，MI 9 实测）：
+        // 本地 adb shell 进程**就是**引擎的存活锚点（见 AdbDeployer/AdbRunner），
+        // 直接 close()（杀锚点）等于强杀 —— `PipelineServer.cleanup()` 被截断，手机
+        // 留在"面板熄灭 + screen_off_timeout 停在 2147483647 哨兵"。所以先发哨兵
+        // 等它退干净，再放锚点。
+        //
+        // runBlocking 在这里是有意的：closeSession 跑在 lifecycle 单线程上、没有
+        // 挂起上下文，而这两条路径（关窗 / 应用并重连）都必须**同步**等完收尾
+        // （DesktopMain 紧接着 exitProcess；重连则马上要部署新引擎）。等待有界：
+        // vdStopEngine = 哨兵 + 有界轮询（graceful 预算 6s）+ -9 兜底（见
+        // AdbDeployer.TEARDOWN_GRACEFUL_TIMEOUT_MS）；未部署过引擎时立即返回。
+        runCatching { runBlocking { adbDeployer.gracefulStop { log.info("adb", it) } } }
         runCatching { adbDeployer.close() }
         runCatching { scope?.cancel() }
         runCatching { keepAwake.disable() }
@@ -445,8 +465,19 @@ class DesktopApp(
     private companion object {
         const val TAG = "app"
 
-        /** [stop] 等待收尾的上限：解码线程 join 最坏 2s，再加 adb 子进程回收（audit WIN-03）。 */
-        const val STOP_TIMEOUT_MS = 5_000L
+        /**
+         * [stop] 等待收尾的上限（audit WIN-03）。
+         *
+         * 预算（2026-10-10 实测修订）：解码线程 join 最坏 2s + 设备侧引擎优雅退出
+         * （`AdbDeployer.TEARDOWN_GRACEFUL_TIMEOUT_MS` 12s）+ -9 兜底 3s + 每条
+         * shell 命令的往返（~0.5s）≈ 17.5s，取 20s。
+         *
+         * 此前 5s 只覆盖"解码 join + 杀 adb 进程"；现在 closeSession 还会**等引擎
+         * 把 cleanup 跑完**（实测 6.1~6.3s），否则锚点一杀 cleanup 就被截断
+         * （面板熄、screen_off_timeout 停在哨兵值）。超时不会中断收尾本身，只是
+         * 本方法不再等 —— 而调用方紧接着就 `exitProcess`，所以必须留足。
+         */
+        const val STOP_TIMEOUT_MS = 20_000L
 
         /** 本进程内允许自动发起的"持续黑屏重连"次数（audit WIN-07）。 */
         const val MAX_BLACK_SCREEN_RECONNECTS = 2

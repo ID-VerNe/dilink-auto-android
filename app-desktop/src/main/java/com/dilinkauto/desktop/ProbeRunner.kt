@@ -67,6 +67,9 @@ internal class ProbeRunner(
             log.error("session", "会话异常: ${e.message}")
         } finally {
             // 只有会话真正结束才释放 adb（audit WIN-02）——提前关会杀掉刚启动的引擎。
+            // 顺序（2026-10-10）：先让引擎优雅退出（哨兵 + 有界等待 + -9 兜底），再放
+            // 锚点 —— 直接 close() 等于强杀，设备侧 cleanup 被截断（同 DesktopApp.closeSession）。
+            runCatching { runBlocking { deployer.gracefulStop { log.info(TAG, it) } } }
             deployer.close()
         }
         log.info("session", "会话结束，收到视频帧总数=${frameCount.get()}")

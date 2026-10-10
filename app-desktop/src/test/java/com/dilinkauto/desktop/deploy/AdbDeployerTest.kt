@@ -52,9 +52,9 @@ class AdbDeployerTest {
             val command = args.getOrNull(3)
             return when {
                 args.firstOrNull() == "connect" -> connectResult
-                command == VdDeploy.killCommand -> true
+                command == VdDeploy.gracefulStopCommand -> true
                 command == VdDeploy.probeExitCodeCommand -> probeAlive()
-                command == VdDeploy.stopCommand -> true
+                command == VdDeploy.killCommandForce -> true
                 args.lastOrNull()?.contains("app_process") == true -> launchResult
                 else -> true
             }
@@ -83,7 +83,7 @@ class AdbDeployerTest {
         AdbDeployer(runner = runner, now = { time.now() }, sleep = { time.sleep(it) })
 
     @Test
-    fun `正常流程按 connect - kill - 探活 - 前台启动 的顺序执行`() = runBlocking {
+    fun `正常流程按 connect - 优雅停止 - 探活 - 前台启动 的顺序执行`() = runBlocking {
         val runner = FakeRunner()
         val logs = mutableListOf<String>()
 
@@ -91,8 +91,8 @@ class AdbDeployerTest {
 
         assertTrue(ok)
         val shells = runner.shellCommands()
-        // kill → 探活 ×2（连续两次"已退出"） → launch
-        assertEquals(listOf(VdDeploy.killCommand, VdDeploy.probeExitCodeCommand, VdDeploy.probeExitCodeCommand), shells.dropLast(1))
+        // 优雅停止（哨兵文件）→ 探活 ×2（连续两次"已退出"） → launch
+        assertEquals(listOf(VdDeploy.gracefulStopCommand, VdDeploy.probeExitCodeCommand, VdDeploy.probeExitCodeCommand), shells.dropLast(1))
         assertTrue("最后一条应是启动命令: ${shells.last()}", shells.last().contains("exec app_process"))
 
         // 启动命令必须保持前台（waitForExit=false），否则 adb shell 流一关引擎就被回收
@@ -124,13 +124,13 @@ class AdbDeployerTest {
 
     @Test
     fun `旧引擎迟迟不退时会补一次强制 kill 再启动`() = runBlocking {
-        // 探活永远报存活 → 等到超时 → 走 stopCommand 兜底
+        // 探活永远报存活 → graceful 等待超时 → 走 -9 兜底
         val runner = FakeRunner(probeAlive = { true })
 
         val ok = deployer(runner).deploy(config(), 5555, VdDeploy.JAR_PATH) {}
 
         assertTrue(ok)
-        assertTrue("应补发 stopCommand: ${runner.shellCommands()}", runner.shellCommands().contains(VdDeploy.stopCommand))
+        assertTrue("应补发 killCommandForce: ${runner.shellCommands()}", runner.shellCommands().contains(VdDeploy.killCommandForce))
         // 无论等多久，最后一定是启动命令，不能把会话卡在"等旧引擎退出"
         assertTrue(runner.shellCommands().last().contains("exec app_process"))
     }
@@ -140,6 +140,53 @@ class AdbDeployerTest {
         val runner = FakeRunner()
         deployer(runner).close()
         assertEquals(1, runner.killAllCalled)
+    }
+
+    /**
+     * 收尾路径（2026-10-10）：关窗 / 「应用并重连」时在 `close()`（杀 adb 锚点）
+     * 之前必须先让设备侧引擎优雅退出 —— 否则锚点一死引擎被 adbd 回收，
+     * `cleanup()` 被截断（面板熄、screen_off_timeout 停在哨兵值）。
+     */
+    @Test
+    fun `gracefulStop 未部署过时是 no-op`() = runBlocking {
+        val runner = FakeRunner()
+
+        val stopped = deployer(runner).gracefulStop {}
+
+        assertFalse("本端没部署过引擎（Shizuku 路径），不应发任何命令", stopped)
+        assertEquals(0, runner.calls.size)
+    }
+
+    @Test
+    fun `gracefulStop 发哨兵并等两次 GONE，不启动新引擎`() = runBlocking {
+        val runner = FakeRunner()
+        val deployer = deployer(runner)
+        deployer.deploy(config(), 5555, VdDeploy.JAR_PATH) {} // 先部署一次以记录 serial
+
+        val stopped = deployer.gracefulStop {}
+
+        assertTrue(stopped)
+        // 收尾阶段 = 启动命令（app_process）之后的全部 shell 命令
+        val teardownShells = runner.shellCommands().dropWhile { !it.contains("app_process") }.drop(1)
+        assertEquals(
+            listOf(VdDeploy.gracefulStopCommand, VdDeploy.probeExitCodeCommand, VdDeploy.probeExitCodeCommand),
+            teardownShells,
+        )
+    }
+
+    @Test
+    fun `gracefulStop 引擎不退时补 -9 兜底`() = runBlocking {
+        val runner = FakeRunner(probeAlive = { true })
+        val deployer = deployer(runner)
+        deployer.deploy(config(), 5555, VdDeploy.JAR_PATH) {}
+
+        val stopped = deployer.gracefulStop {}
+
+        assertTrue(stopped)
+        assertTrue(
+            "应补发 killCommandForce: ${runner.shellCommands()}",
+            runner.shellCommands().contains(VdDeploy.killCommandForce),
+        )
     }
 
     /**

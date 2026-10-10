@@ -16,6 +16,7 @@ import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.nio.channels.SocketChannel
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.LockSupport
 
 /**
@@ -53,6 +54,23 @@ internal class GlPipeline(
 
     private var vdInputSurface: Surface? = null
     private var stTexture: android.graphics.SurfaceTexture? = null
+
+    // ── Frame-arrival signal ──────────────────────────────────────────────
+    //
+    // 2026-10-10 实机缺陷（车机屏概率性全黑，~50%，MI 9 / Android 15）：
+    // 帧到达回调曾注册在 pipelineLoop() 里，而 pipelineLoop 要等"客户端连接
+    // + unpark"才开始 —— VD 创建 → 客户端连接之间 SurfaceFlinger 提交的所有
+    // 帧（HOME 启动动画、随后的稳定画面）既不会触发回调、也不会被
+    // updateTexImage 消费；buffer queue 被占满后 SF 的后续提交还会阻塞。
+    // 结果 tex/cb 停在 0 或某个小值后永久静止、"最新纹理"停在某张陈旧或
+    // 未初始化的黑帧上，编码器无限重编码黑帧 → 车机屏全黑。
+    //
+    // 现在回调在 initEglAndSurfaceTexture() 里注册（早于 VD 创建），VD 的
+    // 第一帧起就有记录：pipelineLoop 启动时 flag 已累积置位，第一轮就
+    // updateTexImage 取到"队列最新帧"（SF 的最后一次提交 = 当前稳定画面）。
+    private val frameAvail = AtomicBoolean(false)
+    private val frameCbCount = AtomicLong(0)
+    private var cbThread: android.os.HandlerThread? = null
 
     /** S-M8: guards [cleanup] so EGL handles are destroyed at most once. */
     private val glTornDown = AtomicBoolean(false)
@@ -98,6 +116,15 @@ internal class GlPipeline(
         stTexture!!.setDefaultBufferSize(displayWidth, displayHeight)
         vdInputSurface = Surface(stTexture)
 
+        // Register the frame-arrival listener NOW — before the VirtualDisplay
+        // exists (PipelineServer creates it only after this method signals
+        // ready). Must not live in pipelineLoop(): see the field comment above.
+        cbThread = android.os.HandlerThread("PipeCB").apply { start() }
+        stTexture!!.setOnFrameAvailableListener({
+            frameCbCount.incrementAndGet()
+            frameAvail.set(true)
+        }, android.os.Handler(cbThread!!.looper))
+
         // Fullscreen quad
         val quad = floatArrayOf(-1f, -1f, 0f, 1f, 1f, -1f, 1f, 1f, -1f, 1f, 0f, 0f, 1f, 1f, 1f, 0f)
         quadBuf = ByteBuffer.allocateDirect(quad.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
@@ -115,15 +142,15 @@ internal class GlPipeline(
         val st = stTexture ?: return
         val bufInfo = MediaCodec.BufferInfo()
 
-        // Frame sync
-        val frameLock = Any(); val frameAvail = booleanArrayOf(false)
-        val cbThread = android.os.HandlerThread("PipeCB").apply { start() }
-        st.setOnFrameAvailableListener({
-            synchronized(frameLock) { frameAvail[0] = true; (frameLock as java.lang.Object).notifyAll() }
-        }, android.os.Handler(cbThread.looper))
-
+        // Frame sync: the arrival listener was registered in
+        // initEglAndSurfaceTexture (see the field comment there for why).
+        // Frames that arrived while this loop was still parked waiting for the
+        // car are already flagged — the first iteration below drains the flag,
+        // so updateTexImage() picks the queue's most recent frame instead of a
+        // stale/black one.
         var nextFrameNanos = System.nanoTime()
         var frameCount = 0L; var keyFrameCount = 0L; var lastLogAt = 0L
+        var texUpdates = 0L; var swapFails = 0L
         val adaptive = AdaptiveBitrate(bitrate)
         PipeLog.log("Pipeline: ${encodeWidth}x${encodeHeight} ${fps}fps ${bitrate/1_000_000}Mbps")
 
@@ -134,8 +161,7 @@ internal class GlPipeline(
                 nextFrameNanos += frameIntervalNanos
                 if (nextFrameNanos <= System.nanoTime()) nextFrameNanos = System.nanoTime() + frameIntervalNanos
 
-                val hasNew: Boolean; synchronized(frameLock) { hasNew = frameAvail[0]; frameAvail[0] = false }
-                if (hasNew) st.updateTexImage()
+                if (frameAvail.getAndSet(false)) { st.updateTexImage(); texUpdates++ }
 
                 GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
                 GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, stTexId)
@@ -143,7 +169,7 @@ internal class GlPipeline(
                 GLES20.glVertexAttribPointer(glPosLoc, 2, GLES20.GL_FLOAT, false, 16, qb); GLES20.glEnableVertexAttribArray(glPosLoc)
                 qb.position(2); GLES20.glVertexAttribPointer(glTexLoc, 2, GLES20.GL_FLOAT, false, 16, qb); GLES20.glEnableVertexAttribArray(glTexLoc)
                 GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
-                EGL14.eglSwapBuffers(eglDisplay, eglSurface)
+                if (!EGL14.eglSwapBuffers(eglDisplay, eglSurface)) swapFails++
 
                 var drained = 0
                 while (true) {
@@ -166,12 +192,17 @@ internal class GlPipeline(
                         encoder.releaseOutputBuffer(idx, false)
                     }
                 }
-                if (frameCount - lastLogAt >= 120) { lastLogAt = frameCount; PipeLog.log("Pipeline: $frameCount frames ${adaptive.currentBitrate/1_000_000}Mbps keys=$keyFrameCount") }
+                if (frameCount - lastLogAt >= 120) {
+                    lastLogAt = frameCount
+                    PipeLog.log("Pipeline: $frameCount frames ${adaptive.currentBitrate/1_000_000}Mbps keys=$keyFrameCount tex=$texUpdates cb=${frameCbCount.get()} swapFails=$swapFails ts=${st.timestamp} glErr=${GLES20.glGetError()}")
+                }
             }
         } finally {
             // cbThread is non-daemon; if writeFrame throws or GL faults, the
-            // parked Looper would prevent a clean JVM exit. quitSafely in finally.
-            cbThread.quitSafely()
+            // parked Looper would prevent a clean JVM exit. quitSafely in
+            // finally — cleanup() also quits it as a fallback for the path
+            // where this loop never ran (bind/accept failure).
+            cbThread?.quitSafely()
         }
         PipeLog.log("Pipeline exited: $frameCount frames")
     }
@@ -211,6 +242,11 @@ internal class GlPipeline(
         if (d != null && s != null) EGL14.eglDestroySurface(d, s)
         if (d != null && c != null) EGL14.eglDestroyContext(d, c)
         eglDisplay = null; eglSurface = null; eglContext = null
+        // Stop the frame-callback looper BEFORE releasing the SurfaceTexture it
+        // may still be posting from. Fallback for the path where pipelineLoop
+        // never ran (its own finally is the primary stopper); quitSafely is
+        // idempotent, so the double call is safe.
+        cbThread?.quitSafely(); cbThread = null
         vdInputSurface?.release(); vdInputSurface = null
         stTexture?.release(); stTexture = null
     }

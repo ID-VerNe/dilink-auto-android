@@ -8,33 +8,54 @@ package com.dilinkauto.protocol
  * them here means a change to the classpath layout, the main class, or the
  * kill flag lands in one place. The argv tail is built by [VdDeployArgs].
  *
- * The kill command comes in two flavors:
- *  - [killCommand] — graceful `pkill -f` (SIGTERM, lets the process clean up
- *    via its shutdown hook).
- *  - [killCommandForce] — `pkill -9 -f` for cases where the process is wedged
- *    and must be shot immediately.
+ * ── How the engine is stopped (2026-10-10, MI 9 实测重写) ──
  *
- *  - [stopCommand] — the two-stage "SIGTERM, wait, then SIGKILL" sequence used
- *    when tearing a session down. It exists as ONE shell line on purpose: the
- *    caller gets it back from a single [com.dilinkauto.client.ShizukuManager.execAndWait],
- *    so a coroutine cancellation (Service.onDestroy cancels serviceScope) can
- *    never land between the two signals and leave the process half-killed with
- *    cleanup() unrun.
+ * **SIGTERM does NOT run the JVM shutdown hook on Android.** ART's
+ * `app_process` treats a bare SIGTERM as an immediate, uncatchable terminate:
+ * MI 9 实测 `kill -TERM <pid>` 后进程 1 秒内消失、`PipelineServer.cleanup()`
+ * （面板电源/letterbox/IME/screen_off_timeout 恢复、VD 释放）**零执行**——
+ * vd-server.log 里连 cleanup 的第一条 shell 命令都没有。历史上
+ * [killCommand]/`stopCommand` 依赖的"SIGTERM 会触发 shutdown hook"是
+ * **桌面 JVM 的语义，在 ART 上不成立**，这正是"每次重连后设备状态被
+ * 污染"的根因（`screen_off_timeout` 永远停在哨兵值）。
  *
- * All patterns use the `[P]ipelineServer` bracket trick. A plain
- * `PipelineServer` pattern makes `pkill -f` match the *wrapper shell itself*
- * (`sh -c "pkill -f PipelineServer ..."` has that string in its own cmdline),
- * so the shell gets SIGTERM'd mid-script and any command after it in the same
- * line silently never runs. The bracket form matches the engine but not the
- * literal `[P]ipelineServer` text in the shell's cmdline.
+ * cleanup 只在**正常退出路径**（main 线程的 `run()` finally）可靠执行——
+ * socket 断开、绑定超时等都走这条路。因此停止协议改为**文件哨兵**：
+ *
+ *  1. [gracefulStopCommand] — 写 [STOP_REQUEST_PATH]（瞬时返回）；
+ *  2. 引擎的 watchdog 轮询到该文件后消费它（删除）并置 `running=false`，
+ *     于是所有等待点退出、`run()` 走到 finally、cleanup 完整跑完；
+ *  3. 外部轮询等待进程真正退出（[vdAwaitExit]）；超时才用
+ *     [killCommandForce] 兜底 —— 强杀路径接受"cleanup 被跳过"的代价。
+ *
+ * 引擎启动时也会删除残留哨兵（防上一轮未消费的信号误杀新实例）。
+ *
+ * [killCommand]（裸 SIGTERM）**不再用于部署序列**——在 ART 上它等同于
+ * SIGKILL 但少一层"明确表态"；保留常量仅供手动排查/调试。
+ *
+ * ── 进程定位与 `[P]ipelineServer` 方括号技巧（2026-10-10 MI 9 实测）──
+ *
+ * **裸名 `PipelineServer` 不能用**：命令原文会进发起它的 wrapper shell 自己的
+ * cmdline（`sh -c "... pgrep -f PipelineServer ..."`），于是定位会命中自己，
+ * 后续命令在同一行里被静默跳过。方括号形式（[PROCESS_PATTERN]）是"能被正则
+ * 解释成引擎、但不会匹配 wrapper 里那段字面文本"的写法。
+ *
+ * 实测边界（重要）：
+ *  - `pgrep -f "[P]ipelineServer"` —— 方括号技巧**有效**：引擎在位 rc=0、
+ *    不在位 rc=1、wrapper 不自匹配。三个探针 [probeCommand]/[probeExitCodeCommand]
+ *    与强杀命令都建立在这个已实测的行为上。
+ *  - `pkill -f "[P]ipelineServer"` —— **会连 wrapper 一起杀**（adb 返回 137，
+ *    `echo` 都没跑）。引擎也被杀掉（已复现两次），但"这次 kill 命中没有"读不出来。
+ *    所以强杀改走 [killCommandForce]（pgrep 定位 + 按 pid kill），语义与探针一致。
  */
 object VdDeploy {
     const val MAIN_CLASS = "com.dilinkauto.vdserver.PipelineServer"
 
     /**
-     * Regex that matches the vd-server process but NOT the literal
-     * `[P]ipelineServer` text inside the wrapper shell's own cmdline.
-     * See the class doc for why the plain name is unsafe.
+     * 定位引擎用的**正则**（`pgrep -f` 语义）：匹配引擎的
+     * `com.dilinkauto.vdserver.PipelineServer`，但**不**匹配 wrapper shell 自己
+     * cmdline 里那段字面文本 `[P]ipelineServer`。类头有实测记录 —— 注意这条性质
+     * 只对 `pgrep` 成立，`pkill -f` 不可依赖它（见 [killCommandForce]）。
      */
     const val PROCESS_PATTERN = "[P]ipelineServer"
 
@@ -46,42 +67,76 @@ object VdDeploy {
     val JAR_PATH get() = "$DIR_PATH/$JAR_NAME"
     val LOG_PATH get() = "$DIR_PATH/$LOG_NAME"
 
-    /** Graceful kill (SIGTERM). Stderr suppressed because pkill returns non-zero when no match. */
-    const val killCommand = "pkill -f $PROCESS_PATTERN 2>/dev/null"
+    /**
+     * 杀引擎命令的模板：**先 `pgrep -f` 定位、再按 pid `kill`** —— 不用 `pkill -f`。
+     *
+     * 为什么不用 `pkill -9 -f <pattern>`（2026-10-10 MI 9 实测）：
+     * 命令原文会进发起它的那个 wrapper shell 自己的 cmdline，于是 `pkill -f`
+     * **连这个 wrapper 一起杀**（内联执行 `adb shell 'pkill -9 -f "[P]ipelineServer"'`
+     * 时 adb 直接返回 137，`echo` 都来不及打印）。引擎**确实**也被杀掉了，但
+     * "这次 kill 到底命中没有"从此读不出来 —— 兜底路径最不该有这种模糊信号。
+     *
+     * `pgrep -f` 的语义在本文件里已被逐条实测（方括号技巧防自匹配、引擎在位 rc=0、
+     * 不在位 rc=1，见 [probeCommand]），强杀复用**同一条定位逻辑**，就不存在
+     * "pgrep 与 pkill 判定不一致"的可能 —— 而那正是"等退出"与"强杀"必须对齐的地方。
+     *
+     * `2>/dev/null` + `exit 0`：没东西可杀不是失败。
+     */
+    private fun killByPid(signal: String): String =
+        "for p in \$(pgrep -f \"$PROCESS_PATTERN\"); do kill $signal \$p; done 2>/dev/null; exit 0"
 
-    /** Force kill (-9). Use only when the process cannot shut down on its own. */
-    const val killCommandForce = "pkill -9 -f $PROCESS_PATTERN 2>/dev/null"
+    /** Graceful kill (SIGTERM). 保留仅供手动排查：ART 上 SIGTERM 直接终止进程、不跑 shutdown hook，等价于强杀。 */
+    val killCommand: String get() = killByPid("-TERM")
+
+    /** Force kill (-9). The only kill signal with well-defined semantics on ART. */
+    val killCommandForce: String get() = killByPid("-9")
+
+    /** 停止哨兵文件名（见类头"如何停止引擎"）。 */
+    const val STOP_REQUEST_NAME = "stop-request"
 
     /**
-     * Two-stage stop: SIGTERM → wait 1s → SIGKILL, as a single shell line.
-     *
-     * This is the only stop path the display restorer uses. The previous
-     * `pkill -9` skipped the JVM shutdown hook entirely, so `PipelineServer.cleanup()`
-     * (which releases the VirtualDisplay, restores IME, resets letterbox and
-     * re-powers the physical panel) never ran on most teardowns — each
-     * exit/reconnect cycle leaked one VirtualDisplay plus a permanently
-     * power-off physical panel, which is what turns the car screen black after
-     * a few reconnects.
+     * 停止哨兵文件路径。外部（部署序列 / PhoneDisplayRestorer）写它表示
+     * "请优雅退出"；引擎的 watchdog 轮询它、消费（删除）它、然后走正常退出
+     * 路径跑完整 cleanup。放在 [DIR_PATH] 下：app_process(shell UID)、
+     * adb shell、Shizuku 三个身份都有读写权限。
      */
-    const val stopCommand =
-        "pkill -f $PROCESS_PATTERN 2>/dev/null; sleep 1; pkill -9 -f $PROCESS_PATTERN 2>/dev/null; exit 0"
+    const val STOP_REQUEST_PATH = "$DIR_PATH/$STOP_REQUEST_NAME"
+
+    /**
+     * 请求引擎优雅停止：写哨兵文件，瞬时返回。
+     *
+     * 命令本身**不做任何等待**（三条 transport 的 shell 超时各不相同，最紧的
+     * 只有 5s）——等待由调用方用 [vdAwaitExit] 轮询，超时兜底用
+     * [killCommandForce]。`rm -f` 先清残留，保证 touch 后文件时间戳属于本次请求。
+     */
+    const val gracefulStopCommand =
+        "rm -f $STOP_REQUEST_PATH 2>/dev/null; touch $STOP_REQUEST_PATH 2>/dev/null; exit 0"
 
     /**
      * Liveness probe, output form: prints `Y` when a vd-server process exists,
-     * `N` otherwise. Uses `pkill -0` (signal 0 = existence check only, no
-     * signal sent) so it needs no `ps`/`pidof` (whose name matching breaks on
-     * app_process, where the comm name is truncated). For callers that can read
-     * stdout (the phone's Shizuku path).
+     * `N` otherwise. For callers that can read stdout (the phone's Shizuku path).
+     *
+     * ── `pgrep -f`, not `pkill -0` (2026-10-10, MI 9 实测) ──
+     * toybox 0.8.11-android 的 `pkill` **不接受 `-0`**：`pkill -0 -f '[P]ipelineServer'`
+     * 直接报 `pkill: bad -L '0'` 并以 rc=1 退出 → 探针**永远**返回 GONE，
+     * `vdAwaitExit` 形同虚设（这正是"两个引擎抢同一个 VD"的历史土壤）。
+     * `pgrep` 与 `pkill` 在 toybox 里是同一份源码、同一张选项表，所以凡是
+     * `pkill -f`（强杀路径必需）能跑的设备，`pgrep -f` 一定可用。
+     * 实测：引擎在跑 rc=0，不存在 rc=1（均带括号技巧）。
      */
     const val probeCommand =
-        "if pkill -0 -f $PROCESS_PATTERN >/dev/null 2>&1; then echo Y; else echo N; fi"
+        "if pgrep -f $PROCESS_PATTERN >/dev/null 2>&1; then echo Y; else echo N; fi"
 
     /**
      * Liveness probe, exit-code form: exit 0 = alive, exit 1 = gone.
-     * For callers that only see an exit status (the car's ADB `shell()` path).
+     * For callers that only see an exit status (the car's ADB `shell()` path,
+     * the desktop's `AdbDeployer.probe()`).
+     *
+     * Also `pgrep` for the same reason as [probeCommand] —— `pkill -0` 在
+     * toybox 上恒报错、恒 GONE，会让"等旧引擎退出"变成空转。
      */
     const val probeExitCodeCommand =
-        "if pkill -0 -f $PROCESS_PATTERN >/dev/null 2>&1; then exit 0; else exit 1; fi"
+        "if pgrep -f $PROCESS_PATTERN >/dev/null 2>&1; then exit 0; else exit 1; fi"
 
     /**
      * Build the full app_process command line.
@@ -128,15 +183,18 @@ object VdDeploy {
     fun shellQuote(text: String): String = "'" + text.replace("'", "'\\''") + "'"
 
     /**
-     * A fully-assembled VD-server deploy plan: the argv tail, the kill command,
-     * and the launch command line. Built once from viewport + DPI + fps by
-     * [buildDeployPlan] and handed to whichever executor is available
-     * (car USB ADB, car TCP ADB, or phone Shizuku) so the three deploy sites
-     * do not each re-assemble the same sequence.
+     * A fully-assembled VD-server deploy plan: the argv tail and the launch
+     * command line. Built once from viewport + DPI + fps by [buildDeployPlan]
+     * and handed to whichever executor is available (car USB ADB, car TCP ADB,
+     * or phone Shizuku) so the three deploy sites do not each re-assemble the
+     * same sequence.
+     *
+     * 停止命令**不在 plan 里**：`vdRunDeploySequence` 统一用
+     * [gracefulStopCommand]（哨兵文件）+ [killCommandForce]（超时兜底）——
+     * 见类头"如何停止引擎"。
      */
     data class DeployPlan(
         val args: String,
-        val killCommand: String,
         val launchCommand: String
     )
 
@@ -177,7 +235,6 @@ object VdDeploy {
         )
         return DeployPlan(
             args = args,
-            killCommand = killCommand,
             launchCommand = commandLine(jarPath, logPath, args, background)
         )
     }

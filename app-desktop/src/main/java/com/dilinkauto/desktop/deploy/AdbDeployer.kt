@@ -5,6 +5,7 @@ import com.dilinkauto.protocol.VdDeploy
 import com.dilinkauto.protocol.VdDeployExecutor
 import com.dilinkauto.protocol.VdProbeResult
 import com.dilinkauto.protocol.vdRunDeploySequence
+import com.dilinkauto.protocol.vdStopEngine
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 
@@ -14,7 +15,8 @@ import kotlinx.coroutines.sync.Mutex
  * 流程与车机端 `VdServerDeployer` 完全对应，只是把 `TcpAdbConnection` 换成
  * 本地 `adb.exe`：
  *   1. `adb connect <host>:<port>`
- *   2. kill 旧引擎，并**等它真的退出**（两个引擎抢同一个 VD/9638-9639，抢输的
+ *   2. 优雅停止旧引擎（`stop-request` 哨兵 + 等它真的退出），并**等它真的退出**
+ *      ——（两个引擎抢同一个 VD/9638-9639，抢输的
  *      那个永远不会跑 cleanup()，每轮重连泄漏一个 VirtualDisplay）
  *   3. 前台启动新引擎（`exec app_process`，不 `&`）
  *
@@ -49,6 +51,15 @@ class AdbDeployer(
 
     /** 单部署串行化（audit D-M6）：restart 期间新旧两代不能同时跑部署序列。 */
     private val deployMutex = Mutex()
+
+    /**
+     * 最近一次 [deploy] 使用的 adb serial（`host:port`）。
+     *
+     * [gracefulStop] 用它把停止命令发到同一台设备上；null = 本端从未部署过引擎
+     * （例如手机走了 Shizuku 路径），收尾时无事可做。
+     */
+    @Volatile
+    private var lastSerial: String? = null
 
     /**
      * 部署一次 VD server。返回 false 时上层应提示用户走 Shizuku 或检查 adb 环境；
@@ -91,30 +102,11 @@ class AdbDeployer(
             }
 
             val plan = AdbDeploy.plan(config, jarPath = jarPath, phoneVdWidth = phoneVdWidth, phoneVdHeight = phoneVdHeight)
-            log("ADB 部署：kill 旧引擎")
+            log("ADB 部署：优雅停止旧引擎")
 
-            val executor = object : VdDeployExecutor {
-                override suspend fun shellSync(command: String) {
-                    runner.run(AdbDeploy.shellArgs(serial, command), true, SHELL_TIMEOUT_MS, log)
-                }
-
-                override suspend fun launch(command: String): Boolean = runner.run(
-                    AdbDeploy.shellArgs(serial, command),
-                    waitForExit = false,
-                    timeoutMs = 0,
-                    onOutput = log,
-                )
-
-                override suspend fun probe(): VdProbeResult {
-                    val alive = runner.run(
-                        AdbDeploy.shellArgs(serial, VdDeploy.probeExitCodeCommand),
-                        waitForExit = true,
-                        timeoutMs = SHELL_TIMEOUT_MS,
-                        onOutput = {},
-                    )
-                    return if (alive) VdProbeResult.ALIVE else VdProbeResult.GONE
-                }
-            }
+            // 记录 serial：收尾（closeSession）时的 gracefulStop 需要它 —— 见本方法注释。
+            lastSerial = serial
+            val executor = executorFor(serial, log)
 
             // 直接挂起驱动共享序列（audit D-M6）：等旧引擎退出的轮询等待走 [sleep]
             // （生产 = kotlinx 的 delay，协程取消时立刻抛 CancellationException 停下），
@@ -133,11 +125,116 @@ class AdbDeployer(
         }
     }
 
-    /** 结束本端持有的 adb 进程（会连带关掉设备侧引擎的 shell 流，等效于停止 VD server）。 */
+    /**
+     * 收尾：让设备侧引擎**优雅退出**（哨兵 → 等它退出 → 超时才 -9 兜底）。
+     *
+     * 为什么必须在 [close] 之前调用：本地 `adb shell` 进程**就是设备侧引擎的
+     * 存活锚点**（见 [ProcessAdbRunner] 的硬约束）—— 直接 [close]（杀锚点）
+     * 等于强杀，`PipelineServer.cleanup()` 被截断：手机留在"面板保持熄灭、
+     * `screen_off_timeout` 停在 2147483647 哨兵"的状态（2026-10-10 MI 9 实测；
+     * 「应用并重连」与关窗都走这条）。同理，引擎自己也要先收到"该退了"的信号
+     * —— 光靠"视频口断开"它虽然最终也会退出，但这里用哨兵把等待收敛到确定时限。
+     *
+     * 与部署序列共用 `protocol-core` 的 [vdStopEngine]（同一套"两次连续 GONE"
+     * 收敛规则与 -9 兜底）。本端没部署过引擎（Shizuku 路径）时直接返回。
+     *
+     * 与 [deploy] 一样拿 [deployMutex]：同一时刻只允许一轮在跑。
+     *
+     * @param gracefulTimeoutMs 优雅退出预算。默认与部署序列同值（12s，见常量
+     *   注释里的实测数据）；等不到才 -9，代价是这次 cleanup 被跳过。
+     * @param log 收尾日志（放最后是为了让调用点写成 `gracefulStop { log(...) }`）。
+     * @return false = 本端没有需要停的引擎（或从未部署）；true = 已走完停止序列
+     */
+    suspend fun gracefulStop(
+        gracefulTimeoutMs: Long = TEARDOWN_GRACEFUL_TIMEOUT_MS,
+        log: (String) -> Unit,
+    ): Boolean {
+        val serial = lastSerial ?: return false
+        deployMutex.lock()
+        try {
+            log("ADB 收尾：优雅停止设备侧引擎（哨兵 ${VdDeploy.STOP_REQUEST_PATH}）")
+            val t0 = now()
+            // 探针跃迁日志：这条路径上"等不到引擎退出"有两种完全不同的成因 ——
+            // 引擎真的还在跑 cleanup（探针一路 ALIVE），还是探针本身没认账
+            // （引擎已 GONE 但第一次 GONE 没有立刻出现）。两者的修法完全不同，
+            // 所以把跃迁点记下来；正常一次收尾只有 1~2 行。
+            var lastProbe: VdProbeResult? = null
+            val base = executorFor(serial, log)
+            val traced = object : VdDeployExecutor {
+                override suspend fun shellSync(command: String) = base.shellSync(command)
+                override suspend fun launch(command: String) = base.launch(command)
+                override suspend fun probe(): VdProbeResult = base.probe().also { r ->
+                    if (r != lastProbe) {
+                        log("ADB 收尾：探针 $r @+${now() - t0}ms")
+                        lastProbe = r
+                    }
+                }
+            }
+            val forcedKill = vdStopEngine(
+                traced,
+                gracefulTimeoutMs = gracefulTimeoutMs,
+                now = now,
+                sleep = sleep,
+            )
+            val elapsed = now() - t0
+            if (forcedKill) {
+                log("ADB 收尾：引擎未在 ${gracefulTimeoutMs}ms 内退出（实测 ${elapsed}ms），已强制 kill（cleanup 可能未跑完）")
+            } else {
+                log("ADB 收尾：引擎已优雅退出（耗时 ${elapsed}ms）")
+            }
+            return true
+        } finally {
+            deployMutex.unlock()
+        }
+    }
+
+    /** [deploy] 与 [gracefulStop] 共用的 ADB 执行器（一个 serial 一套 shell 通道）。 */
+    private fun executorFor(serial: String, log: (String) -> Unit): VdDeployExecutor =
+        object : VdDeployExecutor {
+            override suspend fun shellSync(command: String) {
+                runner.run(AdbDeploy.shellArgs(serial, command), true, SHELL_TIMEOUT_MS, log)
+            }
+
+            override suspend fun launch(command: String): Boolean = runner.run(
+                AdbDeploy.shellArgs(serial, command),
+                waitForExit = false,
+                timeoutMs = 0,
+                onOutput = log,
+            )
+
+            override suspend fun probe(): VdProbeResult {
+                val alive = runner.run(
+                    AdbDeploy.shellArgs(serial, VdDeploy.probeExitCodeCommand),
+                    waitForExit = true,
+                    timeoutMs = SHELL_TIMEOUT_MS,
+                    onOutput = {},
+                )
+                return if (alive) VdProbeResult.ALIVE else VdProbeResult.GONE
+            }
+        }
+
+    /**
+     * 结束本端持有的 adb 进程（会连带关掉设备侧引擎的 shell 流 = 引擎被 adbd
+     * 回收）。**调用前必须先 [gracefulStop]**，否则引擎的 cleanup 被截断。
+     */
     fun close() = runner.killAll()
 
     companion object {
         private const val CONNECT_TIMEOUT_MS = 10_000L
         private const val SHELL_TIMEOUT_MS = 5_000L
+
+        /**
+         * 收尾（关窗 / 「应用并重连」）等引擎优雅退出的预算。
+         *
+         * **必须 ≥ `VdDeploySequence.GRACEFUL_EXIT_TIMEOUT_MS`**：这是同一个操作
+         * （哨兵 → 完整 cleanup → 进程退出），只是入口不同。2026-10-10 MI 9 实测
+         * 6.1~6.3 秒（桌面端探针日志 + 设备侧轮询互证）；当时这里的预算是 6 秒，
+         * 差 130ms 没等到 → 每轮重连都补一记 -9，把 `screen_off_timeout` 恢复截掉。
+         * 现在与部署序列取同一个数（12s），不再"更紧一点"。
+         *
+         * 常见情况仍是 6 秒出头就返回 —— 预算只在引擎卡死时才起作用，那时多等
+         * 几秒换取"不把 cleanup 截断"是划算的。
+         */
+        private const val TEARDOWN_GRACEFUL_TIMEOUT_MS = 12_000L
     }
 }

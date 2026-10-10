@@ -18,6 +18,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.dilinkauto.desktop.SessionState
 import com.dilinkauto.desktop.apps.AppEntry
 import kotlinx.coroutines.flow.MutableStateFlow
 
@@ -72,18 +73,21 @@ internal fun CheckRow(
     }
 }
 
-/** 无 material 依赖的按钮。 */
+/** 无 material 依赖的按钮。[primary] = 强调色底 + 深色文字（如「重试连接」）。 */
 @Composable
-internal fun ActionButton(label: String, onClick: () -> Unit) {
+internal fun ActionButton(label: String, onClick: () -> Unit, primary: Boolean = false) {
     Box(
         modifier = Modifier
             .clip(RoundedCornerShape(8.dp))
-            .background(Palette.Button)
+            .background(if (primary) Palette.Accent else Palette.Button)
             .clickable(onClick = onClick)
             .padding(horizontal = 12.dp, vertical = 8.dp),
         contentAlignment = Alignment.Center,
     ) {
-        BasicText(label, style = TextStyle(color = Palette.Text, fontSize = 13.sp))
+        BasicText(
+            label,
+            style = TextStyle(color = if (primary) Palette.Backdrop else Palette.Text, fontSize = 13.sp),
+        )
     }
 }
 
@@ -91,3 +95,5 @@ internal fun ActionButton(label: String, onClick: () -> Unit) {
 internal val NoSessionEnded = MutableStateFlow(false)
 internal val NoHardwareDecode = MutableStateFlow(false)
 internal val NoApps = MutableStateFlow(emptyList<AppEntry>())
+internal val NoLastError = MutableStateFlow<String?>(null)
+internal val NoState = MutableStateFlow(SessionState.IDLE)

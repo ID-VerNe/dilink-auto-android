@@ -384,12 +384,12 @@ A desktop receiver that plays the car's role over the same wire protocol, so one
 
 A leaked VirtualDisplay per reconnect cycle turned the car screen black after a few cycles. Root cause: `pkill -9` skipped the JVM shutdown hook, so `PipelineServer.cleanup()` never ran — leaking the VD, keeping the physical panel powered off, and losing the `screen_off_timeout` setting (snapshot captured its own `2147483647` sentinel). Fixed across 12 files:
 
-1. **Two-stage VD stop** (`VdDeploy.stopCommand`). SIGTERM → wait 1s → SIGKILL, as a single shell line. A coroutine cancellation cannot land between the two signals.
-2. **Bracket process pattern** (`VdDeploy.PROCESS_PATTERN`). `[P]ipelineServer` prevents `pkill -f` from matching the wrapper shell's own cmdline.
-3. **Liveness probes** (`VdDeploy.probeCommand` / `probeExitCodeCommand`). `pkill -0` existence check — no signal delivered.
+1. **Two-stage VD stop** (`VdDeploy.stopCommand`). SIGTERM → wait 1s → SIGKILL, as a single shell line. A coroutine cancellation cannot land between the two signals. *(Superseded 2026-10-10: ART never runs the shutdown hook on SIGTERM, so this was equivalent to a force kill — replaced by the stop-request sentinel protocol, see the Fix Tracker row below.)*
+2. **Bracket process pattern** (`VdDeploy.PROCESS_PATTERN`). `[P]ipelineServer` prevents `pkill -f` from matching the wrapper shell's own cmdline. *(Boundary measured 2026-10-10: the bracket trick is honoured by `pgrep -f`; `pkill -f` still killed the invoking wrapper shell when run inline — kills now locate with `pgrep` and signal by PID, see the Fix Tracker.)*
+3. **Liveness probes** (`VdDeploy.probeCommand` / `probeExitCodeCommand`). `pkill -0` existence check — no signal delivered. *(Superseded 2026-10-10: toybox rejects `pkill -0` with `bad -L '0'`, so the probe always reported GONE — both probes now use `pgrep -f`.)*
 4. **VD exit wait** (`ShizukuManager.waitForVdServerExit()` / `VdServerDeployer.waitForVdServerExit()`). Polls until the old engine exits before launching the replacement. Two live engines race for the same VirtualDisplay / DTA / 9638-9639 binds and the loser skips `cleanup()` entirely.
 5. **Cleanup idempotency** (`ConnectionService.cleanupGuard`). `AtomicBoolean` guard prevents 7 `cleanupSession()` call sites from firing repeatedly (observed: 1 disconnect → 9 "Force-waking physical display" lines). `resetCleanupGuard()` before each new session.
-6. **Process-lifetime PhoneDisplayRestorer scope**. Owns a `CoroutineScope(SupervisorJob() + Dispatchers.IO)` — deliberately not the Service scope, which `onDestroy()` cancels. `NonCancellable` context ensures `cmd display power-on` cannot be skipped. `inFlight` `AtomicBoolean` collapses concurrent restore requests into one.
+6. **Process-lifetime PhoneDisplayRestorer scope**. Owns a `CoroutineScope(SupervisorJob() + Dispatchers.IO)` — deliberately not the Service scope, which `onDestroy()` cancels. `NonCancellable` context ensures `cmd display power-reset` cannot be skipped. `inFlight` `AtomicBoolean` collapses concurrent restore requests into one.
 7. **`stopVdServer()` returns Boolean**. Was void — callers had no way to know if CMD_STOP succeeded or fell back to shell kill.
 8. **`PipelineServer.cleanup()` reorder**. Global window/rotation state reset FIRST (device-wide, not per-display), then move foreground app, then restore panel + IME, then release threads/GL/encoder/VD. Previous order had `virtualDisplay.release()` dead last with nothing after it.
 9. **`saveCurrentIme()` before `VirtualDisplayCreator.create()`**. The snapshot used to run after `create()` had already written `screen_off_timeout=2147483647`, so the restore path treated the sentinel as "already the sentinel, nothing to do" and the user's real timeout was lost forever.
@@ -399,6 +399,7 @@ A leaked VirtualDisplay per reconnect cycle turned the car screen black after a 
 13. **`CarConnectionService.rehandshakeForBlackScreen()`**. Rebuilds the phone-side VD when the stream is persistently black. `blackScreenRecoveryInFlight` latch ensures at most one rebuild per session.
 14. **`rehandshakeOnExistingControl()` extracted**. Shared by rotation and black-screen paths — tears down video/input on the existing control connection without re-establishing TCP.
 15. **`scripts/verify-blackscreen-fix.sh`**. Automated log verification: VD leak check (start count vs cleanup count), cleanup idempotency (disconnect count vs wake count), black-screen self-heal (sustained detection vs rebuild trigger), stop path audit.
+16. **Reconnect/close cleanup regression automation** (`scripts/e2e-reconnect-cleanup.sh` + `scripts/verify-reconnect-cleanup.sh`, 2026-10-10). The manual on-device verification loop for the stop-path fixes is now one command: build gate (asserts 0 test failures) → APK `assets/vd-server.jar` dex symbol check (`ShellSyncPoint` / `__DILINK_SYNC__` / `awaitIdle` / `pgrep -f` / `stop-request`) → install + relaunch → isolated `DILINK_DESKTOP_HOME` desktop session → UI-driven 「应用并重连」 and window close → live device assertions (timeout sentinel in session, restore to baseline after cleanup, engine gone) → offline log assertions (probe ALIVE→GONE transitions, 「引擎已优雅退出」 with no 「强制 kill」, elapsed < 12s budget, `__DILINK_SYNC__` drain echo, `Cleanup complete`, second handshake). `debug-logs/uitest/win_auto.py` gained a `close` (WM_CLOSE) subcommand as a pointer-click fallback. First live run hardened both sides of the UI coupling: (a) **all polling loops now use real elapsed time** (`SECONDS` deadline) instead of `iteration-count × sleep` — this box forks/execs at ~1s per call (AV real-time scanning), which turned a nominal 150s budget into 626s; (b) `win_auto.py focus` now uses `AttachThreadInput` (the real fix for the Windows foreground lock, verified `attached=True ok=True`) because the old ALT-tap + `SetForegroundWindow` was refused and the injected clicks were being swallowed; the E2E also activates the window by clicking the title bar and verifies each click landed (new 「优雅停止设备侧引擎」 in `desktop.log`) with one automatic retry. **For the UI steps to work, the desktop must be left alone while the script runs.**
 
 ### Architecture — direct VD streaming (no phone relay)
 
@@ -420,7 +421,7 @@ VD Server binds `9638` (video) and `9639` (input) directly on `0.0.0.0`; the car
 
 - **`MediaCodecInfo.isHardwareAccelerated()` (API 29+)** threw `NoSuchMethodError` on the BYD API-28 head unit, killing the process. Fix: removed the speculative hardware-decoder picker; `VideoDecoder.start()` calls `MediaCodec.createDecoderByType(MIMETYPE_VIDEO_AVC)` directly. `REGULAR_CODECS` lists hardware first and selects `OMX.qcom.video.decoder.avc` on the BYD.
 - **`am display move-stack` (API 29+)** gated on `SDK_INT >= 29` in `PipelineServer.moveTopApp`. On older levels the foreground app is left in place rather than a silent shell failure masking as success.
-- **`cmd display power-on/off` (API 29+)** is the shell fallback in `DisplayPowerController`. On API 26-28 a `DisplayControl` reflection failure means the physical panel is not restored — now logged via `logErr`, was silent.
+- **`cmd display power-reset` / `power-off` (API 29+)** is the shell fallback in `DisplayPowerController` (no `power-on` subcommand exists). On API 26-28 a `DisplayControl` reflection failure means the physical panel is not restored — now logged via `logErr`, was silent.
 - **`minSdk` raised to 26** for `protocol` and `app-server` (was 24). Re-arms the NewApi lint gate. `app-client` and `vd-server` stay at 29.
 
 ### UI / interaction
@@ -593,7 +594,7 @@ The 2026-10-09 full-project audit ([audit-project-2026-10-09.md](audit-project-2
 | Issue | Impact | Status |
 |-------|--------|--------|
 | USB ADB auth dialog on replug | Phone asked "Allow USB debugging?" each time | **FIXED v0.13.1** — was double-hashing AUTH_TOKEN with SHA1withRSA. Now uses NONEwithRSA + prehashed SHA-1 DigestInfo. "Always allow" persists. |
-| VD leak on reconnect | Each reconnect leaked one VirtualDisplay; panel stayed off | **FIXED v0.18.0-dev-13** — two-stage stop (SIGTERM→SIGKILL), `cleanupGuard` idempotency, VD exit wait before relaunch, `PhoneDisplayRestorer` on process-lifetime scope |
+| VD leak on reconnect | Each reconnect leaked one VirtualDisplay; panel stayed off | **FIXED v0.18.0-dev-13**, **re-fixed 2026-10-10** — the dev-13 mechanisms rested on two assumptions that are false on real devices: (1) ART's `app_process` does **not** run the JVM shutdown hook on SIGTERM, so the "two-stage stop" was a plain force kill and `cleanup()` never ran; the stop is now a **stop-request sentinel file** the engine's watchdog consumes (normal exit path → full cleanup), with `killCommandForce` only as a 10s timeout fallback. (2) toybox rejects `pkill -0`, so both liveness probes silently reported GONE and the "VD exit wait" never waited; probes now use `pgrep -f`. Verified end-to-end on MI 9 (2026-10-10) |
 | Cleanup non-idempotent | 1 disconnect triggered 9 duplicate restore calls | **FIXED v0.18.0-dev-13** — `cleanupGuard` `AtomicBoolean` |
 | Screen timeout lost on teardown | `screen_off_timeout=2147483647` persisted after session | **FIXED v0.18.0-dev-13** — `saveCurrentIme()` now runs before `configureEnvironment()`; `restoreSetting()` validates values |
 | Black screen after reconnect | Car stuck on black screen, no recovery | **FIXED v0.18.0-dev-13** — `onSustainedBlackScreen` callback triggers VD rebuild after 3s (`BlackScreenDetector.BLACK_SCREEN_SUSTAIN_MS`, protocol-core; was 5s in app-server before the e1674f8 extraction). The self-heal itself then had a defect: **FIXED `35d7821`** — the recovery path called `videoDecoder.stop()` while `CarShell` keeps the streaming layout mounted, so nothing ever restarted the codec and a triggered recovery left the screen black for the rest of the session. It now resets the detector state and lets the live codec consume the fresh IDR. |
@@ -635,7 +636,7 @@ Phone (Chinese ROM — Xiaomi HyperOS / Meizu etc., Android 14+)
 │   │   ├── Binds 9638 (video) and 9639 (input) on 0.0.0.0
 │   │   ├── Accepts car's video + input connections directly
 │   │   ├── Reverse-connects lifecycle to phone localhost:19647
-│   │   ├── Encoder: createEncoderByType, CBR 4Mbps Main, I-frame 1s
+│   │   ├── Encoder: candidate-ordered pick (Codec2 before legacy OMX, each really tried), CBR 4Mbps Main, I-frame 1s
 │   │   ├── Watchdog forces cleanup() if pipeline thread hangs in native MediaCodec
 │   │   └── Cleanup: am display move-stack → restore panel → restore IME → kill shell
 │   ├── GlPipeline — EGL14 + GLES20 on the pipeline thread
@@ -643,7 +644,7 @@ Phone (Chinese ROM — Xiaomi HyperOS / Meizu etc., Android 14+)
 │   │   ├── Encoder drain → TCP write (no queues)
 │   │   └── Adaptive bitrate: floor 1.5Mbps, 2s recovery, 0.5Mbps steps
 │   ├── TouchInjector — InputManager reflection, multi-touch, TOUCH_MOVE_BATCH
-│   ├── DisplayPowerController — DisplayControl reflection; cmd display fallback (API 29+)
+│   ├── DisplayPowerController — DisplayControl reflection; cmd display power-reset/off fallback (API 29+)
 │   ├── VirtualDisplayCreator — trust flag 0x6c49, 12L letterbox style
 │   └── PipeLog — vd-server.log
 │

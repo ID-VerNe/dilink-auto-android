@@ -154,7 +154,7 @@ Payload: UTF-8 package name. Car requests the phone to uninstall the given packa
 
 ### GO_RECENT (0x1F) -- Car -> Phone
 
-Empty payload. Triggers the recent-apps view on the virtual display (vd-server runs `input -d <id> keyevent 187` and then re-checks for an empty stack).
+Empty payload. Quick-switches the virtual display to the most recently used *other* task (the "double-tap recents" semantics). Deliberately NOT `input -d <id> keyevent 187` — AOSP's system recents hard-codes the default display, so an injected APP_SWITCH only toggles the *physical* screen's recents and never the VD, and there is no per-display recents shell interface. vd-server instead parses `dumpsys activity recents` (skipping the current VD-top task, the control app, launcher and systemui), then runs `am start --display <id> --task <taskId> -n <component>`. Fully async — never blocks the touch reader.
 
 ### VD_SERVER_READY (0x20)
 
@@ -365,13 +365,20 @@ All VD server lifecycle commands are defined in `VdDeploy.kt` (protocol module) 
 
 | Command | Description |
 |---------|-------------|
-| `killCommand` | Graceful kill: `pkill -f [P]ipelineServer 2>/dev/null` (SIGTERM, lets JVM shutdown hook run) |
-| `killCommandForce` | Force kill: `pkill -9 -f [P]ipelineServer 2>/dev/null` (SIGKILL, skips shutdown hook) |
-| `stopCommand` | Two-stage stop: `pkill -f [P]ipelineServer 2>/dev/null; sleep 1; pkill -9 -f [P]ipelineServer 2>/dev/null; exit 0` — SIGTERM → wait → SIGKILL in one shell line so a coroutine cancellation cannot land between signals |
-| `probeCommand` | Liveness probe (output form): `if pkill -0 -f [P]ipelineServer >/dev/null 2>&1; then echo Y; else echo N; fi` — prints `Y` if alive, `N` if gone. Uses `pkill -0` (signal 0 = existence check only) |
-| `probeExitCodeCommand` | Liveness probe (exit code form): `if pkill -0 -f [P]ipelineServer >/dev/null 2>&1; then exit 0; else exit 1; fi` — exit 0 = alive, exit 1 = gone. For callers that only see exit status (car's ADB `shell()` path) |
+| `killCommand` | Bare SIGTERM: `for p in $(pgrep -f "[P]ipelineServer"); do kill -TERM $p; done 2>/dev/null; exit 0`. **On ART this terminates the process immediately without running the JVM shutdown hook** (see `gracefulStopCommand`) — kept for manual debugging only, no longer used by the deploy sequence |
+| `killCommandForce` | Force kill: **locate with `pgrep -f "[P]ipelineServer"`, then `kill -9` by pid** — `for p in $(pgrep -f "[P]ipelineServer"); do kill -9 $p; done 2>/dev/null; exit 0`. Not `pkill -9 -f`: on MI 9 (2026-10-10) the inline `pkill -f` also SIGKILLs the wrapper shell that is running it (the command text is in that shell's own cmdline, adb returns 137), which makes "did the kill hit anything" unreadable — and that is the last-resort path. Reusing `pgrep -f` also keeps identification and killing on one matching rule. SIGKILL is the only kill signal with well-defined semantics on ART |
+| `gracefulStopCommand` | Graceful stop request: `rm -f /sdcard/DiLinkAuto/stop-request 2>/dev/null; touch ... ; exit 0` — writes the stop-request sentinel and returns immediately (no waiting: the tightest transport shell timeout is 5s). The engine's watchdog polls and **consumes** (deletes) the file, then sets `running=false` so the normal exit path runs the full `cleanup()`. External callers wait via `vdAwaitExit` and fall back to `killCommandForce` |
+| `probeCommand` | Liveness probe (output form): `if pgrep -f [P]ipelineServer >/dev/null 2>&1; then echo Y; else echo N; fi` — prints `Y` if alive, `N` if gone. **`pgrep -f`, not `pkill -0`** (2026-10-10): toybox 0.8.11-android rejects `pkill -0` with `bad -L '0'` (always rc=1 → probe always reported GONE, silently disabling the exit wait). `pgrep` and `pkill` share toybox's option table, so any device where the kill path works has a working probe |
+| `probeExitCodeCommand` | Liveness probe (exit code form): `if pgrep -f [P]ipelineServer >/dev/null 2>&1; then exit 0; else exit 1; fi` — exit 0 = alive, exit 1 = gone. For callers that only see exit status (car's ADB `shell()` path, desktop's `AdbDeployer.probe()`). Also `pgrep` for the same reason as above |
 
-**Process pattern**: All patterns use the `[P]ipelineServer` bracket trick. A plain `PipelineServer` pattern makes `pkill -f` match the wrapper shell itself (`sh -c "pkill -f PipelineServer ..."` has that string in its own cmdline), so the shell gets SIGTERM'd mid-script and any subsequent command silently never runs.
+**Stopping the engine (2026-10-10, measured on MI 9).** SIGTERM does **not** run the JVM shutdown hook on Android: ART's `app_process` treats a bare SIGTERM as an immediate, uncatchable terminate. MI 9 实测 `kill -TERM` → process gone within 1s, `PipelineServer.cleanup()` zero-executed (no recovery step in vd-server.log). `cleanup()` therefore only runs on the engine's **normal exit paths** (main-thread `run()` finally: socket loss, bind timeouts, watchdog). The stop protocol is a **file sentinel**: the external side writes `stop-request` (`gracefulStopCommand`), the engine's watchdog consumes it and exits gracefully, and only if that times out (`VdDeploySequence.GRACEFUL_EXIT_TIMEOUT_MS`, **12s**) does the caller force-kill. The engine also deletes a stale sentinel at startup so a leftover request can never kill a fresh instance.
+
+**Exit latency is ~6.1–6.3s, not 2–4s (2026-10-10, two independent measurements).** The earlier "cleanup takes 2–4s" estimate only covered the shell commands *inside* `cleanup()`; it missed the pipeline thread's bounded join, encoder/VD release, and the wait on the phone-side `ConnectionService` teardown grabbing the same display/rotation locks. Desktop-side probe log (`探针 ALIVE @+189ms` → `探针 GONE @+6123ms`) and an independent device-side poller (sentinel → pid gone ≈ 6.3s) agree. With the then-6s budget the wait missed by **130 ms on every reconnect**, so a `-9` was always issued right as `cleanup()` was finishing — truncating the tail of it (the `screen_off_timeout` restore). Both budgets are now 12s (≈2× the measured value).
+
+**Process pattern (`[P]ipelineServer`) — what it does and does not protect (2026-10-10, MI 9).** A plain `PipelineServer` pattern is unusable: the command text lands in the invoking wrapper shell's own cmdline (`sh -c "... pgrep -f PipelineServer ..."`), so the lookup matches *itself* and every later command on that line is silently skipped. The bracket form is a **regex** that matches the engine's `com.dilinkauto.vdserver.PipelineServer` but not the literal `[P]ipelineServer` text in that wrapper. Measured limits:
+
+- `pgrep -f "[P]ipelineServer"` — the trick **holds**: engine present → rc=0, absent → rc=1, no self-match. All probes are built on this.
+- `pkill -f "[P]ipelineServer"` — **does not hold**: it also kills the wrapper running it (adb returns 137 before the next `echo`). The engine *is* signaled (reproduced twice), but the exit code stops being evidence. That is why the force kill uses `pgrep` + `kill <pid>` instead — identification and killing then share one matching rule.
 
 ### VD Server argv (`VdDeployArgs`)
 

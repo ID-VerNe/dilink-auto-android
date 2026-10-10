@@ -10,10 +10,12 @@ import com.dilinkauto.client.ShizukuManager
 import com.dilinkauto.protocol.AppPrefs
 import com.dilinkauto.protocol.ImeRestore
 import com.dilinkauto.protocol.VdDeploy
+import com.dilinkauto.protocol.VdProbeResult
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicBoolean
@@ -24,16 +26,20 @@ import java.util.concurrent.atomic.AtomicBoolean
  *
  * The VD server powers off the physical panel directly via
  * `DisplayControl.setDisplayPowerMode(0)` — a deeper off than PowerManager
- * can recover from. Its own cleanup() only runs if the process exits cleanly
- * (CMD_STOP received, or SIGTERM so the JVM shutdown hook fires). When the
- * lifecycle channel breaks so CMD_STOP never arrives, or the process hangs in
- * a native futex, cleanup() never runs and the panel stays off → phone is
- * unusable. PowerManager wakeUp/wake-locks cannot reverse this; only
- * `setDisplayPowerMode(2)` / `cmd display power-on` can, which needs shell
- * privileges (Shizuku).
+ * can recover from. Its cleanup() runs on the engine's **normal exit paths**
+ * (CMD_STOP / socket 断开 / watchdog 消费停止哨兵). 注意 SIGTERM 不是一条
+ * 正常路径：**ART 的 app_process 收 SIGTERM 直接终止、不跑 shutdown hook**
+ * （2026-10-10 MI 9 实测），所以本类先用 [VdDeploy.gracefulStopCommand]
+ * 的哨兵文件请求引擎优雅退出。When the lifecycle channel breaks so CMD_STOP
+ * never arrives, or the process hangs in a native futex and even the sentinel
+ * times out, cleanup() may still be skipped and the panel stays off →
+ * phone is unusable. PowerManager wakeUp/wake-locks cannot reverse this;
+ * only `setDisplayPowerMode(2)` / `cmd display power-reset` can, which needs
+ * shell privileges (Shizuku).
  *
  * Layers (tried in order, each independent):
- *  1. Shizuku: stop VD server + `cmd display power-on` + IME restore.
+ *  1. Shizuku: graceful-stop (sentinel + wait + force kill) + `cmd display
+ *     power-reset` + IME restore.
  *  2. PowerManager.wakeUp() via reflection — system-level wake.
  *  3. Launch MainActivity with FLAG_TURN_SCREEN_ON — WindowManager triggers display on.
  *  4. WakeLock with ACQUIRE_CAUSES_WAKEUP — framework-level.
@@ -42,7 +48,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * The previous version ran on the Service's `serviceScope`, which
  * `ConnectionService.onDestroy()` cancels. When the user hit "stop" (or the
  * system reclaimed the Service) the restore coroutine was cancelled *between*
- * the `pkill` and the `cmd display power-on`, leaving the physical panel off
+ * the `pkill` and the `cmd display power-reset`, leaving the physical panel off
  * with nothing left to turn it back on:
  *
  *     Force-waking physical display          x3
@@ -79,7 +85,7 @@ internal class PhoneDisplayRestorer(
         }
         restoreScope.launch {
             // NonCancellable: once we start killing the engine we must run the
-            // power-on too. A cancellation in the middle leaves the panel off.
+            // power-reset too. A cancellation in the middle leaves the panel off.
             withContext(NonCancellable) {
                 try {
                     restoreInternal(savedIme)
@@ -97,13 +103,34 @@ internal class PhoneDisplayRestorer(
             // Layer 0: Restore SurfaceFlinger-level display power via Shizuku.
             if (ShizukuManager.isAvailable) {
                 try {
-                    // Two-stage stop in ONE shell line (SIGTERM -> 1s -> SIGKILL).
-                    // SIGTERM lets the JVM run PipelineServer's shutdown hook, so
-                    // cleanup() releases the VirtualDisplay and restores IME /
-                    // letterbox / screen settings. The old `pkill -9` skipped the
-                    // hook outright and leaked a VD on every reconnect.
-                    ShizukuManager.execAndWait(VdDeploy.stopCommand)
-                    ShizukuManager.execAndWait("cmd display power-on 0 2>/dev/null")
+                    // 优雅停止三步（协议见 VdDeploy 类头）：ART 的 app_process 收
+                    // SIGTERM 直接终止、**不跑 shutdown hook**（2026-10-10 MI 9 实测：
+                    // 进程 1 秒内消失、cleanup 零执行），所以先用哨兵文件请引擎自己
+                    // 走正常退出路径、把 cleanup 完整跑完（面板/letterbox/IME/
+                    // screen_off_timeout 恢复 + VD 释放），再轮询等它退出；超时才
+                    // -9 兜底（强杀路径接受 cleanup 被跳过的代价）。
+                    ShizukuManager.execAndWait(VdDeploy.gracefulStopCommand)
+                    var engineExited = false
+                    val engineDeadline = System.currentTimeMillis() + ENGINE_EXIT_WAIT_MS
+                    while (System.currentTimeMillis() < engineDeadline) {
+                        if (ShizukuManager.probeVdServer() != VdProbeResult.ALIVE) {
+                            engineExited = true
+                            break
+                        }
+                        delay(300)
+                    }
+                    if (!engineExited) {
+                        FileLog.w(TAG, "VD server did not exit within ${ENGINE_EXIT_WAIT_MS}ms — force kill")
+                        ShizukuManager.execAndWait(VdDeploy.killCommandForce)
+                    }
+                    // 点亮物理屏的正确子命令是 `power-reset`。2026-10-10 MI 9 /
+                    // Android 15 实机 `cmd display help` 证明 **`power-on` 子命令
+                    // 不存在**（旧写法报 "Unknown command" 且被 `2>/dev/null` 吞掉，
+                    // 反射路径一旦失败，物理屏就再也点不亮）。power-reset = "Turn
+                    // the DISPLAY_ID power to a state the display supposed to have"
+                    // —— 实机验证可点亮被 power-off 的物理屏（与 vd-server 的
+                    // DisplayPowerController 同一修法 / 同一实机结论）。
+                    ShizukuManager.execAndWait("cmd display power-reset 0 2>/dev/null")
                     val targetIme = savedIme
                         ?: appContext.getSharedPreferences(AppPrefs.FILE_NAME, Context.MODE_PRIVATE)
                             .getString(AppPrefs.SAVED_DEFAULT_IME, null)
@@ -111,7 +138,7 @@ internal class PhoneDisplayRestorer(
                         ShizukuManager.execAndWait(ImeRestore.imeRestoreCommandLine(targetIme!!))
                         FileLog.i(TAG, "Original IME restored via Shizuku: $targetIme")
                     }
-                    FileLog.i(TAG, "Physical display restored via Shizuku (stop + power-on + IME)")
+                    FileLog.i(TAG, "Physical display restored via Shizuku (stop + power-reset + IME)")
                 } catch (e: Exception) {
                     FileLog.w(TAG, "Shizuku display restore failed: ${e.message}")
                 }
@@ -174,5 +201,13 @@ internal class PhoneDisplayRestorer(
 
     companion object {
         private const val TAG = "PhoneDisplayRestorer"
+
+        /**
+         * 等引擎优雅退出的上限（哨兵文件 → 完整 cleanup → 退出）。
+         * 与 `VdDeploySequence.GRACEFUL_EXIT_TIMEOUT_MS` 同量级，且必须是同一个数：
+         * MI 9 实测（2026-10-10）从哨兵到**进程真的消失**要 6.1~6.3 秒（早先
+         * "2~4 秒"的说法只看到了 cleanup 内部的 shell 命令）。12 秒 = 约 2 倍余量。
+         */
+        private const val ENGINE_EXIT_WAIT_MS = 12_000L
     }
 }

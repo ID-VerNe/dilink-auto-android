@@ -144,7 +144,7 @@ class ConnectionService : Service() {
         carAppInstaller = CarAppInstaller(this) { msg -> _installStatusStatic.value = msg }
         appListBuilder = AppListBuilder(applicationContext, serviceScope)
         // No scope passed: the restorer owns a process-lifetime scope so a
-        // Service.onDestroy() mid-restore cannot skip `cmd display power-on`.
+        // Service.onDestroy() mid-restore cannot skip `cmd display power-reset`.
         displayRestorer = PhoneDisplayRestorer(applicationContext)
     }
 
@@ -882,7 +882,7 @@ class ConnectionService : Service() {
         //
         // Order preserved: graceful CMD_STOP → channel close → panel/IME restore.
         // Runs on process-lifetime scope because onDestroy() cancels serviceScope —
-        // a restore launched there would die before `cmd display power-on`.
+        // a restore launched there would die before `cmd display power-reset`.
         teardownScope.launch {
             // Graceful stop: CMD_STOP first so the engine's readLifecycleCommands()
             // sets running=false and its finally block runs cleanup() (releases the
@@ -893,7 +893,7 @@ class ConnectionService : Service() {
             try { client?.disconnect() } catch (e: Exception) { FileLog.w(TAG, "vdClient disconnect: ${e.message}") }
             try { conn?.disconnect() } catch (e: Exception) { FileLog.w(TAG, "control disconnect: ${e.message}") }
             // Runs on PhoneDisplayRestorer's own process-lifetime scope: the two-stage
-            // stop + `cmd display power-on` cannot be cancelled by onDestroy().
+            // stop + `cmd display power-reset` cannot be cancelled by onDestroy().
             displayRestorer.restore(ime)
         }
     }

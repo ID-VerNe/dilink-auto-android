@@ -79,11 +79,20 @@ internal object ShellExec {
      * 持久 sh 的 stdout/stderr 是管道：无人读取时缓冲写满（约 64KB）会让 sh 永久
      * 阻塞在 write 上，之后所有命令（am/input/settings）静默失效。排水线程把每行
      * 输出写进 vd-server.log，既防阻塞，又能看到命令的真实回显与报错。
+     *
+     * @param onLine 每读到一行输出回调一次（[PersistentShell] 用它驱动
+     *   [ShellSyncPoint] 的同步屏障 —— teardown 时"等最后几条恢复命令执行完"
+     *   依赖 stdout 的回显顺序）；日志照记。
      */
-    fun startOutputDrain(p: Process) {
+    fun startOutputDrain(p: Process, onLine: ((String) -> Unit)? = null) {
         for ((name, stream) in listOf("out" to p.inputStream, "err" to p.errorStream)) {
             Thread({
-                try { stream.bufferedReader().forEachLine { line -> PipeLog.log("sh<$name| $line") } }
+                try {
+                    stream.bufferedReader().forEachLine { line ->
+                        PipeLog.log("sh<$name| $line")
+                        onLine?.invoke(line)
+                    }
+                }
                 catch (_: Exception) {}
             }, "ShellDrain-$name").also { it.isDaemon = true; it.start() }
         }

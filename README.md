@@ -74,21 +74,25 @@ client 和 server 都加了 `values-zh-rCN` / `values-zh`。这是面向中国�
 
 **根因**:每次重连都泄漏一个 VirtualDisplay。旧代码用 `pkill -9` 杀 VD 进程,跳过了 JVM shutdown hook,`PipelineServer.cleanup()` 从未执行 —— 导致 VD 不释放、物理面板保持关屏、`screen_off_timeout` 设置丢失(快照捕获的是自己写入的 `2147483647` 哨兵值)。连续几次重连后车机变黑屏。
 
+> **2026-10-10 后续修订(实机测得两个假设不成立)**:① ART 的 `app_process` 收 SIGTERM **不跑** shutdown hook(上面的"两阶段停止"实际等价于强杀),停止改为 **stop-request 哨兵文件**(引擎 watchdog 消费后走正常退出路径跑完整 `cleanup()`,超时才 `pkill -9` 兜底);② toybox 拒收 `pkill -0`(`bad -L '0'`),两个存活探针恒报 GONE、"等旧引擎退出"从未真正等待,探针改用 `pgrep -f`。已在 MI 9 上端到端验证。
+
 **修复(跨 12 个文件)**:
 
-- **`VdDeploy.stopCommand`**:两阶段停止(SIGTERM → 等 1 秒 → SIGKILL),合并成**一条 shell 命令**,确保协程取消不会落在两个信号之间导致进程半死。
-- **`VdDeploy.PROCESS_PATTERN`**:`[P]ipelineServer` 括号技巧,避免 `pkill -f` 匹配到 wrapper shell 自身的 cmdline。
-- **`VdDeploy.probeCommand` / `probeExitCodeCommand`**:`pkill -0` 存活探测(信号 0 = 仅检查,不发送信号)。
+- **`VdDeploy.gracefulStopCommand`**(原 `stopCommand` 两阶段停止已废弃):写停止哨兵 `/sdcard/DiLinkAuto/stop-request`,引擎 watchdog 消费后走**正常退出路径**跑完整 `cleanup()` —— ART 上裸 SIGTERM 不跑 shutdown hook,两阶段停止等价于强杀,是 VD 泄漏的根源。
+- **`VdDeploy.killCommandForce`**:兜底强杀用 `pgrep -f` 定位 + 按 pid `kill -9`(不用 `pkill -f`:内联执行时它会连发起命令的 wrapper shell 一起杀、adb 返回 137,"这一刀到底命中没有"从此读不出来)。
+- **`VdDeploy.PROCESS_PATTERN`**:`[P]ipelineServer` 方括号技巧 —— **只对 `pgrep` 有效**(防自匹配),`pkill -f` 不可依赖它(2026-10-10 MI 9 实测)。
+- **`VdDeploy.probeCommand` / `probeExitCodeCommand`**:`pgrep -f` 存活探测(toybox 拒绝 `pkill -0`,曾让探针恒报 GONE、"等旧引擎退出"变成空转)。
 - **`ConnectionService.cleanupGuard`**:`AtomicBoolean` 幂等 guard,防止 7 个调用点重复执行 `cleanupSession()`(实测 1 次断连 → 9 次 "Force-waking physical display")。新会话开始时 `resetCleanupGuard()`。
 - **`ShizukuManager.waitForVdServerExit()`**:轮询直到 VD 进程真正退出,再启动新引擎,防止两个实例争抢同一个 VirtualDisplay / DTA / 9638-9639 端口。
 - **`VdServerDeployer.waitForVdServerExit()`**:车机端同样等待旧实例退出后再部署。
-- **`PhoneDisplayRestorer`**:自建 process-lifetime `CoroutineScope`(不再是 Service scope,`onDestroy` 不会取消它)。`NonCancellable` 上下文,确保 `pkill` 后 `cmd display power-on` 不会被中断。`inFlight` 单飞 guard 合并并发请求。
+- **`PhoneDisplayRestorer`**:自建 process-lifetime `CoroutineScope`(不再是 Service scope,`onDestroy` 不会取消它)。`NonCancellable` 上下文,确保 `pkill` 后 `cmd display power-reset` 不会被中断。`inFlight` 单飞 guard 合并并发请求。
 - **`PipelineServer.cleanup()` 重排序**:先重置全局 window/rotation 状态,再移回前台 app,再恢复面板/IME,最后释放线程/GL/编码器/VD。
 - **`VirtualDisplayCreator.create()` 拆分**:`create()` 不再调用 `configureDisplayEnvironment()`,新增 `configureEnvironment()` 方法 —— 必须在 `saveCurrentIme()` 快照**之后**调用,否则快照捕获的是自己的写入值。
 - **`DisplayPowerController.restoreSetting()`**:写入前验证值合理性(非空、非 null/undefined、数字 > 0),防止写入哨兵值。
 - **`VideoDecoder.onSustainedBlackScreen`**:持续黑屏检测 —— 仅在连续 3 秒以上微小关键帧后才触发,3 帧的短暂黑帧(启动/重建时的正常瞬态)不会触发重连风暴。判定现由 `protocol-core` 的 `BlackScreenDetector` 承载(`BLACK_SCREEN_SUSTAIN_MS = 3000`),车机与桌面共用。
 - **`CarConnectionService.rehandshakeForBlackScreen()`**:检测到持续黑屏后,通过重新握手让手机重建 VD。`blackScreenRecoveryInFlight` 闩锁确保每次会话最多触发一次。
 - **`scripts/verify-blackscreen-fix.sh`**:自动化日志验证脚本,检查 VD 泄漏、cleanup 幂等、黑屏自愈、停机路径。
+- **`scripts/e2e-reconnect-cleanup.sh` / `scripts/verify-reconnect-cleanup.sh`**:**「应用并重连 + 关窗」收尾清理的端到端实机回归**(2026-10-10 MI 9 全流程自动化):预检 → 构建门 → APK 内嵌 dex 符号校验 → 装包重启 → 起桌面端 → UI 驱动重连/关窗 → 设备终态断言 → 日志离线断言(探针跃迁 ALIVE→GONE、必须「引擎已优雅退出」且无「强制 kill」、耗时 < 12s 预算、`__DILINK_SYNC__` 排水回显、`Cleanup complete`、`screen_off_timeout` 恢复非哨兵、二次握手)。
 
 ### 11. Windows 接收端 `:app-desktop`(v0.18.0-dev-13 起)
 
@@ -144,7 +148,7 @@ app-desktop --probe
 - 引导式权限授权
 - 简体中文 + 8 种其他语言(英、葡、俄、白俄、法、哈、乌、乌兹)
 - 直连 VD 架构:手机不做中继,视频/触摸直通
-- VD 泄漏修复:两阶段优雅停机、清理幂等 guard、VD 退出等待 —— 每次重连不再泄漏 VirtualDisplay
+- VD 泄漏修复:停止哨兵优雅停机(引擎跑完整 cleanup,超时兜底强杀)、清理幂等 guard、VD 退出等待 —— 每次重连不再泄漏 VirtualDisplay
 - 黑屏自愈:车机端检测到持续 3 秒以上黑屏后触发重建 VD(重握手);持续黑屏判定已上移到 `protocol-core`,Windows 接收端用同一套判据(10 秒窗口)。恢复路径原先会 `stop()` 解码器却没人重启它,反而把屏幕永久留在黑屏 —— 已修(`35d7821`)
 - Windows 接收端(`app-desktop`):镜像窗口 + 鼠标触摸 + 应用启动器 + DPI/硬解面板 + adb 部署,`jpackage` 出免安装 app-image
 
@@ -165,7 +169,7 @@ app-desktop --probe
 - 偶发花屏 —— 解码器重启竞争,下一个关键帧(~1s)恢复。
 - 流式延迟在负载下约 100-200ms。
 - 部分应用不铺满屏幕(信箱化/仅竖屏)。DiLink-Auto 把横屏虚拟显示器镜像到车机,不支持横屏方向的应用会出现黑边 —— 这由应用自身决定,镜像侧无法解决。
-- API 26-28 车机上,若 DisplayControl 反射失败,`cmd display power-on/off` shell 回退也是 API 29+,物理面板可能无法恢复(会打日志,不再静默)。
+- API 26-28 车机上,若 DisplayControl 反射失败,`cmd display power-reset`/`power-off` shell 回退也是 API 29+(无 `power-on` 子命令),物理面板可能无法恢复(会打日志,不再静默)。
 - 安装进度在中文等非英文界面语言下不显示 —— `InstallStatus.parse` 只按英文子串分类安装状态串,而状态串本身是本地化文案;中文界面下全部落入 `IDLE`,阶段勾选与错误颜色都不出现。已用测试固定现状,未修(`docs/IMPLEMENTATION_REPORT_TESTING.md` C-6)。
 - 车机应用首装在极端版本号下可能被跳过 —— 车机未安装时 `readInstalledVersion` 返回 `"0"`,若内嵌 `versionName` 也是 `0` / `0.0` / `0.0.0` 这种形式,比较结果会被判"已最新"而跳过首装。当前 `versionName` 为 `0.18.0-dev-13`,不触发(同上 C-5)。
 

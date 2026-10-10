@@ -3,8 +3,10 @@ package com.dilinkauto.vdserver
 import android.hardware.display.VirtualDisplay
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
+import android.media.MediaCodecList
 import android.media.MediaFormat
 import com.dilinkauto.protocol.*
+import java.io.File
 import java.io.IOException
 import java.net.ConnectException
 import java.net.InetSocketAddress
@@ -163,13 +165,17 @@ class PipelineServer(
 
     fun run() {
         Runtime.getRuntime().addShutdownHook(Thread({ cleanup() }, "ShutdownHook"))
+        // 删除上一轮可能残留的停止哨兵（见 [VdDeploy.gracefulStopCommand] 的协议）：
+        // 场景——外部写了请求、引擎未及消费即被强杀，文件残留；下一次 launch
+        // 的新引擎必须忽略它，否则会"一启动就被上一轮的旧信号误杀"。
+        runCatching { File(VdDeploy.STOP_REQUEST_PATH).delete() }
         try {
             touchInjector.initInputManager()
             shell.start()
             try { setupEncoder() } catch (e: Exception) { err("Fatal: encoder: ${e.message}"); return }
-            val enc = encoder ?: return
-            encoderSurface = enc.createInputSurface()
-            enc.start()
+            // setupEncoder 成功时 encoder/encoderSurface 已是一对可用的
+            // create→configure→createInputSurface→start 实例（见其 KDoc）。
+            if (encoder == null || encoderSurface == null) return
 
             glPipeline = GlPipeline(
                 displayWidth, displayHeight, encodeWidth, encodeHeight, fps,
@@ -211,6 +217,21 @@ class PipelineServer(
         }
     }
 
+    /**
+     * 选一个**真正能跑**的 H.264 编码器并完成 start（成功时 [encoder]/[encoderSurface]
+     * 为一对可用实例）。
+     *
+     * 旧写法是 `createEncoderByType()` 盲取框架排序里的第一个 video/avc 编码器。
+     * 2026-10-10 MI 9（Android 15 移植 ROM）实机缺陷：该 ROM 的 media_codecs.xml
+     * 把遗留组件 `OMX.qcom.video.encoder.avc` 排在 `c2.qti.avc.encoder` 之前，而前者
+     * 在 configure 时抛 `CodecException`（message 为空；logcat 真因
+     * `venc_dev: Unsupported eColorFormat 0x7f000789`，即不支持 COLOR_FormatSurface）
+     * —— 采集管线整体起不来，而空消息让 vd-server.log 只剩一行 "Fatal: encoder: "。
+     *
+     * 现在按 [orderEncoderCandidates] 排序后逐个 create → configure →
+     * createInputSurface → start，第一个成功者胜出；全部失败时抛出的异常**聚合每个
+     * 候选与失败原因**（可直接从 vd-server.log 定位，不再依赖 logcat）。
+     */
     private fun setupEncoder() {
         val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, encodeWidth, encodeHeight)
         format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
@@ -222,8 +243,51 @@ class PipelineServer(
         format.setInteger(MediaFormat.KEY_LATENCY, 0); format.setInteger(MediaFormat.KEY_PRIORITY, 0)
         format.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0); format.setInteger(MediaFormat.KEY_OPERATING_RATE, fps)
         format.setLong("repeat-previous-frame-after", 500_000L)
-        encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).also { it.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE) }
-        log("Encoder: ${encodeWidth}x${encodeHeight} CBR@${bitrate/1_000_000}Mbps Main ${fps}fps")
+
+        val tried = mutableListOf<String>()
+        for (name in orderEncoderCandidates(avcEncoderCandidates())) {
+            try {
+                val codec = MediaCodec.createByCodecName(name)
+                try {
+                    codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                    encoderSurface = codec.createInputSurface()
+                    codec.start()
+                } catch (e: Exception) {
+                    // 半成品实例必须释放：失败的 codec 已占用底层组件（真机上
+                    // OMX.qcom 的失败实例不释放会占住 concurrent-instances 名额）。
+                    runCatching { codec.release() }
+                    throw e
+                }
+                encoder = codec
+                log(
+                    "Encoder: $name ${encodeWidth}x${encodeHeight} CBR@${bitrate / 1_000_000}Mbps Main ${fps}fps" +
+                        if (tried.isEmpty()) "" else "（跳过不可用: ${tried.joinToString(", ")}）"
+                )
+                return
+            } catch (e: Exception) {
+                // 失败原因保留在聚合信息里；空 message 的 CodecException 用类名兜底。
+                val why = e.message?.trim().takeUnless { it.isNullOrEmpty() } ?: e.javaClass.simpleName
+                tried += "$name($why)"
+            }
+        }
+        throw IOException("没有可用的 H.264 编码器；候选与失败原因: ${tried.joinToString("; ")}")
+    }
+
+    /**
+     * 枚举框架里所有 video/avc 编码器（名字 + 是否纯软实现），保留框架原顺序。
+     *
+     * 用 `ALL_CODECS`：本缺陷的教训正是"框架排序里的第一个"不可靠 —— 拿全量列表
+     * 自己排序 + 逐个真尝试（见 [orderEncoderCandidates] 与 [setupEncoder]）。
+     */
+    private fun avcEncoderCandidates(): List<Pair<String, Boolean>> {
+        val infos = MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos
+        val out = ArrayList<Pair<String, Boolean>>(infos.size)
+        for (info in infos) {
+            if (!info.isEncoder) continue
+            if (info.supportedTypes.none { it.equals(MediaFormat.MIMETYPE_VIDEO_AVC, ignoreCase = true) }) continue
+            out += info.name to info.isSoftwareOnly
+        }
+        return out
     }
 
     // ── VD Creation ──
@@ -476,6 +540,17 @@ class PipelineServer(
     private fun startWatchdog() {
         Thread({
             while (running) {
+                // 停止哨兵：部署序列 / PhoneDisplayRestorer 写文件请求优雅停止。
+                // 不能用信号——ART 的 app_process 收 SIGTERM 直接终止、不跑 shutdown
+                // hook，cleanup 会被整体跳过（2026-10-10 MI 9 实测，见 VdDeploy 类头）。
+                // 这里置 running=false 后各等待点（accept 轮询 / park 切片 / bind 重试）
+                // 会在 ≤100ms 内退出，run() 走到 finally，cleanup 完整执行。
+                if (consumeStopRequest()) {
+                    log("Stop request detected (${VdDeploy.STOP_REQUEST_PATH}) — graceful shutdown")
+                    running = false
+                    pipelineThread?.let { LockSupport.unpark(it) }
+                    break
+                }
                 try { Thread.sleep(500) } catch (_: InterruptedException) { break }
             }
             val deadline = System.currentTimeMillis() + WATCHDOG_GRACE_MS
@@ -550,6 +625,13 @@ class PipelineServer(
         displayController.restoreIme()
         // 4. Stop the LifeWriter thread before killing the shell — it may be mid-write.
         lifecycle.stop()
+        // 4b. 屏障（2026-10-10，MI 9 实测）：上面的恢复命令是 fire-and-forget 写进
+        // 常驻 sh 的 stdin，而 close() 的 destroy() 会立刻 SIGTERM 掉它 —— 最后
+        // 几条命令还没被 sh 读走就随进程死了。实测丢的正是
+        // `settings put system screen_off_timeout 60000`：日志完整显示"恢复成功 +
+        // Cleanup complete"，但会话结束后值仍停在 2147483647 哨兵。echo 一个唯一
+        // 标记并等排水线程回显（stdin/stdout 双 FIFO）⇒ 此前命令都已执行完。
+        shell.awaitIdle()
         // Now kill the shell
         shell.close()
         // S-M8/S-06: ask the pipeline thread to exit (running=false + unpark) and wait for it
@@ -567,4 +649,37 @@ class PipelineServer(
         virtualDisplay?.let { try { it.release() } catch (_: Exception) {} }
         log("Cleanup complete")
     }
+}
+
+/**
+ * 编码器候选排序（纯函数，单测锁定契约 —— 见 `EncoderCandidateOrderTest`）。
+ *
+ * 排序键（稳定排序，同键保留框架给出的原顺序）：
+ *  1. 非纯软实现优先（`isSoftwareOnly=false`，硬编性能）；
+ *  2. 同组内 Codec2（`c2.` 前缀）优先于遗留 OMX（`OMX.` 前缀）—— 新设备上的
+ *     OMX 封装常是陈旧/残缺实现。2026-10-10 MI 9 实机：`OMX.qcom.video.encoder.avc`
+ *     在 configure 即失败（不支持 COLOR_FormatSurface），`c2.qti.avc.encoder` 正常。
+ *
+ * 排序只决定"先试谁"，正确性由 [PipelineServer.setupEncoder] 的逐个真尝试兜底：
+ * 靠前的候选失败会自动落到下一个，直到 `c2.android`（软编）之类的最后防线。
+ */
+internal fun orderEncoderCandidates(candidates: List<Pair<String, Boolean>>): List<String> =
+    candidates
+        .sortedWith(compareBy({ it.second }, { if (it.first.startsWith("c2.")) 0 else 1 }))
+        .map { it.first }
+
+/**
+ * 消费停止哨兵（协议见 [VdDeploy.gracefulStopCommand]）：文件存在则**删除并返回
+ * true**——删除是给外部的"已受理"信号（可选观察），删不掉也不影响停止（残留由
+ * 下一次启动的 `run()` 开头兜底清理）。不存在则返回 false。
+ *
+ * Top-level 且路径可注入：vd-server 的单测在纯 JVM 上跑，用临时目录验证
+ * "不存在→false / 存在→true 且被删除 / 二次调用→false"的契约；watchdog 的
+ * 线程集成不在单测范围内。
+ */
+internal fun consumeStopRequest(path: String = VdDeploy.STOP_REQUEST_PATH): Boolean {
+    val f = File(path)
+    if (!f.exists()) return false
+    runCatching { f.delete() }
+    return true
 }

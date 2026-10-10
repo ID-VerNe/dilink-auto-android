@@ -54,6 +54,14 @@ class DesktopConnectionService(
     var onLog: ((String) -> Unit)? = null
 
     /**
+     * 会话异常终止的原因（2026-10-10）：连接被拒、握手被拒、部署失败、等待 VD
+     * 超时等最终都汇聚到 [runSession] 的 catch —— 那里调一次本回调。UI（镜像页
+     * 失败面板）用它显示具体原因。取消（restart / 关闭窗口）不算错误，不触发。
+     */
+    @Volatile
+    var onSessionError: ((String) -> Unit)? = null
+
+    /**
      * 手机没有 Shizuku 时（`connectionMethod != CONNECTION_METHOD_SHIZUKU`），
      * 部署 VD server 的责任转到本端（Phase 5c，走本地 `adb.exe`）。
      *
@@ -127,6 +135,7 @@ class DesktopConnectionService(
             throw e
         } catch (e: Exception) {
             log("session error: ${e.message}")
+            onSessionError?.invoke(e.message ?: e.javaClass.simpleName)
         } finally {
             teardown()
             // D-L3：teardown 的完成信号。runSession 被取消时 Kotlin 协程依然会跑

@@ -49,7 +49,6 @@ class VdDeploySequenceTest {
 
     private fun plan() = VdDeploy.DeployPlan(
         args = "dummy-args",
-        killCommand = VdDeploy.killCommand,
         launchCommand = "launch-command",
     )
 
@@ -58,13 +57,27 @@ class VdDeploySequenceTest {
             vdRunDeploySequence(plan(), executor, now = clock::now, sleep = { clock.sleep(it) })
         }
 
+    /**
+     * 假时钟下"graceful 预算 + 强杀确认窗口"的总耗时。
+     *
+     * 轮询循环的条件是 `now() < deadline`，所以预算会被
+     * [VdDeploySequence.EXIT_WAIT_POLL_MS] **向上取整**（12s → 12.0s，10s → 10.05s）。
+     * 从常量算而不是写死数字：预算一改，写死的断言会退化成"断言 13.05 秒"这种
+     * 与被测行为无关的误导性失败。
+     */
+    private fun expectedStopElapsedMs(): Long {
+        val poll = VdDeploySequence.EXIT_WAIT_POLL_MS
+        val graceful = ((VdDeploySequence.GRACEFUL_EXIT_TIMEOUT_MS + poll - 1) / poll) * poll
+        return graceful + VdDeploySequence.EXIT_WAIT_TIMEOUT_MS
+    }
+
     @Test
-    fun `clean exit runs kill, two gone probes, then launch`() {
+    fun `clean exit runs graceful stop, two gone probes, then launch`() {
         val executor = FakeExecutor(ArrayDeque(listOf(VdProbeResult.GONE, VdProbeResult.GONE)))
 
         val outcome = run(executor)
 
-        assertEquals(listOf(VdDeploy.killCommand, "launch-command"), executor.commands)
+        assertEquals(listOf(VdDeploy.gracefulStopCommand, "launch-command"), executor.commands)
         assertEquals("连续两次 GONE 确认退出", 2, executor.probeCount)
         assertFalse("正常退出不应触发兜底强杀", outcome.forcedKill)
         assertTrue(outcome.launched)
@@ -80,11 +93,11 @@ class VdDeploySequenceTest {
 
         assertEquals("存活一次后需再确认两次", 3, executor.probeCount)
         assertFalse(outcome.forcedKill)
-        assertEquals(listOf(VdDeploy.killCommand, "launch-command"), executor.commands)
+        assertEquals(listOf(VdDeploy.gracefulStopCommand, "launch-command"), executor.commands)
     }
 
     @Test
-    fun `timeout falls back to stopCommand and still launches`() {
+    fun `graceful timeout falls back to force kill and still launches`() {
         // Never gone → both waits time out; the second must still end with launch.
         val commands = mutableListOf<String>()
         val stubborn = object : VdDeployExecutor {
@@ -104,10 +117,10 @@ class VdDeploySequenceTest {
             vdRunDeploySequence(plan(), stubborn, now = clock::now, sleep = { clock.sleep(it) })
         }
 
-        assertTrue("超时后必须补 stopCommand", outcome.forcedKill)
-        assertEquals("假时钟两轮等待各耗尽 3s 预算", 6_000L, clock.millis)
+        assertTrue("graceful 超时后必须补 -9 兜底", outcome.forcedKill)
+        assertEquals("两轮等待各耗尽预算", expectedStopElapsedMs(), clock.millis)
         assertEquals(
-            listOf(VdDeploy.killCommand, VdDeploy.stopCommand, "launch-command"),
+            listOf(VdDeploy.gracefulStopCommand, VdDeploy.killCommandForce, "launch-command"),
             commands,
         )
     }
@@ -120,7 +133,7 @@ class VdDeploySequenceTest {
 
         assertEquals("无法探测时立即放行，不轮询", 1, executor.probeCount)
         assertFalse(outcome.forcedKill)
-        assertEquals(listOf(VdDeploy.killCommand, "launch-command"), executor.commands)
+        assertEquals(listOf(VdDeploy.gracefulStopCommand, "launch-command"), executor.commands)
     }
 
     @Test
@@ -134,5 +147,47 @@ class VdDeploySequenceTest {
 
         assertFalse(outcome.launched)
         assertFalse(outcome.forcedKill)
+    }
+
+    // ── vdStopEngine（会话收尾专用：只停不启，2026-10-10）──
+
+    @Test
+    fun `stop engine writes the sentinel and waits, without launching`() {
+        val executor = FakeExecutor(ArrayDeque(listOf(VdProbeResult.GONE, VdProbeResult.GONE)))
+        val clock = FakeClock()
+
+        val forcedKill = runBlocking {
+            vdStopEngine(executor, now = clock::now, sleep = { clock.sleep(it) })
+        }
+
+        assertFalse("干净退出不应触发强杀", forcedKill)
+        assertEquals("收尾路径只停不启", listOf(VdDeploy.gracefulStopCommand), executor.commands)
+        assertEquals(2, executor.probeCount)
+    }
+
+    @Test
+    fun `stop engine force kills when the graceful wait times out`() {
+        val stubborn = object : VdDeployExecutor {
+            val commands = mutableListOf<String>()
+            override suspend fun shellSync(command: String) {
+                commands += command
+            }
+
+            override suspend fun launch(command: String): Boolean = true
+
+            override suspend fun probe(): VdProbeResult = VdProbeResult.ALIVE
+        }
+        val clock = FakeClock()
+
+        val forcedKill = runBlocking {
+            vdStopEngine(stubborn, now = clock::now, sleep = { clock.sleep(it) })
+        }
+
+        assertTrue(forcedKill)
+        assertEquals(
+            listOf(VdDeploy.gracefulStopCommand, VdDeploy.killCommandForce),
+            stubborn.commands,
+        )
+        assertEquals("两轮等待各耗尽预算", expectedStopElapsedMs(), clock.millis)
     }
 }
