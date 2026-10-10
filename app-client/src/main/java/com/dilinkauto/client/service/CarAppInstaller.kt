@@ -24,7 +24,7 @@ import java.io.File
 class CarAppInstaller(
     private val context: Context,
     private val onStatus: (String) -> Unit
-) {
+) : CarInstaller<Dadb> {
 
     private val privKey: File = File(context.filesDir, "adbkey")
     private val pubKey: File = File(context.filesDir, "adbkey.pub")
@@ -34,7 +34,7 @@ class CarAppInstaller(
      * open [Dadb]. Caller owns [Dadb.close]. Returns null on timeout — the car
      * auth dialog is likely pending.
      */
-    fun connect(carIp: String): Dadb? {
+    override fun connect(carIp: String): Dadb? {
         val keyPair = ensureKeyPair()
         return AdbKeyUtil.dadbCreateWithTimeout(TAG, carIp, CAR_ADB_PORT, keyPair, DADB_TIMEOUT_SECONDS)
     }
@@ -43,11 +43,11 @@ class CarAppInstaller(
      * Reads the car's currently-installed `app-server` version name, or "0"
      * if not installed. Requires an open [dadb] session.
      */
-    fun readInstalledVersion(dadb: Dadb): String {
+    override fun readInstalledVersion(dadb: Dadb): String {
         val output = dadb.shell(
             "dumpsys package com.dilinkauto.server 2>/dev/null | grep versionName"
         ).allOutput
-        return Regex("""versionName=(\S+)""").find(output)?.groupValues?.get(1) ?: "0"
+        return parseInstalledVersion(output)
     }
 
     /**
@@ -56,7 +56,7 @@ class CarAppInstaller(
      * (contains "Success" on a successful install). The caller owns [dadb]
      * lifecycle (close it after).
      */
-    fun pushAndInstall(dadb: Dadb, apkFile: File, versionLabel: String): String {
+    override fun pushAndInstall(dadb: Dadb, apkFile: File, versionLabel: String): String {
         val remotePath = "/data/local/tmp/app-server.apk"
         onStatus.invoke(context.getString(R.string.car_install_status_pushing_apk, apkFile.length() / 1024 / 1024))
         dadb.push(apkFile, remotePath)
@@ -75,9 +75,21 @@ class CarAppInstaller(
 
     private fun ensureKeyPair(): AdbKeyPair = AdbKeyUtil.ensureAdbKeyPair(context.filesDir)
 
+    override fun close(dadb: Dadb) {
+        dadb.close()
+    }
+
     companion object {
         private const val TAG = "CarAppInstaller"
         private const val CAR_ADB_PORT = Ports.ADB_PORT
         private const val DADB_TIMEOUT_SECONDS = 15L
+
+        /**
+         * Parse the installed version name out of `dumpsys package` output;
+         * "0" (the not-installed sentinel) when absent. Extracted as a pure
+         * function so the parsing is unit-testable without a Dadb session.
+         */
+        internal fun parseInstalledVersion(output: String): String =
+            Regex("""versionName=(\S+)""").find(output)?.groupValues?.get(1) ?: "0"
     }
 }

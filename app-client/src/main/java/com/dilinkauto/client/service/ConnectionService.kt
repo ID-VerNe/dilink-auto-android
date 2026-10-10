@@ -799,7 +799,7 @@ class ConnectionService : Service() {
     }
 
     /** Built lazily: needs filesDir and the live connection's remote IP. */
-    private val installCoordinator: CarInstallCoordinator by lazy {
+    private val installCoordinator: CarInstallCoordinator<dadb.Dadb> by lazy {
         CarInstallCoordinator(
             context = this,
             apkFile = java.io.File(filesDir, "app-server.apk"),
