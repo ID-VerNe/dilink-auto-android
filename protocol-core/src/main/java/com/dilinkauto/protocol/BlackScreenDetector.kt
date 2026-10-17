@@ -18,6 +18,10 @@ package com.dilinkauto.protocol
  *
  * 升级每次会话最多触发一次，直到 [reset]。
  *
+ * 纯码流判据分不清「内容本身是黑」和「管线卡死」（两者都是连续极小 I 帧），
+ * 所以升级前可以再过一道 [decodingAliveCheck] 闸门：黑但解码仍在出帧 = 内容黑，
+ * 不升级。桌面端已接线（2026-10-17），车机端未接线（行为不变）。
+ *
  * 时钟由调用方注入（[clock]）：车机端传 `SystemClock.elapsedRealtime()`，桌面端用
  * 默认的 `System.nanoTime()`。只要求"同一个单调源"，与绝对值无关；默认值不能再写
  * `SystemClock` —— 本模块是纯 JVM，不依赖 Android。
@@ -51,6 +55,23 @@ class BlackScreenDetector(
 
     /** 黑屏持续多久才触发 [onSustainedBlackScreen]。 */
     var sustainMs: Long = BLACK_SCREEN_SUSTAIN_MS
+
+    /**
+     * 升级闸门：返回 `true`（解码仍在正常出帧）时**只保留告警位、不升级**
+     * （[onSustainedBlackScreen] 不触发）。
+     *
+     * 为什么需要：纯码流判据分不清「内容本身就是黑」和「管线卡死」——两者都表现为
+     * 连续极小 I 帧。桌面端实测（2026-10-17 MEIZU）：VD 内容合法为黑（空 launcher /
+     * 手机屏熄灭）时，编码器持续输出极小 I 帧，10s 窗口一到必然误报，每个会话白烧
+     * 2 轮重连（~40s，`MAX_BLACK_SCREEN_RECONNECTS`）。
+     *
+     * 接上「解码是否还在出帧」后：**黑 + 仍在正常解码 = 内容黑，不升级**；
+     * **黑 + 解码停摆 = 管线故障，升级**。闸门每帧都会被问一次（只在满窗后），
+     * 实现方必须是廉价且非阻塞的。
+     *
+     * 默认 `null` = 不设闸门 = 原有行为（车机端未接线，行为不变）。
+     */
+    var decodingAliveCheck: (() -> Boolean)? = null
 
     /**
      * 喂一帧。
@@ -87,6 +108,9 @@ class BlackScreenDetector(
         if (recoveryFired) return
         val since = blackSinceMs ?: return
         if (nowMs - since >= sustainMs) {
+            // 黑屏但解码仍在正常出帧 → 内容本身是黑，不是管线故障：不升级，
+            // 保留 blackSinceMs 继续观察（一旦解码停摆，下一帧就会升级）。
+            if (decodingAliveCheck?.invoke() == true) return
             recoveryFired = true
             onSustainedBlackScreen?.invoke()
         }

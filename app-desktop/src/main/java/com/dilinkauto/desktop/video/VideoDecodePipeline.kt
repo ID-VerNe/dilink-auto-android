@@ -108,9 +108,44 @@ class VideoDecodePipeline(
     /**
      * 持续黑屏判定器。探测方法与车机端完全一致，只有持续窗口不同
      * （[BLACK_SCREEN_SUSTAIN_MS] 比 protocol-core 的默认值长，见那里的说明）。
+     *
+     * 升级闸门接了「解码是否还在出帧」：VD 内容合法为黑（空 launcher / 手机屏熄灭）
+     * 时编码器会持续输出极小 I 帧，纯码流判据必然误报 —— 2026-10-17 MEIZU 实测：
+     * 每个会话白烧 2 轮自动重连（~40s），把重连预算烧在没有故障的画面上。
+     * 黑 + 仍在正常解码 = 内容黑，不重连；黑 + 解码停摆 = 管线卡死，才重连。
      */
     private val blackScreen = BlackScreenDetector().apply {
         setSustainWindow(BLACK_SCREEN_SUSTAIN_MS)
+        decodingAliveCheck = { decodingAlive() }
+    }
+
+    /** [decodingAlive] 的采样基线：上次看到的 framesDecoded 值及其时间戳（ms）。 */
+    @Volatile
+    private var decodeAliveCount = 0L
+
+    @Volatile
+    private var decodeAliveAtMs = 0L
+
+    /**
+     * 解码线程是否还在出帧（最近 [DECODE_ALIVE_WINDOW_MS] 内 [framesDecoded] 有增长）。
+     *
+     * 只在黑屏满窗后才被调用（每帧一次），代价是读一个 AtomicLong + 一次时钟。
+     * 首次采样时若还一帧都没解出来，按「活着」处理：预热期不该升级，等下一个
+     * 窗口再判（真的停摆会在 2s 后翻成 false）。
+     */
+    private fun decodingAlive(): Boolean {
+        val now = System.nanoTime() / 1_000_000L
+        val n = framesDecoded.get()
+        if (n != decodeAliveCount) {
+            decodeAliveCount = n
+            decodeAliveAtMs = now
+            return true
+        }
+        if (decodeAliveAtMs == 0L) {
+            decodeAliveAtMs = now
+            return true
+        }
+        return now - decodeAliveAtMs < DECODE_ALIVE_WINDOW_MS
     }
 
     /** 最近一次收到的 CONFIG，供解码器重建时重放。 */
@@ -394,6 +429,15 @@ class VideoDecodePipeline(
          * 暂停在全黑画面，同样会持续输出极小 I 帧 —— 长窗口让这类合法场景基本不命中。
          */
         const val BLACK_SCREEN_SUSTAIN_MS = 10_000L
+
+        /**
+         * 「解码还活着」的判定窗口：最近这么久内 [framesDecoded] 没增长就算停摆。
+         *
+         * 2s 的取值：正常播放 24~30fps，2s 里至少该解出 48 帧；2s 一帧都没有 =
+         * 解码线程确实卡住了（不是帧率抖动）。比黑屏窗口（10s）短得多，所以
+         * 「内容黑但正常解码」永远进不了升级分支。
+         */
+        private const val DECODE_ALIVE_WINDOW_MS = 2_000L
 
         private const val STOP_JOIN_TIMEOUT_MS = 2_000L
         private const val REBUILD_BACKOFF_MS = 500L

@@ -234,4 +234,75 @@ class BlackScreenDetectorTest {
         d.onFrame(true, tiny(), 500)
         assertEquals(1, fired)
     }
+
+    /**
+     * 升级闸门关闭时：告警照常置位，但**不升级**。
+     *
+     * 场景（2026-10-17 MEIZU 真机）：VD 内容本身就是黑（空 launcher / 手机屏熄灭），
+     * 编码器持续输出极小 I 帧，但解码在正常出帧 —— 画面黑不是故障，重连只会白烧预算。
+     */
+    @Test
+    fun closedGateSuppressesEscalationButKeepsTheAlert() {
+        var fired = 0
+        val d = detector(alertStreak = 2, sustainMs = 1000L).apply {
+            onSustainedBlackScreen = { fired++ }
+            decodingAliveCheck = { true }   // 解码仍在出帧
+        }
+        d.onFrame(true, tiny(), 0)
+        d.onFrame(true, tiny(), 500)
+        assertTrue("告警位不受闸门影响", d.isAlerted())
+        d.onFrame(true, tiny(), 5000)
+        assertEquals("黑 + 解码正常 = 内容黑，不得升级", 0, fired)
+        assertFalse(d.hasFiredRecovery())
+    }
+
+    /**
+     * 闸门只在**满窗之后**才被咨询：预热期的帧不该触发一次多余的判断。
+     */
+    @Test
+    fun gateIsConsultedOnlyAfterTheSustainWindow() {
+        var calls = 0
+        val d = detector(alertStreak = 2, sustainMs = 1000L).apply {
+            decodingAliveCheck = { calls++; true }
+        }
+        d.onFrame(true, tiny(), 0)
+        d.onFrame(true, tiny(), 400)
+        assertEquals("窗口未满时不问闸门", 0, calls)
+        d.onFrame(true, tiny(), 1000)
+        assertEquals("满窗那一帧问一次", 1, calls)
+    }
+
+    /**
+     * 闸门先关后开：解码停摆之后必须还能升级（不能因为之前判过「内容黑」就永久闭嘴）。
+     */
+    @Test
+    fun gateReopensAndEscalationStillHappens() {
+        var fired = 0
+        var alive = true
+        val d = detector(alertStreak = 2, sustainMs = 1000L).apply {
+            onSustainedBlackScreen = { fired++ }
+            decodingAliveCheck = { alive }
+        }
+        d.onFrame(true, tiny(), 0)
+        d.onFrame(true, tiny(), 2000)
+        assertEquals("解码正常，不升级", 0, fired)
+        alive = false                       // 解码线程卡死
+        d.onFrame(true, tiny(), 2100)
+        assertEquals("解码停摆，同一段黑屏立刻升级", 1, fired)
+        assertTrue(d.hasFiredRecovery())
+    }
+
+    /**
+     * 不设闸门时行为与抽取前完全一致（车机端未接线，不能因为桌面端的修复改变它）。
+     */
+    @Test
+    fun absentGateKeepsLegacyEscalation() {
+        var fired = 0
+        val d = detector(alertStreak = 1, sustainMs = 1000L).apply {
+            onSustainedBlackScreen = { fired++ }
+        }
+        d.onFrame(true, tiny(), 0)
+        d.onFrame(true, tiny(), 1000)
+        assertEquals(1, fired)
+    }
 }
