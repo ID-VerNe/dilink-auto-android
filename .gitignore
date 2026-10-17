@@ -62,3 +62,10 @@ app-client/DiLinkAuto/
 
 # Agent scratch state (was only ignored via .git/info/exclude — audit B-I3)
 .freebuff/
+
+# Python bytecode cache (explore.py 等)
+__pycache__/
+*.pyc
+
+# E2E harness 偶发在仓库根写出的快照（正常产物在 debug-logs/e2e/<TS>/ 下）
+/vdlog.snapshot

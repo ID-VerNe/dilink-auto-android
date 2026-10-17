@@ -83,4 +83,57 @@ class SessionScreenTimeoutTest {
             )
         }
     }
+
+    // ── effectiveSnapshot（2026-10-17 S19 真机实证的 kill 路径修正）──
+
+    @Test
+    fun `effectiveSnapshot prefers the file archive when the setting reads back the sentinel`() {
+        // 上个会话被 kill：settings 读回哨兵，但文件存档里有真实原值。
+        assertEquals("300000", SessionScreenTimeout.effectiveSnapshot("2147483647", "300000"))
+        assertEquals("300000", SessionScreenTimeout.effectiveSnapshot("  2147483647  ", " 300000 "))
+    }
+
+    @Test
+    fun `effectiveSnapshot keeps a healthy current value over the file archive`() {
+        // 正常路径：用户（或系统）当前值优先，文件只是历史存档。
+        assertEquals("120000", SessionScreenTimeout.effectiveSnapshot("120000", "300000"))
+        assertEquals("60000", SessionScreenTimeout.effectiveSnapshot("60000", null))
+    }
+
+    @Test
+    fun `effectiveSnapshot falls back to the default when nothing is usable`() {
+        val def = SessionScreenTimeout.DEFAULT_TIMEOUT_MS.toString()
+        // 哨兵 + 存档不可用（缺失 / 读失败标记 / 非正数 / 非数值 / 本身是哨兵）→ 默认值。
+        assertEquals(def, SessionScreenTimeout.effectiveSnapshot("2147483647", null))
+        assertEquals(def, SessionScreenTimeout.effectiveSnapshot("2147483647", ""))
+        assertEquals(def, SessionScreenTimeout.effectiveSnapshot("2147483647", "  "))
+        assertEquals(def, SessionScreenTimeout.effectiveSnapshot("2147483647", "null"))
+        assertEquals(def, SessionScreenTimeout.effectiveSnapshot("2147483647", "undefined"))
+        assertEquals(def, SessionScreenTimeout.effectiveSnapshot("2147483647", "0"))
+        assertEquals(def, SessionScreenTimeout.effectiveSnapshot("2147483647", "-5"))
+        assertEquals(def, SessionScreenTimeout.effectiveSnapshot("2147483647", "abc"))
+        assertEquals(def, SessionScreenTimeout.effectiveSnapshot("2147483647", "2147483647"))
+    }
+
+    @Test
+    fun `effectiveSnapshot treats a failed read as the old default path`() {
+        // 读失败（null）与修复前行为逐字一致：直接默认值，不启用文件修正。
+        assertEquals(
+            SessionScreenTimeout.DEFAULT_TIMEOUT_MS.toString(),
+            SessionScreenTimeout.effectiveSnapshot(null, "300000")
+        )
+    }
+
+    @Test
+    fun `effectiveSnapshot never emits the sentinel for any input pair`() {
+        val currents = listOf(null, "", "null", "0", "60000", "2147483647", "  2147483647  ")
+        val files = listOf(null, "", "null", "0", "-1", "300000", "2147483647")
+        for (c in currents) for (f in files) {
+            val effective = SessionScreenTimeout.effectiveSnapshot(c, f)
+            assertFalse(
+                "effectiveSnapshot('$c', '$f') must never emit the sentinel",
+                SessionScreenTimeout.isSentinel(effective)
+            )
+        }
+    }
 }

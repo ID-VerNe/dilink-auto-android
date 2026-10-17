@@ -24,8 +24,13 @@ import java.security.PrivateKey
  * Key *storage* policy is TCP-specific: keys are written as PEM so they remain
  * readable by Dadb (which the car's dev-mode installer uses). UsbAdbConnection
  * has its own storage rules; the two intentionally do not share that logic.
+ *
+ * `open` is a deliberate test seam: `RemoteAdbControllerTransportFailureTest`
+ * substitutes a scripted fake to pin the transport-failure contract (a `-1`
+ * from [shell]/[shellBackground] must mark the connection dead) without a
+ * live adbd. Production always uses this class directly.
  */
-class TcpAdbConnection(
+open class TcpAdbConnection(
     private val host: String,
     private val port: Int,
     private val keyDir: File
@@ -36,7 +41,7 @@ class TcpAdbConnection(
 
     val isConnected: Boolean get() = socket?.isConnected == true && !socket!!.isClosed
 
-    fun connect(): Boolean {
+    open fun connect(): Boolean {
         try {
             val sock = Socket()
             sock.connect(InetSocketAddress(host, port), 5000)
@@ -70,7 +75,7 @@ class TcpAdbConnection(
     }
 
     /** Execute a shell command synchronously. Returns exit code (0 = stream closed, -1 = error). */
-    fun shell(command: String): Int {
+    open fun shell(command: String): Int {
         val sock = socket ?: return -1
         val localId = nextLocalId()
         var peerRemoteId = 0
@@ -119,7 +124,7 @@ class TcpAdbConnection(
 
     /** Start a long-running shell command. Keeps the stream open so the process survives.
      *  Returns the local stream ID if successful, -1 on failure. */
-    fun shellBackground(command: String): Int {
+    open fun shellBackground(command: String): Int {
         val sock = socket ?: return -1
         val localId = nextLocalId()
         return try {
@@ -140,7 +145,7 @@ class TcpAdbConnection(
     }
 
     /** Fire-and-forget shell command. Returns true if OPEN+OKAY succeeded. */
-    fun shellNoWait(command: String): Boolean {
+    open fun shellNoWait(command: String): Boolean {
         return shellBackground(command) >= 0
     }
 

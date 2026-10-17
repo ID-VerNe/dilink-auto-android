@@ -107,6 +107,11 @@ internal class VdServerDeployer(private val host: CarConnectionService) {
             log("VD server failed to start", "E")
             host.setStatusMessage(R.string.status_vd_failed)
             host.vdServerStarted = false  // Allow retry
+            // The launch command failed at the transport layer (half-open TCP ADB
+            // socket after a phone-side WiFi flap — see RemoteAdbController's class
+            // doc). Drop the controller so the next state pass rebuilds it instead
+            // of reusing the dead socket (S05 live evidence, 2026-10-17).
+            host.resetAdbController()
             return
         }
         host.setStatusMessage(R.string.status_waiting_video)

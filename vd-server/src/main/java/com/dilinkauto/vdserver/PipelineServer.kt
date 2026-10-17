@@ -452,7 +452,13 @@ class PipelineServer(
                 val enc = encoder
                 if (running && ch != null && enc != null) glPipeline.pipelineLoop(enc, ch) { running }
             }
-        } catch (e: Exception) { err("Pipeline: ${e.message}"); e.printStackTrace() }
+        } catch (e: Exception) {
+            err("Pipeline: ${e.message}")
+            // 对端断开（Broken pipe 等）是会话结束的正常形态：一行消息足够，不打完整堆栈
+            // （S19 真机实证：20 轮循环 9 次 Broken pipe 堆栈把 vd-server.log 的 Exception 断言打爆，
+            // 堆栈对断连无任何诊断价值）。
+            if (!isPeerDisconnect(e)) e.printStackTrace()
+        }
         finally {
             // S-M8: EGL/GL teardown belongs to THIS thread — the EGL context was made
             // current here, and the encoder may still be inside dequeueOutputBuffer.
@@ -682,4 +688,20 @@ internal fun consumeStopRequest(path: String = VdDeploy.STOP_REQUEST_PATH): Bool
     if (!f.exists()) return false
     runCatching { f.delete() }
     return true
+}
+
+/**
+ * 对端断开类 IO 异常（Broken pipe / Connection reset / Socket closed）。
+ *
+ * 会话被对端终结（Eject / 拔线 / 引擎被重建）时，视频写路径会抛这些异常——它们是
+ * **正常终止形态**，[PipelineServer] 的兜底 catch 对它们只打一行消息、不打完整堆栈
+ * （S19 真机实证：20 轮循环 9 次 Broken pipe 堆栈把 vd-server.log 的 Exception 断言
+ * 打爆；堆栈对这类断连没有诊断价值）。非 IO 异常 / 消息不匹配一律返回 false（照旧打堆栈）。
+ */
+internal fun isPeerDisconnect(e: Throwable): Boolean {
+    if (e !is IOException) return false
+    val m = e.message ?: return false
+    return m.contains("Broken pipe", ignoreCase = true) ||
+        m.contains("Connection reset", ignoreCase = true) ||
+        m.contains("Socket closed", ignoreCase = true)
 }

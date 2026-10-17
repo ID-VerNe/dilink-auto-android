@@ -19,7 +19,10 @@
 #   9  拉取 vd-server.log，跑 scripts/verify-reconnect-cleanup.sh 全套离线断言
 #
 # 用法：
-#   bash scripts/e2e-reconnect-cleanup.sh [--skip-build] [--no-install] [--serial <adb序列号>]
+#   bash scripts/e2e-reconnect-cleanup.sh --serial <adb序列号> [--skip-build] [--no-install]
+#
+# --serial 必填：双机/TCP 设备在册时自动挑选会挑错设备（把 PIN 输到别的机器上并
+# 计入那台的 failsafe 计数，见 .plan/adb-unlock-for-e2e.md §5）。
 #
 # 前置条件：ADB 设备在线；Windows 桌面已登录（脚本会移动鼠标/点击窗口，跑的时候别用电脑）。
 #
@@ -107,10 +110,20 @@ command -v python >/dev/null 2>&1 || { echo "✗ 找不到 python（win_auto 与
 [ -f "$WIN_AUTO" ] || { echo "✗ 找不到 $WIN_AUTO"; exit 1; }
 
 if [ -z "$SERIAL" ]; then
-  SERIAL=$(adb devices | awk '$2=="device" && $1 !~ /:/ {print $1}' | head -1)
-  [ -z "$SERIAL" ] && SERIAL=$(adb devices | awk '$2=="device" {print $1}' | head -1)
+  echo "✗ 必须显式指定 --serial <adb序列号>（双机/TCP 设备在册时自动挑选会挑错设备，" >&2
+  echo "  把 PIN 输到别的机器上并计入那台的 failsafe 计数，见 .plan/adb-unlock-for-e2e.md §5）" >&2
+  echo "  当前在线设备：" >&2
+  adb devices -l | awk 'NR>1 && $2=="device" { $1=""; sub(/^[ \t]+/,""); print "    " $0 }' >&2
+  echo "  用法：bash $0 --serial <序列号>" >&2
+  exit 2
 fi
-[ -n "$SERIAL" ] || { echo "✗ 没有可用的 ADB 设备"; exit 1; }
+# 指定的 serial 必须在线且为 device 状态（防止打错/掉线后带着错误设备盲跑）
+SSTATE=$(adb -s "$SERIAL" get-state 2>/dev/null | tr -d '\r\n')
+if [ "$SSTATE" != "device" ]; then
+  echo "✗ 设备 $SERIAL 不在线（state=${SSTATE:-无}）" >&2
+  adb devices -l >&2
+  exit 2
+fi
 echo "序列号：$SERIAL"
 echo "产物目录：$RUN"
 

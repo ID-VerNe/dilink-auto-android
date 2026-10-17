@@ -1,6 +1,8 @@
 package com.dilinkauto.vdserver
 
+import java.io.File
 import java.io.OutputStream
+import java.nio.file.Files
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -23,13 +25,21 @@ class DisplayPowerControllerRestoreTest {
         fun lines(): List<String> = sb.toString().split("\n").map { it.trim() }.filter { it.isNotEmpty() }
     }
 
+    /** 每个测试实例独立的临时存档：默认路径在 Windows JVM 上会落到 C:\sdcard\...（跨测试污染）。 */
+    private fun tempSnapshotFile(): TimeoutSnapshotFile {
+        val dir = Files.createTempDirectory("dpc-snapshot").toFile()
+        return TimeoutSnapshotFile(File(dir, "screen-timeout.snapshot").absolutePath)
+    }
+
     private fun dpc(
         shell: CapturingShell,
-        dpi: (String) -> String?
+        snap: TimeoutSnapshotFile = tempSnapshotFile(),
+        dpi: (String) -> String?,
     ) = DisplayPowerController(
         shellProvider = { shell },
         execShellOutput = dpi,
-        logErr = { }
+        logErr = { },
+        snapshotFile = snap,
     )
 
     @Test
@@ -113,5 +123,97 @@ class DisplayPowerControllerRestoreTest {
         assertTrue(lines.any { it == "settings put system screen_off_timeout 60000" })
         assertTrue(lines.any { it == "settings put system lift_wakeup_enabled 1" })
         assertTrue(lines.any { it == "settings put system proximity_wakeup_enabled 1" })
+    }
+
+    // ── 文件存档（2026-10-17 S19 真机实证的 kill 路径修正）──
+    // 修复前的缺陷：快照只存内存，会话被 SIGKILL 后丢失 → 下个会话 fallback 60000，
+    // 用户的 300000 被永久覆盖（vd-server.log 行 148→161→205 逐字可见）。
+
+    private fun dpcWithFile(
+        shell: CapturingShell,
+        snap: TimeoutSnapshotFile,
+        dpi: (String) -> String?
+    ) = DisplayPowerController(
+        shellProvider = { shell },
+        execShellOutput = dpi,
+        logErr = { },
+        snapshotFile = snap,
+    )
+
+    @Test
+    fun `kill-path snapshot file rescues the real original value`() {
+        val dir = Files.createTempDirectory("timeout-snapshot-rescue").toFile()
+        try {
+            val snap = TimeoutSnapshotFile(File(dir, "screen-timeout.snapshot").absolutePath)
+            snap.write("300000") // 上个会话被 kill 前留下的存档
+            val shell = CapturingShell()
+            val dpc = dpcWithFile(shell, snap) { cmd ->
+                when {
+                    cmd.contains("default_input_method") -> "com.baidu.input/.ImeService"
+                    cmd.contains("screen_off_timeout") -> "2147483647" // 被 kill 留下的哨兵
+                    else -> "1"
+                }
+            }
+            dpc.saveCurrentIme()
+            dpc.restoreIme()
+            val lines = shell.lines()
+            assertTrue(
+                "应从文件存档恢复真实原值 300000（而非 fallback 60000）",
+                lines.any { it == "settings put system screen_off_timeout 300000" }
+            )
+            assertFalse("绝不能回落 60000", lines.any { it == "settings put system screen_off_timeout 60000" })
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `sentinel without a snapshot file still falls back to sixty seconds`() {
+        val dir = Files.createTempDirectory("timeout-snapshot-absent").toFile()
+        try {
+            val snap = TimeoutSnapshotFile(File(dir, "screen-timeout.snapshot").absolutePath)
+            val shell = CapturingShell()
+            val dpc = dpcWithFile(shell, snap) { cmd ->
+                when {
+                    cmd.contains("default_input_method") -> "com.baidu.input/.ImeService"
+                    cmd.contains("screen_off_timeout") -> "2147483647"
+                    else -> "1"
+                }
+            }
+            dpc.saveCurrentIme()
+            dpc.restoreIme()
+            assertTrue(
+                "无存档时保持修复前语义（哨兵 → 60000）",
+                shell.lines().any { it == "settings put system screen_off_timeout 60000" }
+            )
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `healthy session archives the original value to the file`() {
+        val dir = Files.createTempDirectory("timeout-snapshot-archive").toFile()
+        try {
+            val path = File(dir, "screen-timeout.snapshot").absolutePath
+            val snap = TimeoutSnapshotFile(path)
+            val shell = CapturingShell()
+            val dpc = dpcWithFile(shell, snap) { cmd ->
+                when {
+                    cmd.contains("default_input_method") -> "com.baidu.input/.ImeService"
+                    cmd.contains("screen_off_timeout") -> "300000"
+                    else -> "1"
+                }
+            }
+            dpc.saveCurrentIme()
+            assertEquals("会话开始即落盘原值", "300000", File(path).readText().trim())
+            dpc.restoreIme()
+            assertTrue(
+                "正常结束路径照常恢复 300000",
+                shell.lines().any { it == "settings put system screen_off_timeout 300000" }
+            )
+        } finally {
+            dir.deleteRecursively()
+        }
     }
 }

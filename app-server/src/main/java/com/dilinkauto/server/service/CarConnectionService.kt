@@ -838,6 +838,30 @@ class CarConnectionService : Service() {
         return tcpOk || usbOk
     }
 
+    /**
+     * Drop the TCP ADB controller so the next state-machine pass rebuilds it.
+     *
+     * Called when the deploy sequence reports a launch failure: the transport
+     * layer (`TcpAdbConnection`) reports socket errors as `-1` without throwing,
+     * and [RemoteAdbController] now clears `isConnected` on that path — this
+     * method additionally nulls the controller and clears [usbReady], which is
+     * what makes [startUsbTrack] fall through to [startTcpAdbTrack] instead of
+     * short-circuiting on `usbReady`.
+     *
+     * 2026-10-17 S05 live evidence: a 5 s phone-side WiFi drop left the car's
+     * TCP ADB socket half-open. Because the old controller kept
+     * `isConnected == true`, every reconnect cycle reused it and the deploy died
+     * in ~150 ms (`VD server failed to start`) with `failures` climbing
+     * 6→9+; only a process restart (S06's fresh app) recovered.
+     */
+    internal fun resetAdbController() {
+        adbController?.disconnect()
+        adbController = null
+        lastAdbHost = null
+        usbReady = false
+        carLogSend("ADB controller reset — will reconnect on next state pass")
+    }
+
     /** Route to the deployer; kept on the service so callers (state machine, USB/TCP tracks) don't change. */
     internal fun deployVdServer() = vdDeployer.deploy()
 

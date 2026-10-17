@@ -16,7 +16,9 @@ import java.io.OutputStream
 internal class DisplayPowerController(
     private val shellProvider: () -> OutputStream?,
     private val execShellOutput: (String) -> String?,
-    private val logErr: (String) -> Unit
+    private val logErr: (String) -> Unit,
+    /** `screen_off_timeout` 原值存档（跨进程；见 [TimeoutSnapshotFile]，2026-10-17 S19 实证新增）。 */
+    private val snapshotFile: TimeoutSnapshotFile = TimeoutSnapshotFile(),
 ) {
     private var displayControlClass: Class<*>? = null
     private var displayControlLoaded = false
@@ -38,7 +40,12 @@ internal class DisplayPowerController(
             }
         } catch (_: Exception) {}
         try {
-            savedScreenOffTimeout = execShellOutput("settings get system screen_off_timeout")?.trim() ?: "60000"
+            // 2026-10-17 S19 实证：读到哨兵（上个会话被 kill）时先用文件存档修正，再落盘本次原值——
+            // 纯内存快照在 SIGKILL 路径会丢，导致用户原值被 fallback 60000 永久覆盖（vd-server.log 行 148→205）。
+            val cur = execShellOutput("settings get system screen_off_timeout")?.trim()
+            val effective = SessionScreenTimeout.effectiveSnapshot(cur, snapshotFile.read())
+            savedScreenOffTimeout = effective
+            snapshotFile.write(effective)
             savedLiftWakeup = execShellOutput("settings get system lift_wakeup_enabled")?.trim() ?: "1"
             savedProximityWakeup = execShellOutput("settings get system proximity_wakeup_enabled")?.trim() ?: "1"
         } catch (_: Exception) {}
@@ -90,6 +97,10 @@ internal class DisplayPowerController(
      * keep the phone awake forever and be inherited by every later session. The
      * sentinel is therefore treated as "no valid snapshot" and replaced with the
      * documented default (60s) instead — see [SessionScreenTimeout].
+     *
+     * 2026-10-17（S19 真机实证）起：原值另有文件存档 [snapshotFile]，恢复时**优先**
+     * 读它——kill 路径（快照仅存内存会丢）下个会话也能恢复真实原值而非 60s。
+     * 存档缺失/损坏时退化为上述 S-M10 语义（哨兵 → 默认值）。
      */
     fun restoreIme() {
         val ime = savedDefaultIme
@@ -99,7 +110,7 @@ internal class DisplayPowerController(
                 PipeLog.log("Restored original IME: $ime")
             } catch (_: Exception) {}
         }
-        val timeout = savedScreenOffTimeout
+        val timeout = snapshotFile.read() ?: savedScreenOffTimeout
         restoreSetting("screen_off_timeout", SessionScreenTimeout.valueToRestore(timeout))
         if (SessionScreenTimeout.isSentinel(timeout)) {
             PipeLog.log("screen_off_timeout snapshot was our own sentinel (previous session was killed) — falling back to ${SessionScreenTimeout.DEFAULT_TIMEOUT_MS}ms")

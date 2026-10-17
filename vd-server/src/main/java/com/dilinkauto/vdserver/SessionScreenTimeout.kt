@@ -20,6 +20,34 @@ internal object SessionScreenTimeout {
     /** `settings get system screen_off_timeout` 的通用默认值（60s）。 */
     const val DEFAULT_TIMEOUT_MS = 60_000L
 
+    /** 原值存档文件名（位于 [com.dilinkauto.protocol.VdDeploy.DIR_PATH]，见 [TimeoutSnapshotFile]）。 */
+    const val SNAPSHOT_FILE_NAME = "screen-timeout.snapshot"
+
+    /**
+     * 计算本次会话应记录（存档 / 恢复）的原始值（2026-10-17 S19 真机实证的 kill 路径修正）。
+     *
+     * 内存快照在被 SIGKILL 的上个会话里会丢失，此时 `settings get` 读回哨兵。修正顺序：
+     *  - [current] 非哨兵 → 原样（正常路径，与旧行为逐字一致，含 null → 默认值）；
+     *  - [current] 是哨兵（上个会话被 kill）→ 用文件存档 [fromFile] 修正；
+     *  - 存档不可用（缺失 / 读失败标记 / 非正数 / 本身是哨兵）→ 回落 [DEFAULT_TIMEOUT_MS]。
+     *
+     * 真机实证（S19 20 轮循环，vd-server.log 行 148→161→205）：第 N 轮被重建强杀 →
+     * 第 N+1 轮读到哨兵 → 旧逻辑 fallback 60000 → **用户的 300000 被永久改成 60000**。
+     * 文件存档（会话开始即写入）让 kill 路径下个会话仍能恢复真实原值。
+     */
+    fun effectiveSnapshot(current: String?, fromFile: String?): String {
+        val c = current?.trim()
+        if (!isSentinel(c)) return c ?: DEFAULT_TIMEOUT_MS.toString()
+        val f = fromFile?.trim()
+        if (isSentinel(f)) return DEFAULT_TIMEOUT_MS.toString()
+        if (f.isNullOrEmpty() || f.equals("null", true) || f.equals("undefined", true)) {
+            return DEFAULT_TIMEOUT_MS.toString()
+        }
+        val n = f.toLongOrNull()
+        if (n == null || n <= 0L) return DEFAULT_TIMEOUT_MS.toString()
+        return f
+    }
+
     /** [snapshot] 是否就是本模块写的哨兵（读失败/非数值都算"不是"）。 */
     fun isSentinel(snapshot: String?): Boolean =
         snapshot?.trim()?.toLongOrNull() == SESSION_TIMEOUT_SENTINEL
