@@ -309,6 +309,35 @@ else
 fi
 
 # ═════════════════════════════════════════════════════════════════════
+# 黑屏自愈风暴静默（2026-10-17 MEIZU 真机实测）
+#
+# 桌面端与车机端共用 BlackScreenDetector：当 VD 内容本身就是黑的（空 launcher /
+# 手机屏熄灭）时，检测器会连发「疑似持续黑屏 → 自动重连」，每次自动重连都产生
+# 一次「优雅停止设备侧引擎」。本进程上限 2 次（DesktopApp 的 MAX_BLACK_SCREEN_RECONNECTS）。
+#
+# 不等它静默就点「应用并重连」，会把自愈的停止算进「点击触发的停止」——实测首跑：
+# 断言 1→3（期望 +1）误判，实际点击只触发 1 次，另 2 次是自愈。
+# 静默判据：连续 12s 无新增自愈；上限 90s。
+# ═════════════════════════════════════════════════════════════════════
+# 观察窗口：检测器的 sustain 窗口是 10s，第一次自愈通常出现在 STREAMING 后 10~15s。
+# 必须等过这个窗口再点，否则「点击窗口」和「自愈窗口」重叠（首跑就是这样误判的）。
+info "观察黑屏自愈窗口（15s）..."
+sleep 15
+ARW0=$(countF "$DLOG" '疑似持续黑屏：自动重连')
+if [ "$ARW0" -gt 0 ]; then
+  info "黑屏自愈已触发 $ARW0 次，等待静默（≤90s）..."
+  TQ=$SECONDS; _last=$ARW0
+  while [ $((SECONDS - TQ)) -lt 90 ]; do
+    _cur=$(countF "$DLOG" '疑似持续黑屏：自动重连')
+    if [ "$_cur" != "$_last" ]; then _last=$_cur; TQ=$SECONDS; fi
+    [ $((SECONDS - TQ)) -ge 12 ] && break
+    sleep 2
+  done
+  ARW1=$(countF "$DLOG" '疑似持续黑屏：自动重连')
+  info "黑屏自愈共 $ARW1 次（上限 2，已知产品行为）——停止计数按「1 + 新增自愈次数」核账"
+fi
+
+# ═════════════════════════════════════════════════════════════════════
 step "6/9 UI 驱动「显示 → 应用并重连」"
 LOG="$DLOG"
 UI_OK=1
@@ -352,6 +381,7 @@ if [ "$UI_OK" -eq 1 ]; then
     info "focus 被前台锁定拒绝（已用点标题栏兜底，点击仍有效）"
   fi
   S0=$(countF "$LOG" '优雅停止设备侧引擎')
+  AR0=$(countF "$LOG" '疑似持续黑屏：自动重连')
   GR0=$(countF "$LOG" '引擎已优雅退出')
   GO0=$(countF "$LOG" '探针 GONE @+')
   HS0=$(countF "$LOG" 'handshake accepted:')
@@ -387,14 +417,24 @@ if [ "$UI_OK" -eq 1 ]; then
     shot "no-restream"
   fi
   S1=$(countF "$LOG" '优雅停止设备侧引擎')
+  AR1=$(countF "$LOG" '疑似持续黑屏：自动重连')
+  # 本窗口内新增的黑屏自愈次数：每次自愈也会产生一次优雅停止，必须单独入账，
+  # 否则「点击只触发 1 次」的断言会把自愈算成点击的副作用（2026-10-17 实测）。
+  AR_DELTA=$((AR1 - AR0))
   GR1=$(countF "$LOG" '引擎已优雅退出')
   GO1=$(countF "$LOG" '探针 GONE @+')
   F1=$(countF "$LOG" '强制 kill')
   HS1=$(countF "$LOG" 'handshake accepted:')
   if [ "$RC_RETRIED" -eq 1 ]; then
-    [ "$S1" -ge $((S0 + 1)) ] && ok "重连触发优雅停止（$S0→$S1；走过重试，只查下界）" || bad "重连未触发优雅停止（$S0→$S1）"
+    [ "$S1" -ge $((S0 + 1 + AR_DELTA)) ] && ok "重连触发优雅停止（$S0→$S1；走过重试，只查下界）" || bad "重连未触发优雅停止（$S0→$S1）"
+  elif [ "$S1" -eq $((S0 + 1 + AR_DELTA)) ]; then
+    if [ "$AR_DELTA" -gt 0 ]; then
+      ok "重连触发 1 次优雅停止（$S0→$S1；其中黑屏自愈 ×$AR_DELTA）"
+    else
+      ok "重连触发 1 次优雅停止（$S0→$S1）"
+    fi
   else
-    [ "$S1" -eq $((S0 + 1)) ] && ok "重连触发 1 次优雅停止（$S0→$S1）" || bad "优雅停止次数 $S0→$S1（期望 +1）"
+    bad "优雅停止次数 $S0→$S1（期望 +1$( [ "$AR_DELTA" -gt 0 ] && echo " + 黑屏自愈 ×$AR_DELTA" )）"
   fi
   [ "$GR1" -ge $((GR0 + 1)) ] && ok "新增「引擎已优雅退出」（$GR0→$GR1）" || bad "未见新的「引擎已优雅退出」（$GR0→$GR1）"
   [ "$GO1" -ge $((GO0 + 1)) ] && ok "新增探针 GONE（$GO0→$GO1）" || bad "未见新探针 GONE（$GO0→$GO1）"
@@ -425,6 +465,7 @@ fi
 step "7/9 UI 驱动关窗"
 if [ "$UI_OK" -eq 1 ]; then
   GS0=$(countF "$LOG" '优雅停止设备侧引擎')
+  ARC0=$(countF "$LOG" '疑似持续黑屏：自动重连')
   GR0=$(countF "$LOG" '引擎已优雅退出')
   GO0=$(countF "$LOG" '探针 GONE @+')
   activate                                                            # 点标题栏激活（点击 × 才会被吃到）
@@ -443,10 +484,20 @@ if [ "$UI_OK" -eq 1 ]; then
     fi
   fi
   GS1=$(countF "$LOG" '优雅停止设备侧引擎')
+  ARC1=$(countF "$LOG" '疑似持续黑屏：自动重连')
+  ARC_DELTA=$((ARC1 - ARC0))
   GR1=$(countF "$LOG" '引擎已优雅退出')
   GO1=$(countF "$LOG" '探针 GONE @+')
   F1=$(countF "$LOG" '强制 kill')
-  [ "$GS1" -eq $((GS0 + 1)) ] && ok "关窗触发 1 次优雅停止（$GS0→$GS1）" || bad "优雅停止次数 $GS0→$GS1（期望 +1）"
+  if [ "$GS1" -eq $((GS0 + 1 + ARC_DELTA)) ]; then
+    if [ "$ARC_DELTA" -gt 0 ]; then
+      ok "关窗触发 1 次优雅停止（$GS0→$GS1；其中黑屏自愈 ×$ARC_DELTA）"
+    else
+      ok "关窗触发 1 次优雅停止（$GS0→$GS1）"
+    fi
+  else
+    bad "优雅停止次数 $GS0→$GS1（期望 +1$( [ "$ARC_DELTA" -gt 0 ] && echo " + 黑屏自愈 ×$ARC_DELTA" )）"
+  fi
   [ "$GR1" -ge $((GR0 + 1)) ] && ok "关窗路径「引擎已优雅退出」（$GR0→$GR1）" || bad "关窗路径未见「引擎已优雅退出」（$GR0→$GR1）"
   [ "$GO1" -ge $((GO0 + 1)) ] && ok "关窗路径探针 GONE（$GO0→$GO1）" || bad "关窗路径未见探针 GONE（$GO0→$GO1）"
   [ "$F1" -eq 0 ] && ok "全程无强制 kill" || bad "出现 $F1 次强制 kill"
