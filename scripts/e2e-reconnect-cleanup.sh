@@ -10,12 +10,12 @@
 #   2  APK 内嵌引擎校验：assets/vd-server.jar 的 classes.dex 必须含本轮修复的符号
 #      （ShellSyncPoint / __DILINK_SYNC__ / awaitIdle / pgrep -f / stop-request）
 #   3  安装 APK + monkey 拉起手机端，等 9637 LISTEN
-#   4  设备基线（清引擎/哨兵/vd-server.log，screen_off_timeout=300000）+ 启动桌面端
+#   4  设备基线（清引擎/哨兵/vd-server.log，screen_off_timeout 捕获原值后置基线）+ 启动桌面端
 #   5  会话中核对：screen_off_timeout=2147483647（引擎哨兵已置）+ 引擎在位
 #   6  UI 驱动「显示 → 应用并重连」：断言 探针 GONE / 引擎已优雅退出 / 无强制 kill /
 #      重新 STREAMING / 新引擎 pid 变化 / 哨兵再次置上
 #   7  UI 驱动关窗：断言 优雅退出 / [main] 已退出 / 窗口消失 / gradle run 进程退出
-#   8  设备终态：screen_off_timeout 回到基线 300000 + 引擎消失
+#   8  设备终态：screen_off_timeout 回到**设备原值**（不硬编码，见步骤 4 注释）+ 引擎消失
 #   9  拉取 vd-server.log，跑 scripts/verify-reconnect-cleanup.sh 全套离线断言
 #
 # 用法：
@@ -46,7 +46,9 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-TS="$(date +%Y%m%d-%H%M%S)"
+# 产物目录：默认按时间戳；统一入口 scripts/e2e.sh 用 E2E_RUN_ID 指定子目录，
+# 让一次「全量」运行的所有产物落在同一个 run 目录下（<run>/dual、<run>/desktop）。
+TS="${E2E_RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
 RUN="debug-logs/e2e/$TS"
 mkdir -p "$RUN"
 
@@ -223,12 +225,20 @@ if [ -n "$LEFTOVER" ]; then
 fi
 dev 'rm -f /sdcard/DiLinkAuto/stop-request'
 dev 'rm -f /sdcard/DiLinkAuto/vd-server.log'
-dev 'settings put system screen_off_timeout 300000'
+# 基线只要求「有辨识度且不等于引擎哨兵 2147483647」。原先硬编码 300000 会把设备
+# 原值永久改掉（2026-10-17 发现：MI 9 原值 1800000，跑一次桌面端套件就被改成 300000）。
+# 改为先捕获原值，基线设置与终态断言都按原值走；原值异常（空/非数字/哨兵）才回落 300000。
+ORIG_TIMEOUT=$(cur_timeout)
+case "$ORIG_TIMEOUT" in
+  ""|*[!0-9]*|2147483647) ORIG_TIMEOUT=300000 ;;
+esac
+info "设备原 screen_off_timeout=$ORIG_TIMEOUT（终态按原值恢复）"
+dev "settings put system screen_off_timeout $ORIG_TIMEOUT"
 sleep 0.5
-if [ "$(cur_timeout)" = "300000" ]; then
-  ok "基线 screen_off_timeout=300000 就绪（有辨识度，区别于引擎哨兵 2147483647）"
+if [ "$(cur_timeout)" = "$ORIG_TIMEOUT" ]; then
+  ok "基线 screen_off_timeout=$ORIG_TIMEOUT 就绪（设备原值，区别于引擎哨兵 2147483647）"
 else
-  bad "基线设置失败，当前=$(cur_timeout)"
+  bad "基线设置失败，当前=$(cur_timeout)（期望 $ORIG_TIMEOUT）"
 fi
 
 export DILINK_DESKTOP_HOME="$ROOT/$RUN/desktop-home"
@@ -467,10 +477,10 @@ fi
 
 # ═════════════════════════════════════════════════════════════════════
 step "8/9 设备终态"
-if wait_timeout_eq 300000 30; then
-  ok "screen_off_timeout 已恢复为基线 300000（cleanup 真落盘）"
+if wait_timeout_eq "$ORIG_TIMEOUT" 30; then
+  ok "screen_off_timeout 已恢复为基线 $ORIG_TIMEOUT（cleanup 真落盘）"
 else
-  bad "screen_off_timeout=$(cur_timeout)，应为 300000（若为 2147483647 = 恢复没跑）"
+  bad "screen_off_timeout=$(cur_timeout)，应为 $ORIG_TIMEOUT（若为 2147483647 = 恢复没跑）"
 fi
 if wait_engine_gone 30; then
   ok "设备侧引擎已消失"
@@ -524,8 +534,8 @@ if [ -n "$(engine_pid)" ]; then
   dev 'for p in $(pgrep -f "[P]ipelineServer"); do kill -9 $p; done; exit 0'
   echo "   引擎：已强制清理"
 fi
-dev 'settings put system screen_off_timeout 300000'
+dev "settings put system screen_off_timeout ${ORIG_TIMEOUT:-300000}"
 dev 'rm -f /sdcard/DiLinkAuto/stop-request'
-echo "   screen_off_timeout：已恢复 300000；哨兵：已删除"
+echo "   screen_off_timeout：已恢复 ${ORIG_TIMEOUT:-300000}；哨兵：已删除"
 echo "失败详情与现场日志：$RUN"
 exit 1

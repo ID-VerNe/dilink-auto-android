@@ -35,6 +35,42 @@
 - 日志断言面在 **B**：`/sdcard/DiLinkAuto/client.log`（A 的日志经 TCP 中继进去，tag=`CarLog`）+ `vd-server.log`。
 - **9637 在会话中只有 ESTABLISHED**（LISTEN 是 WAITING 态瞬态）——断言按 ESTABLISHED 判，别按 LISTEN。
 
+## 0.5 一键入口（2026-10-17 起推荐）
+
+三套件、一条命令、自动出结论，**不需要人工盯屏**：
+
+```bash
+bash scripts/e2e.sh dual       # 车机+手机（A=app-server / B=app-client）
+bash scripts/e2e.sh desktop    # 电脑+手机（app-desktop + app-client）
+bash scripts/e2e.sh all        # 两个都跑，出统一结论
+```
+
+它替你做的自动化：
+
+| 环节 | 自动化行为 |
+|---|---|
+| 角色判定 | 包名（`com.dilinkauto.server`→A，`com.dilinkauto.client`→B）→ 传输类型兜底（TCP→B，USB→A）→ 两条都不成立才要求 `--phone/--car`。**不猜**（猜错会把 PIN 输到别的机器，failsafe 计数）。 |
+| B 掉线 | `adb mdns services` 发现 `_adb._tcp` / `_adb-tls-connect._tcp` → `adb connect` 自愈（无线调试开着但 PC 侧没连的常见情形）。 |
+| PIN | 环境变量优先，其次 `.e2e.local.env`（本机、`.gitignore` 已忽略；**被 git 跟踪时脚本直接拒绝运行** — 红线 8）。 |
+| 失败处置 | 场景失败不中断（先冻结证据再 restore）；首轮失败场景**自动复跑一次**，结论里区分 `FAIL` / `FLAKY`（复跑通过）。 |
+| 结论 | `debug-logs/e2e/run-<TS>/verdict.md`（人读表格）+ `verdict.json`（机读）+ 退出码 `0` 全绿 / `1` 有失败 / `2` 环境或前置问题。 |
+| 产物布局 | 一次运行的所有东西在同一个目录：`<run>/dual/`（summary.txt、各场景、freeze-*）、`<run>/desktop/`（desktop.log、vd-server.log）、`<run>/dual-console.log`。 |
+
+耗时量级（2026-10-17 实测口径）：`dual --scenario S01` ≈ 8.6 分钟（含首次建流的黑屏误报风暴 ×2）；`dual` 全量 22 场景 ≈ **2.5~3.5 小时**（S19 二十轮循环单项就 ~26 分钟）；`desktop` ≈ 3~6 分钟；`all` ≈ 3~4 小时。跑全量建议留足半天并保持电脑空闲（桌面端阶段要动鼠标）。
+
+常用变体：
+
+```bash
+bash scripts/e2e.sh dual --scenario S05,S06 --skip-build   # 只跑指定场景
+bash scripts/e2e.sh all  --yes                             # 无人值守（桌面端跳过倒计时）
+bash scripts/e2e.sh dual --retry 0                         # 关闭失败复跑
+bash scripts/e2e.sh all  --dry-run                         # 只做设备发现 + 打印计划
+bash scripts/e2e.sh --list                                 # 套件与场景清单
+```
+
+> 桌面端套件会**移动真实鼠标**并点击窗口，跑的时候电脑必须空闲；`--yes` 只跳过 10 秒倒计时，不改变这一点。
+> 旧入口 `scripts/e2e-dual-device.sh` / `scripts/e2e-reconnect-cleanup.sh` 仍然可用——统一入口只是它们的编排层，参数语义完全一致。
+
 ## 1. 明早一条命令
 
 ```bash
@@ -46,7 +82,7 @@ bash scripts/e2e-dual-device.sh --phone 192.168.3.206:5555 --car 9e779dea \
 
 - `--phone` = B（发送端）adb serial（无线场景是 `IP:5555`），`--car` = A（接收端）adb serial，**必填、别自动挑**（双机在册会挑错 → PIN 输错机器 → failsafe 计数）。
 - 跑前确认 **B 在线且授权**（`adb devices` 里 B 是 `device` 不是 `authorizing`）；A 的锁屏已人工解开。
-- PIN 只从环境变量读，**不进门参数、不落任何文件**（`.plan/`、`scripts/` 全在 git 里）。
+- PIN 只从环境变量或 `.e2e.local.env`（本机、git 忽略）读，**不进门参数、不落任何被跟踪的文件**（`.plan/`、`scripts/` 全在 git 里）。
 - APK 前一晚已构建；不放心就去掉 `--skip-build`（会先跑 `./gradlew test` + 双 APK + dex 符号校验，约数分钟）。
 - **S01 单独跑通后再连跑**（先验底座）：`--scenario S01` → 全绿 → `--scenario P0`。
 

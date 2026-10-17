@@ -69,3 +69,7 @@ __pycache__/
 
 # E2E harness 偶发在仓库根写出的快照（正常产物在 debug-logs/e2e/<TS>/ 下）
 /vdlog.snapshot
+
+# E2E 本地凭据（PIN 禁落仓库 — docs/e2e-dual-device-runbook.md §6 红线 8）。
+# 只存本机、供 scripts/e2e.sh 无人值守加载；被 git 跟踪时脚本会直接拒绝运行。
+/.e2e.local.env

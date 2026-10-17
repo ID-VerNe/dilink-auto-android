@@ -339,7 +339,9 @@ fi
 select_scenarios || exit 2
 
 # 互斥锁：防双编排抢设备（陈旧锁按 PID 存活判断后告警，不自动删）
-TS="$(date +%Y%m%d-%H%M%S)"
+# 产物目录：默认按时间戳；统一入口 scripts/e2e.sh 用 E2E_RUN_ID 指定子目录，
+# 让一次「全量」运行的所有产物落在同一个 run 目录下（<run>/dual、<run>/desktop）。
+TS="${E2E_RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
 RUN="debug-logs/e2e/$TS"
 mkdir -p "$RUN" || { echo "✗ 无法创建产物目录 $RUN"; exit 2; }
 LOCKDIR="debug-logs/e2e/.lock"
