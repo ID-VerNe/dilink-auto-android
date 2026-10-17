@@ -567,6 +567,10 @@ echo "结果：通过 $PASS 项；失败 $FAIL 项"
 echo "产物目录：$RUN"
 if [ "$FAIL" -eq 0 ]; then
   echo "全部通过 ✓"
+  # 成功路径也要清哨兵：引擎启动时会自清（PipelineServer.run 开头），所以残留不致命，
+  # 但留一份「上一轮的停止请求」在 /sdcard 上不符合零残留约定（2026-10-17 实测发现
+  # 首跑成功后 stop-request 仍在，失败路径清了、成功路径漏了）。
+  dev 'rm -f /sdcard/DiLinkAuto/stop-request' > /dev/null 2>&1 || true
   exit 0
 fi
 
