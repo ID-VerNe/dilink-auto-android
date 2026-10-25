@@ -4,6 +4,8 @@
 
 本 fork 面向中国手机 ROM + BYD DiLink 车机使用场景,并在 **比亚迪 秦PLUS DM-i 2023款 冠军版 55KM 领先型**(DiLink 4.0 低配,骁龙 439 / Android 9 / 1280x800)上做了针对性性能调优。语言分工:核心六篇(Setup / Architecture / Protocol / Client / Server / Progress)是英文,审计与测试报告是中文;本页与根目录中文 README 一为开发者视角、一为用户视角,互补而不重复。
 
+**仓库改动流程(issue → plan 追评 → worktree → PR → 对账/回签)是强制规范**,总览见根目录 [AGENTS.md](../AGENTS.md),操作细节见下表的 Issue Guide 与 PR Guide。
+
 ## 文档索引
 
 | 文档 | 读者 | 内容 |
@@ -21,6 +23,8 @@
 | [UI / UX 审计](./audit-ui-ux.md) | 开发者 | 15 项无障碍 / 一致性问题及其修复 pass(2026-10-08);**15 项全部闭环**(见报告尾注) |
 | [桌面接收端审计](./audit-desktop.md) | 开发者 | `:app-desktop` 的代码审计与修复状态(15 项 `WIN-*`);**15 项全部闭环**(见报告 §7) |
 | [功能提案:双模接收端](./FEATURE_DUAL_MODE_RECEIVER.md) | 开发者 | 接收端「模式」按钮提案(车机反向控制 / 代理转发);设计 + 可测核心已落地,上层接线与真机验证待办 |
+| [Issue Guide](./ISSUE_GUIDE.md) | 贡献者 / Agent | 立单规范:标题 `type(scope)`、正文四要素、可粘贴的复现命令、`needs-repro` 与回签关闭 |
+| [PR Guide](./PR_GUIDE.md) | 贡献者 / Agent | 开 PR 规范:`Closes` / `Refs`、worktree 分支与命名、正文分段、基线验证、合并条件、对账与回签 |
 
 > Windows 接收端(`app-desktop/`)暂未单独成文档:模块说明、链路与打包命令见根目录 [README.md](../README.md) 的「Windows 接收端」一节,链路与设计决策见 [architecture.md](./architecture.md)。
 
