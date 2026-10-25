@@ -27,9 +27,10 @@ import java.util.concurrent.locks.LockSupport
  * [initEglAndSurfaceTexture], used in [pipelineLoop], and torn down by that same
  * thread (audit S-M8: cross-thread eglDestroy* on a context made current elsewhere
  * is a crash, not a leak). [cleanup] is what the pipeline thread's finally calls. The pipeline samples the SurfaceTexture at [fps] (paced by
- * [frameIntervalNanos]) and writes each encoded frame to the car video
- * channel. Adaptive bitrate drops bandwidth when the car's socket backs up
- * and recovers it after a sustained clean interval.
+ * [frameIntervalNanos]) and hands each encoded frame to [VideoFrameSender]
+ * (bounded queue + its own writer thread), so a slow car socket can never park
+ * this loop — see issue #3. Adaptive bitrate drops bandwidth when the car's
+ * socket backs up and recovers it after a sustained clean interval.
  *
  * Extracted from [PipelineServer] to isolate the GL/encode hot path
  * (THREAD_PRIORITY_URGENT_DISPLAY) from the connection lifecycle.
@@ -84,6 +85,9 @@ internal class GlPipeline(
     // Logging goes straight to the PipeLog singleton — no local alias (audit R3-DRY-22③).
 
     // Write-loop policy (5s deadline + 100us backoff) now comes from FrameCodec.
+
+    /** 上一次请求 IDR 的时刻；丢帧/降码率触发的 IDR 请求必须 ≥1s 一次（issue #3）。 */
+    private var lastSyncRequestNanos = 0L
 
     /**
      * Initialize EGL/GLES on the current thread, create the SurfaceTexture
@@ -151,7 +155,14 @@ internal class GlPipeline(
         var nextFrameNanos = System.nanoTime()
         var frameCount = 0L; var keyFrameCount = 0L; var lastLogAt = 0L
         var texUpdates = 0L; var swapFails = 0L
+        var sendDrops = 0L; var lastWriteMs = 0L
         val adaptive = AdaptiveBitrate(bitrate)
+        // 有界队列 + 独立写线程（issue #3）：本线程只入队，写慢不再反压 updateTexImage。
+        val sender = VideoFrameSender(
+            writeFrame = { FrameCodec.writeFrameToChannel(carVideo, it) },
+            closeChannel = { runCatching { carVideo.close() } }
+        )
+        sender.start()
         PipeLog.log("Pipeline: ${encodeWidth}x${encodeHeight} ${fps}fps ${bitrate/1_000_000}Mbps")
 
         try {
@@ -181,23 +192,44 @@ internal class GlPipeline(
                             val payload = ByteArray(bufInfo.size); buf.get(payload)
                             val isConfig = (bufInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
                             val msgType = if (isConfig) VideoMsg.CONFIG else VideoMsg.FRAME
-                            if ((bufInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0) keyFrameCount++
-                            val ws = System.nanoTime()
-                            writeFrame(carVideo, msgType, payload)
-                            val wm = System.nanoTime() - ws
-                            if (adaptive.onFrameWritten(wm)) applyBitrate(encoder, adaptive.currentBitrate)
-                            if (adaptive.needsSyncFrame) { requestSyncFrame(encoder); adaptive.onBitrateApplied() }
+                            val isKey = (bufInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+                            if (isKey) keyFrameCount++
+                            // 入队即返回：写不进队列时按直播优先策略丢 P 帧，本线程不回退。
+                            sender.offer(msgType, payload, isKey)
                             drained++; frameCount++
                         }
                         encoder.releaseOutputBuffer(idx, false)
                     }
                 }
+
+                // 采样写线程观测值：慢写驱动自适应码率，丢帧驱动一次（限流的）IDR。
+                // 原先这两件事都由「本帧写耗时」直接触发；现在写发生在别的线程上。
+                val stats = sender.sampleStats()
+                if (stats.maxWriteNanos > 0) {
+                    lastWriteMs = stats.maxWriteNanos / 1_000_000
+                    if (adaptive.onFrameWritten(stats.maxWriteNanos)) {
+                        applyBitrate(encoder, adaptive.currentBitrate)
+                        if (adaptive.needsSyncFrame) { requestSyncFrameThrottled(encoder); adaptive.onBitrateApplied() }
+                    }
+                }
+                if (stats.dropped > 0) {
+                    sendDrops += stats.dropped
+                    requestSyncFrameThrottled(encoder)
+                }
+                if (sender.failed) {
+                    // 写线程 5s 无进展已退出：video 链路确实死了，结束管线交给会话层重连。
+                    PipeLog.err("Pipeline: video send stalled, exiting for reconnect (frames=$frameCount sendDrops=$sendDrops)")
+                    break
+                }
+
                 if (frameCount - lastLogAt >= 120) {
                     lastLogAt = frameCount
-                    PipeLog.log("Pipeline: $frameCount frames ${adaptive.currentBitrate/1_000_000}Mbps keys=$keyFrameCount tex=$texUpdates cb=${frameCbCount.get()} swapFails=$swapFails ts=${st.timestamp} glErr=${GLES20.glGetError()}")
+                    PipeLog.log("Pipeline: $frameCount frames ${adaptive.currentBitrate/1_000_000}Mbps keys=$keyFrameCount tex=$texUpdates cb=${frameCbCount.get()} swapFails=$swapFails q=${sender.queued} sendDrops=$sendDrops maxW=${lastWriteMs}ms ts=${st.timestamp} glErr=${GLES20.glGetError()}")
                 }
             }
         } finally {
+            // 先停写线程再拆 GL：close() 关 video channel 解开可能卡在 writeAll 里的写线程。
+            sender.close()
             // cbThread is non-daemon; if writeFrame throws or GL faults, the
             // parked Looper would prevent a clean JVM exit. quitSafely in
             // finally — cleanup() also quits it as a fallback for the path
@@ -208,16 +240,19 @@ internal class GlPipeline(
     }
 
     /**
-     * Frame header layout and write deadline live in [FrameCodec] (protocol-core).
+     * 请求一个 IDR，但**限流到 ≥1s 一次**。
      *
-     * This used to be a hand-rolled copy with a comment claiming vd-server could
-     * not reach the protocol module. That was false — vd-server already depends on
-     * :protocol, which re-exports :protocol-core via `api(...)`, and this file has
-     * imported `com.dilinkauto.protocol.*` all along (see docs/audit-srp-dry.md
-     * DRY-3). One definition now, so a protocol change cannot silently diverge.
+     * 现场日志（issue #3）：丢帧/降码率后立刻索要 IDR 会在大 I 帧上再卡一次写，
+     * 下一次采样又降码率——小正反馈。`I_FRAME_INTERVAL = 1` 本来就保证每秒一个
+     * 自然 IDR，这里只负责「丢过帧、参考链断了」时的尽快修复，不必每帧都发。
+     *
+     * 帧头布局与写截止时间在 [FrameCodec]（protocol-core）。
      */
-    private fun writeFrame(ch: SocketChannel, msgType: Byte, payload: ByteArray) {
-        FrameCodec.writeFrameToChannel(ch, FrameCodec.Frame(Channel.VIDEO, msgType, payload))
+    private fun requestSyncFrameThrottled(enc: MediaCodec) {
+        val now = System.nanoTime()
+        if (lastSyncRequestNanos != 0L && now - lastSyncRequestNanos < SYNC_REQUEST_MIN_INTERVAL_NANOS) return
+        lastSyncRequestNanos = now
+        requestSyncFrame(enc)
     }
     private fun applyBitrate(enc: MediaCodec, br: Int) { try { val p = Bundle(); p.putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, br); enc.setParameters(p) } catch (_: Exception) {} }
     private fun requestSyncFrame(enc: MediaCodec) { try { val p = Bundle(); p.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0); enc.setParameters(p) } catch (_: Exception) {} }
@@ -249,5 +284,10 @@ internal class GlPipeline(
         cbThread?.quitSafely(); cbThread = null
         vdInputSurface?.release(); vdInputSurface = null
         stTexture?.release(); stTexture = null
+    }
+
+    companion object {
+        /** IDR 请求的最小间隔：丢帧/降码率后不每帧都索要大 I 帧（issue #3）。 */
+        private const val SYNC_REQUEST_MIN_INTERVAL_NANOS = 1_000_000_000L
     }
 }
