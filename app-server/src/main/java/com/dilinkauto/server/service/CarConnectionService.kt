@@ -17,6 +17,7 @@ import android.net.NetworkRequest
 import android.os.Binder
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.SystemClock
 import android.view.Surface
 import androidx.core.app.NotificationCompat
 import com.dilinkauto.protocol.*
@@ -33,6 +34,7 @@ import kotlinx.coroutines.flow.*
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Car-side service managing the connection to the phone.
@@ -137,6 +139,14 @@ class CarConnectionService : Service() {
      * phone that keeps serving black frames cannot drive a rebuild storm.
      */
     private var blackScreenRebuilds = 0
+    /**
+     * 上一次向手机索要 IDR 的时刻（elapsedRealtime，issue #9）。
+     *
+     * [VideoDecoder] 在网络线程与喂帧线程都可能报告参考链缺口，这里用 CAS 做成
+     * 全局 ≥[SYNC_FRAME_REQUEST_MIN_INTERVAL_MS] 的限流，避免丢帧风暴时把 CONTROL
+     * 通道刷满。
+     */
+    private val lastSyncFrameRequestMs = AtomicLong(0L)
     /**
      * Teardown generation guard (audit S-05). `handleDisconnect` runs from
      * `Connection.disconnect()` listeners, and `disconnectAllConnections()`
@@ -266,6 +276,19 @@ class CarConnectionService : Service() {
         logWriter.setEnabled(com.dilinkauto.server.BuildConfig.DEBUG)
         logWriter.start()
         videoDecoder.logSink = { msg -> carLogSend(msg) }
+        // issue #9：参考链断裂时向手机索要一个 IDR，别等下一个自然 GOP 边界。
+        // 解码器的缺口可能来自网络线程或喂帧线程 → 这里做全局限流；真正发命令
+        // 走 sendCommandToVd（自己切 IO 协程），回调本身必须立即返回。
+        videoDecoder.onNeedsSyncFrame = {
+            val now = SystemClock.elapsedRealtime()
+            val prev = lastSyncFrameRequestMs.get()
+            if (now - prev >= SYNC_FRAME_REQUEST_MIN_INTERVAL_MS &&
+                lastSyncFrameRequestMs.compareAndSet(prev, now)
+            ) {
+                carLogSend("[VideoDecoder] requesting IDR from phone (reference chain broken)")
+                sendCommandToVd(ControlMsg.REQUEST_SYNC_FRAME)
+            }
+        }
         // Self-heal: a stream that stays black for seconds means the phone's
         // VirtualDisplay is producing nothing (stuck DTA, leaked display,
         // compositor wedged). Nothing on the car side can fix that — only a
@@ -1628,6 +1651,12 @@ class CarConnectionService : Service() {
          * cannot drive an endless re-handshake loop; reset by startConnection().
          */
         internal const val MAX_BLACK_SCREEN_REBUILDS = 2
+
+        /**
+         * 向手机索要 IDR 的最小间隔（issue #9）。车机端一次参考链缺口可能对应
+         * 连续多次丢帧，500ms 足以把重复请求挡掉，又不会让真正的第二次缺口等太久。
+         */
+        internal const val SYNC_FRAME_REQUEST_MIN_INTERVAL_MS = 500L
     }
 }
 

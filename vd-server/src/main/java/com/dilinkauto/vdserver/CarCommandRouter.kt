@@ -23,6 +23,9 @@ import com.dilinkauto.protocol.requirePackageName
  * @param displayId the virtual display id; -1 before VD creation.
  * @param onStackEmpty signal the phone that the VD activity stack drained.
  * @param setDisplayPower toggle the physical panel (`SET_DISPLAY_POWER`).
+ * @param requestSyncFrame ask the pipeline to emit an IDR on the video channel
+ *   (`REQUEST_SYNC_FRAME`，issue #9). Pipeline-thread owned, hence a plain flag
+ *   handoff rather than an encoder call from this (Lifecycle/Touch) thread.
  */
 internal class CarCommandRouter(
     private val exec: (String) -> Unit,
@@ -30,6 +33,7 @@ internal class CarCommandRouter(
     private val displayId: () -> Int,
     private val onStackEmpty: () -> Unit,
     private val setDisplayPower: (Boolean) -> Unit,
+    private val requestSyncFrame: () -> Unit,
 ) {
 
     fun dispatch(f: FrameCodec.Frame) {
@@ -60,6 +64,12 @@ internal class CarCommandRouter(
                 val on = f.payload.isNotEmpty() && f.payload[0].toInt() != 0
                 setDisplayPower(on)
                 PipeLog.log("Physical display power -> ${if (on) "ON" else "OFF"}")
+            }
+            // 车机端参考链断了要一个 IDR（issue #9），payload 忽略。
+            // 这里只置位；真正 setParameters 发生在 Pipeline 线程（见 GlPipeline.pipelineLoop）。
+            ControlMsg.REQUEST_SYNC_FRAME -> {
+                requestSyncFrame()
+                PipeLog.log("Car requested sync frame (IDR)")
             }
         }
     }

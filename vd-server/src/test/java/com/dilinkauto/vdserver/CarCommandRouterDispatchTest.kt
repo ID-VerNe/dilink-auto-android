@@ -23,6 +23,7 @@ class CarCommandRouterDispatchTest {
         val execs = java.util.concurrent.CopyOnWriteArrayList<String>()
         val execOuts = java.util.concurrent.CopyOnWriteArrayList<String>()
         val powers = java.util.concurrent.CopyOnWriteArrayList<Boolean>()
+        val syncRequests = java.util.concurrent.atomic.AtomicInteger(0)
         var displayId = 7
         var launchResolve: String? = null
         var appInfoResolve: String? = null
@@ -46,6 +47,7 @@ class CarCommandRouterDispatchTest {
             displayId = { displayId },
             onStackEmpty = { },
             setDisplayPower = { powers += it },
+            requestSyncFrame = { syncRequests.incrementAndGet() },
         )
     }
 
@@ -157,6 +159,17 @@ Display #7 (activities from top to bottom):
 
         val two = Rig(); two.router.dispatch(control(ControlMsg.SET_DISPLAY_POWER, byteArrayOf(2)))
         assertEquals(listOf(true), two.powers)
+    }
+
+    @Test
+    fun `request sync frame asks the pipeline for an IDR`() {
+        // issue #9：车机端参考链断裂 → 手机端在 Pipeline 线程索要 IDR。
+        // 空 payload 也必须生效（车机端不需要携带参数）。
+        val r = Rig()
+        r.router.dispatch(control(ControlMsg.REQUEST_SYNC_FRAME, ByteArray(0)))
+        assertEquals(1, r.syncRequests.get())
+        // 不得误触发屏电源开关（两条命令相邻，编号错位会立刻被这条钉住）
+        assertTrue(r.powers.isEmpty())
     }
 
     @Test
