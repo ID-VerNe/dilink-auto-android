@@ -98,12 +98,33 @@ class VideoDecoder {
 
     private var frameCount = 0L
     private var receiveCount = 0L
+
+    /**
+     * 累计出帧数。喂帧线程在 drainOutput() 里自增，网络线程的黑屏闸门会读它
+     * （issue #11），所以必须 @Volatile。只用于「是否还在增长」的比较，不需要原子自增。
+     */
+    @Volatile
     private var renderCount = 0L
     private var dropCount = 0L
     private var inputFailCount = 0L
     private var keyFramesReceived = 0L
     private var keyFramesFed = 0L
     private var keyFramesDropped = 0L
+
+    /**
+     * 黑屏自愈的升级闸门（issue #11）。
+     *
+     * 纯码流判据分不清「内容本身是黑」（切 app 后的启动/加载页纯色）与「管线卡死」。
+     * 接上 [DecodeLiveness] 后：黑屏满窗时若解码仍在出帧 = 内容黑，不升级；只有出帧
+     * 停摆才真正重握手。桌面端同款语义见 `VideoDecodePipeline.decodingAlive()`。
+     */
+    private val liveness = DecodeLiveness()
+
+    /**
+     * 闸门抑制升级的日志限流时刻（issue #11）：同一段内容黑里只留少量痕迹，
+     * 便于实车回签确认「确实是被闸门挡住」而不是解码停摆。
+     */
+    private var lastGateLogMs = 0L
 
     // 黑屏检测策略在 protocol-core（车机端 VideoDecoder 与桌面端 VideoDecodePipeline
     // 共用一套判据，可脱离 MediaCodec 单测）。车机端沿用 elapsedRealtime（含休眠），
@@ -112,6 +133,11 @@ class VideoDecoder {
         clock = { SystemClock.elapsedRealtime() },
     ).apply {
         sustainMs = BLACK_SCREEN_SUSTAIN_MS
+        decodingAliveCheck = {
+            val alive = liveness.isAlive(renderCount, SystemClock.elapsedRealtime())
+            if (alive) logSuppressedRebuild()
+            alive
+        }
     }
 
     /**
@@ -134,6 +160,18 @@ class VideoDecoder {
 
     /** Reset the black-screen detector so a fresh session starts clean. */
     fun resetBlackScreenState() = blackScreen.reset()
+
+    /**
+     * 黑屏满窗但解码仍在出帧 —— 内容黑，不重握手（issue #11）。
+     *
+     * 只在闸门问询时调用（网络线程、每帧一次），用 [ALIVE_GATE_LOG_INTERVAL_MS] 限流。
+     */
+    private fun logSuppressedRebuild() {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastGateLogMs < ALIVE_GATE_LOG_INTERVAL_MS) return
+        lastGateLogMs = now
+        log("[BLACK] decode still alive (rendered=$renderCount) — content is black, VD rebuild suppressed")
+    }
 
     /**
      * 记录一次参考链缺口；只有首次进入重同步时才向上游索要 IDR。
@@ -184,6 +222,8 @@ class VideoDecoder {
             // Re-arm the black-screen detector: a fresh stream gets a fresh chance, and
             // the "escalate once" latch must not survive into the new session.
             resetBlackScreenState()
+            // 新会话的出帧计数从 0 起算，闸门基线一并复位（issue #11）。
+            liveness.reset()
             // 新编解码器没有旧参考链的包袱，重同步状态同样重新起算（issue #9）。
             resync.reset()
 
@@ -522,6 +562,7 @@ class VideoDecoder {
             outputSurfaceValid = false
             log("Stopping decoder: fed=$frameCount rendered=$renderCount drops=$dropCount inputFails=$inputFailCount")
             resetBlackScreenState()
+            liveness.reset()
             resync.reset()
             frameQueue.clear()
             cachedKeyFrame = null
@@ -562,6 +603,14 @@ companion object {
          * still looking at it.
          */
         private const val BLACK_SCREEN_SUSTAIN_MS = BlackScreenDetector.BLACK_SCREEN_SUSTAIN_MS
+
+        /**
+         * 闸门抑制日志的最小间隔（issue #11）。
+         *
+         * 黑屏满窗后每来一帧都会问一次闸门，关键帧约 1.2s 一个；同一段内容黑可能持续
+         * 几十秒，逐帧打日志只会把车机日志冲掉。5s 一条足以证明闸门在工作。
+         */
+        private const val ALIVE_GATE_LOG_INTERVAL_MS = 5_000L
 
         /**
          * Clamp a requested frame rate into the protocol's declared range
