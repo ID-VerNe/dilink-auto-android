@@ -146,6 +146,8 @@ class PipelineServer(
 
         @JvmStatic fun main(args: Array<String>) {
             AndroidPlatformHooks.install()
+            // issue #8: 第一行先打可读版本号，车机侧不必反编译 dex 即可判断跑的是哪份构建。
+            log("DiLink vd-server ${com.dilinkauto.vdserver.BuildConfig.VERSION_NAME}+g${com.dilinkauto.vdserver.BuildConfig.BUILD_REVISION}")
             val w = args.getOrNull(0)?.toInt() ?: 1408; val h = args.getOrNull(1)?.toInt() ?: 792
             val d = args.getOrNull(2)?.toInt() ?: 120; val ph = args.getOrNull(3) ?: "127.0.0.1"
             val ew = args.getOrNull(4)?.toInt() ?: w; val eh = args.getOrNull(5)?.toInt() ?: h

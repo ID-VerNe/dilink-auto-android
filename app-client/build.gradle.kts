@@ -18,6 +18,10 @@ android {
         targetSdk = 34
         versionCode = project.property("app.versionCode").toString().toInt()
         versionName = project.property("app.versionName").toString()
+        // issue #8: 日志可读版本号。BUILD_REVISION 由根 build.gradle.kts 单点算出，
+        // app-client 与 vd-server 同源；VERSION_NAME/VERSION_CODE 已由 AGP 自动生成。
+        buildConfigField("String", "BUILD_REVISION",
+            "\"${rootProject.extra["buildRevision"]}\"")
     }
 
     signingConfigs {

@@ -9,6 +9,17 @@ android {
 
     defaultConfig {
         minSdk = 29
+        // issue #8: 让 vd-server.dex 带编译期版本常量，app_process 启动时
+        // 第一行就能打出可读版本号。vd-server 本是 library 且无 BuildConfig，
+        // 这里打开 buildConfig 并注入两个字段；versionName 单点来自 gradle.properties。
+        buildConfigField("String", "VERSION_NAME",
+            "\"${project.property("app.versionName")}\"")
+        buildConfigField("String", "BUILD_REVISION",
+            "\"${rootProject.extra["buildRevision"]}\"")
+    }
+
+    buildFeatures {
+        buildConfig = true
     }
 
     compileOptions {

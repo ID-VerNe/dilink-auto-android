@@ -181,6 +181,8 @@ class ConnectionService : Service() {
     }
 
     private fun logDeviceInfo() {
+        // issue #8: 启动头先打一行可读版本号，不必反编译 dex 即可判断跑的是哪份构建。
+        FileLog.i(TAG, "DiLink client ${com.dilinkauto.client.BuildConfig.VERSION_NAME}+g${com.dilinkauto.client.BuildConfig.BUILD_REVISION}")
         FileLog.i(TAG, DeviceInfo.buildDeviceInfoBlock(this))
     }
 
