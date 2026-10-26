@@ -34,6 +34,14 @@ object ControlMsg {
      * 这条命令只是把"中途手动点亮/熄灭"的开关交给用户。
      */
     const val SET_DISPLAY_POWER: Byte = 0x32
+    /**
+     * Car/PC → Phone: 要一个同步帧（IDR），payload 为空。
+     *
+     * 车机端解码器的参考链因丢帧出现洞时发这条（issue #9）：手机端立刻向编码器
+     * `PARAMETER_KEY_REQUEST_SYNC_FRAME`，不必等下一个自然 GOP 边界（最多 ~1.2s）。
+     * 与 SET_DISPLAY_POWER 同走输入口 9639 的 CONTROL 通道，由 vd-server 执行。
+     */
+    const val REQUEST_SYNC_FRAME: Byte = 0x33
 }
 
 /** Video channel message types */

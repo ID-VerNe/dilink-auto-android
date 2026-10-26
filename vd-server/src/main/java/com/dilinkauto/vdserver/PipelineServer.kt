@@ -113,13 +113,22 @@ class PipelineServer(
         execOut = { shell.execOutput(it) },
         displayId = { displayId },
         onStackEmpty = { lifecycle.enqueue(VdLifecycle.MSG_STACK_EMPTY, ByteArray(0)) },
-        setDisplayPower = { displayController.setPhysicalDisplayPower(it) }
+        setDisplayPower = { displayController.setPhysicalDisplayPower(it) },
+        requestSyncFrame = { syncFrameRequested.set(true) }
     )
     private lateinit var glPipeline: GlPipeline
 
     // Synchronization between main thread and pipeline thread
     private val inputSurfaceReady = CountDownLatch(1)
     @Volatile private var carVideoChannel: SocketChannel? = null
+    /**
+     * 车机端索要 IDR 的请求位（issue #9）。
+     *
+     * CarCommandRouter 在 Lifecycle/TouchReader 线程收到 REQUEST_SYNC_FRAME 只置位；
+     * Pipeline 线程每帧 `getAndSet(false)` 消费后调 encoder.setParameters ——
+     * GL/编码器状态只在 Pipeline 线程碰（见 GlPipeline 的线程模型说明）。
+     */
+    private val syncFrameRequested = AtomicBoolean(false)
 
     companion object {
         private const val BITRATE = VideoConfig.DEFAULT_BITRATE // alias — bitrate bounds live in VideoConfig
@@ -452,7 +461,9 @@ class PipelineServer(
                 while (carVideoChannel == null && running) LockSupport.parkNanos(PARK_POLL_NANOS)
                 val ch = carVideoChannel
                 val enc = encoder
-                if (running && ch != null && enc != null) glPipeline.pipelineLoop(enc, ch) { running }
+                if (running && ch != null && enc != null) {
+                    glPipeline.pipelineLoop(enc, ch, { running }, { syncFrameRequested.getAndSet(false) })
+                }
             }
         } catch (e: Exception) {
             err("Pipeline: ${e.message}")

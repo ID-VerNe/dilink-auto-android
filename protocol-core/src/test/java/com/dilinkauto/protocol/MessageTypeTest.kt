@@ -42,4 +42,10 @@ class MessageTypeTest {
         // 编号是协议契约，改动等于破坏兼容；钉住具体值
         assertEquals(0x32.toByte(), ControlMsg.SET_DISPLAY_POWER)
     }
+
+    @Test
+    fun `REQUEST_SYNC_FRAME 编号固定为 0x33`() {
+        // issue #9：车机端索要 IDR 的逃生通道，编号同样是协议契约
+        assertEquals(0x33.toByte(), ControlMsg.REQUEST_SYNC_FRAME)
+    }
 }

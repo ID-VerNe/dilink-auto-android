@@ -142,7 +142,12 @@ internal class GlPipeline(
      * draw the fullscreen quad, swap, and ship each encoded frame to the car.
      * Returns when [running] turns false.
      */
-    fun pipelineLoop(encoder: MediaCodec, carVideo: SocketChannel, running: () -> Boolean) {
+    fun pipelineLoop(
+        encoder: MediaCodec,
+        carVideo: SocketChannel,
+        running: () -> Boolean,
+        consumeSyncRequest: () -> Boolean,
+    ) {
         val st = stTexture ?: return
         val bufInfo = MediaCodec.BufferInfo()
 
@@ -214,6 +219,12 @@ internal class GlPipeline(
                 }
                 if (stats.dropped > 0) {
                     sendDrops += stats.dropped
+                    requestSyncFrameThrottled(encoder)
+                }
+                // 车机端报告参考链断裂（issue #9）：它那边已经在丢 P 帧等 IDR 了，
+                // 这里尽快补一个同步帧，别让车机等到下一个自然 GOP 边界。
+                if (consumeSyncRequest()) {
+                    PipeLog.log("Pipeline: car requested IDR")
                     requestSyncFrameThrottled(encoder)
                 }
                 if (sender.failed) {

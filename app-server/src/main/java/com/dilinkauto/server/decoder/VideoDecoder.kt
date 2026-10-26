@@ -86,8 +86,15 @@ class VideoDecoder {
     // until the next live IDR (1-2s of black). start() feeds this right after CONFIG.
     @Volatile
     private var cachedKeyFrame: ByteArray? = null
-    @Volatile
-    private var seekingKeyFrame = false
+
+    /**
+     * 参考链断裂后的重同步状态机（issue #9）。
+     *
+     * 任何一次 P 帧丢弃（队列满、为关键帧驱逐、输入缓冲超时）都会让解码器的参考链
+     * 出现洞；旧实现只在连续 10 次输入失败后 flush，普通丢弃继续喂 P 帧 → 马赛克，
+     * 直到下一个自然 IDR。现在统一走 [ResyncPolicy]：丢弃即停喂 P 帧，等到 IDR 再恢复。
+     */
+    private val resync = ResyncPolicy()
 
     private var frameCount = 0L
     private var receiveCount = 0L
@@ -115,8 +122,29 @@ class VideoDecoder {
     @Volatile
     var onSustainedBlackScreen: (() -> Unit)? = null
 
+    /**
+     * 参考链首次断裂时回调（issue #9），仅在同一次缺口里回调一次。
+     *
+     * 车机端据此经 CONTROL 通道向手机索要一个 IDR（[com.dilinkauto.protocol.ControlMsg.REQUEST_SYNC_FRAME]），
+     * 把重同步等待从「下一个自然 GOP 边界（最多 ~1.2s）」缩短到一次往返。
+     * 可能从网络线程或喂帧线程触发，实现方必须自行处理线程安全与限流。
+     */
+    @Volatile
+    var onNeedsSyncFrame: (() -> Unit)? = null
+
     /** Reset the black-screen detector so a fresh session starts clean. */
     fun resetBlackScreenState() = blackScreen.reset()
+
+    /**
+     * 记录一次参考链缺口；只有首次进入重同步时才向上游索要 IDR。
+     *
+     * 缺口点分布在网络线程（队列丢弃）与喂帧线程（输入缓冲失败），[resync] 内部互斥。
+     */
+    private fun noteGap() {
+        if (!resync.onGap()) return
+        logW("Reference chain broken — waiting for next IDR (${dropCount} drops, ${inputFailCount} inputFails)")
+        onNeedsSyncFrame?.invoke()
+    }
 
     // Accumulated decode time for the current 30-frame window (Phase L1 / perf 9.3).
     // Reset at each per-30-frame log so the reported value is per-window, not lifetime.
@@ -156,6 +184,8 @@ class VideoDecoder {
             // Re-arm the black-screen detector: a fresh stream gets a fresh chance, and
             // the "escalate once" latch must not survive into the new session.
             resetBlackScreenState()
+            // 新编解码器没有旧参考链的包袱，重同步状态同样重新起算（issue #9）。
+            resync.reset()
 
             val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
                 setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
@@ -250,20 +280,18 @@ class VideoDecoder {
                             continue
                         } else {
                             val isKey = frame.isKeyFrame
-                            // After a flush, MediaCodec has no reference frame — feeding P-frames
-                            // produces no output and clogs input buffers until the next IDR. Drain
-                            // and discard everything until a keyframe arrives. onFrameReceived gives
-                            // keyframes queue priority, so the next IDR reaches the head quickly.
-                            if (seekingKeyFrame && !isKey) {
+                            // 参考链有洞时（issue #9），MediaCodec 用坏参考解 P 帧只会产马赛克。
+                            // 停喂 P 帧、只等 IDR：onFrameReceived 给关键帧队列优先，下一个 IDR
+                            // 很快到队头；能索要时还会经 onNeedsSyncFrame 让手机立刻补一个。
+                            if (!resync.shouldFeed(isKey)) {
                                 skipCount++
                                 if (skipCount <= 5 || skipCount % 30 == 0L) {
-                                    logW("Post-flush: skipping P-frame #$skipCount until next IDR")
+                                    logW("Resync: skipping P-frame #$skipCount until next IDR")
                                 }
                                 continue
                             }
-                            if (seekingKeyFrame && isKey) {
-                                seekingKeyFrame = false
-                                log("Post-flush: resynced at IDR keyframe after skipping $skipCount P-frames")
+                            if (skipCount > 0) {
+                                log("Resync: resynced at IDR keyframe after skipping $skipCount P-frames")
                                 skipCount = 0L
                             }
                             if (isKey) {
@@ -277,10 +305,10 @@ class VideoDecoder {
                             if (frameCount % 30 == 0L) {
                                 if (debugFrameStats) {
                                     val decodeMs = windowDecodeNanos / 1_000_000.0
-                                    log("Fed $frameCount rendered=$renderCount drops=$dropCount inputFails=$inputFailCount keys_recv=$keyFramesReceived keys_fed=$keyFramesFed keys_drop=$keyFramesDropped queue=${frameQueue.size} skips=$skipCount decodeMs=${"%.1f".format(decodeMs)}")
+                                    log("Fed $frameCount rendered=$renderCount drops=$dropCount inputFails=$inputFailCount keys_recv=$keyFramesReceived keys_fed=$keyFramesFed keys_drop=$keyFramesDropped queue=${frameQueue.size} skips=$skipCount resync=${resync.awaitingIdr} decodeMs=${"%.1f".format(decodeMs)}")
                                     windowDecodeNanos = 0L
                                 } else {
-                                    log("Fed $frameCount rendered=$renderCount drops=$dropCount inputFails=$inputFailCount keys_recv=$keyFramesReceived keys_fed=$keyFramesFed keys_drop=$keyFramesDropped queue=${frameQueue.size} skips=$skipCount")
+                                    log("Fed $frameCount rendered=$renderCount drops=$dropCount inputFails=$inputFailCount keys_recv=$keyFramesReceived keys_fed=$keyFramesFed keys_drop=$keyFramesDropped queue=${frameQueue.size} skips=$skipCount resync=${resync.awaitingIdr}")
                                 }
                             }
                         }
@@ -307,7 +335,10 @@ class VideoDecoder {
     private fun feedBuffer(decoder: MediaCodec, data: ByteArray, flags: Int) {
         if (!running.get()) return
         try {
-            val inputIndex = decoder.dequeueInputBuffer(2000) // 2ms — drain-first, don't block on input
+            // 2ms 太短：喂帧线程刚 drain 完输出，输入缓冲偶尔还在解码器手里，
+            // 一次失败就丢整帧并打断参考链（issue #9）。10ms 只影响异常路径，
+            // 正常路径 dequeueInputBuffer 立即返回。
+            val inputIndex = decoder.dequeueInputBuffer(10_000)
             if (inputIndex >= 0) {
                 val inputBuffer = decoder.getInputBuffer(inputIndex)!!
                 inputBuffer.clear()
@@ -318,6 +349,8 @@ class VideoDecoder {
             } else {
                 consecutiveDrops++
                 inputFailCount++
+                // 丢掉的这帧若参与参考链，后续 P 帧就都不可信了 → 进入重同步。
+                if (flags == 0) noteGap()
                 if (consecutiveDrops <= 3 || consecutiveDrops % 10 == 0) {
                     logW("dequeueInputBuffer failed: consecutiveDrops=$consecutiveDrops, size=${data.size}, flags=$flags")
                 }
@@ -325,10 +358,9 @@ class VideoDecoder {
                     logW("Decoder stuck ($consecutiveDrops drops), flushing")
                     decoder.flush()
                     consecutiveDrops = 0
-                    // After flush the decoder has no reference frame; set the
-                    // seek flag so the feed loop drains P-frames until the next
-                    // IDR keyframe before resuming normal feeding.
-                    seekingKeyFrame = true
+                    // flush 后解码器没有参考帧；resync 已在首次缺口时置位，喂帧循环
+                    // 会丢 P 帧直到下一个 IDR。
+                    resync.onGap()
                     configData?.let { config ->
                         val idx = decoder.dequeueInputBuffer(50_000)
                         if (idx >= 0) {
@@ -425,6 +457,9 @@ class VideoDecoder {
                 val evicted = frameQueue.poll()
                 dropCount++
                 if (evicted != null && evicted.isKeyFrame) keyFramesDropped++
+                // 被驱逐的帧（无论是 P 还是关键帧）都在参考链上留了洞：
+                // 进入重同步，队列里剩余的陈旧 P 帧一律不喂。
+                noteGap()
                 if (dropCount <= 3 || dropCount % 60 == 0L) {
                     logW("Queue full — evicted for KEYFRAME #$dropCount (keys_dropped=$keyFramesDropped)")
                 }
@@ -436,6 +471,8 @@ class VideoDecoder {
         // P-frame: try to enqueue, drop if full
         if (!frameQueue.offer(frame)) {
             dropCount++
+            // 丢 P 帧 = 参考链有洞，后续 P 帧不可信 → 重同步到下一个 IDR。
+            noteGap()
             if (dropCount <= 5 || dropCount % 60 == 0L) {
                 logW("Queue full — dropped incoming P-frame #$dropCount (receive=$receiveCount)")
             }
@@ -485,6 +522,7 @@ class VideoDecoder {
             outputSurfaceValid = false
             log("Stopping decoder: fed=$frameCount rendered=$renderCount drops=$dropCount inputFails=$inputFailCount")
             resetBlackScreenState()
+            resync.reset()
             frameQueue.clear()
             cachedKeyFrame = null
 
