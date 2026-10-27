@@ -21,6 +21,10 @@ package com.dilinkauto.protocol
  *                 every other host on the phone's WiFi out of a shell-UID process.
  *                 `-` or empty = accept any peer (legacy behaviour, kept for
  *                 deploy sites that cannot determine their own outbound IP).
+ *   - ALLOWED   — issue #21: comma-joined package names the user允许上车（车机 App 列表
+ *                 的白名单），`-` = 不下传（引擎不做白名单过滤）。引擎侧用它约束
+ *                 [com.dilinkauto.protocol.RecentsParser.pickQuickSwitchTarget] 的
+ *                 建屏恢复目标，避免把私有应用拉到车机屏。
  */
 object VdDeployArgs {
     const val MAX_ENCODE_WIDTH = 1920
@@ -28,6 +32,9 @@ object VdDeployArgs {
 
     /** Sentinel for "no peer pinning" in the CAR_HOST argv slot. */
     const val CAR_HOST_ANY = "-"
+
+    /** Sentinel for "no allowlist handed down" in the ALLOWED argv slot（issue #21）. */
+    const val ALLOWED_ANY = "-"
 
     /** Dotted-quad IPv4 or a DNS hostname — nothing a shell could break out of. */
     private val HOST_REGEX = Regex("^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$")
@@ -45,7 +52,8 @@ object VdDeployArgs {
         encodeHeight: Int,
         fps: Int,
         bitrate: Int = VideoConfig.DEFAULT_BITRATE,
-        carHost: String = CAR_HOST_ANY
+        carHost: String = CAR_HOST_ANY,
+        allowedPackages: Collection<String> = emptyList()
     ): String {
         // 等比缩放到编码上限内：此前宽高分开 clamp 会把竖屏 1080x2152 压成方形
         // 1080x1080，导致车机端画面比例失真；等比缩放保持车机 viewport 原始宽高比。
@@ -58,7 +66,38 @@ object VdDeployArgs {
             bitrate
         } else VideoConfig.DEFAULT_BITRATE
         val safeCarHost = sanitizeCarHost(carHost)
-        return "$vdWidth $vdHeight $dpi $phoneHost $ew $eh $fps $br $safeCarHost"
+        return "$vdWidth $vdHeight $dpi $phoneHost $ew $eh $fps $br $safeCarHost ${formatAllowedPackages(allowedPackages)}"
+    }
+
+    /**
+     * issue #21：把白名单包名集合编码进 argv 的 ALLOWED 槽位。
+     *
+     * 只保留能过 [PACKAGE_NAME_REGEX] 的条目 —— 这个字符串会进设备侧 shell 行
+     * （`app_process ... <args>`），任何 shell 元字符都必须被挡在编码端。非法条目
+     * 直接丢弃而不是抛错：少放行一个应用只会退化成"不恢复它"，不值得让整次部署失败。
+     */
+    fun formatAllowedPackages(packages: Collection<String>): String =
+        packages.asSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && it.length <= 255 && PACKAGE_NAME_REGEX.matches(it) }
+            .distinct()
+            .joinToString(",")
+            .ifEmpty { ALLOWED_ANY }
+
+    /**
+     * 解析引擎侧的 ALLOWED 槽位（[formatAllowedPackages] 的逆操作）。
+     *
+     * `null`/`-`/空串/全部非法 → 空集合 = 不做白名单过滤（三条部署路径里车机/桌面
+     * 拿不到手机 prefs，保持它们原有的行为）。
+     */
+    fun parseAllowedPackages(arg: String?): Set<String> {
+        val raw = arg?.trim().orEmpty()
+        if (raw.isEmpty() || raw == ALLOWED_ANY) return emptySet()
+        return raw.split(',')
+            .asSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && it.length <= 255 && PACKAGE_NAME_REGEX.matches(it) }
+            .toSet()
     }
 
     /**

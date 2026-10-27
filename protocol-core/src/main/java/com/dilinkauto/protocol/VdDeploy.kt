@@ -215,6 +215,9 @@ object VdDeploy {
      *                  (audit S-01). [VdDeployArgs.CAR_HOST_ANY] keeps the
      *                  legacy accept-any behaviour for deploy sites that cannot
      *                  determine their own outbound address.
+     * @param allowedPackages 车机可见应用的包名集合（issue #21）。只有手机端
+     *                  Shizuku 部署路径能读到 allowlist prefs 并下传；车机/桌面
+     *                  ADB 路径传空集合（引擎不做过滤，行为不变）。
      */
     fun buildDeployPlan(
         jarPath: String,
@@ -228,10 +231,12 @@ object VdDeploy {
         fps: Int,
         bitrate: Int = VideoConfig.DEFAULT_BITRATE,
         background: Boolean,
-        carHost: String = VdDeployArgs.CAR_HOST_ANY
+        carHost: String = VdDeployArgs.CAR_HOST_ANY,
+        allowedPackages: Collection<String> = emptyList()
     ): DeployPlan {
         val args = VdDeployArgs.format(
-            vdWidth, vdHeight, dpi, phoneHost, encodeWidth, encodeHeight, fps, bitrate, carHost
+            vdWidth, vdHeight, dpi, phoneHost, encodeWidth, encodeHeight, fps, bitrate, carHost,
+            allowedPackages
         )
         return DeployPlan(
             args = args,

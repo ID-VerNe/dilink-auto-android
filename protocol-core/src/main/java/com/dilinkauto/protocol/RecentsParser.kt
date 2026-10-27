@@ -90,16 +90,22 @@ object RecentsParser {
      *   activities` 的 display 段解析），null = 未知（不排除任何任务）。
      *   [selfPackage] 是控制端包名：把自家 Activity 拉进 VD 会踩
      *   "no focused window" 输入派发超时 → ANR（见 moveTopApp 的注释）。
+     * @param allowedPackages 车机可见应用的包名集合（issue #21）。非空时只在该集合内
+     *   挑选：建屏恢复属于"系统替用户做的动作"，不能把用户明确没勾选上车的应用
+     *   （银行/聊天/相册等）拉到车机屏。空集合 = 不做白名单过滤（车机/桌面 ADB
+     *   部署路径拿不到手机 prefs），行为与引入该参数前一致。
      */
     fun pickQuickSwitchTarget(
         tasks: List<RecentTask>,
         currentTaskId: Int?,
         selfPackage: String,
+        allowedPackages: Set<String> = emptySet(),
     ): RecentTask? = tasks.firstOrNull { t ->
         t.taskId != currentTaskId &&
             t.packageName != selfPackage &&
             !t.packageName.contains("launcher", ignoreCase = true) &&
-            !t.packageName.contains("systemui", ignoreCase = true)
+            !t.packageName.contains("systemui", ignoreCase = true) &&
+            (allowedPackages.isEmpty() || t.packageName in allowedPackages)
     }
 
     /**

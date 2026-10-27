@@ -55,13 +55,25 @@ internal class AppListBuilder(
      * A null selection (never configured) passes everything through.
      */
     private fun filterByAllowlist(allApps: List<AppInfo>): List<AppInfo> {
+        val allowed = allowedPackages()
+        return if (allowed != null) allApps.filter { it.packageName in allowed } else allApps
+    }
+
+    /**
+     * 当前「允许上车」的包名集合；`null` = 从未配置（全量放行）。
+     *
+     * issue #21：引擎（shell UID 的 vd-server）读不到本 App 的 prefs，所以部署引擎时
+     * 由 [com.dilinkauto.client.service.ConnectionService] 取这份集合、经 argv 下传，
+     * 让建屏恢复（`ensureContent`）只在车机 App 列表内挑选目标。与 [filterByAllowlist]
+     * 共用同一份读取/首启播种逻辑，保证「引擎看到的集合」= 「发给车机的集合」。
+     */
+    internal fun allowedPackages(): Set<String>? {
         val pm = context.packageManager
         val prefs = context.getSharedPreferences(ConnectionService.ALLOWLIST_PREFS, Context.MODE_PRIVATE)
         if (!prefs.getBoolean(ConnectionService.ALLOWLIST_CONFIGURED_KEY, false)) {
             allowlistSeeder.seedIfNeeded(pm, prefs)
         }
-        val allowed = prefs.getStringSet(ConnectionService.ALLOWLIST_PACKAGES_KEY, null)
-        return if (allowed != null) allApps.filter { it.packageName in allowed } else allApps
+        return prefs.getStringSet(ConnectionService.ALLOWLIST_PACKAGES_KEY, null)
     }
 
     /** Clear the icon-hash cache so the next [sendAppList] re-sends every icon. */

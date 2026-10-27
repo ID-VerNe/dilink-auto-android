@@ -199,7 +199,10 @@ class AuditProtocolFixesTest {
             vdWidth = 1280, vdHeight = 720, dpi = 160, phoneHost = "127.0.0.1",
             encodeWidth = 1280, encodeHeight = 720, fps = 24
         )
-        assertTrue("default must be the ANY sentinel", base.endsWith(" ${VdDeployArgs.CAR_HOST_ANY}"))
+        // issue #21 之后 argv 末位多了一个 allowlist 槽位（也是 `-` 哨兵），
+        // 所以 CAR_HOST 的判定改成按下标取字段，而不是 endsWith。
+        assertEquals("default must be the ANY sentinel",
+            VdDeployArgs.CAR_HOST_ANY, base.split(" ")[8])
 
         assertEquals("192.168.1.5", VdDeployArgs.sanitizeCarHost("192.168.1.5"))
         assertEquals("car.local", VdDeployArgs.sanitizeCarHost("car.local"))
@@ -214,8 +217,8 @@ class AuditProtocolFixesTest {
             encodeWidth = 1280, encodeHeight = 720, fps = 24,
             carHost = "192.168.1.5"
         )
-        assertTrue(pinned.endsWith(" 192.168.1.5"))
-        assertFalse(pinned.contains(VdDeployArgs.CAR_HOST_ANY))
+        assertEquals("192.168.1.5", pinned.split(" ")[8])
+        assertEquals("allowlist 槽位保持未下传哨兵", VdDeployArgs.ALLOWED_ANY, pinned.split(" ")[9])
 
         val plan = VdDeploy.buildDeployPlan(
             jarPath = VdDeploy.JAR_PATH, logPath = VdDeploy.LOG_PATH,

@@ -17,7 +17,10 @@ class CarCommandRouterDispatchTest {
 
     private fun control(type: Byte, payload: ByteArray) = FrameCodec.Frame(Channel.CONTROL, type, payload)
 
-    private class Rig {
+    private class Rig(
+        /** issue #21：部署端下传的白名单；空 = 不过滤（车机/桌面 ADB 路径）。 */
+        allowedPackages: Set<String> = emptySet()
+    ) {
         // 线程安全列表：quickSwitch / fillLaunchedApp 在后台线程里追加，
         // 测试线程同时读取（轮询断言），普通 ArrayList 会偶发 CME。
         val execs = java.util.concurrent.CopyOnWriteArrayList<String>()
@@ -50,6 +53,7 @@ class CarCommandRouterDispatchTest {
             setDisplayPower = { powers += it },
             requestSyncFrame = { syncRequests.incrementAndGet() },
             repairLayerTree = { layerRepairs.incrementAndGet() },
+            allowedPackages = allowedPackages,
         )
     }
 
@@ -386,5 +390,54 @@ Display #7 (activities from top to bottom):
         r.router.ensureDisplayHasContent(7)
 
         assertTrue("无可恢复目标时不得发 am start", r.execOuts.none { it.startsWith("am start") })
+    }
+
+    // ─── issue #21：建屏恢复不得绕过车机白名单 ───
+
+    /** 实车日志里的证据样本：Shizuku 管理器、淘宝都不在白名单（7/120）内。 */
+    private val recentsOutsideAllowlist = """
+  * RecentTaskInfo #0: 
+    id=33952 userId=0 hasTask=true lastActiveTime=849748141
+    baseIntent=Intent { act=android.intent.action.MAIN cat=[android.intent.category.LAUNCHER] flg=0x10200000 cmp=moe.shizuku.privileged.api/moe.shizuku.manager.MainActivity }
+  * RecentTaskInfo #1: 
+    id=34024 userId=0 hasTask=true lastActiveTime=849625054
+    baseIntent=Intent { act=android.intent.action.MAIN cat=[android.intent.category.LAUNCHER] flg=0x10200000 cmp=com.taobao.taobao/com.taobao.tao.welcome.Welcome }
+"""
+
+    @Test
+    fun `ensure content never pulls an app outside the car allowlist into the vd`() {
+        // issue #21：5/5 次建屏都把 Shizuku 管理器 / 淘宝拉到了车机屏。白名单下传后，
+        // recents 里只有白名单外应用时必须什么都不做（首次帧仍是纯黑，等用户从车机
+        // App 列表启动），隐私优先级高于"首帧非黑"。
+        val r = Rig(allowedPackages = setOf("com.autonavi.minimap", "com.baidu.BaiduMap"))
+        r.activitiesDump = emptyDisplayDump
+        r.recentsDump = recentsOutsideAllowlist
+        r.router.ensureDisplayHasContent(7)
+
+        assertTrue(
+            "白名单外的应用不得被拉进 VD: ${r.execOuts.filter { it.startsWith("am start") }}",
+            r.execOuts.none { it.startsWith("am start") }
+        )
+    }
+
+    @Test
+    fun `ensure content picks the allowlisted app even when it is not the most recent`() {
+        // 白名单内的应用即使不是 recents 第一条，也要被选中（按 allowlist 挑选，
+        // 而不是"最近用过的那个"）。
+        val r = Rig(allowedPackages = setOf("com.autonavi.minimap"))
+        r.activitiesDump = emptyDisplayDump
+        r.recentsDump = recentsOutsideAllowlist + """
+  * RecentTaskInfo #2: 
+    id=34033 userId=0 hasTask=true lastActiveTime=849600000
+    baseIntent=Intent { act=android.intent.action.MAIN cat=[android.intent.category.LAUNCHER] flg=0x10200000 cmp=com.autonavi.minimap/com.autonavi.map.activity.SplashActivity }
+"""
+        r.router.ensureDisplayHasContent(7)
+
+        assertTrue(
+            "应按白名单选中高德（Task 34033）: ${r.execOuts.filter { it.startsWith("am start") }}",
+            r.execOuts.contains(
+                "am start --display 7 --task 34033 -n 'com.autonavi.minimap/com.autonavi.map.activity.SplashActivity'"
+            )
+        )
     }
 }

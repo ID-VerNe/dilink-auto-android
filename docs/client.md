@@ -84,6 +84,7 @@ Builds and sends the car-visible app list on behalf of `ConnectionService`.
 - Owns only the allowlist filter and the send; list assembly lives in `AppInfoProvider` (query the enabled launcher apps, derive each package's change hash) and icon suppression in `IconHashGate` (audit R3-SRP-18).
 - Filters launcher apps by the allowlist (`ALLOWLIST_PACKAGES_KEY`) before going on the wire, shrinking the wire payload and the car's icon-decode work. A **null** selection (never configured) passes everything through.
 - `filterByAllowlist` first calls `AllowlistSeeder.seedIfNeeded` when `ALLOWLIST_CONFIGURED_KEY` is false, so a stale empty prefs file is seeded exactly once per install.
+- `allowedPackages()` exposes the same effective set to the deploy path: the engine (`shell UID` `app_process`) cannot read this app's prefs, so `ConnectionService.startVdServerViaShizuku` hands it down through the `ALLOWED` argv slot and `ensureContent` only restores apps from it (issue #21). A **null** selection (never configured) hands nothing down and the engine keeps its unfiltered behaviour.
 - Icon data is sent once per package per session — `IconHashGate.lastSent` (a `ConcurrentHashMap`, keyed on `lastUpdateTime`; made concurrent in audit A-M11 because `reset()` runs on Main while `iconFor()` runs on the list-building IO thread) suppresses unchanged icons. `resetIconHashes()` forces a full re-send on disconnect or car-app reinstall.
 - Categorization is not done here — see `AppCategorizer` below.
 
