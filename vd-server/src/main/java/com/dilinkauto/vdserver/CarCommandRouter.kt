@@ -220,6 +220,64 @@ internal class CarCommandRouter(
     }
 
     /**
+     * 会话建立后确认 VD 里真的有窗口（issue #17）。
+     *
+     * 现场证据（`dilinkauto-logs(10).zip`）：新建 VD 后 `am start --display N -a MAIN
+     * -c HOME` 对已存在的 launcher 任务只做 bring-to-front（`Warning: Activity not
+     * started, its current task has been brought to the front`），不会在 N 上建任务；
+     * [moveTopApp] 又显式跳过 launcher / systemui / 自家控制端 —— 于是 display 段里
+     * 连一个 `Task{` 都没有，编码器只能输出纯黑关键帧（`Pipeline: … tex=0 cb=0`），
+     * 车机侧判定黑屏后反复重握手，用户看到的一直是黑屏；[healDisplay] 对"空段"按
+     * 空栈语义直接返回，救不了它。
+     *
+     * 补救：把最近一次被镜像的应用迁回 VD —— `am start --display N --task <id> -n <cmp>`
+     * 的跨 display 迁移能力已在实机验证（见 [quickSwitch]），目标选择沿用
+     * [RecentsParser.pickQuickSwitchTarget]，因此不会把自家控制端搬进来（会踩
+     * "no focused window" → ANR）。
+     *
+     * 不搬 launcher/home 任务：`type=home` 任务跨 display 迁移没有实机证据，VD 释放时
+     * home task 的回收语义也不明确（有连 launcher 一起销毁的风险）。
+     *
+     * 同步执行（创建期命令本来就在同一线程串行）：2 次 dumpsys + 1 次 am start +
+     * 400ms 复查，远小于 30s 的 car accept 超时；失败只记日志，绝不阻塞会话。
+     */
+    fun ensureDisplayHasContent(id: Int) {
+        if (id < 0) return
+        try {
+            val sec = displaySection(execOut("dumpsys activity activities 2>/dev/null") ?: "", id)
+            if (sec != null && sec.contains("Task{") && isTopTaskVisible(sec)) {
+                PipeLog.log("ensureContent: display=$id already has a visible task")
+                return
+            }
+            val current = sec?.let { TOP_ACTIVITY_RE.find(it) }?.groupValues?.get(2)?.toIntOrNull()
+            val recents = execOut("dumpsys activity recents 2>/dev/null")
+                ?.let { RecentsParser.parse(it) } ?: emptyList()
+            val target = RecentsParser.pickQuickSwitchTarget(recents, current, SELF_PACKAGE)
+            PipeLog.log(
+                "ensureContent: display=$id has no visible window (before='${summarizeDisplay(sec)}'), " +
+                    "${recents.size} live tasks, target=" +
+                    (target?.let { "${it.packageName}#${it.taskId}" } ?: "<none>")
+            )
+            if (target == null) {
+                PipeLog.log("ensureContent: display=$id nothing to restore — first frames stay black until an app is launched")
+                return
+            }
+            val out = execOut("am start --display $id --task ${target.taskId} -n ${VdDeploy.shellQuote(target.component)}")
+            PipeLog.log("ensureContent: am start -> ${out?.trim()?.replace(Regex("\\s+"), " ")?.take(200) ?: "<no output>"}")
+            Thread.sleep(HEAL_VERIFY_MS)
+            val after = displaySection(execOut("dumpsys activity activities 2>/dev/null") ?: "", id)
+            if (after != null && isTopTaskVisible(after)) {
+                PipeLog.log("ensureContent: restored ${target.packageName} (Task ${target.taskId}) on display=$id")
+                fillTask(target.taskId, id)
+            } else {
+                PipeLog.err("ensureContent: ${target.packageName} did not become display $id's visible task (after='${summarizeDisplay(after)}')")
+            }
+        } catch (e: Exception) {
+            PipeLog.err("ensureContent: ${e.message}")
+        }
+    }
+
+    /**
      * 「最近」= 快速切换到上一个任务（2026-10-10 用户拍板的语义）。
      *
      * 不用 `input -d N keyevent 187`：AOSP 的系统 recents 硬编码作用于默认显示器
