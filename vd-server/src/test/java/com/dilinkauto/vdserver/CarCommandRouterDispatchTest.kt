@@ -24,6 +24,7 @@ class CarCommandRouterDispatchTest {
         val execOuts = java.util.concurrent.CopyOnWriteArrayList<String>()
         val powers = java.util.concurrent.CopyOnWriteArrayList<Boolean>()
         val syncRequests = java.util.concurrent.atomic.AtomicInteger(0)
+        val layerRepairs = java.util.concurrent.atomic.AtomicInteger(0)
         var displayId = 7
         var launchResolve: String? = null
         var appInfoResolve: String? = null
@@ -48,6 +49,7 @@ class CarCommandRouterDispatchTest {
             onStackEmpty = { },
             setDisplayPower = { powers += it },
             requestSyncFrame = { syncRequests.incrementAndGet() },
+            repairLayerTree = { layerRepairs.incrementAndGet() },
         )
     }
 
@@ -256,5 +258,71 @@ Display #7 (activities from top to bottom):
         assertTrue(threw)
         assertTrue(r.execOuts.none { it.startsWith("am start") })
         assertTrue(r.execs.isEmpty())
+    }
+
+    // ─── issue #15：VD 内容持续纯黑时的显示自愈阶梯 ───
+
+    private fun waitFor(timeoutMs: Long = 5_000, cond: () -> Boolean) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline && !cond()) Thread.sleep(10)
+    }
+
+    /** 实车原话（issue #15 证据链）：可见时带 `visibleRequested=true` + `topResumedActivity=`。 */
+    private val visibleDump = """
+Display #7 (activities from top to bottom):
+  * Task{a11 #77 type=standard A=1000:com.foo.bar U=0 visible=true visibleRequested=true mode=fullscreen translucent=false sz=1}
+    topResumedActivity=ActivityRecord{751a1f5 u0 com.foo.bar/.MainActivity t77}
+    * ActivityRecord{751a1f5 u0 com.foo.bar/.MainActivity t77}
+"""
+
+    /** 黑屏时的同一行：`visible=true` 但 `visibleRequested=false`，且没有 topResumedActivity。 */
+    private val invisibleDump = """
+Display #7 (activities from top to bottom):
+  * Task{e27 #34033 type=standard A=10265:com.autonavi.minimap U=0 visible=true visibleRequested=false mode=fullscreen translucent=true sz=1}
+    * ActivityRecord{b68 u0 com.autonavi.minimap/com.autonavi.map.activity.SplashActivity t34033}
+"""
+
+    @Test
+    fun `display heal skips task surgery but still verifies the layer tree when WM says visible`() {
+        // WM 侧可见 ≠ SF 一定合成得出画面（issue #15 现场：会话结束 dump 已恢复
+        // visibleRequested=true，车机仍是黑）→ 不能直接返回，要走一次层树检查；
+        // 但不得再动任务（am start / move-stack 会白抖一次画面）。
+        val r = Rig(); r.activitiesDump = visibleDump
+        r.router.dispatch(control(ControlMsg.REQUEST_DISPLAY_HEAL, ByteArray(0)))
+
+        waitFor { r.layerRepairs.get() > 0 }
+        assertTrue("已可见时不得再动任务", r.execOuts.none {
+            it.startsWith("am start") || it.startsWith("am display move-stack")
+        })
+        assertEquals(1, r.layerRepairs.get())
+        // 回归钉子：该 ROM 上 keyevent 3/4 对 VD 无效，不得被当作恢复手段。
+        assertTrue(r.execs.isEmpty())
+    }
+
+    @Test
+    fun `display heal re-fronts an invisible top task`() {
+        val r = Rig(); r.activitiesDump = invisibleDump
+        r.router.dispatch(control(ControlMsg.REQUEST_DISPLAY_HEAL, ByteArray(0)))
+
+        waitFor { r.execOuts.any { it.startsWith("am start --display 7 --task") } }
+        assertTrue(
+            r.execOuts.contains(
+                "am start --display 7 --task 34033 -n 'com.autonavi.minimap/com.autonavi.map.activity.SplashActivity'"
+            )
+        )
+        assertTrue("不得注入 keyevent 3", r.execs.isEmpty())
+    }
+
+    @Test
+    fun `display heal escalates to move stack round trip and layer tree repair`() {
+        // 每步复查都读到同一份"仍不可见"的 dump → 阶梯必须走到底：
+        // 1) am start --task  2) move-stack 0 → 7 往返  3) 层树修复。
+        val r = Rig(); r.activitiesDump = invisibleDump
+        r.router.dispatch(control(ControlMsg.REQUEST_DISPLAY_HEAL, ByteArray(0)))
+
+        waitFor(8_000) { r.layerRepairs.get() > 0 }
+        assertTrue(r.execOuts.contains("am display move-stack 34033 0"))
+        assertTrue(r.execOuts.contains("am display move-stack 34033 7"))
+        assertEquals(1, r.layerRepairs.get())
     }
 }

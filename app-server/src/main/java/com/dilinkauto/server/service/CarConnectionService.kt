@@ -289,6 +289,13 @@ class CarConnectionService : Service() {
                 sendCommandToVd(ControlMsg.REQUEST_SYNC_FRAME)
             }
         }
+        // issue #15：解码还活着但码流持续是黑（VD 顶层没有可见窗口）。此时不重建 VD
+        // ——那是 #11 明确否掉的误伤——而是请手机侧做一次轻量显示自愈。触发节奏由
+        // 解码器内的 ContentBlackHealTracker 控制（首帧起算 6s，之后 15s 一次）。
+        videoDecoder.onContentBlackPersistent = {
+            carLogSend("[BLACK] decode alive but content still black — requesting phone-side display heal", "W")
+            sendCommandToVd(ControlMsg.REQUEST_DISPLAY_HEAL)
+        }
         // Self-heal: a stream that stays black for seconds means the phone's
         // VirtualDisplay is producing nothing (stuck DTA, leaked display,
         // compositor wedged). Nothing on the car side can fix that — only a

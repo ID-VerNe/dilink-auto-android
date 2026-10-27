@@ -8,6 +8,7 @@ import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
 import com.dilinkauto.protocol.BlackScreenDetector
+import com.dilinkauto.protocol.ContentBlackHealTracker
 import com.dilinkauto.protocol.H264NalParser
 import com.dilinkauto.protocol.VideoConfig
 import java.util.concurrent.ArrayBlockingQueue
@@ -121,6 +122,16 @@ class VideoDecoder {
     private val liveness = DecodeLiveness()
 
     /**
+     * 「解码存活但内容一直黑」的自愈节奏（issue #15）。
+     *
+     * #11 的闸门在"内容黑 + 解码存活"时只抑制重建 —— 对纯色启动页是对的，但实车
+     * 出现过 VD 顶层没有可见窗口、黑屏可持续数十秒且不会自恢复的情况。这里在闸门
+     * 判定"存活"之后追加一级：黑满 [ContentBlackHealTracker.DEFAULT_FIRST_REQUEST_AFTER_MS]
+     * 就向上游请求一次轻量自愈，之后限流重试，而不是等用户断连重连。
+     */
+    private val contentBlackHeal = ContentBlackHealTracker()
+
+    /**
      * 闸门抑制升级的日志限流时刻（issue #11）：同一段内容黑里只留少量痕迹，
      * 便于实车回签确认「确实是被闸门挡住」而不是解码停摆。
      */
@@ -134,8 +145,16 @@ class VideoDecoder {
     ).apply {
         sustainMs = BLACK_SCREEN_SUSTAIN_MS
         decodingAliveCheck = {
-            val alive = liveness.isAlive(renderCount, SystemClock.elapsedRealtime())
-            if (alive) logSuppressedRebuild()
+            val now = SystemClock.elapsedRealtime()
+            val alive = liveness.isAlive(renderCount, now)
+            if (alive) {
+                logSuppressedRebuild()
+                // 存活但持续黑：交给 tracker 决定是否向上游要一次显示自愈（issue #15）。
+                if (contentBlackHeal.onAliveBlackFrame(now)) onContentBlackPersistent?.invoke()
+            } else {
+                // 解码停摆是真故障，走重握手；自愈节奏同时清空，避免恢复后立刻再发。
+                contentBlackHeal.reset()
+            }
             alive
         }
     }
@@ -157,6 +176,16 @@ class VideoDecoder {
      */
     @Volatile
     var onNeedsSyncFrame: (() -> Unit)? = null
+
+    /**
+     * "解码存活且码流持续是黑"时的轻量自愈回调（issue #15）。
+     *
+     * 触发频率由 [ContentBlackHealTracker] 限流，实现方直接发一条
+     * [com.dilinkauto.protocol.ControlMsg.REQUEST_DISPLAY_HEAL] 即可，不必再做节流。
+     * 从网络线程调用，必须立即返回。
+     */
+    @Volatile
+    var onContentBlackPersistent: (() -> Unit)? = null
 
     /** Reset the black-screen detector so a fresh session starts clean. */
     fun resetBlackScreenState() = blackScreen.reset()
@@ -224,6 +253,8 @@ class VideoDecoder {
             resetBlackScreenState()
             // 新会话的出帧计数从 0 起算，闸门基线一并复位（issue #11）。
             liveness.reset()
+            // 自愈节奏同样重新起算（issue #15）。
+            contentBlackHeal.reset()
             // 新编解码器没有旧参考链的包袱，重同步状态同样重新起算（issue #9）。
             resync.reset()
 
@@ -469,6 +500,8 @@ class VideoDecoder {
             logW("Suspected BLACK SCREEN: ${blackScreen.streak()} consecutive tiny keyframes, latest=${data.size}B")
         } else if (wasAlerted && !blackScreen.isAlerted()) {
             log("Black screen alert cleared — keyframe=${data.size}B")
+            // 画面回来了：自愈节奏重新起算，别让上一段黑屏的起点漏到下一段。
+            contentBlackHeal.reset()
         }
         if (isConfig || isKey || receiveCount <= 3 || receiveCount % 60 == 0L) {
             log("onFrameReceived #$receiveCount isConfig=$isConfig isKey=$isKey size=${data.size} running=${running.get()} queue=${frameQueue.size}")
@@ -563,6 +596,7 @@ class VideoDecoder {
             log("Stopping decoder: fed=$frameCount rendered=$renderCount drops=$dropCount inputFails=$inputFailCount")
             resetBlackScreenState()
             liveness.reset()
+            contentBlackHeal.reset()
             resync.reset()
             frameQueue.clear()
             cachedKeyFrame = null

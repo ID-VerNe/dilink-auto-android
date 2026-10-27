@@ -9,6 +9,7 @@ import com.dilinkauto.protocol.RecentsParser
 import com.dilinkauto.protocol.VdDeploy
 import com.dilinkauto.protocol.requireComponentName
 import com.dilinkauto.protocol.requirePackageName
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Everything the car can ask for over `Channel.CONTROL`, plus the display
@@ -26,6 +27,8 @@ import com.dilinkauto.protocol.requirePackageName
  * @param requestSyncFrame ask the pipeline to emit an IDR on the video channel
  *   (`REQUEST_SYNC_FRAME`，issue #9). Pipeline-thread owned, hence a plain flag
  *   handoff rather than an encoder call from this (Lifecycle/Touch) thread.
+ * @param repairLayerTree SF 层树脱同步的最后一级修复（`VirtualDisplayCreator.ensureDtaAttached()`），
+ *   只由 [healDisplay] 在 WM 侧判据都正常时调用（issue #15）。
  */
 internal class CarCommandRouter(
     private val exec: (String) -> Unit,
@@ -34,7 +37,10 @@ internal class CarCommandRouter(
     private val onStackEmpty: () -> Unit,
     private val setDisplayPower: (Boolean) -> Unit,
     private val requestSyncFrame: () -> Unit,
+    private val repairLayerTree: () -> Unit,
 ) {
+    /** [healDisplay] 的并发去重：车机端每 15s 重试一次，叠加时不能嵌套执行。 */
+    private val healInFlight = AtomicBoolean(false)
 
     fun dispatch(f: FrameCodec.Frame) {
         PipeLog.log("Car command received: 0x${Integer.toHexString(f.messageType.toInt() and 0xFF)}")
@@ -71,6 +77,8 @@ internal class CarCommandRouter(
                 requestSyncFrame()
                 PipeLog.log("Car requested sync frame (IDR)")
             }
+            // 车机端"解码存活但内容持续纯黑"时请求显示自愈（issue #15），payload 忽略。
+            ControlMsg.REQUEST_DISPLAY_HEAL -> healDisplay()
         }
     }
 
@@ -121,6 +129,94 @@ internal class CarCommandRouter(
                 if (empty) onStackEmpty()
             } catch (e: Exception) { PipeLog.err("checkStackEmpty: ${e.message}") }
         }, "StackCheck").start()
+    }
+
+    /**
+     * VD 内容持续纯黑时的显示自愈阶梯（issue #15）。
+     *
+     * 实车证据（issue #15）：一个会话里连续启动第 4 个应用后，该 display 的顶层
+     * task 停在 `visible=true visibleRequested=false ... translucent=true`、且没有
+     * `topResumedActivity=`，编码器随之持续输出极小 I 帧（车机侧 32 秒纯黑）；同时
+     * `input -d <vd> keyevent 3/4`（0x11/0x12）在该 ROM 上对该 display 完全无效，
+     * 手机侧没有任何恢复手段，用户只能断连重连。
+     *
+     * 阶梯（每步复查，成功即返回，避免多余的 display 抖动）：
+     *  1. `am start --display <id> --task <taskId> -n <cmp>`：把"已存在但没 resume"的
+     *     顶层任务重新拉到本 display 前台（[quickSwitch] 的同一形态命令已在实机验证
+     *     可把任务迁移到指定 display）；
+     *  2. `am display move-stack <taskId> 0` → `... <id>` 往返：让 WM 重新把任务关联
+     *     到该 display（往返期间任务短暂落到手机物理屏，而会话期间物理屏已被
+     *     `cmd display power-off 0` 熄灭，用户不可见）；
+     *  3. [repairLayerTree]：WM 判据都正常但画面仍黑时才怀疑 SF 层树（Flyme DTA
+     *     孤立），复跑创建期那套旋转往返修复。
+     *
+     * 全程后台线程（3 次 dumpsys + 2 次 move-stack 合计数百毫秒，绝不阻塞
+     * TouchReader）；[healInFlight] 去重。display 段里连 Task 都没有时**不做任何事**
+     * —— 那是 [checkStackEmpty] 的"空栈自动断开"语义，不能在这里把用户踢回桌面。
+     */
+    private fun healDisplay() {
+        if (!healInFlight.compareAndSet(false, true)) {
+            PipeLog.log("healDisplay: already in flight, skip")
+            return
+        }
+        Thread({
+            try {
+                val id = displayId()
+                if (id < 0) { PipeLog.log("healDisplay: skipped, display id unknown"); return@Thread }
+                val sec = displaySection(execOut("dumpsys activity activities 2>/dev/null") ?: "", id)
+                PipeLog.log("healDisplay: display=$id before='${summarizeDisplay(sec)}'")
+                if (sec == null || !sec.contains("Task{")) {
+                    PipeLog.log("healDisplay: display=$id has no task — leave the empty-stack semantics alone")
+                    return@Thread
+                }
+                if (isTopTaskVisible(sec)) {
+                    // WM 侧看起来是可见的，但车机持续报内容黑 —— 现场日志（issue #15）
+                    // 出现过"会话结束 dump 已恢复 visibleRequested=true、画面仍是黑"，
+                    // 所以这里不能直接返回，要走最后的层树检查（健康的 DTA 检查零副作用）。
+                    PipeLog.log("healDisplay: display=$id top task visible in WM but content is black — verify layer tree")
+                } else {
+                    val m = TOP_ACTIVITY_RE.find(sec)
+                    val cmp = m?.groupValues?.get(1)
+                    val taskId = m?.groupValues?.get(2)?.toIntOrNull()
+                    if (cmp.isNullOrBlank() || taskId == null || taskId <= 0) {
+                        PipeLog.log("healDisplay: no top ActivityRecord in display=$id, falling through to layer-tree repair")
+                    } else {
+                        val out = execOut("am start --display $id --task $taskId -n ${VdDeploy.shellQuote(cmp)}")
+                        PipeLog.log("healDisplay: step1 am start -> ${out?.trim()?.replace(Regex("\\s+"), " ")?.take(200) ?: "<no output>"}")
+                        Thread.sleep(HEAL_VERIFY_MS)
+                        val after1 = displaySection(execOut("dumpsys activity activities 2>/dev/null") ?: "", id)
+                        PipeLog.log("healDisplay: after step1='${summarizeDisplay(after1)}'")
+                        if (after1 != null && isTopTaskVisible(after1)) {
+                            PipeLog.log("healDisplay: recovered by step1 (re-front task $taskId)")
+                            return@Thread
+                        }
+                        execOut("am display move-stack $taskId 0")
+                        Thread.sleep(HEAL_VERIFY_MS)
+                        execOut("am display move-stack $taskId $id")
+                        Thread.sleep(HEAL_VERIFY_MS)
+                        val after2 = displaySection(execOut("dumpsys activity activities 2>/dev/null") ?: "", id)
+                        PipeLog.log("healDisplay: after step2='${summarizeDisplay(after2)}'")
+                        if (after2 != null && isTopTaskVisible(after2)) {
+                            PipeLog.log("healDisplay: recovered by step2 (move-stack round trip)")
+                            return@Thread
+                        }
+                    }
+                }
+                PipeLog.log("healDisplay: step3 layer-tree repair")
+                repairLayerTree()
+                val after3 = displaySection(execOut("dumpsys activity activities 2>/dev/null") ?: "", id)
+                PipeLog.log("healDisplay: after step3='${summarizeDisplay(after3)}'")
+                if (after3 != null && isTopTaskVisible(after3)) {
+                    PipeLog.log("healDisplay: recovered by step3 (layer-tree repair)")
+                } else {
+                    PipeLog.err("healDisplay: still black after the whole ladder — see the dumps above")
+                }
+            } catch (e: Exception) {
+                PipeLog.err("healDisplay: ${e.message}")
+            } finally {
+                healInFlight.set(false)
+            }
+        }, "DisplayHeal").start()
     }
 
     /**
@@ -275,6 +371,32 @@ internal class CarCommandRouter(
         return if (next >= 0) dump.substring(start, next) else dump.substring(start)
     }
 
+    /**
+     * 该 display 段的顶层 Task 是否 `visibleRequested=true`。
+     *
+     * 只取段内第一个 Task{}（activity 按 top→bottom 排列，首个即顶层）。判据来自
+     * issue #15 的现场差异：健康时 `visible=true visibleRequested=true` 且带
+     * `topResumedActivity=`；黑屏时同一行是 `visible=true visibleRequested=false`。
+     * `visibleRequested=false` 表示窗口容器没有请求可见 —— 无论 WM 是否还标着
+     * `visible=true`，该 display 上都不会有内容被合成。
+     */
+    private fun isTopTaskVisible(section: String): Boolean {
+        val inner = TOP_TASK_RE.find(section)?.groupValues?.get(1) ?: return false
+        return inner.contains("visibleRequested=true")
+    }
+
+    /**
+     * 把 display 段压成单行并保留足够长度，供 [healDisplay] 落盘。
+     *
+     * 全局 [ShellExec] 只记 400 字符摘要，`visibleRequested` 之后的 ActivityRecord
+     * 列表、`isSleeping`、bounds 全被截掉 —— issue #15 就是因为这个截断无法在
+     * "WM 未 resume"与"SF 层树脱同步"之间实锤。只在这一条路径上放开到 2000 字符。
+     */
+    private fun summarizeDisplay(section: String?): String {
+        if (section == null) return "<no section>"
+        return section.trim().replace(Regex("\\s+"), " ").take(HEAL_DUMP_LOG_CHARS)
+    }
+
     private companion object {
         /**
          * 手机控制端包名，从跨模块常量派生（见 [AppTargets] 的说明：applicationId
@@ -301,5 +423,17 @@ internal class CarCommandRouter(
 
         /** `wm size -d <id>` 输出 "Physical size: 2340x1316" 里的首个 WxH。 */
         val WM_SIZE_RE = Regex("(\\d+)x(\\d+)")
+
+        /**
+         * `dumpsys activity activities` 的 Task 行：取花括号内文本，供
+         * [isTopTaskVisible] 读 `visibleRequested`（issue #15）。
+         */
+        val TOP_TASK_RE = Regex("Task\\{([^}]*)\\}")
+
+        /** [healDisplay] 每步复查前的等待：am start / move-stack 落地都是异步的。 */
+        const val HEAL_VERIFY_MS = 400L
+
+        /** 自愈路径落盘的 display 段长度上限，见 [summarizeDisplay]。 */
+        const val HEAL_DUMP_LOG_CHARS = 2000
     }
 }

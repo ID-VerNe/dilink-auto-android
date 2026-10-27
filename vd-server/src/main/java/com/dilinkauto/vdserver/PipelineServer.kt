@@ -114,7 +114,10 @@ class PipelineServer(
         displayId = { displayId },
         onStackEmpty = { lifecycle.enqueue(VdLifecycle.MSG_STACK_EMPTY, ByteArray(0)) },
         setDisplayPower = { displayController.setPhysicalDisplayPower(it) },
-        requestSyncFrame = { syncFrameRequested.set(true) }
+        requestSyncFrame = { syncFrameRequested.set(true) },
+        // issue #15：车机请求"显示自愈"时的最后一级 —— SF 层树脱同步修复，
+        // 复用创建期那套旋转往返（见 VirtualDisplayCreator.ensureDtaAttached）。
+        repairLayerTree = { vdCreator.ensureDtaAttached() }
     )
     private lateinit var glPipeline: GlPipeline
 
