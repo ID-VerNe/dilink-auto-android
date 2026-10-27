@@ -33,7 +33,19 @@ internal class VirtualDisplayCreator(
     private val execShell: (String) -> Unit,
     private val execShellOutput: (String) -> String?,
     private val log: (String) -> Unit,
-    private val err: (String) -> Unit
+    private val err: (String) -> Unit,
+    /**
+     * 层树检测探针（issue #19 的回归钉子接缝）。
+     *
+     * null = 用真实 `dumpsys SurfaceFlinger` 解析；单测注入固定序列，不依赖设备。
+     * 返回值语义与 [isDtaAttachedUnderDisplay] 一致：true 健康 / false DTA 孤立 /
+     * null 无法判定（按需要修复处理）。
+     */
+    private val layersAttached: (() -> Boolean?)? = null,
+    /**
+     * 旋转往返之间的等待。生产用 [Thread.sleep]；单测注入 no-op，避免每例真睡 6s。
+     */
+    private val sleepMs: (Long) -> Unit = { Thread.sleep(it) },
 ) {
     private companion object {
         /**
@@ -141,20 +153,23 @@ internal class VirtualDisplayCreator(
      * 修复：对该 display 做一次 user-rotation 往返 (lock 1 → lock 0)，
      * 实测可强制 WindowManager 重新提交层树事务、把 DTA 挂回原位。
      * 健康设备上检测通过即返回，零副作用。
+     *
+     * @param targetDisplayId 要检查/修复的 display。默认为本类创建的那个 VD；
+     *   显式传入是为 issue #19 的回归钉子留的接缝（测试里不能写 [displayId] 字段）。
      */
-    fun ensureDtaAttached() {
-        if (displayId < 0) { err("DTA check skipped: display id unknown"); return }
-        when (isDtaAttachedUnderDisplay()) {
+    fun ensureDtaAttached(targetDisplayId: Int = displayId) {
+        if (targetDisplayId < 0) { err("DTA check skipped: display id unknown"); return }
+        when (isDtaAttachedUnderDisplay(targetDisplayId)) {
             true -> { log("DTA attached — no repair needed"); return }
             false -> log("DTA orphaned in Offscreen Hierarchy — repairing via rotation round-trip")
             null -> log("DTA check inconclusive — applying preventive rotation round-trip")
         }
         repeat(2) { round ->
-            execShell("wm user-rotation -d $displayId lock 1")
-            Thread.sleep(1500)
-            execShell("wm user-rotation -d $displayId lock 0")
-            Thread.sleep(1500)
-            if (isDtaAttachedUnderDisplay() == true) { log("DTA repair OK (round ${round + 1})"); return }
+            execShell("wm user-rotation -d $targetDisplayId lock 1")
+            sleepMs(1500)
+            execShell("wm user-rotation -d $targetDisplayId lock 0")
+            sleepMs(1500)
+            if (isDtaAttachedUnderDisplay(targetDisplayId) == true) { log("DTA repair OK (round ${round + 1})"); return }
             err("DTA still orphaned after repair round ${round + 1}")
         }
         err("DTA repair failed after 2 rounds — car may show a black screen")
@@ -165,9 +180,11 @@ internal class VirtualDisplayCreator(
      * false = DTA 孤立在 Offscreen Hierarchy（黑屏状态）；
      * null  = dump 不可用或无法解析（保守起见按需要修复处理）。
      */
-    private fun isDtaAttachedUnderDisplay(): Boolean? {
+    private fun isDtaAttachedUnderDisplay(targetDisplayId: Int): Boolean? {
+        val injected = layersAttached
+        if (injected != null) return injected()
         val dump = execShellOutput("dumpsys SurfaceFlinger") ?: return null
-        val start = dump.indexOf("Display $displayId name=")
+        val start = dump.indexOf("Display $targetDisplayId name=")
         if (start < 0) return null
         // 区段终点 = 下一个 display 行 / Offscreen Hierarchy 段，取更早者
         val nextDisplay = Regex("Display \\d+ name=").find(dump, start + 1)?.range?.first ?: -1

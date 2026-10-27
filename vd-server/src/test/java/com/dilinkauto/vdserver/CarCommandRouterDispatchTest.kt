@@ -223,6 +223,42 @@ Display #7 (activities from top to bottom):
         assertTrue(r.execOuts.contains("am task resize 77 0 0 2340 1316"))
     }
 
+    // ─── issue #19：fill 之后的层树复查 ───
+
+    /** fill 能找到顶层任务时的 dump（实车形态）。 */
+    private val filledDisplayDump = """
+Display #7 (activities from top to bottom):
+  * Task{a11 #77 type=standard A=1000:com.foo.bar}
+    * ActivityRecord{751a1f5 u0 com.foo.bar/.MainActivity t77}
+"""
+
+    @Test
+    fun `launch app rechecks the layer tree after filling the task`() {
+        // issue #19：DTA 脱同步发生在 `am task resize … fill` 之后约 1.6s
+        // （创建期那次检查必然读到健康），所以 fill 完成后必须再查一次层树。
+        val r = Rig()
+        r.launchResolve = "com.foo.bar/.MainActivity"
+        r.activitiesDump = filledDisplayDump
+        r.router.dispatch(control(ControlMsg.LAUNCH_APP, "com.foo.bar".toByteArray()))
+
+        waitFor(6_000) { r.layerRepairs.get() > 0 }
+        assertEquals("fill 之后必须复查一次层树（且只一次）", 1, r.layerRepairs.get())
+    }
+
+    @Test
+    fun `fill that never finds the launched task does not recheck the layer tree`() {
+        // 没铺满就没有那次导致脱同步的 resize 事务，复查纯属空跑 —— 不应发生。
+        val r = Rig()
+        r.launchResolve = "com.foo.bar/.MainActivity"
+        r.activitiesDump = "Display #7 (activities from top to bottom):\n"
+        r.router.dispatch(control(ControlMsg.LAUNCH_APP, "com.foo.bar".toByteArray()))
+
+        // 等 fill 的轮询预算（8 × 300ms）走完，再多给一点落地窗口。
+        waitFor(6_000) { r.execOuts.count { it.startsWith("dumpsys activity activities") } >= 8 }
+        Thread.sleep(200)
+        assertEquals("未发生 fill 时不得复查层树", 0, r.layerRepairs.get())
+    }
+
     @Test
     fun `launch app rejects resolve output that is not a valid component`() {
         val r = Rig()
