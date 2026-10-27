@@ -131,6 +131,31 @@ class CarConnectionService : Service() {
      */
     @Volatile private var reHandshakeInFlight = false
     /**
+     * 视口变化重握手门（issue #22）。旋转动画期间会连续上报多个尺寸，重握手本身
+     * 又要拆旧 VD + 重新部署引擎；这里只注入定时器与真正的重握手动作，判定逻辑
+     * 在纯 JVM 的 [ViewportRehandshakeGate] 里，单测见 `ViewportRehandshakeGateTest`。
+     */
+    private val viewportGate = ViewportRehandshakeGate(
+        debounceMs = VIEWPORT_REHANDSHAKE_DEBOUNCE_MS,
+        schedule = { delayMs, action ->
+            val job = scope.launch {
+                delay(delayMs)
+                action()
+            }
+            ViewportRehandshakeGate.Cancelable { job.cancel() }
+        },
+        request = { target ->
+            val ctrl = controlConnection
+            if (ctrl == null || !ctrl.isConnected) {
+                carLogSend("Viewport re-handshake skipped: control link gone", "W")
+            } else {
+                carLogSend("Car viewport changed -> re-handshake ${target.width}x${target.height} (was ${vdWidth}x${vdHeight})")
+                scope.launch(Dispatchers.IO) { rehandshakeOnExistingControl(ctrl, target.width, target.height, target.dpi) }
+            }
+        },
+        isInFlight = { reHandshakeInFlight },
+    )
+    /**
      * Per-session VD rebuild counter for the black-screen self-heal
      * (audit S-M1). The old gate required `vdServerStarted`, which is never
      * set in Shizuku mode and which the recovery itself clears — so the
@@ -457,6 +482,8 @@ class CarConnectionService : Service() {
         // black-screen rebuild budget (audit S-05 / S-M1).
         teardownGuard.set(false)
         blackScreenRebuilds = 0
+        // 上一会话排队的视口尺寸不得在新会话里补跑（issue #22）。
+        viewportGate.reset()
 
         // Reset prerequisite flags (keep usbReady if USB is physically connected)
         wifiReady = false
@@ -1282,15 +1309,18 @@ class CarConnectionService : Service() {
     fun onCarViewportChanged(widthPx: Int, heightPx: Int, dpi: Int) {
         val dm = resources.displayMetrics
         val vp = CarViewport.size(widthPx, heightPx, dm.density)
-        val newVpW = vp.first
-        val newVpH = vp.second
-        if (newVpW == vdWidth && newVpH == vdHeight) return
-        if (_state.value != State.STREAMING && _state.value != State.CONNECTED) return
-        val ctrl = controlConnection ?: return
-        if (!ctrl.isConnected) return
-        carLogSend("Car viewport changed -> re-handshake ${newVpW}x${newVpH} (was ${vdWidth}x${vdHeight})")
-        // rehandshakeOnExistingControl is suspend; this entry point is not.
-        scope.launch(Dispatchers.IO) { rehandshakeOnExistingControl(ctrl, newVpW, newVpH, dpi) }
+        val state = _state.value
+        // 重握手期间 state 是 CONNECTING，但此时上报的新尺寸恰恰是「进行中收到新尺寸」
+        // 要补跑的那一次，不能按旧的 STREAMING/CONNECTED 条件丢掉；首次连接同样处于
+        // CONNECTING（reHandshakeInFlight 为 false），保持原有行为不动。
+        val sessionReady = state == State.STREAMING || state == State.CONNECTED ||
+            (state == State.CONNECTING && reHandshakeInFlight)
+        viewportGate.onViewportChanged(
+            candidate = ViewportRehandshakeGate.Target(vp.first, vp.second, dpi),
+            appliedWidth = vdWidth,
+            appliedHeight = vdHeight,
+            sessionReady = sessionReady,
+        )
     }
 
     /**
@@ -1333,6 +1363,8 @@ class CarConnectionService : Service() {
             rehandshakeOnExistingControlLocked(ctrl, newVpW, newVpH, dpi)
         } finally {
             reHandshakeInFlight = false
+            // 旋转与黑屏两条路径共用这里：重握手期间积压的视口尺寸在此补跑一次。
+            viewportGate.onRehandshakeFinished()
         }
     }
 
@@ -1452,6 +1484,7 @@ class CarConnectionService : Service() {
         discoveryJob?.cancel()
         discoveryJob = null
         reHandshakeInFlight = false
+        viewportGate.reset()
 
         // Decoder teardown is ordered (it joins the feed thread), so run it on
         // the decoder executor rather than the caller's thread — this can be
@@ -1664,6 +1697,13 @@ class CarConnectionService : Service() {
          * 连续多次丢帧，500ms 足以把重复请求挡掉，又不会让真正的第二次缺口等太久。
          */
         internal const val SYNC_FRAME_REQUEST_MIN_INTERVAL_MS = 500L
+
+        /**
+         * 视口变化合并窗口（issue #22）。旋转动画/分屏拖动会在数百毫秒内连续上报
+         * 多个尺寸；700ms 的静默期既能把它们合成一次重握手，又不会让真正的旋转
+         * 明显延迟（issue 建议 500–800ms）。
+         */
+        internal const val VIEWPORT_REHANDSHAKE_DEBOUNCE_MS = 700L
     }
 }
 
