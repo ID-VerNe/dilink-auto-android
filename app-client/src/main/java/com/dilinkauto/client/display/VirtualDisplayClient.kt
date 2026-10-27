@@ -5,6 +5,7 @@ import com.dilinkauto.protocol.FrameCodec
 import com.dilinkauto.protocol.NioReader
 import com.dilinkauto.protocol.VdLifecycle
 import kotlinx.coroutines.*
+import java.io.EOFException
 import java.net.InetSocketAddress
 import java.nio.ByteBuffer
 import java.nio.channels.ServerSocketChannel
@@ -152,23 +153,27 @@ class VirtualDisplayClient(
         commandRelayJob = scope.launch(Dispatchers.IO) {
             val rdr = reader ?: return@launch
             FileLog.i(TAG, "Command relay started")
-            try {
-                while (isActive && isConnected) {
-                    val msgType = rdr.readByte()
+            val end = commandRelayLoop(
+                // readByteOrNull：类型字段永远在消息边界，对端关闭时返回 null 而不是抛
+                // IOException("Channel closed: expected 1 bytes") —— 后者在旧实现里被记成 E。
+                readType = { rdr.readByteOrNull() },
+                shouldContinue = { isConnected },
+                onMessage = { msgType -> handleRelayMessage(msgType) },
+                log = fileRelayLog
+            )
+            // 循环因对端关闭或故障退出时对外仍标记为未连接（原异常路径的语义）。
+            if (end != RelayEnd.STOPPED) isConnected = false
+        }
+    }
 
-                    when (msgType) {
-                        VdLifecycle.MSG_STACK_EMPTY -> {
-                            FileLog.i(TAG, "VD stack empty")
-                            onStackEmpty?.invoke()
-                        }
-                        else -> {
-                            FileLog.w(TAG, "Unknown VD msg type: 0x${msgType.toString(16)}")
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                FileLog.e(TAG, "Command relay error", e)
-                isConnected = false
+    private fun handleRelayMessage(msgType: Byte) {
+        when (msgType) {
+            VdLifecycle.MSG_STACK_EMPTY -> {
+                FileLog.i(TAG, "VD stack empty")
+                onStackEmpty?.invoke()
+            }
+            else -> {
+                FileLog.w(TAG, "Unknown VD msg type: 0x${msgType.toString(16)}")
             }
         }
     }
@@ -251,7 +256,7 @@ class VirtualDisplayClient(
     }
 
     companion object {
-        private const val TAG = "VirtualDisplayClient"
+        internal const val TAG = "VirtualDisplayClient"
         // Port the VD server reverse-connects to. Matches Ports.LIFECYCLE_PORT.
         const val SERVER_PORT = com.dilinkauto.protocol.Ports.LIFECYCLE_PORT
         // Lifecycle wire constants (MSG_DISPLAY_READY / MSG_STACK_EMPTY / CMD_STOP)
@@ -265,3 +270,71 @@ class VirtualDisplayClient(
         private const val STOP_WRITE_JOIN_MS = 1000L
     }
 }
+
+/**
+ * 命令 relay 的日志出口。
+ *
+ * [FileLog] 直接依赖 `android.util.Log`，在 JVM 单测里既不能被断言、也不该被触发，
+ * 所以把 relay 用到的最小日志面抽成接口 —— issue #24 的回归钉子靠它区分 I/E。
+ */
+internal interface RelayLog {
+    fun info(msg: String)
+    fun warn(msg: String)
+    fun error(msg: String, err: Throwable)
+}
+
+/** 命令 relay 循环的终止原因。 */
+internal enum class RelayEnd {
+    /** 对端在消息边界关闭：用户关车机 App、旋转重握手、会话结束 —— 正常断开。 */
+    PEER_CLOSED,
+
+    /** 本地 `disconnect()` 让循环条件失效，或无消息可读后自然退出。 */
+    STOPPED,
+
+    /** 真实故障（协议错位、读超时等），已经记 E。 */
+    FAILED,
+}
+
+/**
+ * 命令 relay 的单帧读循环。
+ *
+ * [readType] 读的是消息类型字段，永远位于消息边界，因此允许它返回 `null` 表示
+ * 对端已关闭 —— 正常断开不应走异常路径，更不该记 E（issue #24）。
+ * 协程取消必须原样上抛：吞掉取消会破坏 `cancelAndJoin()` 的语义。
+ */
+internal suspend fun commandRelayLoop(
+    readType: suspend () -> Byte?,
+    shouldContinue: () -> Boolean,
+    onMessage: (Byte) -> Unit,
+    log: RelayLog
+): RelayEnd {
+    return try {
+        while (currentCoroutineContext().isActive && shouldContinue()) {
+            val msgType = readType()
+            if (msgType == null) {
+                // 消息边界上的 EOF：用户关车机 App、旋转重握手、会话结束。
+                log.info("Command relay closed by peer (EOF at message boundary)")
+                return RelayEnd.PEER_CLOSED
+            }
+            onMessage(msgType)
+        }
+        RelayEnd.STOPPED
+    } catch (e: CancellationException) {
+        // 取消不是故障：原样上抛，否则 cancelAndJoin() 的语义被打断。
+        throw e
+    } catch (e: EOFException) {
+        log.info("Command relay closed by peer (EOF)")
+        RelayEnd.PEER_CLOSED
+    } catch (e: Exception) {
+        log.error("Command relay error", e)
+        RelayEnd.FAILED
+    }
+}
+
+/** relay 在 App 里的真实日志出口。 */
+private val fileRelayLog = object : RelayLog {
+    override fun info(msg: String) = FileLog.i(VirtualDisplayClient.TAG, msg)
+    override fun warn(msg: String) = FileLog.w(VirtualDisplayClient.TAG, msg)
+    override fun error(msg: String, err: Throwable) = FileLog.e(VirtualDisplayClient.TAG, msg, err)
+}
+
