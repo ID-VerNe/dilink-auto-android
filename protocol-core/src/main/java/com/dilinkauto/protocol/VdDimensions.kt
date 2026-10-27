@@ -28,7 +28,10 @@ package com.dilinkauto.protocol
  *    identically at DPI 120/200/300/400.
  *  - DPI: a car-side override (coerced to [120, 480]) bypasses the
  *    portrait-app-safe cap; otherwise auto-calibrate for a ~380dp logical
- *    width in landscape.
+ *    width in landscape. **The car-reported density is scaled by the same
+ *    anti-crop factor as the viewport** — the car reports density for its own
+ *    (smaller) viewport, so using it verbatim on the enlarged VD makes the UI
+ *    render too small (issue #20).
  */
 object VdDimensions {
 
@@ -53,8 +56,11 @@ object VdDimensions {
         val isPhoneLandscape = phoneRealWidth > phoneRealHeight
         val phonePhysicalWidth =
             if (isPhoneLandscape == isCarLandscape) phoneRealWidth else phoneRealHeight
+        // 放大倍数要保留到 DPI 计算：车机上报的密度是按它自己的视口算的，
+        // VD 放大多少倍，同一逻辑密度就要跟着放大多少倍（#20）。
+        var scale = 1f
         if (vdWidth < phonePhysicalWidth) {
-            val scale = phonePhysicalWidth.toFloat() / vdWidth
+            scale = phonePhysicalWidth.toFloat() / vdWidth
             vdWidth = DimAlign.even((vdWidth * scale).toInt())
             vdHeight = DimAlign.even((vdHeight * scale).toInt())
         }
@@ -62,7 +68,13 @@ object VdDimensions {
         val dpi = if (request.dpiOverride > 0) {
             VdDeployArgs.coerceDpiOverride(request.dpiOverride)
         } else {
-            VideoConfig.calculateOptimalDpi(vdWidth, vdHeight, request.screenDpi)
+            // 未放大时 scale = 1，行为与原来完全一致；放大后把车机上报密度
+            // 一起放大，否则 120..320 区间内会被原样保留，导致 UI 相对 VD 过小。
+            VideoConfig.calculateOptimalDpi(
+                vdWidth,
+                vdHeight,
+                (request.screenDpi * scale).toInt(),
+            )
         }
         return Triple(vdWidth, vdHeight, dpi)
     }

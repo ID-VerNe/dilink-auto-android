@@ -37,7 +37,8 @@ class VdDimensionsTest {
         val (w, h, dpi) = VdDimensions.compute(defaultRequest(), 1368, 3192)
         assertEquals(3192, w)
         assertEquals(1794, h) // 1080 * 3192/1920 = 1795.5 -> even-round down
-        assertEquals(160, dpi) // car-reported 160 is in [120,320], below maxSafe
+        // 车机密度 160 按放大倍数 1.6625 缩放成 266（#20）
+        assertEquals(266, dpi)
     }
 
     @Test
@@ -45,7 +46,7 @@ class VdDimensionsTest {
         val (w, h, dpi) = VdDimensions.compute(defaultRequest(), 3192, 1368)
         assertEquals(3192, w)
         assertEquals(1794, h)
-        assertEquals(160, dpi)
+        assertEquals(266, dpi)
     }
 
     @Test
@@ -70,7 +71,8 @@ class VdDimensionsTest {
         )
         assertEquals(1080, w)
         assertEquals(1920, h)
-        assertEquals(160, dpi)
+        // 放大 1.5 倍后车机密度 160 -> 240（#20）
+        assertEquals(240, dpi)
     }
 
     @Test
@@ -109,6 +111,19 @@ class VdDimensionsTest {
             defaultRequest(dpiOverride = 999), 1368, 3192
         )
         assertEquals(480, dpi)
+    }
+
+    @Test
+    fun carSmallViewport_reportedDpiScalesWithVdScale() {
+        // 实车现场（#20 复现）：车机 1204x660 @160dpi，手机真实 1368x3192。
+        // VD 被放大 2.6512 倍到 3192x1748，车机密度要同步放大到约 424，
+        // 落出 120..320 带后由 golden 公式给出 377；修复前这里是 160。
+        val (w, h, dpi) = VdDimensions.compute(
+            defaultRequest(carW = 1204, carH = 660), 1368, 3192
+        )
+        assertEquals(3192, w)
+        assertEquals(1748, h)
+        assertEquals(377, dpi)
     }
 
     @Test
