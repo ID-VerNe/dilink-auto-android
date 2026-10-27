@@ -28,7 +28,8 @@ import java.util.concurrent.atomic.AtomicBoolean
  *   (`REQUEST_SYNC_FRAME`，issue #9). Pipeline-thread owned, hence a plain flag
  *   handoff rather than an encoder call from this (Lifecycle/Touch) thread.
  * @param repairLayerTree SF 层树脱同步的最后一级修复（`VirtualDisplayCreator.ensureDtaAttached()`），
- *   只由 [healDisplay] 在 WM 侧判据都正常时调用（issue #15）。
+ *   由 [healDisplay] 在 WM 侧判据都正常时调用（issue #15），以及 [recheckLayersAfterFill]
+ *   在 `fill` 之后补一次复查（issue #19）。健康设备上它零副作用。
  * @param allowedPackages 车机可见应用的包名集合（issue #21，来自部署端 argv）。空集合 =
  *   部署端没下传，建屏恢复不做白名单过滤（车机/桌面 ADB 路径的既有行为）。
  */
@@ -44,6 +45,15 @@ internal class CarCommandRouter(
 ) {
     /** [healDisplay] 的并发去重：车机端每 15s 重试一次，叠加时不能嵌套执行。 */
     private val healInFlight = AtomicBoolean(false)
+
+    /**
+     * [recheckLayersAfterFill] 的并发去重（issue #19）。
+     *
+     * 连点启动多个应用会并发跑出多个 fill 线程；旋转往返本身会抖动 display，
+     * 同一时刻只允许一次。被跳过的那次由 #15 的 [healDisplay] 阶梯兜底
+     * （车机侧 6s 判黑 → 15s 自愈）。
+     */
+    private val layerRecheckInFlight = AtomicBoolean(false)
 
     fun dispatch(f: FrameCodec.Frame) {
         PipeLog.log("Car command received: 0x${Integer.toHexString(f.messageType.toInt() and 0xFF)}")
@@ -316,6 +326,8 @@ internal class CarCommandRouter(
                     PipeLog.log("quickSwitch: am start -> ${out?.trim()?.replace(Regex("\\s+"), " ")?.take(200) ?: "<no output>"}")
                     // 旧会话遗留的小窗任务切回前台时同样铺满（新任务由 launchApp 铺满）。
                     fillTask(target.taskId, id)
+                    // 跨 display 迁移 + resize 同样是脱同步的触发形态（issue #19）。
+                    recheckLayersAfterFill()
                 }
             } catch (e: Exception) { PipeLog.err("quickSwitch: ${e.message}") }
         }, "QuickSwitch").start()
@@ -355,6 +367,9 @@ internal class CarCommandRouter(
                         PipeLog.log("launchApp: fill skipped — '$pkg' never became display $id's top task")
                     } else {
                         fillTask(taskId, id)
+                        // issue #19：DTA 被踢出层树就发生在这次 resize 之后约 1.6s
+                        // （创建期那次检查必然读到健康），所以 fill 完必须再查一次。
+                        recheckLayersAfterFill()
                     }
                 }
             } catch (e: Exception) { PipeLog.err("launchApp fill: ${e.message}") }
@@ -378,6 +393,36 @@ internal class CarCommandRouter(
         }
         val out = execOut("am task resize $taskId 0 0 $w $h")
         PipeLog.log("fill: task $taskId -> 0,0-$w,$h out='${out?.trim()?.replace(Regex("\\s+"), " ")?.take(120) ?: "<no output>"}'")
+    }
+
+    /**
+     * `fill` 之后延迟复查一次 SF 层树（issue #19）。
+     *
+     * 为什么不能紧跟着查：实车证据是 `am task resize` 之后**约 1.6s** 才看到
+     * `DefaultTaskDisplayArea` 被挪到根的 `Offscreen Hierarchy` 下。立刻查会读到
+     * 脱同步之前的状态（健康）→ 判定"无需修复"，正好漏掉这次故障。
+     *
+     * 为什么挂在 fill 之后而不是帧循环轮询（候选 B）：健康会话不必持续付出
+     * dumpsys 开销；fill 是已确认的唯一触发点（创建期检查由
+     * `PipelineServer` 建屏后那次覆盖）。
+     *
+     * 全程在当前后台线程（"FillDisplay"/"QuickSwitch"）里跑，绝不阻塞 TouchReader。
+     * 健康设备上 [repairLayerTree] 只做一次 dumpsys 就返回；只有在真的孤立时才
+     * 会做旋转往返（最多 2 轮 × 3s）。
+     */
+    private fun recheckLayersAfterFill() {
+        if (!layerRecheckInFlight.compareAndSet(false, true)) {
+            PipeLog.log("layer recheck: already in flight, skip")
+            return
+        }
+        try {
+            Thread.sleep(LAYER_RECHECK_DELAY_MS)
+            repairLayerTree()
+        } catch (e: Exception) {
+            PipeLog.err("layer recheck: ${e.message}")
+        } finally {
+            layerRecheckInFlight.set(false)
+        }
     }
 
     fun moveTopApp(fromDisplay: Int, toDisplay: Int) {
@@ -497,6 +542,12 @@ internal class CarCommandRouter(
 
         /** [healDisplay] 每步复查前的等待：am start / move-stack 落地都是异步的。 */
         const val HEAL_VERIFY_MS = 400L
+
+        /**
+         * [recheckLayersAfterFill] 的等待：实车是 `am task resize` 之后约 1.6s 才
+         * 观察到 DTA 被踢出层树（issue #19），1.5s 会早于故障发生，取 1.8s 留余量。
+         */
+        const val LAYER_RECHECK_DELAY_MS = 1_800L
 
         /** 自愈路径落盘的 display 段长度上限，见 [summarizeDisplay]。 */
         const val HEAL_DUMP_LOG_CHARS = 2000
