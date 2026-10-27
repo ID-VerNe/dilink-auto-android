@@ -42,6 +42,15 @@ object ControlMsg {
      * 与 SET_DISPLAY_POWER 同走输入口 9639 的 CONTROL 通道，由 vd-server 执行。
      */
     const val REQUEST_SYNC_FRAME: Byte = 0x33
+    /**
+     * Car/PC → Phone: VD 内容持续纯黑但解码仍在出帧时，请求手机侧做一次显示自愈。
+     *
+     * 与"重握手重建 VD"（[com.dilinkauto.protocol.BlackScreenDetector.onSustainedBlackScreen]）
+     * 是两条不同的路：重建 VD 会打断整条会话（issue #11 已证明对纯色画面是误伤），
+     * 而这里只让手机侧重新确认 VD 上的可见性（issue #15：多开应用后顶层 task
+     * `visibleRequested=false`，内容纯黑且无法自恢复）。payload 为空。
+     */
+    const val REQUEST_DISPLAY_HEAL: Byte = 0x34
 }
 
 /** Video channel message types */
