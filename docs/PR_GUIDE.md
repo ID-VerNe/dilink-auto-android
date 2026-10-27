@@ -83,7 +83,18 @@ git worktree add .tmp/wt-<issue> -b <type>/<issue>-<slug> main
 
 ## 合并条件（全满足才合）
 
-1. **CI 全绿**：`.github/workflows/build.yml` 的 `build` 通过（PR 上执行 `:app-client:assembleDebug :app-client:testDebugUnitTest`）。`main` 当前未开分支保护，这条靠自觉执行，不因"按钮能点"就合。
+1. **CI 全绿，且 CI 确实跑过**：用命令验证，不靠肉眼「按钮能点」：
+
+   ```powershell
+   gh pr checks <NN>
+   ```
+   - 输出**非空**（有 check）且**全部 success**（exit 0）才合格。输出为空 = CI 没跑（见下「fork 启用前置」），**不因按钮能点就合**。
+   - 「CI 没跑」与「CI 红了」同等不合格；「本机等价门禁」不再代替 CI —— PR 正文「## 测试」段必须**同时**贴本机 `.\gradlew.bat` 原始输出与 CI run 链接，缺一即视为未验证。
+   - `.github/workflows/build.yml` 在 push 与 pull_request 上都执行 `:app-client:assembleDebug :app-client:testDebugUnitTest`，跑在 `ubuntu-latest`。
+
+   **fork 启用前置**：本仓库是 fork，GitHub 默认不自动运行 fork 的 workflow。首次使用前，owner 必须在仓库 Actions 页点过「I understand my workflows, go ahead and enable them」按钮，否则任何 PR/push 都零 check（`gh pr checks` 输出为空）。启用只对未来事件生效，**不回溯补跑**已合并的 PR。`actions/permissions` 显示 `enabled:true` 与「Actions 页未启用」是两个不同开关，前者为 true 不代表后者已点。
+
+   `main` 当前未开分支保护，以上全靠自觉执行。
 2. **无冲突**：GitHub 显示可合并。有冲突不强行合——在 worktree 里 `git merge origin/main`（或 rebase）解决，重跑构建与单测后再推。
 3. 适用时有 `## 基线验证` 段。
 4. 行为类 PR 合并后不直接关 issue，走下面的对账与回签。
