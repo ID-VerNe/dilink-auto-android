@@ -8,7 +8,6 @@ import com.dilinkauto.client.FileLog
 import com.dilinkauto.client.MainActivity
 import com.dilinkauto.client.ShizukuManager
 import com.dilinkauto.protocol.AppPrefs
-import com.dilinkauto.protocol.ImeRestore
 import com.dilinkauto.protocol.VdDeploy
 import com.dilinkauto.protocol.VdProbeResult
 import kotlinx.coroutines.CoroutineScope
@@ -37,7 +36,8 @@ import java.util.concurrent.atomic.AtomicBoolean
  * only `setDisplayPowerMode(2)` / `cmd display power-reset` can, which needs
  * shell privileges (Shizuku).
  *
- * Layers (tried in order, each independent):
+ * Layers (tried in order, each independent) — 具体执行与判定见
+ * [DisplayRestoreSequence]：
  *  1. Shizuku: graceful-stop (sentinel + wait + force kill) + `cmd display
  *     power-reset` + IME restore.
  *  2. PowerManager.wakeUp() via reflection — system-level wake.
@@ -100,15 +100,14 @@ internal class PhoneDisplayRestorer(
         try {
             FileLog.i(TAG, "Force-waking physical display")
 
-            // Layer 0: Restore SurfaceFlinger-level display power via Shizuku.
+            // Shizuku 优雅停止三步（协议见 VdDeploy 类头）：ART 的 app_process 收
+            // SIGTERM 直接终止、**不跑 shutdown hook**（2026-10-10 MI 9 实测：
+            // 进程 1 秒内消失、cleanup 零执行），所以先用哨兵文件请引擎自己
+            // 走正常退出路径、把 cleanup 完整跑完（面板/letterbox/IME/
+            // screen_off_timeout 恢复 + VD 释放），再轮询等它退出；超时才
+            // -9 兜底（强杀路径接受 cleanup 被跳过的代价）。
             if (ShizukuManager.isAvailable) {
                 try {
-                    // 优雅停止三步（协议见 VdDeploy 类头）：ART 的 app_process 收
-                    // SIGTERM 直接终止、**不跑 shutdown hook**（2026-10-10 MI 9 实测：
-                    // 进程 1 秒内消失、cleanup 零执行），所以先用哨兵文件请引擎自己
-                    // 走正常退出路径、把 cleanup 完整跑完（面板/letterbox/IME/
-                    // screen_off_timeout 恢复 + VD 释放），再轮询等它退出；超时才
-                    // -9 兜底（强杀路径接受 cleanup 被跳过的代价）。
                     ShizukuManager.execAndWait(VdDeploy.gracefulStopCommand)
                     var engineExited = false
                     val engineDeadline = System.currentTimeMillis() + ENGINE_EXIT_WAIT_MS
@@ -123,22 +122,6 @@ internal class PhoneDisplayRestorer(
                         FileLog.w(TAG, "VD server did not exit within ${ENGINE_EXIT_WAIT_MS}ms — force kill")
                         ShizukuManager.execAndWait(VdDeploy.killCommandForce)
                     }
-                    // 点亮物理屏的正确子命令是 `power-reset`。2026-10-10 MI 9 /
-                    // Android 15 实机 `cmd display help` 证明 **`power-on` 子命令
-                    // 不存在**（旧写法报 "Unknown command" 且被 `2>/dev/null` 吞掉，
-                    // 反射路径一旦失败，物理屏就再也点不亮）。power-reset = "Turn
-                    // the DISPLAY_ID power to a state the display supposed to have"
-                    // —— 实机验证可点亮被 power-off 的物理屏（与 vd-server 的
-                    // DisplayPowerController 同一修法 / 同一实机结论）。
-                    ShizukuManager.execAndWait("cmd display power-reset 0 2>/dev/null")
-                    val targetIme = savedIme
-                        ?: appContext.getSharedPreferences(AppPrefs.FILE_NAME, Context.MODE_PRIVATE)
-                            .getString(AppPrefs.SAVED_DEFAULT_IME, null)
-                    if (ImeRestore.shouldRestoreIme(targetIme)) {
-                        ShizukuManager.execAndWait(ImeRestore.imeRestoreCommandLine(targetIme!!))
-                        FileLog.i(TAG, "Original IME restored via Shizuku: $targetIme")
-                    }
-                    FileLog.i(TAG, "Physical display restored via Shizuku (stop + power-reset + IME)")
                 } catch (e: Exception) {
                     FileLog.w(TAG, "Shizuku display restore failed: ${e.message}")
                 }
@@ -146,61 +129,86 @@ internal class PhoneDisplayRestorer(
                 FileLog.w(TAG, "Shizuku unavailable — relying on framework wake layers only")
             }
 
-            val pm = appContext.getSystemService(Context.POWER_SERVICE) as PowerManager
+            val targetIme = savedIme
+                ?: appContext.getSharedPreferences(AppPrefs.FILE_NAME, Context.MODE_PRIVATE)
+                    .getString(AppPrefs.SAVED_DEFAULT_IME, null)
 
-            // Layer 1: PowerManager.wakeUp() — direct system call
-            try {
-                val wakeUp = PowerManager::class.java.getDeclaredMethod(
-                    "wakeUp", Long::class.javaPrimitiveType,
-                    Int::class.javaPrimitiveType, String::class.java
-                )
-                wakeUp.invoke(pm, SystemClock.uptimeMillis(),
-                    5 /* WAKE_REASON_APPLICATION */, "DiLink:restore")
-                FileLog.i(TAG, "Display wakeUp() succeeded")
-            } catch (e: Exception) {
-                FileLog.d(TAG, "wakeUp() not available: ${e.message}")
-            }
-
-            // Layer 2: Launch MainActivity with FLAG_TURN_SCREEN_ON.
-            try {
-                // Direct reference, not Class.forName (audit A-L19): the class
-                // lives in the same module, so the reflection only bought a
-                // runtime "class not found" surface with no benefit.
-                val intent = Intent(appContext, MainActivity::class.java)
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                intent.addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
-                intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
-                intent.addFlags(0x10000000) // FLAG_TURN_SCREEN_ON
-                appContext.startActivity(intent)
-                FileLog.i(TAG, "Launched MainActivity with FLAG_TURN_SCREEN_ON")
-            } catch (e: Exception) {
-                FileLog.d(TAG, "Activity launch for wake failed: ${e.message}")
-            }
-
-            // Layer 3: WakeLock with ACQUIRE_CAUSES_WAKEUP
-            @Suppress("DEPRECATION")
-            val flags = PowerManager.SCREEN_BRIGHT_WAKE_LOCK or
-                PowerManager.ACQUIRE_CAUSES_WAKEUP or
-                PowerManager.ON_AFTER_RELEASE
-            val wl = pm.newWakeLock(flags, "DiLink:display:restore2")
-            try {
-                wl.acquire(3000)
-            } finally {
-                // try/finally + isHeld (audit A-L20): acquire() throws when
-                // the framework refuses (e.g. the timeout arg is invalid on a
-                // vendor ROM), and releasing a lock that failed to acquire —
-                // or that the 3s timeout already auto-released — throws
-                // RuntimeException from here, skipping nothing else in this
-                // method only because the restore is already done.
-                if (wl.isHeld) wl.release()
+            val report = sequence.run(targetIme)
+            if (report.anyDisplayLayerOk) {
+                FileLog.i(TAG, "物理屏恢复汇总：${report.describe()}")
+            } else {
+                FileLog.w(TAG, "物理屏恢复失败：所有层均未生效（${report.describe()}）")
             }
         } catch (e: Exception) {
             FileLog.w(TAG, "forceWakeScreen error: ${e.message}")
         }
     }
 
+    /** 第 1/2/4 层的真实实现：判定与日志由 [DisplayRestoreSequence] 负责。 */
+    private val sequence = DisplayRestoreSequence(
+        shell = { cmd ->
+            ShizukuManager.execAndWait(cmd)?.let { ShellOutcome(it.stdout, it.stderr) }
+        },
+        wakeUpFn = { wakeUpViaReflection() },
+        launchActivityFn = { launchMainActivityForWake() },
+        wakeLockFn = { acquireRestoreWakeLock() },
+        log = fileLogAdapter,
+    )
+
+    /** Layer 2: PowerManager.wakeUp() — direct system call. */
+    @android.annotation.SuppressLint("BlockedPrivateApi")
+    private fun wakeUpViaReflection() {
+        val pm = appContext.getSystemService(Context.POWER_SERVICE) as PowerManager
+        val wakeUp = PowerManager::class.java.getDeclaredMethod(
+            "wakeUp", Long::class.javaPrimitiveType,
+            Int::class.javaPrimitiveType, String::class.java
+        )
+        wakeUp.invoke(pm, SystemClock.uptimeMillis(), 5 /* WAKE_REASON_APPLICATION */, "DiLink:restore")
+    }
+
+    /** Layer 3: Launch MainActivity with FLAG_TURN_SCREEN_ON. */
+    private fun launchMainActivityForWake() {
+        // Direct reference, not Class.forName (audit A-L19): the class
+        // lives in the same module, so the reflection only bought a
+        // runtime "class not found" surface with no benefit.
+        val intent = Intent(appContext, MainActivity::class.java)
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        intent.addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        intent.addFlags(0x10000000) // FLAG_TURN_SCREEN_ON
+        appContext.startActivity(intent)
+    }
+
+    /** Layer 4: WakeLock with ACQUIRE_CAUSES_WAKEUP. */
+    @Suppress("DEPRECATION")
+    private fun acquireRestoreWakeLock() {
+        val pm = appContext.getSystemService(Context.POWER_SERVICE) as PowerManager
+        val flags = PowerManager.SCREEN_BRIGHT_WAKE_LOCK or
+            PowerManager.ACQUIRE_CAUSES_WAKEUP or
+            PowerManager.ON_AFTER_RELEASE
+        val wl = pm.newWakeLock(flags, "DiLink:display:restore2")
+        try {
+            wl.acquire(3000)
+        } finally {
+            // try/finally + isHeld (audit A-L20): acquire() throws when
+            // the framework refuses (e.g. the timeout arg is invalid on a
+            // vendor ROM), and releasing a lock that failed to acquire —
+            // or that the 3s timeout already auto-released — throws
+            // RuntimeException from here, skipping nothing else in this
+            // method only because the restore is already done.
+            if (wl.isHeld) wl.release()
+        }
+    }
+
     companion object {
         private const val TAG = "PhoneDisplayRestorer"
+
+        /** FileLog 适配器：恢复序列只依赖日志接缝，不直接依赖 Android。 */
+        private val fileLogAdapter = object : RestoreLog {
+            override fun i(msg: String) { FileLog.i(TAG, msg) }
+            override fun w(msg: String) { FileLog.w(TAG, msg) }
+            override fun d(msg: String) { FileLog.d(TAG, msg) }
+        }
 
         /**
          * 等引擎优雅退出的上限（哨兵文件 → 完整 cleanup → 退出）。
