@@ -59,7 +59,13 @@ class PipelineServer(
      * address). The engine runs as shell UID with otherwise unauthenticated
      * ports, so anything that CAN determine it must pass it.
      */
-    private val carHost: String? = null
+    private val carHost: String? = null,
+    /**
+     * issue #21：车机可见应用的包名集合（手机端 allowlist）。只在 [CarCommandRouter]
+     * 的建屏恢复里生效，约束 `ensureContent` 不得把白名单外的应用拉进 VD。
+     * 空集合 = 部署端没下传（车机/桌面 ADB 路径），行为与引入前一致。
+     */
+    private val allowedPackages: Set<String> = emptySet()
 ) {
     /**
      * S-L2：fps 来自 argv，可能是遗留/被手改的 pref（含 0）。`1_000_000_000L / 0`
@@ -117,7 +123,9 @@ class PipelineServer(
         requestSyncFrame = { syncFrameRequested.set(true) },
         // issue #15：车机请求"显示自愈"时的最后一级 —— SF 层树脱同步修复，
         // 复用创建期那套旋转往返（见 VirtualDisplayCreator.ensureDtaAttached）。
-        repairLayerTree = { vdCreator.ensureDtaAttached() }
+        repairLayerTree = { vdCreator.ensureDtaAttached() },
+        // issue #21：建屏恢复只允许挑车机 App 列表里的应用（空集合 = 不过滤）。
+        allowedPackages = allowedPackages
     )
     private lateinit var glPipeline: GlPipeline
 
@@ -170,8 +178,11 @@ class PipelineServer(
             // passes the receiver IP it is serving; accepts from any other host
             // are refused. `-`/absent keeps the legacy accept-any behaviour.
             val carHost = args.getOrNull(8)?.takeIf { it.isNotBlank() && it != VdDeployArgs.CAR_HOST_ANY }
+            // issue #21：第 10 个槽位是「允许上车的应用」逗号清单，`-`/缺省 = 不过滤。
+            val allowed = VdDeployArgs.parseAllowedPackages(args.getOrNull(9))
             log("Starting: VD=${w}x${h} @${d}dpi, encode=${ew}x${eh}, phoneHost=$ph, fps=$f, bitrate=${br/1_000_000}M, carHost=${carHost ?: "ANY"}")
-            PipelineServer(w, h, d, ph, ew, eh, f, br, carHost).run()
+            log("Allowlist: ${if (allowed.isEmpty()) "not handed down (no recents filtering)" else "${allowed.size} packages"}")
+            PipelineServer(w, h, d, ph, ew, eh, f, br, carHost, allowed).run()
         }
         private fun log(msg: String) = PipeLog.log(msg)
         private fun err(msg: String) = PipeLog.err(msg)

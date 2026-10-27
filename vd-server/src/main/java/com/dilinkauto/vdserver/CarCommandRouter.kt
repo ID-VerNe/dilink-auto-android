@@ -29,6 +29,8 @@ import java.util.concurrent.atomic.AtomicBoolean
  *   handoff rather than an encoder call from this (Lifecycle/Touch) thread.
  * @param repairLayerTree SF 层树脱同步的最后一级修复（`VirtualDisplayCreator.ensureDtaAttached()`），
  *   只由 [healDisplay] 在 WM 侧判据都正常时调用（issue #15）。
+ * @param allowedPackages 车机可见应用的包名集合（issue #21，来自部署端 argv）。空集合 =
+ *   部署端没下传，建屏恢复不做白名单过滤（车机/桌面 ADB 路径的既有行为）。
  */
 internal class CarCommandRouter(
     private val exec: (String) -> Unit,
@@ -38,6 +40,7 @@ internal class CarCommandRouter(
     private val setDisplayPower: (Boolean) -> Unit,
     private val requestSyncFrame: () -> Unit,
     private val repairLayerTree: () -> Unit,
+    private val allowedPackages: Set<String> = emptySet(),
 ) {
     /** [healDisplay] 的并发去重：车机端每 15s 重试一次，叠加时不能嵌套执行。 */
     private val healInFlight = AtomicBoolean(false)
@@ -252,10 +255,14 @@ internal class CarCommandRouter(
             val current = sec?.let { TOP_ACTIVITY_RE.find(it) }?.groupValues?.get(2)?.toIntOrNull()
             val recents = execOut("dumpsys activity recents 2>/dev/null")
                 ?.let { RecentsParser.parse(it) } ?: emptyList()
-            val target = RecentsParser.pickQuickSwitchTarget(recents, current, SELF_PACKAGE)
+            // issue #21：建屏恢复属于系统替用户做的动作，只在车机白名单内挑选目标；
+            // 白名单外的应用（银行/相册/Shizuku 管理器等）不得被拉到车机屏。
+            val target = RecentsParser.pickQuickSwitchTarget(recents, current, SELF_PACKAGE, allowedPackages)
             PipeLog.log(
                 "ensureContent: display=$id has no visible window (before='${summarizeDisplay(sec)}'), " +
-                    "${recents.size} live tasks, target=" +
+                    "${recents.size} live tasks, allowlist=" +
+                    (allowedPackages.size.takeIf { it > 0 }?.toString() ?: "<not handed down>") +
+                    ", target=" +
                     (target?.let { "${it.packageName}#${it.taskId}" } ?: "<none>")
             )
             if (target == null) {

@@ -685,6 +685,10 @@ class ConnectionService : Service() {
             // engine before its first stdout flush — vd-server.log stays at 0
             // bytes. `setsid` detaches the engine into its own session so it
             // survives the parent sh's exit.
+            // issue #21：引擎读不到本 App 的 allowlist prefs，部署时把「允许上车」的包名
+            // 集合经 argv 下传，建屏恢复（ensureContent）才不会把白名单外的私有应用
+            // 拉到车机屏。null = 从未配置（全量放行），此时不下传，保持引擎原有行为。
+            val allowedPackages = appListBuilder.allowedPackages().orEmpty()
             val plan = VdDeploy.buildDeployPlan(
                 jarPath = jarPath,
                 logPath = logPath,
@@ -697,7 +701,8 @@ class ConnectionService : Service() {
                 // serving. The phone knows the car's IP from the control
                 // connection's remote address; without this any host on the
                 // phone's WiFi could drive the shell-UID engine.
-                carHost = controlConnection?.remoteAddress ?: VdDeployArgs.CAR_HOST_ANY
+                carHost = controlConnection?.remoteAddress ?: VdDeployArgs.CAR_HOST_ANY,
+                allowedPackages = allowedPackages
             )
 
             // Order, convergence rule and the force-kill fallback all live in
