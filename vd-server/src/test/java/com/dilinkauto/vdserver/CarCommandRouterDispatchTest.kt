@@ -325,4 +325,66 @@ Display #7 (activities from top to bottom):
         assertTrue(r.execOuts.contains("am display move-stack 34033 7"))
         assertEquals(1, r.layerRepairs.get())
     }
+
+    // ─── issue #17：会话建立后 VD 里必须有窗口 ───
+
+    private val emptyDisplayDump = "Display #7 (activities from top to bottom):\n"
+
+    /** 实车样本（`dumpsys activity recents`）：自家控制端必须被排除。 */
+    private val recentsSample = """
+  * RecentTaskInfo #0: 
+    id=2039 userId=0 hasTask=true lastActiveTime=849748141
+    baseIntent=Intent { act=android.intent.action.MAIN cat=[android.intent.category.LAUNCHER] flg=0x10200000 cmp=com.autonavi.minimap/com.autonavi.map.activity.SplashActivity }
+  * RecentTaskInfo #1: 
+    id=2040 userId=0 hasTask=true lastActiveTime=849625054
+    baseIntent=Intent { act=android.intent.action.MAIN cat=[android.intent.category.LAUNCHER] flg=0x10200000 cmp=com.dilinkauto.client/.MainActivity }
+"""
+
+    @Test
+    fun `ensure content leaves a display that already shows a window alone`() {
+        // 已有可见 task（例如 moveTopApp 刚把前台应用搬进来）→ 不得再动任务，
+        // 也不该再去读 recents（白抖一次画面）。
+        val r = Rig(); r.activitiesDump = visibleDump
+        r.router.ensureDisplayHasContent(7)
+
+        assertTrue("已有窗口时不得发 am 命令", r.execOuts.none { it.startsWith("am start") })
+        assertTrue("已有窗口时不得读 recents", r.execOuts.none { it.startsWith("dumpsys activity recents") })
+    }
+
+    @Test
+    fun `ensure content restores the most recent app when the display is empty`() {
+        // 实车缺陷（issue #17）：新建 VD 后 display 段里没有 Task{ }，编码器只能出
+        // 纯黑帧。这里锁住补救动作 —— 把最近一次被镜像的应用（排除自家控制端）
+        // 用 am start --task 迁进 VD。
+        val r = Rig()
+        r.activitiesDump = emptyDisplayDump
+        r.recentsDump = recentsSample
+        r.router.ensureDisplayHasContent(7)
+
+        assertTrue(
+            r.execOuts.contains(
+                "am start --display 7 --task 2039 -n 'com.autonavi.minimap/com.autonavi.map.activity.SplashActivity'"
+            )
+        )
+        assertTrue("恢复后必须复查 display 段", r.execOuts.count { it.startsWith("dumpsys activity activities") } >= 2)
+    }
+
+    @Test
+    fun `ensure content issues nothing when recents only has self and launcher`() {
+        // 没有可恢复的应用（只剩自家控制端/launcher）→ 只记日志，不发 am 命令；
+        // 该场景首次帧仍是纯黑，留给后续 issue。
+        val r = Rig()
+        r.activitiesDump = emptyDisplayDump
+        r.recentsDump = """
+  * RecentTaskInfo #0: 
+    id=2040 userId=0 hasTask=true lastActiveTime=849625054
+    baseIntent=Intent { cmp=com.dilinkauto.client/.MainActivity }
+  * RecentTaskInfo #1: 
+    id=3000 userId=0 hasTask=true lastActiveTime=849625000
+    baseIntent=Intent { cmp=com.meizu.flyme.launcher/com.android.launcher3.uioverrides.QuickstepLauncher }
+"""
+        r.router.ensureDisplayHasContent(7)
+
+        assertTrue("无可恢复目标时不得发 am start", r.execOuts.none { it.startsWith("am start") })
+    }
 }
