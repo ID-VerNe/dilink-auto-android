@@ -22,6 +22,34 @@ android {
         }
     }
 
+    // 与 app-client 同源的发布签名：正式 keystore 只在口令环境变量齐全时启用，
+    // 缺失且没显式放行 debug 签名时，release 构建在配置阶段直接失败（audit B-12），
+    // 不再产出装不上的 -unsigned.apk（车机端此前完全没有 release signingConfig）。
+    val releaseKeystorePassword = System.getenv("RELEASE_KEYSTORE_PASSWORD")
+    val releaseKeyPassword = System.getenv("RELEASE_KEY_PASSWORD")
+    val wantsRelease = gradle.startParameter.taskNames.any {
+        it.contains("release", ignoreCase = true)
+    }
+    // 显式放行「release 变体 + debug 签名」，语义同 app-client：
+    // 只在本地拿不到正式 keystore 口令时才用，必须显式置 1。
+    val allowDebugSignedRelease = System.getenv("ALLOW_DEBUG_SIGNED_RELEASE") == "1"
+    if (releaseKeystorePassword != null && releaseKeyPassword != null) {
+        signingConfigs {
+            create("release") {
+                storeFile = file(System.getenv("RELEASE_KEYSTORE_FILE") ?: "../app-client/dilink-auto-release.keystore")
+                storePassword = releaseKeystorePassword
+                keyAlias = System.getenv("RELEASE_KEY_ALIAS") ?: "dilinkauto"
+                keyPassword = releaseKeyPassword
+            }
+        }
+    } else if (wantsRelease && !allowDebugSignedRelease) {
+        throw GradleException(
+            "Release build requested but RELEASE_KEYSTORE_PASSWORD / " +
+                "RELEASE_KEY_PASSWORD are not set. Set both, or set " +
+                "ALLOW_DEBUG_SIGNED_RELEASE=1 to sign the release variant with the debug key."
+        )
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
@@ -31,6 +59,16 @@ android {
                 "proguard-rules.pro"
             )
         }
+    }
+
+    // 正式 keystore 可用时，release 用正式签名；否则按显式放行走 debug key，
+    // 避免 release 变体落成 unsigned。
+    signingConfigs.findByName("release")?.let { releaseConfig ->
+        buildTypes.getByName("release").signingConfig = releaseConfig
+    }
+    if (signingConfigs.findByName("release") == null && allowDebugSignedRelease && wantsRelease) {
+        buildTypes.getByName("release").signingConfig = signingConfigs.getByName("debug")
+        logger.lifecycle("[signing] ALLOW_DEBUG_SIGNED_RELEASE=1 — release 变体使用 debug key 签名")
     }
 
     buildFeatures {

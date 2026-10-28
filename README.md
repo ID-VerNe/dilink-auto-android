@@ -6,7 +6,7 @@
 
 实测车型:**比亚迪 秦PLUS DM-i 2023款 冠军版 55KM 领先型**。该款车机是 DiLink 4.0 低配方案 —— 骁龙 439(8x Cortex-A53 全小核、Adreno 505)、4GB RAM、16GB eMMC、1280x800 屏、仅 2.4GHz WiFi、Android 9 / API 28、H.264 硬件解码上限 1080p。本 fork 的性能调优全部围绕这套硬件展开。
 
-当前版本:**0.18.0-dev-13**(`versionCode 58`)。
+当前版本:**1.0.0**(`versionCode 59`)。
 
 原本要解决的矛盾是:手机(小米 HyperOS 国行版等)装不了 Android Auto,而车机只支持 Android Auto —— 中间没有桥。DiLink-Auto 对任何 Android 10+ 手机都通用,有没有 Google 服务都行。
 
@@ -171,7 +171,7 @@ app-desktop --probe
 - 部分应用不铺满屏幕(信箱化/仅竖屏)。DiLink-Auto 把横屏虚拟显示器镜像到车机,不支持横屏方向的应用会出现黑边 —— 这由应用自身决定,镜像侧无法解决。
 - API 26-28 车机上,若 DisplayControl 反射失败,`cmd display power-reset`/`power-off` shell 回退也是 API 29+(无 `power-on` 子命令),物理面板可能无法恢复(会打日志,不再静默)。
 - 安装进度在中文等非英文界面语言下不显示 —— `InstallStatus.parse` 只按英文子串分类安装状态串,而状态串本身是本地化文案;中文界面下全部落入 `IDLE`,阶段勾选与错误颜色都不出现。已用测试固定现状,未修(`docs/IMPLEMENTATION_REPORT_TESTING.md` C-6)。
-- 车机应用首装在极端版本号下可能被跳过 —— 车机未安装时 `readInstalledVersion` 返回 `"0"`,若内嵌 `versionName` 也是 `0` / `0.0` / `0.0.0` 这种形式,比较结果会被判"已最新"而跳过首装。当前 `versionName` 为 `0.18.0-dev-13`,不触发(同上 C-5)。
+- 车机应用首装在极端版本号下可能被跳过 —— 车机未安装时 `readInstalledVersion` 返回 `"0"`,若内嵌 `versionName` 也是 `0` / `0.0` / `0.0.0` 这种形式,比较结果会被判"已最新"而跳过首装。当前 `versionName` 为 `1.0.0`,不触发(同上 C-5)。
 
 ---
 

@@ -59,11 +59,11 @@
 
 | 编号 | 位置 | 现象 |
 |------|------|------|
-| C-5 | `app-client` `Versioning` / `CarAppInstaller` | 车机未安装时 `readInstalledVersion` 返回 `"0"`;若内嵌 `versionName` 也是 `0` / `0.0` / `0.0.0` 形式,比较结果判为"已最新",**跳过本应进行的首装**。当前 `0.18.0-dev-13` 不触发 |
+| C-5 | `app-client` `Versioning` / `CarAppInstaller` | 车机未安装时 `readInstalledVersion` 返回 `"0"`;若内嵌 `versionName` 也是 `0` / `0.0` / `0.0.0` 形式,比较结果判为"已最新",**跳过本应进行的首装**。当前 `1.0.0` 不触发 |
 | C-6 | `app-client` `InstallStatus.parse` | 状态串由 `context.getString` 本地化产出,分类却只按英文子串;中文等非英文 locale 全部落入 `IDLE`(无进度、无错误),且 `"not reachable"` / `"Invalid IP"` 也不归类为 ERROR。建议改走结构化状态枚举 |
 | S-02 | `vd-server` `CarCommandRouter.dispatch` | `LAUNCH_APP` / `APP_UNINSTALL` 的 decode 未加保护(包名已有 `shellQuote` + 解码器形状校验),恶意包名仍能让读帧线程抛异常;`APP_INFO` 分支有 try/catch |
 | — | 解码器重启竞争 | 偶发花屏,下一个关键帧(~1s)恢复,见根 README「已知限制」 |
 
 ## 下载
 
-不提供具体版本号(代码版本与 Release tag 不一致,以 [Releases](https://github.com/ID-VerNe/dilink-auto-android/releases/latest) 为准)。当前代码版本:`versionName = 0.18.0-dev-13` / `versionCode = 58`(`gradle.properties`),主要变化为 VD 泄漏修复 + 清理幂等 + 黑屏自愈,之后的测试补齐与安全加固尚未改版本号。
+不提供具体版本号(代码版本与 Release tag 不一致,以 [Releases](https://github.com/ID-VerNe/dilink-auto-android/releases/latest) 为准)。当前代码版本:`versionName = 1.0.0` / `versionCode = 59`(`gradle.properties`)。

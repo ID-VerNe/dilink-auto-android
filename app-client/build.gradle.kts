@@ -36,6 +36,10 @@ android {
     val wantsRelease = gradle.startParameter.taskNames.any {
         it.contains("release", ignoreCase = true)
     }
+    // 显式放行「release 变体 + debug 签名」：只在本地想拿混淆后的安装包、又拿不到
+    // 正式 keystore 口令时使用。必须显式设 ALLOW_DEBUG_SIGNED_RELEASE=1 才生效，
+    // 默认行为仍是缺口令即失败（audit B-12），不会静默产出 unsigned 包。
+    val allowDebugSignedRelease = System.getenv("ALLOW_DEBUG_SIGNED_RELEASE") == "1"
     if (releaseKeystorePassword != null && releaseKeyPassword != null) {
         signingConfigs {
             create("release") {
@@ -45,7 +49,7 @@ android {
                 keyPassword = releaseKeyPassword
             }
         }
-    } else if (wantsRelease) {
+    } else if (wantsRelease && !allowDebugSignedRelease) {
         // Audit B-12: without this the release build silently produced an
         // UNSIGNED APK (uninstallable over a properly signed build, and
         // publishable to a release channel by accident). A release build with
@@ -79,6 +83,12 @@ android {
     signingConfigs.findByName("release")?.let { releaseConfig ->
         buildTypes.getByName("release").signingConfig = releaseConfig
         buildTypes.getByName("debug").signingConfig = releaseConfig
+    }
+    // 没有正式 keystore、但显式放行了 debug 签名：release 变体改用 debug key 签，
+    // 否则 AGP 会产出装不上的 -unsigned.apk。
+    if (signingConfigs.findByName("release") == null && allowDebugSignedRelease && wantsRelease) {
+        buildTypes.getByName("release").signingConfig = signingConfigs.getByName("debug")
+        logger.lifecycle("[signing] ALLOW_DEBUG_SIGNED_RELEASE=1 — release 变体使用 debug key 签名")
     }
 
     buildFeatures {
