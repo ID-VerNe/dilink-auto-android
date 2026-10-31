@@ -29,7 +29,7 @@ class Connection(
     init {
         channel.configureBlocking(false)
         val sock = channel.socket()
-        sock.sendBufferSize = SOCKET_BUF_BYTES    // request 256KB
+        sock.sendBufferSize = SOCKET_BUF_BYTES    // request 512KB（issue #70：显式设置即内核不再自动调大，故这值就是硬上限）
         sock.receiveBufferSize = SOCKET_BUF_BYTES
         sock.tcpNoDelay = true
         sock.keepAlive = true
@@ -406,12 +406,16 @@ class Connection(
         private const val FLUSH_GRACE_MS = 500L
 
         /**
-         * TCP send/receive buffer request (256KB). Raised above the OS default
+         * TCP send/receive buffer request (512KB). Raised above the OS default
          * because 1080p keyframes burst larger than the default window.
          * Public because vd-server's socket setup uses the same value — this
          * constant is the single source for both ends of the video path.
+         *
+         * issue #70：显式设置 SO_SNDBUF 会关掉内核自动调大，所以这是个**硬上限**。
+         * 原来是 256KB，2.5h 导航日志里关键帧突发把缓冲填满后出现连续 5s 零进展
+         * （`Write timed out`），整条会话被判死重连；加到 512KB 多留一档突发余量。
          */
-        const val SOCKET_BUF_BYTES = 262144
+        const val SOCKET_BUF_BYTES = 524288
 
         suspend fun connect(host: String, port: Int, scope: CoroutineScope): Connection =
             connect(host, port, scope, CONNECT_TIMEOUT_MS)

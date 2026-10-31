@@ -143,7 +143,14 @@ class PipelineServer(
 
     companion object {
         private const val BITRATE = VideoConfig.DEFAULT_BITRATE // alias — bitrate bounds live in VideoConfig
-        private const val I_FRAME_INTERVAL = 1
+        /**
+         * 关键帧间隔（秒）。issue #70：原来是 1，等价于每秒一次大 I 帧突发——
+         * 实测（2.5h 日志 `keys=659 / 15731 frames @24fps`）正好 ≈1 IDR/s。
+         * 突发撞上 WiFi 抖动时，256KB 发送缓冲 5s 排不空就把引擎打退重连。
+         * 车机端缺帧时会主动索要 IDR（[CarCommandRouter] 的 REQUEST_SYNC_FRAME），
+         * 所以拉长到 3s 只影响「自然刷新」节奏，不拖慢断链恢复。
+         */
+        private const val I_FRAME_INTERVAL = 3
         private const val WATCHDOG_GRACE_MS = 3000L
         private const val SOCKET_BUF_BYTES = Connection.SOCKET_BUF_BYTES // single source: protocol-core
 
