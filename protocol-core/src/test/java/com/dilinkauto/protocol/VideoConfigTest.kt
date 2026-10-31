@@ -11,8 +11,9 @@ class VideoConfigTest {
 
     @Test
     fun `frame interval is integer derived`() {
-        // 锁定 1000/24 = 41ms；改 TARGET_FPS 会连带改掉所有管线超时的推导，必须显性失败
-        assertEquals(41L, VideoConfig.FRAME_INTERVAL_MS)
+        // 锁定 1000/20 = 50ms（issue #71 起 24 → 20 fps）；
+        // 改 TARGET_FPS 会连带改掉所有管线超时的推导，必须显性失败
+        assertEquals(50L, VideoConfig.FRAME_INTERVAL_MS)
     }
 
     @Test

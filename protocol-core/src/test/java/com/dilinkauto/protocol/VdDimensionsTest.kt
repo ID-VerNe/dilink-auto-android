@@ -31,22 +31,24 @@ class VdDimensionsTest {
 
     @Test
     fun realPhonePortrait_carLandscape_scalesToTruePhysicalLongEdge() {
-        // The 2026-10-09 test phone: real 1368x3192 @560dpi (portrait).
-        // Compat-scaled metrics report 2992 for the long edge — this test
-        // pins that 3192 (the true width the IME renders at) wins.
-        val (w, h, dpi) = VdDimensions.compute(defaultRequest(), 1368, 3192)
-        assertEquals(3192, w)
-        assertEquals(1794, h) // 1080 * 3192/1920 = 1795.5 -> even-round down
-        // 车机密度 160 按放大倍数 1.6625 缩放成 266（#20）
-        assertEquals(266, dpi)
+        // 2026-10-09 的回归钉：调用方必须传真实物理尺寸而不是兼容缩放值。
+        // issue #71 起放大封顶 2560，3192 的机型已经分不出 3192 / 2992（两边都被封顶），
+        // 所以这条钉子改用长边 2400 的手机（兼容模式会报 2200 左右）。
+        val (w, h, dpi) = VdDimensions.compute(defaultRequest(), 1080, 2400)
+        assertEquals(2400, w)
+        assertEquals(1350, h) // 1080 * 2400/1920
+        // 车机密度 160 按放大倍数 1.25 缩放成 200（#20）
+        assertEquals(200, dpi)
     }
 
     @Test
     fun landscapePhone_usesLongEdgeAsPhysicalWidthToo() {
+        // 3192 长边超过封顶 2560 → 只放大到 2560；1080 * 2560/1920 = 1440（#71）
         val (w, h, dpi) = VdDimensions.compute(defaultRequest(), 3192, 1368)
-        assertEquals(3192, w)
-        assertEquals(1794, h)
-        assertEquals(266, dpi)
+        assertEquals(2560, w)
+        assertEquals(1440, h)
+        // 160 * (2560/1920) = 213，仍落在 120..320 带内且 maxSafe=320 不截断
+        assertEquals(213, dpi)
     }
 
     @Test
@@ -87,12 +89,12 @@ class VdDimensionsTest {
 
     @Test
     fun oddCarViewport_isEvenAlignedBeforeScaling() {
-        // 1921x1081 evens to 1920x1080 first, then follows the standard path.
+        // 1921x1081 evens to 1920x1080 first, then follows the standard path (封顶 2560).
         val (w, h, _) = VdDimensions.compute(
             defaultRequest(carW = 1921, carH = 1081), 1368, 3192
         )
-        assertEquals(3192, w)
-        assertEquals(1794, h)
+        assertEquals(2560, w)
+        assertEquals(1440, h)
     }
 
     @Test
@@ -100,8 +102,8 @@ class VdDimensionsTest {
         val (w, h, dpi) = VdDimensions.compute(
             defaultRequest(dpiOverride = 300), 1368, 3192
         )
-        assertEquals(3192, w)
-        assertEquals(1794, h)
+        assertEquals(2560, w)
+        assertEquals(1440, h)
         assertEquals(300, dpi)
     }
 
@@ -115,41 +117,54 @@ class VdDimensionsTest {
 
     @Test
     fun carSmallViewport_reportedDpiScalesWithVdScale() {
-        // 实车现场（#20 复现）：车机 1204x660 @160dpi，手机真实 1368x3192。
-        // VD 被放大 2.6512 倍到 3192x1748，车机密度要同步放大到约 424，
-        // 落出 120..320 带后由 golden 公式给出 377；修复前这里是 160。
+        // 实车现场（#20 复现 / #71 发烫）：车机 1204x660 @160dpi，手机真实 1368x3192。
+        // 封顶前 VD 会放大 2.6512 倍到 3192x1748（每帧 5.58MP，实测持续发烫）；
+        // issue #71 封顶 2560 → 2560x1402（-36% 合成像素），车机密度同步放大到 340，
+        // 落出 120..320 带后由 golden 公式给出 302。
         val (w, h, dpi) = VdDimensions.compute(
             defaultRequest(carW = 1204, carH = 660), 1368, 3192
         )
-        assertEquals(3192, w)
-        assertEquals(1748, h)
-        assertEquals(377, dpi)
+        assertEquals(2560, w)
+        assertEquals(1402, h)
+        assertEquals(302, dpi)
+    }
+
+    @Test
+    fun upscaleIsCappedAtMaxUpscaledWidth() {
+        // 手机物理长边远超上限时，VD 只到 [VdDimensions.MAX_UPSCALED_WIDTH]。
+        // 代价：输入法按物理宽渲染，会在这里被裁掉 3200-2560 = 640px（约 20%），
+        // 这是 issue #71 明确接受的取舍（发烫 vs 键盘）。
+        val (w, _, _) = VdDimensions.compute(
+            defaultRequest(carW = 1204, carH = 660), 1440, 3200
+        )
+        assertEquals(VdDimensions.MAX_UPSCALED_WIDTH, w)
     }
 
     @Test
     fun carDpiOutsideAutoBand_fallsBackToGoldenDpi() {
-        // 480 is outside [120,320] -> golden = 1794*0.52*160/385 = 387,
-        // below maxSafe (1794*80/360 = 398), so it survives the final clamp.
+        // 480 放大后是 640，落出 [120,320] → golden = 1440*0.52*160/385 = 311，
+        // maxSafe = 1440*80/360 = 320，所以 golden 值原样保留。
         val (_, _, dpi) = VdDimensions.compute(
             defaultRequest(carDpi = 480), 1368, 3192
         )
-        assertEquals(387, dpi)
+        assertEquals(311, dpi)
     }
 
     @Test
-    fun imeFullWidthInvariant_holdsForBothOrientations() {
-        // The whole point of the anti-crop scale: the VD's long edge must be
-        // >= the phone's physical long edge whenever the car viewport is
-        // narrower, because the IME renders at the physical width.
+    fun imeWidthInvariant_holdsUpToTheUpscaleCap() {
+        // anti-crop 的本意：VD 长边 >= 手机物理长边（IME 按物理宽渲染）。
+        // issue #71 起放大封顶 2560，超过上限的机型必然裁掉一部分键盘 ——
+        // 这里钉住「上限以内仍然满足」，超上限的行为由 upscaleIsCappedAtMaxUpscaledWidth 覆盖。
         val fixtures = listOf(
             Triple(1368, 3192, 3192L), // portrait phone, long edge 3192
             Triple(3192, 1368, 3192L), // landscape phone, long edge 3192
         )
         for ((pw, ph, longEdge) in fixtures) {
             val (w, _, _) = VdDimensions.compute(defaultRequest(), pw, ph)
+            val required = minOf(longEdge, VdDimensions.MAX_UPSCALED_WIDTH.toLong())
             assertTrue(
-                "VD width $w must be >= physical long edge $longEdge (phone ${pw}x$ph)",
-                w >= longEdge
+                "VD width $w must be >= $required (phone ${pw}x$ph, cap ${VdDimensions.MAX_UPSCALED_WIDTH})",
+                w >= required
             )
         }
     }

@@ -43,7 +43,7 @@ Manual install (only if you have ADB access to the car and want to bypass the au
 
 1. Plug the phone into the car's USB port — the car app auto-launches — or connect the phone and car to the same WiFi network.
 2. Phone and car connect over the WiFi track (USB is only used to bootstrap ADB; streaming itself is over WiFi TCP).
-3. The phone deploys the VD server (`vd-server.jar` extracted to `/sdcard/DiLinkAuto/`, started as `app_process` running as shell UID) and streaming begins at 24 fps, 4 Mbps CBR H.264 Main profile.
+3. The phone deploys the VD server (`vd-server.jar` extracted to `/sdcard/DiLinkAuto/`, started as `app_process` running as shell UID) and streaming begins at 20 fps, 4 Mbps CBR H.264 Main profile.
 4. Use the car touchscreen to interact with phone apps. The persistent nav bar at the bottom of the car screen has three buttons: **Eject** (disconnect session), **Home**, and **Back**. There is no notification button, recent-apps rail, clock, or network info — those were removed in this fork.
 5. Long-press an app tile on the car launcher to pin it to the top (or unpin). The phone-side Allowlist screen (`AllowlistScreen`) controls which installed apps appear on the car launcher at all.
 
@@ -98,7 +98,7 @@ When the phone connects to the car:
 5. **Three-connection setup:** after handshake the car opens video (`9638`) and input (`9639`) connections; the VD server reverse-connects to the phone on localhost:`19647` for the lifecycle channel.
 6. **Phone deploys VD server** — extracts `vd-server.jar` to `/sdcard/DiLinkAuto/`, starts `app_process` as shell UID with the VD dimensions, DPI, encode dims, and FPS as args.
 7. **VD server creates the VirtualDisplay** at the negotiated DPI (Auto or override) and runs the GL pipeline: frame clock → GL render → encoder drain → TCP write, all on a single thread with `System.nanoTime()` / `LockSupport.parkNanos()` timing.
-8. **Video streams** over WiFi TCP on port `9638` — H.264 Main profile, 4 Mbps CBR, 24 fps, encode dimensions capped at 1920x1080. Adaptive bitrate drops to 75% (never below a 1.5 Mbps floor) when the car stops draining, then climbs back in 0.5 Mbps steps after each 2s of clean writes.
+8. **Video streams** over WiFi TCP on port `9638` — H.264 Main profile, 4 Mbps CBR, 20 fps, encode dimensions capped at 1920x1080. Adaptive bitrate drops to 75% (never below a 1.5 Mbps floor) when the car stops draining, then climbs back in 0.5 Mbps steps after each 2s of clean writes.
 
 Port reference: `9637` control+data, `9638` video, `9639` touch input, `19647` lifecycle (VD server → phone localhost), `5555` ADB TCP.
 
