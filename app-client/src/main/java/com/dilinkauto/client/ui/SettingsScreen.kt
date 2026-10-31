@@ -83,9 +83,15 @@ fun SettingsScreen(
     val hasAllFiles = remember(permissionsKey) { PermissionChecker.hasAllFilesAccess() }
     val hasBattery = remember(permissionsKey) { PermissionChecker.hasBatteryExemption(context, pkg) }
     val hasAccessibility = remember(permissionsKey) { PermissionChecker.hasAccessibility(context, pkg) }
+    // 初值必须反映「真的会不会落盘」，而不是「偏好里存了什么」（issue #72）：
+    // release 下用户没设过开关时，旧写法显示「开」，运行时却按 BuildConfig.DEBUG
+    // 关掉了日志，整段导航一行都没记。
     var logEnabled by remember {
-        mutableStateOf(context.getSharedPreferences(com.dilinkauto.protocol.AppPrefs.FILE_NAME, android.content.Context.MODE_PRIVATE)
-            .getBoolean(com.dilinkauto.protocol.AppPrefs.LOG_ENABLED, true))
+        mutableStateOf(
+            com.dilinkauto.client.FileLog.isEnabledIn(
+                context.getSharedPreferences(com.dilinkauto.protocol.AppPrefs.FILE_NAME, android.content.Context.MODE_PRIVATE)
+            )
+        )
     }
 
     Column(

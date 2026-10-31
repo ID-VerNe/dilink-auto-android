@@ -26,8 +26,13 @@ internal class LogArchiver(
     private val logDir: File,
     /** Prefix identifying archives of this app's own logs. */
     private val archivePrefix: String = "client-",
-    /** Number of archives to keep. Total on disk = keep + the live file. */
-    private val keepArchives: Int = 9
+    /**
+     * Number of archives to keep. Total on disk = keep + the live file.
+     *
+     * 9 → 30（issue #72）：长时间导航中途反复断线重连，每次服务重启都会轮转一份
+     * 归档，9 份在几小时内就会被删光，早期现场反而留不下来。
+     */
+    private val keepArchives: Int = 30
 ) {
 
     /**

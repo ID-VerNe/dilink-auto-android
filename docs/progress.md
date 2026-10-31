@@ -447,7 +447,7 @@ VD Server binds `9638` (video) and `9639` (input) directly on `0.0.0.0`; the car
 - **Single-connection ADB.** `RemoteAdbController` simplified to use `TcpAdbConnection` (single socket, reused for all shell commands); Dadb dependency removed from the car → phone path (Dadb is still used by the phone → car `CarAppInstaller`).
 - **VD deployment fix.** `app_process` was killed when the ADB shell process exited (non-interactive shells kill background jobs). Fixed via `shellBackground` — keeps the ADB stream open so the VD server process survives.
 - **Phone screen restore order.** Reordered `PipelineServer` cleanup to restore the physical display BEFORE destroying the persistent shell process (was calling `input keyevent 224` after shell was already closed).
-- **Log toggle.** Settings → Debug → Diagnostic logs switch. Off = zero disk writes. Propagated to car via `LOG_TOGGLE` data message. Defaults: ON for debug/pre-release (`BuildConfig.DEBUG`), OFF for release; user choice persists via `AppPrefs.LOG_ENABLED` + `LOG_ENABLED_USER_SET`.
+- **Log toggle.** Settings → Debug → Diagnostic logs switch. Off = zero disk writes. Propagated to car via `LOG_TOGGLE` data message, and re-sent after every handshake so a reconnect no longer resets the car side to OFF (issue #72). The switch shows the effective state (release builds correctly start OFF). Defaults: ON for debug/pre-release (`BuildConfig.DEBUG`), OFF for release; user choice persists via `AppPrefs.LOG_ENABLED` + `LOG_ENABLED_USER_SET`.
 - **Port 19637 → 19647.** The lifecycle channel port was wrong in the upstream docs. `Discovery.LIFECYCLE_PORT = 19647`.
 
 ### Direct VD streaming refactor (commit 1c28d71 / fd89f0b)

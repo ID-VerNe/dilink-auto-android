@@ -80,7 +80,7 @@ object FileLog {
 
     /**
      * Rotate: rename current log with timestamp, start fresh.
-     * Keeps at most 10 log files (9 archived + current). Oldest are deleted.
+     * Keeps at most 30 log files (29 archived + current). Oldest are deleted.
      */
     /**
      * Read enabled state from SharedPreferences. Call on service start.
@@ -88,13 +88,24 @@ object FileLog {
      * Once user explicitly toggles, that choice persists regardless of build type.
      */
     fun loadEnabled(prefs: android.content.SharedPreferences) {
-        val userSet = prefs.getBoolean(AppPrefs.LOG_ENABLED_USER_SET, false)
-        enabled = if (userSet) {
-            prefs.getBoolean(AppPrefs.LOG_ENABLED, false)
-        } else {
-            com.dilinkauto.client.BuildConfig.DEBUG  // true for pre-release, false for release
-        }
+        enabled = isEnabledIn(prefs)
     }
+
+    /**
+     * 「开关是否真的在落盘」的唯一判定入口（issue #72）。
+     *
+     * 设置页此前直接读 `getBoolean(LOG_ENABLED, true)`：release 构建下用户没设过
+     * 开关时 UI 显示「开」，而 [loadEnabled] 按 [BuildConfig.DEBUG] 算出来是「关」，
+     * 于是开关在撒谎。UI 与运行时现在都走这一个入口，规则只有一份。
+     *
+     * 注意：默认仍然关闭，不为长时间导航的常态 I/O 增加发烫风险。
+     */
+    fun isEnabledIn(prefs: android.content.SharedPreferences): Boolean =
+        resolveLogEnabled(
+            userSet = prefs.getBoolean(AppPrefs.LOG_ENABLED_USER_SET, false),
+            userValue = prefs.getBoolean(AppPrefs.LOG_ENABLED, false),
+            debugBuild = com.dilinkauto.client.BuildConfig.DEBUG
+        )
 
     fun rotate() {
         queue.clear()
@@ -128,3 +139,17 @@ object FileLog {
         queue.offer("$level␞$tag␞$msg")
     }
 }
+
+/**
+ * 诊断日志开关的判定规则（issue #72）。
+ *
+ * 抽成纯函数是为了能被 JVM 单测直接覆盖：`FileLog` 是持有 writer 线程的对象，
+ * 在单测里构造它会真的开文件。
+ *
+ * @param userSet 用户是否在设置页显式切换过开关
+ * @param userValue 用户显式选择的值
+ * @param debugBuild 当前构建是否为 debug/pre-release
+ * @return 最终是否落盘
+ */
+internal fun resolveLogEnabled(userSet: Boolean, userValue: Boolean, debugBuild: Boolean): Boolean =
+    if (userSet) userValue else debugBuild

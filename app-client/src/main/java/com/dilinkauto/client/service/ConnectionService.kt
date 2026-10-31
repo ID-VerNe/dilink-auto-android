@@ -621,6 +621,13 @@ class ConnectionService : Service() {
                 return@launch
             }
 
+            // 每次握手（首连与旋转重握手都走这里）都把手机端的诊断开关同步给车机。
+            // 车机端 startConnection 会把 logWriter 重置成 BuildConfig.DEBUG，
+            // 旧的实现只有用户手动切换设置时才发 LOG_TOGGLE，于是 release 下每次
+            // 重连后车机日志都被静默关掉（issue #72）。放在握手响应之后，是因为
+            // 车机在发 HANDSHAKE_REQUEST 之前就注册好了 Channel.DATA 处理器。
+            syncLogToggle(conn)
+
             // If Shizuku is available, deploy VD server directly BEFORE waiting for lifecycle connection
             if (useShizuku) {
                 startVdServerViaShizuku(request.screenWidth, request.screenHeight, vdWidth, vdHeight, displayDpi, vdJarCrc)
@@ -644,6 +651,25 @@ class ConnectionService : Service() {
                     return@launch
                 }
             }
+        }
+    }
+
+    /**
+     * 把手机端的诊断日志开关下发给车机（issue #72）。
+     *
+     * 车机端 CarConnectionService 每次 `startConnection` 都会把
+     * `CarLogWriter` 重置为 `BuildConfig.DEBUG`（release 下为关），只有收到
+     * `DataMsg.LOG_TOGGLE` 才会重新打开。手机端只在用户手动切换设置时发过这一帧，
+     * 所以「手机上开着日志 + 中途断线重连」的组合会让车机端整段会话静默无日志。
+     *
+     * 失败不影响会话：一帧诊断数据的丢失不能反过来把连接打掉。
+     */
+    private fun syncLogToggle(conn: Connection) {
+        try {
+            conn.sendData(DataMsg.LOG_TOGGLE, byteArrayOf(if (FileLog.enabled) 1 else 0))
+            FileLog.i(TAG, "Log toggle synced to car: ${FileLog.enabled}")
+        } catch (e: Exception) {
+            FileLog.w(TAG, "Failed to sync log toggle to car: ${e.message}")
         }
     }
 
