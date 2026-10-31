@@ -254,8 +254,9 @@ internal class GlPipeline(
      * 请求一个 IDR，但**限流到 ≥1s 一次**。
      *
      * 现场日志（issue #3）：丢帧/降码率后立刻索要 IDR 会在大 I 帧上再卡一次写，
-     * 下一次采样又降码率——小正反馈。`I_FRAME_INTERVAL = 1` 本来就保证每秒一个
-     * 自然 IDR，这里只负责「丢过帧、参考链断了」时的尽快修复，不必每帧都发。
+     * 下一次采样又降码率——小正反馈。自然 IDR 的节奏由
+     * [PipelineServer] 的 `I_FRAME_INTERVAL` 决定（issue #70 起改为 3s），这里只负责
+     * 「丢过帧、参考链断了」时的尽快修复，不必每帧都发。
      *
      * 帧头布局与写截止时间在 [FrameCodec]（protocol-core）。
      */
