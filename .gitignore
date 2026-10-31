@@ -63,6 +63,9 @@ app-client/DiLinkAuto/
 # Agent scratch state (was only ignored via .git/info/exclude — audit B-I3)
 .freebuff/
 
+# Agent worktree 目录（AGENTS.md §3 规定的 .tmp/wt-<issue> 位置）
+/.tmp/
+
 # Python bytecode cache (explore.py 等)
 __pycache__/
 *.pyc
