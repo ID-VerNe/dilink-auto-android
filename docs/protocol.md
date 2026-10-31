@@ -36,7 +36,7 @@ The lifecycle channel on `localhost:19647` is documented in [client.md](./client
 - **Read path**: `FrameCodec.readFrame(NioReader)` (suspend) for coroutine callers (phone, car); `FrameCodec.readFrame(InputStream)` and `FrameCodec.readFrameBlocking(NioReader)` for blocking callers (VD server). The two blocking variants share one `readFrameCore` skeleton, and every path validates the declared payload size through the same `validatePayloadSize` before allocating anything.
 - **Reader buffer ceiling**: `NioReader.MAX_READ_UNIT` = `HEADER_SIZE + MAX_PAYLOAD_SIZE` is a hard ceiling for a single grow; `maybeShrink()` at each frame boundary drops an oversized buffer back to `DEFAULT_CAPACITY` (128 KB) so one big frame does not pin memory for the session.
 - **NioReader stalls**: `readStallTimeoutMs` (10 s on every `Connection`) fails a read that stalls *mid-frame* — partial bytes already buffered, then silence (half-open TCP, killed peer). An idle wait at a clean frame boundary (touch link with no user input) deliberately arms nothing and is never timed out.
-- **Write timeout**: `FrameCodec.writeAll` throws if no progress is made for 5 seconds (send buffer full / peer not reading). The `Connection` writer coroutine has no deadline of its own — the watchdog owns dead connections.
+- **Write timeout**: `FrameCodec.writeAll` throws if no progress is made for 10 seconds (send buffer full / peer not reading). Was 5s; raised in issue #70 — the deadline only resets on real byte progress, so 5s zero-progress on a 512KB buffer meant a brief WiFi hiccup killed the session. The `Connection` writer coroutine has no deadline of its own — the watchdog owns dead connections.
 - **Graceful close**: a clean peer EOF (`reader: EOF`) flushes already-queued frames for `FLUSH_GRACE_MS` (500 ms) before the writer is cancelled and the socket closed, so a `DISCONNECT` followed by FIN still delivers queued replies.
 - **Connect deadline**: `Connection.connect` fails after `CONNECT_TIMEOUT_MS` (10 s) instead of spinning `finishConnect()` forever on a black-holed SYN.
 - **Version check**: `requireSupportedProtocolVersion` rejects any `protocolVersion` != `PROTOCOL_VERSION` with `ProtocolDecodeException`. The field used to be carried and never validated, which decoded trailing fields at the wrong offsets.
@@ -185,7 +185,7 @@ H.264 NAL units representing a video frame.
 - Bitrate: 4 Mbps CBR (`VideoConfig.DEFAULT_BITRATE`, `PipelineServer.BITRATE`). Receiver-requested via `HandshakeRequest.bitrate`; deploy-argv validation range 0.5-20 Mbps (`INPUT_MIN_BITRATE`..`INPUT_MAX_BITRATE`), settings-UI range 1-12 Mbps. Adaptive fallback: floor 1.5 Mbps (`VideoConfig.ADAPTIVE_MIN_BITRATE`), drop to 75% of current on a stalled decoder, recovery with a 2 s window and 0.5 Mbps steps.
 - Frame rate: 20 fps (`VideoConfig.TARGET_FPS = 20`, issue #71). Car requests this via `targetFps` in handshake; settings UI accepts 10-60.
 - Frame interval: `1000 / 20` = 50 ms (`VideoConfig.FRAME_INTERVAL_MS`). Used as the max wait for video-path loops (encoder drain, SurfaceScaler redraw).
-- IDR interval: 1 second (`PipelineServer.I_FRAME_INTERVAL = 1`).
+- IDR interval: 3 seconds (`PipelineServer.I_FRAME_INTERVAL = 3`, issue #70). Was 1s; the 2.5h navigation log showed ~1 IDR/s (`keys=659 / 15731 frames @24fps`), which burned bandwidth on keyframes the car did not need.
 - SurfaceScaler: periodic re-draw every `FRAME_INTERVAL_MS` ensures encoder output on static content.
 
 **Keyframe identification**: `H264NalParser.isKeyFrame` (protocol-core) is the single definition shared by the car decoder and the Windows pipeline: it scans only the first ~1 KB of a frame for a 3-byte (`00 00 01`) or 4-byte (`00 00 00 01`) Annex B start code and tests `nal_header & 0x1F == 5` — the type mask, not the whole byte, because a real encoder emits `0x65` (`nal_ref_idc = 3`).
@@ -426,7 +426,7 @@ HEARTBEAT_INTERVAL    = 3000 ms  (control connection only, injectable)
 HEARTBEAT_TIMEOUT     = 10000 ms (control connection only, injectable)
 CONNECT_TIMEOUT_MS    = 10000 ms (TCP connect deadline)
 FLUSH_GRACE_MS        = 500 ms  (writer drain on a graceful peer close)
-SOCKET_BUF_BYTES      = 262144   (256 KB requested send/receive buffer)
+SOCKET_BUF_BYTES      = 524288   (512 KB requested send/receive buffer; explicit SO_SNDBUF = hard cap)
 WRITE_QUEUE_CAPACITY  = 64       (frames, BufferOverflow.SUSPEND)
 MAX_PAYLOAD_SIZE      = 16,777,216 bytes  (16 MB, FrameCodec)
 HEADER_SIZE           = 6 bytes  (4 length + 1 channel + 1 type)
