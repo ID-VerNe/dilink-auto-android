@@ -5,7 +5,14 @@ package com.dilinkauto.protocol
  * All waits/polls on the video path should use FRAME_INTERVAL_MS as their max timeout.
  */
 object VideoConfig {
-    const val TARGET_FPS = 24  // 24fps: 42ms/frame budget on weak A53+Adreno 505; cuts WiFi/GPU/allocation 20% vs 30fps
+    /**
+     * 默认目标帧率。issue #71：24 → 20（每帧预算 41ms → 50ms，管线节拍 -17%）。
+     *
+     * 24fps 是给 A53 + Adreno 505 那档车机留的折中；实车 2.5h 导航反馈手机持续发烫，
+     * 降帧是与 VD 放大封顶配套的第二档减压手段。车机若存过 `startup_fps` 偏好，
+     * 仍会按存值下发，需要在设置里同步改。
+     */
+    const val TARGET_FPS = 20
 
     /** UI-accepted frame-rate range for the settings screens' FPS field. */
     const val MIN_FPS = 10
@@ -39,7 +46,7 @@ object VideoConfig {
      */
     const val ADAPTIVE_MIN_BITRATE = 1_500_000
 
-    const val FRAME_INTERVAL_MS = 1000L / TARGET_FPS  // ~42ms at 24fps
+    const val FRAME_INTERVAL_MS = 1000L / TARGET_FPS  // 50ms at 20fps
     const val VIRTUAL_DISPLAY_DPI = 480  // legacy fallback constant
     const val TARGET_SW_DP = 600  // smallest-width dp for VD size calculation
     const val DEFAULT_FALLBACK_DPI = 160

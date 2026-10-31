@@ -34,7 +34,7 @@
 
 - **直连 VD 架构**:VD Server 直接绑定 9638/9639 端口与接收端对话,手机端不做视频/触摸中继。
 - **接收端可替换**:同一份协议跑在车机(`app-server`)或 Windows(`app-desktop`);纯 JVM 的部分抽到 `protocol-core`,三端共用。
-- **DiLink 4.0 低配车机适配**:编码尺寸 cap 1920x1080、码率 4Mbps、24fps、TextureView → SurfaceView、线程优先级、图标缓存清理等九项优化。
+- **DiLink 4.0 低配车机适配**:编码尺寸 cap 1920x1080、码率 4Mbps、20fps、TextureView → SurfaceView、线程优先级、图标缓存清理等九项优化。
 - **API 28 车机兼容**:移除 API 29+ 的硬件解码器 picker,minSdk 提到 26。
 - **导航栏重设计**:精简为 Eject / Home / Back 三键;通知转发、最近任务栏、时钟、网络信息全部移除。
 - **应用允许列表 + 应用置顶**:手机端选择推送到车机的应用,车机端长按置顶。

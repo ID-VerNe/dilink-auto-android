@@ -74,7 +74,7 @@ Foreground service managing the full connection lifecycle with a parallel prereq
 **VD Server Deploy:**
 - Delegated to `VdServerDeployer.deploy()` (or `deployDirect()` for the dev-mode TCP-ADB path). The deployer owns the retry counter and the TCP-ADB fallback policy (retries twice on transient "no ADB", then falls back to TCP ADB using the phone-host IP if known), assembles the plan with `VdDeploy.buildDeployPlan`, and runs the kill → wait-for-exit → launch sequence through `vdRunDeploySequence` — the orchestration in protocol-core that the phone's Shizuku path and the desktop adb.exe path also call, so the "wait for a real exit" rule cannot drift between deploy sites again.
 - Launch runs with `background = false` (`shellBackground` on the TCP transport keeps the ADB stream open). A `&`-backgrounded launch exits the shell immediately, which closes the car-side `TcpAdbConnection` stream and kills the engine it just started.
-- Args: `W H DPI PORT EW EH FPS` — `targetFps` from `VideoConfig.TARGET_FPS` (24), `bitrate` from `carPrefs.startupBitrate` (`VideoConfig.DEFAULT_BITRATE`, 4 Mbps)
+- Args: `W H DPI PORT EW EH FPS` — `targetFps` from `VideoConfig.TARGET_FPS` (20), `bitrate` from `carPrefs.startupBitrate` (`VideoConfig.DEFAULT_BITRATE`, 4 Mbps)
 
 **Rotation Re-Handshake:**
 - `onCarViewportChanged(widthPx, heightPx, dpi)` is called by `MainActivity.onConfigurationChanged` when the car panel rotates. If the viewport dims changed and the state is STREAMING or CONNECTED, the service cancels discovery loops and calls `rehandshakeOnExistingControl`, which tears down video/input (clearing their disconnect listeners so `handleDisconnect` is not invoked for the intentional teardown), clears `wifiReady`/`vdServerStarted`/`handshakeDone`, sets state to CONNECTING, and re-sends `HANDSHAKE_REQUEST` on the existing control connection with the new dims + current `startupDpi` — leaving the decoder running (see the Black Screen Re-Handshake section for why stopping it would black the screen). The phone tears down the old VD server, deploys a fresh one at the new dims, re-binds 9638/9639, and sends `VD_PORTS_BOUND` again — same flow as the initial connect, just without re-establishing the control TCP connection.
@@ -229,7 +229,7 @@ The live composables formerly in `LauncherScreen.kt` now live in `HomeScreen.kt`
 
 ### MirrorScreen
 
-Mirror content — `SurfaceView` for video + touch forwarding (`ui/screen/MirrorScreen.kt`). SurfaceView (not TextureView) so the decoder's output goes through a hardware overlay instead of an extra per-frame GL composite pass. On the Adreno 505 the TextureView composite cost (~2-5ms/frame at 1280x800) is a meaningful slice of the 42ms budget at 24fps; SurfaceView bypasses it entirely.
+Mirror content — `SurfaceView` for video + touch forwarding (`ui/screen/MirrorScreen.kt`). SurfaceView (not TextureView) so the decoder's output goes through a hardware overlay instead of an extra per-frame GL composite pass. On the Adreno 505 the TextureView composite cost (~2-5ms/frame at 1280x800) is a meaningful slice of the 50ms budget at 20fps; SurfaceView bypasses it entirely.
 
 Tradeoff: SurfaceView destroys its surface when the view goes INVISIBLE, where TextureView kept it alive. Navigation HOME<->APP toggles `visible`, so `surfaceCreated`/`surfaceDestroyed` fire on each switch. The decoder is NOT stopped on `surfaceDestroyed` — it stays running, and `VideoDecoder.invalidateSurface()` gates the render flag off so frames aren't dropped to a destroyed surface. `surfaceCreated` calls `switchSurface` (`setOutputSurface`) to re-attach, restoring rendering with zero keyframe loss. `handleDisconnect`/`shutdown` owns the final decoder stop.
 
@@ -273,7 +273,7 @@ Nine fixes target the Snapdragon 439 / Adreno 505 / 4GB RAM head unit:
 
 1. Encode dims capped to 1920x1080 (decoupled from VD dims via `EW EH` args; VD stays scaled-up to preserve the IME-crop fix, encode uses car-reported dims clamped to 1080p). Without this, >1080p phones trigger software decode on the 439 → single-digit fps.
 2. Bitrate 8 Mbps → 4 Mbps; adaptive fallback tightened (floor 1.5 Mbps, 2s recovery window, 0.5 Mbps steps — was 2 Mbps / 5s / 1 Mbps).
-3. Framerate 30 → 24 fps (`VideoConfig.TARGET_FPS = 24`). Per-frame budget 33ms → 42ms, -20% WiFi/GPU/allocation.
+3. Framerate 30 → 20 fps (`VideoConfig.TARGET_FPS = 20`). Per-frame budget 33ms → 50ms, -33% WiFi/GPU/allocation. (Was 24 fps before issue #71.)
 4. MirrorScreen TextureView → SurfaceView (bypass Adreno 505 per-frame GL composite; `outputSurfaceValid` gate prevents rendering to destroyed surface across navigation hide/show).
 5. Thread priorities: `THREAD_PRIORITY_URGENT_DISPLAY` on encode/decode/socket-drain threads; `THREAD_PRIORITY_BACKGROUND` on LifeWriter. A53 has no big cores.
 6. `carLogEnabled` defaults to `BuildConfig.DEBUG` (was true); `ConcurrentLinkedQueue.size()` (O(n)) → `AtomicInteger`.

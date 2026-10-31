@@ -17,7 +17,7 @@
 # 各采一次 A 的 screencap 方差（两次不同前缀），只判两件事——
 #   ① 切换后画面非纯黑（screencap_variance 自带 stddev>1.0 判据）；
 #   ② 画面发生过变化（两次 stddev 数值不同）。
-# 为什么宽松：镜像流 24fps（VideoConfig.TARGET_FPS）+ SurfaceScaler 周期重绘
+# 为什么宽松：镜像流 20fps（VideoConfig.TARGET_FPS）+ SurfaceScaler 周期重绘
 #（FRAME_INTERVAL_MS 保证静态内容也出帧），同一画面两次采样的 stddev 几乎必然
 # 不同；数值完全相同 ⇒ 画面静止/切换未生效（与 wait_stream_alive 的帧增长判据
 # 互相印证）。不断言具体哪个 app 上屏：网格首项命中取决于 B 的安装集与

@@ -36,6 +36,19 @@ package com.dilinkauto.protocol
 object VdDimensions {
 
     /**
+     * 放大上限（VD 宽度，px）。
+     *
+     * issue #71：anti-crop 放大的目的只有一个 —— 满足「输入法按物理宽渲染」的
+     * ROM 硬编码。但 VD 每帧都要整屏合成，本机（车机 1204x660、手机物理宽 3192）
+     * 被放大 2.65× 到 3192x1748，即每帧 5.58MP，是长时间导航持续发烫的主要来源。
+     * 封顶 2560 后同场景降到 2560x1402（合成像素 -36%）。
+     *
+     * 代价（明确记录）：物理宽超过 2560 的机型，输入法仍会被裁掉一部分
+     * （3192 → 2560 约 20%）。这是用发热换来的取舍，见 issue #71 的 plan 追评。
+     */
+    const val MAX_UPSCALED_WIDTH = 2560
+
+    /**
      * @param phoneRealWidth  real physical pixel width of the phone's default
      *   display (compat-scaling must be bypassed by the caller — see class
      *   KDoc).
@@ -59,10 +72,15 @@ object VdDimensions {
         // 放大倍数要保留到 DPI 计算：车机上报的密度是按它自己的视口算的，
         // VD 放大多少倍，同一逻辑密度就要跟着放大多少倍（#20）。
         var scale = 1f
-        if (vdWidth < phonePhysicalWidth) {
-            scale = phonePhysicalWidth.toFloat() / vdWidth
-            vdWidth = DimAlign.even((vdWidth * scale).toInt())
-            vdHeight = DimAlign.even((vdHeight * scale).toInt())
+        // issue #71：放大目标同时受 [MAX_UPSCALED_WIDTH] 约束（发烫）。
+        val targetWidth = minOf(phonePhysicalWidth, MAX_UPSCALED_WIDTH)
+        if (vdWidth < targetWidth) {
+            val sourceWidth = vdWidth
+            scale = targetWidth.toFloat() / sourceWidth
+            // 宽度直接取目标值，高度用整数比例算 —— 避免 `width * (target/width)`
+            // 的浮点回算误差（1080*3192/1920 = 1795.5，float 可能落到 1794/1796 两侧）。
+            vdWidth = DimAlign.even(targetWidth)
+            vdHeight = DimAlign.even(((vdHeight.toLong() * targetWidth) / sourceWidth).toInt())
         }
 
         val dpi = if (request.dpiOverride > 0) {

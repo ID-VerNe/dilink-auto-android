@@ -37,7 +37,7 @@ class VideoDecoderFpsTest {
 
     @Test
     fun inRangeFpsIsUntouched() {
-        assertEquals(24, VideoDecoder.coerceFps(VideoConfig.TARGET_FPS))
+        assertEquals(VideoConfig.TARGET_FPS, VideoDecoder.coerceFps(VideoConfig.TARGET_FPS))
         assertEquals(VideoConfig.MIN_FPS, VideoDecoder.coerceFps(VideoConfig.MIN_FPS))
         assertEquals(VideoConfig.MAX_FPS, VideoDecoder.coerceFps(VideoConfig.MAX_FPS))
     }

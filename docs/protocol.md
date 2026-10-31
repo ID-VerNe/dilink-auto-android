@@ -181,10 +181,10 @@ H.264 NAL units representing a video frame.
 **Encoding parameters** (set by VD server `PipelineServer`):
 - Codec: H.264/AVC
 - Profile: Main
-- Resolution: encode dimensions proportionally scaled down to fit inside 1920x1080 (`VdDeployArgs.MAX_ENCODE_WIDTH/HEIGHT`), decoupled from VD dimensions via the `EW EH` args. The VD stays scaled-up to preserve the IME-crop fix; the encoder uses car-reported dims clamped to 1080p. Scaling is aspect-preserving (the old per-axis clamp turned a 1080x2152 portrait viewport into a square 1080x1080). Without the cap, phones with >1080p output trigger software decode on low-spec car SoCs (e.g., Snapdragon 439) and drop to single-digit fps.
+- Resolution: encode dimensions proportionally scaled down to fit inside 1920x1080 (`VdDeployArgs.MAX_ENCODE_WIDTH/HEIGHT`), decoupled from VD dimensions via the `EW EH` args. The VD stays scaled-up to preserve the IME-crop fix (capped at 2560 px wide since issue #71); the encoder uses car-reported dims clamped to 1080p. Scaling is aspect-preserving (the old per-axis clamp turned a 1080x2152 portrait viewport into a square 1080x1080). Without the cap, phones with >1080p output trigger software decode on low-spec car SoCs (e.g., Snapdragon 439) and drop to single-digit fps.
 - Bitrate: 4 Mbps CBR (`VideoConfig.DEFAULT_BITRATE`, `PipelineServer.BITRATE`). Receiver-requested via `HandshakeRequest.bitrate`; deploy-argv validation range 0.5-20 Mbps (`INPUT_MIN_BITRATE`..`INPUT_MAX_BITRATE`), settings-UI range 1-12 Mbps. Adaptive fallback: floor 1.5 Mbps (`VideoConfig.ADAPTIVE_MIN_BITRATE`), drop to 75% of current on a stalled decoder, recovery with a 2 s window and 0.5 Mbps steps.
-- Frame rate: 24 fps (`VideoConfig.TARGET_FPS = 24`). Car requests this via `targetFps` in handshake; settings UI accepts 10-60.
-- Frame interval: `1000 / 24` ~= 42 ms (`VideoConfig.FRAME_INTERVAL_MS`). Used as the max wait for video-path loops (encoder drain, SurfaceScaler redraw).
+- Frame rate: 20 fps (`VideoConfig.TARGET_FPS = 20`, issue #71). Car requests this via `targetFps` in handshake; settings UI accepts 10-60.
+- Frame interval: `1000 / 20` = 50 ms (`VideoConfig.FRAME_INTERVAL_MS`). Used as the max wait for video-path loops (encoder drain, SurfaceScaler redraw).
 - IDR interval: 3 seconds (`PipelineServer.I_FRAME_INTERVAL = 3`, issue #70). Was 1s; the 2.5h navigation log showed ~1 IDR/s (`keys=659 / 15731 frames @24fps`), which burned bandwidth on keyframes the car did not need.
 - SurfaceScaler: periodic re-draw every `FRAME_INTERVAL_MS` ensures encoder output on static content.
 
@@ -416,8 +416,8 @@ VIDEO_PORT            = 9638  (VD server binds 0.0.0.0 -> car connects)
 INPUT_PORT            = 9639  (VD server binds 0.0.0.0 -> car connects)
 LIFECYCLE_PORT        = 19647 (VD server reverse-connects to phone localhost)
 ADB_PORT              = 5555  (standard ADB TCP port)
-TARGET_FPS            = 24
-FRAME_INTERVAL_MS     = 1000 / TARGET_FPS  (~= 42 ms)
+TARGET_FPS            = 20
+FRAME_INTERVAL_MS     = 1000 / TARGET_FPS  (~= 50 ms)
 DEFAULT_BITRATE       = 4000000  (4 Mbps, CBR start bitrate)
 ADAPTIVE_MIN_BITRATE  = 1500000  (runtime adaptive floor)
 BITRATE range (UI)    = 1000000 .. 12000000
