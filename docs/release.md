@@ -129,13 +129,13 @@ $sdk = "C:\Users\VerNe\AppData\Local\Android\Sdk\build-tools\36.0.0"
 | 4 | `RELEASE_*` 齐全时 debug 变体也用正式签名 | `app-client/build.gradle.kts:83-86` 会把 release signingConfig 套到 debug 变体上，**预发布流水线同样需要 keystore** | `build-pre-release.yml` 也要先解码 keystore |
 | 5 | 未跟踪文件污染版本串 | `.tmp/`（worktree 目录）未忽略时，`BUILD_REVISION` 恒为 `-dirty` | `/.tmp/` 已进 `.gitignore`；发版前仍要 `git status` 复核 |
 | 6 | 签名变更后覆盖安装 | 老包装机 → 新包 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`/签名不一致 | 首次迁移到正式签名时**先卸载旧包**；用户升级说明里要写明 |
-| 7 | 车机内嵌 APK 的变体 | `app-client/build.gradle.kts:223-248` 固定嵌入 `app-server-debug.apk`（audit B-05）；正式签名后，手机端自更新推给车机的是 **debug 签名**包，与已装的正式签名车机包签名不匹配，安装失败 | **尚未修复**，单独 issue 跟踪；在此之前，车机包请手动部署，或先卸载车机旧包再让手机推送 |
+| 7 | 车机内嵌 APK 的变体 | 旧行为固定嵌入 `app-server-debug.apk`（audit B-05）；正式签名后手机端自更新会推 debug 签名包，与车机上已装的正式签名包冲突 | **已修复（issue #37）**：`embedServerApk` 按客户端变体选 `app-server-release.apk` / `app-server-debug.apk`；`build-release.yml` 的 `Verify embedded car APK signature` 步骤比对两份产物的证书摘要，不一致即失败 |
 | 8 | `environment: release` 没有保护规则 | 首次运行会自动创建，但 `GET /repos/…/environments` 当前返回 `total_count: 0`，即**没有** required reviewers，tag 推上去会直接发版 | 想加审批闸门需要手建 environment 并配置 reviewers；不要以为写了 `environment:` 就有闸门 |
 | 9 | GitHub 标签过滤器的 `+` 语义 | 分支/标签过滤器里 `+` 表示"前一个字符一次或多次"，`v[0-9]+.[0-9]+.[0-9]+` 才能匹配 `v1.0.2`；它不是正则 | 改 tag 规则时按这个语义写，别用正则直觉 |
 | 10 | 历史 tag 的资产不会自动更新 | 改了构建配置后，旧 tag 的 Release 资产仍是旧包 | 用新 tag 发新版本；**不要**删 tag 重推 |
 | 11 | PowerShell 读 `local.properties` | `sdk.dir` 值带 `C\:\\…` 转义，直接喂给 `Get-ChildItem -Directory` 会报错 | 脚本里直接用 `C:\Users\VerNe\AppData\Local\Android\Sdk` 硬编码或用 `-LiteralPath` |
 | 12 | `gh` 走代理失败 | 本机代理让 `gh` 请求卡住 | 调用前 `$env:NO_PROXY=""` |
-| 13 | `Leave fork network` 不可逆 | 脱离 fork 会**永久**丢失该仓库的 issues / PR / wiki / stars / watchers / 评论 / 子 fork；GitHub 无对应 REST API，只能网页操作 | 脱离前先备份：`gh issue list --json …` + 逐条按编号与评论导出两份 JSON；不要把备份提交进仓库 |
+| 13 | `Leave fork network` 不可逆 | 只能在网页操作，没有 REST API。本仓库 2026-11-01 实测：脱离后 issues / PR / Release / secrets **全部保留**，只是 `parent` 与 fork 标记消失（`gh repo view --json isFork` 变 `false`、`parent` 变 `null`） | 操作不可逆，脱离前仍建议先导出备份（`gh issue list --json …` + 逐条评论）；备份不要提交进仓库 |
 | 14 | 退出 fork 前删本地 remote 不等于脱离 | `git remote remove upstream` 只影响本地；GitHub 侧 `isFork` 仍为 `true` | 以 `gh repo view <repo> --json isFork,parent` 为唯一判据 |
 
 ## 6. 应急处置

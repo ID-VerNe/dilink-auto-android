@@ -71,6 +71,21 @@ jobs:
           RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
           RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
 
+      # issue #37 回归门禁：release 客户端内嵌的车机包必须与 release 车机包同证书，
+      # 否则手机端自更新会把 debug 签名包推到车上，被 PM 以签名不一致拒绝。
+      # 比对的是两份产物本身的证书摘要，换 keystore 不需要改这里。
+      - name: Verify embedded car APK signature
+        run: |
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | head -1)
+          embedded=$("$APKSIGNER" verify --print-certs app-client/src/main/assets/app-server.apk | grep 'SHA-256 digest')
+          car=$("$APKSIGNER" verify --print-certs app-server/build/outputs/apk/release/app-server-release.apk | grep 'SHA-256 digest')
+          echo "embedded: $embedded"
+          echo "car:      $car"
+          if [ "$embedded" != "$car" ]; then
+            echo "内嵌车机包与 release 车机包证书不一致（issue #37）" >&2
+            exit 1
+          fi
+
       - name: Rename APKs
         run: |
           cp app-client/build/outputs/apk/release/app-client-release.apk DiLinkAuto-Phone.apk

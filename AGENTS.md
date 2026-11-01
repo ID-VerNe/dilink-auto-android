@@ -116,7 +116,8 @@ gh run list -R ID-VerNe/dilink-auto-android --limit 3
 - `RELEASE_*` 齐全时 debug 变体也会套正式签名（`app-client/build.gradle.kts:83-86`），预发布流水线同样要 keystore。
 - `.tmp/` 等未跟踪目录会让 `BUILD_REVISION`（`build.gradle.kts:14-23`）带 `-dirty`；`/.tmp/` 已在 `.gitignore`。
 - 正式签名上线后**旧包不能覆盖安装**，手机与车机都要先卸载。
-- `app-client/build.gradle.kts:223-248` 内嵌的是 `app-server-debug.apk`（audit B-05）：正式签名后车机自更新会签名不匹配，目前未修，车机包请手动部署。
+- `app-client` 的 `embedServerApk` 现在按客户端变体内嵌车机包（issue #37）：release 客户端内嵌正式签名车机包，debug 客户端内嵌 debug 包；`build-release.yml` 有证书摘要比对门禁，别把这条门禁删了。
+- `buildVdServer` 必须同时依赖 `:protocol:bundleLibRuntimeToJarDebug` —— release-only 构建里否则会因找不到 protocol 的 debug `classes.jar` 而 D8 失败。
 - `environment: release` 当前**没有**保护规则（`/environments` 返回 `total_count: 0`），tag 推上去会直接发版，别以为有审批闸门。
 - GitHub 的 tag 过滤器里 `+` 表示"前一个字符一次或多次"，不是正则的 `+`。
-- `Leave fork network` 不可逆且无 API，会丢 issues/PR/wiki/stars；脱离前先导出备份。
+- `Leave fork network` 不可逆且无 API；本仓库 2026-11-01 实测脱离后 issues / PR / Release / secrets 均保留（只是 `parent` 变 `null`），但操作前仍建议导出备份。
