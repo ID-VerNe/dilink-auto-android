@@ -6,6 +6,7 @@
 
 - 怎么发 issue：[docs/ISSUE_GUIDE.md](docs/ISSUE_GUIDE.md)
 - 怎么开 PR：[docs/PR_GUIDE.md](docs/PR_GUIDE.md)
+- 怎么发版、签名怎么配：[docs/release.md](docs/release.md)
 
 面向使用者的说明在 [README.md](README.md)；架构、协议、车机端、桌面端的实现细节在 `docs/`。
 
@@ -19,6 +20,10 @@
 - VD 部署必须 `background = false`（见 `VdServerDeployer`）；启动引擎用 `exec app_process` 保持 shell 流附加，不要用 `&` 后台化。
 - 视频发送顺序必须由单线程派发器保证：**入队顺序 = 调用顺序**。
 - 不提交真实域名、车牌、群号等隐私信息；提交前自查。
+- **正式签名 keystore 与口令绝不入库**：keystore 只在发布者本机与 GitHub Actions secrets，仓库里只允许出现变量名与路径模板。
+- **对外发布的包必须是正式签名**：`ALLOW_DEBUG_SIGNED_RELEASE=1` 只用于本地应急，任何 Release 资产都要用 `apksigner verify --print-certs` 校验证书指纹。
+- **发版前必须 bump `gradle.properties` 版本号**，且工作区 `git status --porcelain` 为空（否则包版本串带 `-dirty`）。
+- **已发布的 tag 不重打、不强推**；修问题用新版本号发新 tag。
 
 ## 1. 仓库结构（改代码前先定位）
 
@@ -77,3 +82,41 @@
 | `.agents/teamwork/` | 多 Agent 协作的派工、简报与交接记录 |
 
 新增方案优先写 `.plan/`，稳定结论回填 `docs/`；不要把过程性讨论写进 issue 长文。
+
+## 7. 发布与签名（详见 [docs/release.md](docs/release.md)）
+
+### 7.1 硬事实
+
+| 项 | 值 / 规则 |
+|---|---|
+| 版本号唯一来源 | `gradle.properties` 的 `app.versionCode` / `app.versionName` |
+| 正式签名证书 | `CN=DiLink Auto`，SHA-256 `84417b25a0ef960efcaa7e787c4779aa38ff1ffb265c345d95135a540e34f36a` |
+| keystore 位置 | 发布者本机 `%USERPROFILE%\.dilink-auto\dilink-auto-release.jks`；CI 走 `RELEASE_KEYSTORE_BASE64` secret 解码到 `$RUNNER_TEMP` |
+| 环境变量 | `RELEASE_KEYSTORE_PASSWORD` / `RELEASE_KEY_PASSWORD` 必需，`RELEASE_KEYSTORE_FILE` / `RELEASE_KEY_ALIAS` 可选 |
+| 触发条件 | 三段式 tag `vX.Y.Z` → `Build (Release)`；`vX.Y.Z-dev-N` → `Build (Pre-Release)` |
+| runner | 两条发布流水线都是 `ubuntu-latest`；本仓库**没有** self-hosted runner |
+
+### 7.2 发布步骤（PowerShell）
+
+```powershell
+# 1. 版本号已在 main 上 bump 并合并，工作区干净
+git status --porcelain
+# 2. 打 tag（用 merge commit，不要用分支名）
+git fetch origin main
+git tag v1.0.2 origin/main
+git push origin v1.0.2
+# 3. 盯流水线
+gh run list -R ID-VerNe/dilink-auto-android --limit 3
+# 4. 下载资产后校验签名（命令见 docs/release.md §3）
+```
+
+### 7.3 不能忘的坑（完整版见 `docs/release.md` §5）
+
+- 缺 keystore 时 release 变体在**配置阶段**直接失败（`app-client/build.gradle.kts:54`），不是产出 unsigned 包。
+- `RELEASE_*` 齐全时 debug 变体也会套正式签名（`app-client/build.gradle.kts:83-86`），预发布流水线同样要 keystore。
+- `.tmp/` 等未跟踪目录会让 `BUILD_REVISION`（`build.gradle.kts:14-23`）带 `-dirty`；`/.tmp/` 已在 `.gitignore`。
+- 正式签名上线后**旧包不能覆盖安装**，手机与车机都要先卸载。
+- `app-client/build.gradle.kts:223-248` 内嵌的是 `app-server-debug.apk`（audit B-05）：正式签名后车机自更新会签名不匹配，目前未修，车机包请手动部署。
+- `environment: release` 当前**没有**保护规则（`/environments` 返回 `total_count: 0`），tag 推上去会直接发版，别以为有审批闸门。
+- GitHub 的 tag 过滤器里 `+` 表示"前一个字符一次或多次"，不是正则的 `+`。
+- `Leave fork network` 不可逆且无 API，会丢 issues/PR/wiki/stars；脱离前先导出备份。
