@@ -8,6 +8,12 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// 变体判据：本次构建是否请求了 release 变体。签名配置与内嵌车机包都用它，
+// 保证「release 客户端装 release 车机包」这一对签名关系不会分叉（issue #37）。
+val wantsReleaseBuild = gradle.startParameter.taskNames.any {
+    it.contains("release", ignoreCase = true)
+}
+
 android {
     namespace = "com.dilinkauto.client"
     compileSdk = 34
@@ -144,6 +150,10 @@ dependencies {
 // This task just runs d8 + jar packaging.
 tasks.register("buildVdServer") {
     dependsOn(":vd-server:bundleLibRuntimeToJarDebug")
+    // 下面 doLast 直接读 :protocol 的 debug classes.jar；只依赖 :vd-server 的 debug
+    // 任务时，release-only 构建里这个 jar 可能不在任务图里，D8 会以
+    // NoSuchFileException 失败（本地 release 构建复现，issue #37 验证时发现）。
+    dependsOn(":protocol:bundleLibRuntimeToJarDebug")
     // :protocol-core 是纯 JVM 模块（PlatformLog 等协议基元都在这里）。Phase 0 把它
     // 从 :protocol 拆出后，下面那份 inputs 曾漏掉它 —— 编译期正常、d8 也正常，直到
     // app_process 启动 vd-server 时才以 NoClassDefFoundError: PlatformLog 崩掉，
@@ -217,12 +227,17 @@ tasks.register("buildVdServer") {
 // Audit B-05: a missing source APK used to be a println warning, so a release
 // build could silently ship a *stale* app-server.apk left over from a previous
 // run; the target is now deleted before the check and a missing source is a
-// hard build error. (The variant-mismatch problem — release client embedding a
-// debug-built server APK — is a tracked follow-up; the debug server APK is the
-// intended product input for now, see docs/audit-project-2026-10-09.md B-05.)
+// hard build error.
+//
+// issue #37: 内嵌的车机包必须与客户端变体同签名。release 客户端内嵌
+// app-server-release.apk（正式签名），debug 客户端内嵌 app-server-debug.apk，
+// 否则手机把 debug 签名的车机包装到已装正式签名包的车上会被 PM 以
+// INSTALL_FAILED_UPDATE_INCOMPATIBLE 拒绝。
+val serverVariant = if (wantsReleaseBuild) "release" else "debug"
+val serverVariantTask = "assemble" + serverVariant.replaceFirstChar { it.uppercase() }
 tasks.register("embedServerApk") {
-    dependsOn(":app-server:assembleDebug")
-    val serverApk = file("${rootDir}/app-server/build/outputs/apk/debug/app-server-debug.apk")
+    dependsOn(":app-server:$serverVariantTask")
+    val serverApk = file("${rootDir}/app-server/build/outputs/apk/$serverVariant/app-server-$serverVariant.apk")
     val assetsDir = file("src/main/assets")
 
     // Declared so Gradle can see what this task consumes/produces; still always
@@ -239,11 +254,11 @@ tasks.register("embedServerApk") {
         if (!serverApk.exists()) {
             throw GradleException(
                 "Server APK not found at ${serverApk.absolutePath} — " +
-                    "run :app-server:assembleDebug first. Refusing to embed a stale APK."
+                    "run :app-server:$serverVariantTask first. Refusing to embed a stale APK."
             )
         }
         serverApk.copyTo(target, overwrite = true)
-        println("Server APK embedded: ${target.length()} bytes")
+        println("Server APK embedded ($serverVariant variant): ${target.length()} bytes")
     }
 }
 

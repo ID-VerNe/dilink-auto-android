@@ -63,7 +63,7 @@
 | C-5 | `app-client` `Versioning` / `CarAppInstaller` | 车机未安装时 `readInstalledVersion` 返回 `"0"`;若内嵌 `versionName` 也是 `0` / `0.0` / `0.0.0` 形式,比较结果判为"已最新",**跳过本应进行的首装**。当前 `1.0.0` 不触发 |
 | C-6 | `app-client` `InstallStatus.parse` | 状态串由 `context.getString` 本地化产出,分类却只按英文子串;中文等非英文 locale 全部落入 `IDLE`(无进度、无错误),且 `"not reachable"` / `"Invalid IP"` 也不归类为 ERROR。建议改走结构化状态枚举 |
 | S-02 | `vd-server` `CarCommandRouter.dispatch` | `LAUNCH_APP` / `APP_UNINSTALL` 的 decode 未加保护(包名已有 `shellQuote` + 解码器形状校验),恶意包名仍能让读帧线程抛异常;`APP_INFO` 分支有 try/catch |
-| B-05 | `app-client` `embedServerApk`(`app-client/build.gradle.kts:223-248`) | 固定内嵌 `app-server-debug.apk`。引入正式签名后,手机端把 debug 签名的车机包装到已装正式签名包的车上会因签名不匹配失败;当前需手动部署车机包,详见 [release.md](./release.md) §5 #7 |
+| B-05 | `app-client` `embedServerApk`(`app-client/build.gradle.kts:223-249`) | 曾固定内嵌 `app-server-debug.apk`。引入正式签名后会出现车机自更新签名不匹配;**已修复(issue #37)**:按客户端变体内嵌 release / debug 车机包,`build-release.yml` 另有证书摘要比对门禁 |
 | — | 解码器重启竞争 | 偶发花屏,下一个关键帧(~1s)恢复,见根 README「已知限制」 |
 
 ## 下载
