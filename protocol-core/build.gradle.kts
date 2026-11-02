@@ -20,6 +20,11 @@ dependencies {
     // Connection 的公开 API 暴露了协程（CoroutineScope / Flow），故用 api 传递
     api("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3")
 
+    // issue #41：60s 天气 API 的 JSON 解析。Gson 是纯 JVM 库，放 protocol-core 一格，
+    // 解析逻辑（WeatherParser）对 app-server 隐藏 Gson 类型（只返回 WeatherData），
+    // 故用 implementation 而非 api —— app-server 不直接依赖 Gson。
+    implementation("com.google.code.gson:gson:2.10.1")
+
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3")
 }

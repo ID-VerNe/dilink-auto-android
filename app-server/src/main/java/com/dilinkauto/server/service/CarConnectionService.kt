@@ -295,6 +295,17 @@ class CarConnectionService : Service() {
     /** GPS 海拔采样与平滑（SRP：从本服务拆出，见 [AltitudeProvider]）。 */
     private var altitudeProvider: AltitudeProvider? = null
 
+    /**
+     * 车机天气的 UI 出口（issue #41）。null = 从未成功拉取（首次安装且从未联网）。
+     * 由 [weatherProvider] 在服务 [onCreate] 时启动；冷启动先渲染 CarPrefs 缓存，
+     * 断网/失败保留旧值并标 stale，恢复网络后自动刷新。
+     */
+    private val _weatherState = MutableStateFlow<WeatherUiState?>(null)
+    val weatherState: StateFlow<WeatherUiState?> = _weatherState.asStateFlow()
+
+    /** 60s 天气 API 拉取与缓存（SRP：从本服务拆出，见 [WeatherProvider]）。 */
+    private var weatherProvider: WeatherProvider? = null
+
     enum class State { IDLE, CONNECTING, CONNECTED, STREAMING }
 
     inner class LocalBinder : Binder() {
@@ -408,6 +419,12 @@ class CarConnectionService : Service() {
         // 不阻塞启动。运行时授权由 MainActivity 请求，授权后调 altitudeProvider.onPermissionResult()。
         AltitudeProvider(scope, this, _altitudeState).let {
             altitudeProvider = it
+            it.start()
+        }
+        // issue #41：天气拉取启动 —— 冷启动先渲染 CarPrefs 缓存，再异步刷新（15 分钟周期，
+        // 失败按 30s→2m→5m→15m 退避）。不新增运行时权限（仅用已有 INTERNET/ACCESS_NETWORK_STATE）。
+        WeatherProvider(scope, this, carPrefs, _weatherState).let {
+            weatherProvider = it
             it.start()
         }
     }
@@ -1665,6 +1682,9 @@ class CarConnectionService : Service() {
         // issue #40：GPS listener 跟随服务注销。
         altitudeProvider?.stop()
         altitudeProvider = null
+        // issue #41：天气轮询协程跟随服务取消。
+        weatherProvider?.stop()
+        weatherProvider = null
         try { unregisterReceiver(usbReceiver) } catch (_: Exception) {}
         networkCallback?.let {
             try { (getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager).unregisterNetworkCallback(it) }

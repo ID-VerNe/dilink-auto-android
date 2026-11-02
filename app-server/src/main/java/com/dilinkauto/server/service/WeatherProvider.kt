@@ -1,0 +1,191 @@
+package com.dilinkauto.server.service
+
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import com.dilinkauto.protocol.WeatherData
+import com.dilinkauto.protocol.WeatherFormat
+import com.dilinkauto.protocol.WeatherParser
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import java.net.HttpURLConnection
+import java.net.URL
+
+/**
+ * 车机主屏天气的 UI 状态（issue #41）。
+ *
+ * `null` 表示从未成功拉取（首次安装且从未联网），UI 渲染 `—`。
+ * [isStale] 标志距上次成功 > 60 分钟或本次刷新失败，驱动 chip 末尾加 ` *`。
+ */
+data class WeatherUiState(
+    val city: String,
+    val condition: String,
+    val temperature: Int,
+    val updatedAtMs: Long,
+    val isStale: Boolean
+)
+
+/**
+ * 60s 天气 API 的拉取、缓存与调度（issue #41）。
+ *
+ * 把「HTTPS 拉取 + Gson 解析 + CarPrefs 缓存 + 退避轮询」从 [CarConnectionService] 拆出
+ * 单独成类（SRP，仿 [ClockProvider] / [AltitudeProvider]）。服务只持有 `weatherState` 出口
+ * 与 [start]/[stop] 两个生命周期调用。
+ *
+ * - 网络：`HttpURLConnection`（HTTPS，超时 5s/8s）；`AndroidManifest.xml` 已是
+ *   `usesCleartextTraffic=false`，接口必须 HTTPS，不做 HTTP 回退。
+ * - 解析：委托 [WeatherParser]（protocol-core，Gson，单测覆盖正常/code!=200/字段缺失/异常）。
+ * - 调度：冷启动立即拉一次，随后每 [WeatherFormat.REFRESH_INTERVAL_MS]（15 分钟）轮询；
+ *   失败按 [WeatherFormat.nextBackoffMs]（30s→2m→5m→15m）退避，不形成请求风暴。
+ * - 缓存：成功后写入 [CarPrefs]（city/condition/temperature/updated_at）；冷启动先渲染缓存
+ *   再异步刷新，断网保留旧值（验收标准 2）。
+ * - 离线空转防护：拉取前自查 [hasNetwork]，无网不拉、不递增失败计数（避免退避被离线拉满）。
+ * - 失败态：HTTP 非 200 / `code != 200` / 解析异常 → 保留旧值，不弹窗、不覆盖缓存；
+ *   从未成功 → null → UI 显示 `—`。
+ *
+ * 不新增运行时敏感权限（仅用已有 INTERNET / ACCESS_NETWORK_STATE）。
+ */
+internal class WeatherProvider(
+    private val scope: CoroutineScope,
+    private val context: Context,
+    private val carPrefs: CarPrefs,
+    private val sink: MutableStateFlow<WeatherUiState?>
+) {
+    /** 只读出口，供 UI `collectAsState`。 */
+    val state: StateFlow<WeatherUiState?> = sink.asStateFlow()
+
+    private var refreshJob: Job? = null
+
+    fun start() {
+        // 冷启动先渲染缓存（若有），再异步刷新。缓存有效（updated_at > 0）时按其是否过期标 stale。
+        val cachedAt = carPrefs.weatherUpdatedAtMs
+        if (cachedAt > 0L) {
+            sink.value = WeatherUiState(
+                city = carPrefs.weatherCity,
+                condition = carPrefs.weatherCondition,
+                temperature = carPrefs.weatherTemperature,
+                updatedAtMs = cachedAt,
+                isStale = WeatherFormat.isStale(cachedAt, System.currentTimeMillis())
+            )
+        }
+        refreshJob = scope.launch {
+            var failures = 0
+            // 冷启动立即拉一次。
+            while (isActive) {
+                val delayMs = if (failures == 0) {
+                    // 首次或上次成功后：正常 15 分钟周期。首次循环先拉再等。
+                    refreshOnceAndOnSuccess { failures = 0 }
+                    WeatherFormat.REFRESH_INTERVAL_MS
+                } else {
+                    // 上次失败：按退避等待后重试。先等再拉。
+                    val backoff = WeatherFormat.nextBackoffMs(failures)
+                    delay(backoff)
+                    refreshOnceAndOnSuccess { failures = 0 }
+                    // 拉完仍失败则继续退避（failures 已在内部自增），下一轮顶部走 else 分支再等。
+                    if (failures > 0) WeatherFormat.nextBackoffMs(failures)
+                    else WeatherFormat.REFRESH_INTERVAL_MS
+                }
+                delay(delayMs)
+            }
+        }
+    }
+
+    fun stop() {
+        refreshJob?.cancel()
+        refreshJob = null
+    }
+
+    /**
+     * 拉一次；成功则清零失败计数（回调 [onSuccess]）、写缓存、更新 sink；
+     * 失败则递增失败计数（通过返回 false 让调用方走退避）。
+     *
+     * @param onSuccess 上次成功时调用（重置调用方的 failures 计数）。
+     * @return true 成功，false 失败。
+     */
+    private suspend fun refreshOnceAndOnSuccess(onSuccess: () -> Unit): Boolean {
+        if (!hasNetwork()) {
+            // 无网：不拉、不递增失败计数（避免离线把退避拉满），但若已有缓存则标 stale。
+            markStaleIfCached()
+            return false
+        }
+        val data = fetch()
+        if (data == null) {
+            markStaleIfCached()
+            return false
+        }
+        // 成功：写缓存 + 更新 sink + 清零计数。
+        carPrefs.weatherCity = data.city
+        carPrefs.weatherCondition = data.condition
+        carPrefs.weatherTemperature = data.temperature
+        carPrefs.weatherUpdatedAtMs = data.updatedAtMs
+        sink.value = WeatherUiState(
+            city = data.city,
+            condition = data.condition,
+            temperature = data.temperature,
+            updatedAtMs = data.updatedAtMs,
+            isStale = false
+        )
+        onSuccess()
+        return true
+    }
+
+    /** 拉取并解析；网络/解析失败返回 null，不抛。 */
+    private fun fetch(): WeatherData? {
+        return try {
+            val conn = (URL(carPrefs.weatherApiBaseUrl).openConnection() as HttpURLConnection).apply {
+                connectTimeout = 5_000
+                readTimeout = 8_000
+                requestMethod = "GET"
+                // 60s API 文档建议带 UA；不带也能用，带上更礼貌。
+                setRequestProperty("User-Agent", "DiLinkAuto/1.0 (car)")
+            }
+            conn.use {
+                if (conn.responseCode != 200) return null
+                conn.inputStream.bufferedReader().use { reader ->
+                    WeatherParser.parse(reader.readText())
+                }
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** 若已有缓存，把 sink 标 stale（断网/失败时保留旧值并提示过时）；无缓存则保持 null。 */
+    private fun markStaleIfCached() {
+        val cachedAt = carPrefs.weatherUpdatedAtMs
+        if (cachedAt <= 0L) return
+        val current = sink.value
+        if (current == null || !current.isStale) {
+            sink.value = WeatherUiState(
+                city = carPrefs.weatherCity,
+                condition = carPrefs.weatherCondition,
+                temperature = carPrefs.weatherTemperature,
+                updatedAtMs = cachedAt,
+                isStale = true
+            )
+        }
+    }
+
+    private fun hasNetwork(): Boolean {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
+        val network = cm.activeNetwork ?: return false
+        val caps = cm.getNetworkCapabilities(network) ?: return false
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+    }
+
+    /** 把 [HttpURLConnection] 的 disconnect 放进 finally 的小工具。 */
+    private inline fun <T> HttpURLConnection.use(block: () -> T): T {
+        try {
+            return block()
+        } finally {
+            disconnect()
+        }
+    }
+}
