@@ -1,15 +1,19 @@
 package com.dilinkauto.server
 
+import android.Manifest
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.os.Bundle
 import android.os.IBinder
 import android.view.View
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -33,6 +37,23 @@ class MainActivity : ComponentActivity() {
     private var carService: CarConnectionService? = null
     internal var pendingUsbDevice: android.hardware.usb.UsbDevice? = null
     private var serviceBound by mutableStateOf(false)
+
+    /**
+     * issue #40：运行时定位授权。`ACCESS_FINE_LOCATION` 已在 manifest 声明，但 app-server
+     * 此前 0 处运行时申请 → 海拔无法获取。首次进入主屏时一次性请求；拒绝则海拔显示 `—`，
+     * 不阻塞启动、不影响其他功能（验收标准 2）。授权后通知 provider 恢复采样。
+     */
+    private val locationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            carService?.let { svc ->
+                // 通过反射友好的内部方法触发；service 暴露 altitudeProvider 的恢复入口。
+                svc.onLocationPermissionGranted()
+            }
+        }
+        // 拒绝 → 什么都不做，provider 保持 null，UI 显示 `—`。
+    }
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
@@ -61,6 +82,14 @@ class MainActivity : ComponentActivity() {
 
         // Handle USB device attached intent (from manifest intent-filter)
         handleUsbIntent(intent)
+
+        // issue #40：首次进入主屏时请求定位授权（仅未授予时弹一次）。
+        // ACCESS_FINE_LOCATION 已在 manifest 声明，但 app-server 此前无运行时申请。
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            locationPermissionLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
 
         setContent {
             CarTheme {

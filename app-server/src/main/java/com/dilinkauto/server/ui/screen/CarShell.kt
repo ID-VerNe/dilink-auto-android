@@ -56,14 +56,20 @@ fun CarShell(service: CarConnectionService) {
     val statusMessage by service.statusMessage.collectAsState()
     val videoReady by service.videoReady.collectAsState()
     val timeState by service.timeState.collectAsState()
+    val altitudeState by service.altitudeState.collectAsState()
     val isConnected = state == CarConnectionService.State.STREAMING ||
             state == CarConnectionService.State.CONNECTED
 
-    // issue #39：顶部信息条只收集「连接页 + 主屏」需要展示的 chip。
-    // MirrorScreen（投屏镜像页）走 Screen.APP 分支，不渲染 InfoBar（见下方 when 分支），
-    // 满足验收标准 5「镜像应用时不渲染时间条」。
-    val infoChips = remember(timeState) {
-        timeState?.let { listOf(InfoChip(it.text)) } ?: emptyList()
+    // issue #39 / #40：顶部信息条收集「连接页 + 主屏」需要展示的 chip。
+    // 时间 chip + 海拔 chip（null 时省略，不占位）。MirrorScreen（投屏镜像页）走 Screen.APP 分支，
+    // 不渲染 InfoBar（见下方 when 分支），满足验收标准「镜像应用时不覆盖手机画面」。
+    val infoChips = remember(timeState, altitudeState) {
+        buildList {
+            timeState?.let { add(InfoChip(it.text)) }
+            // 海拔：null（无有效数据）渲染为 `—`，仍占 chip 位，让用户知道此栏存在；
+            // altitudeState 本身为 null（provider 尚未初始化）时不加 chip。
+            altitudeState?.let { add(InfoChip(com.dilinkauto.protocol.AltitudeFormat.formatAltitude(it.meters))) }
+        }
     }
 
     // During a mid-stream rotation, onCarViewportChanged sets state to CONNECTING but
