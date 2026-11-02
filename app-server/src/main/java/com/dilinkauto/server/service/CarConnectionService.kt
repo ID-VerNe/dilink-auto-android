@@ -273,6 +273,17 @@ class CarConnectionService : Service() {
     private val _appInfoData = MutableStateFlow<AppInfoDataMessage?>(null)
     val appInfoData: StateFlow<AppInfoDataMessage?> = _appInfoData.asStateFlow()
 
+    /**
+     * 车机系统时钟的 UI 出口（issue #39）。null = 尚未首次采样（冷启动那一帧）。
+     * 由 [clockProvider] 在服务 [onCreate] 时启动、每分钟与系统时间/时区变更时更新；
+     * Compose 侧 `collectAsState` 读取，不在 Compose 内做每秒 tick（性能：骁龙 439 / 4GB RAM）。
+     */
+    private val _timeState = MutableStateFlow<TimeUiState?>(null)
+    val timeState: StateFlow<TimeUiState?> = _timeState.asStateFlow()
+
+    /** 系统时钟采样与广播订阅（SRP：从本服务拆出，见 [ClockProvider]）。 */
+    private var clockProvider: ClockProvider? = null
+
     enum class State { IDLE, CONNECTING, CONNECTED, STREAMING }
 
     inner class LocalBinder : Binder() {
@@ -375,6 +386,12 @@ class CarConnectionService : Service() {
             registerReceiver(usbReceiver, filter, RECEIVER_NOT_EXPORTED)
         } else {
             registerReceiver(usbReceiver, filter)
+        }
+        // issue #39：系统时钟采样启动 —— 协程对齐整分钟 + ACTION_TIME_TICK / TIME_CHANGED /
+        // TIMEZONE_CHANGED 广播。注册/注销跟随服务生命周期（onDestroy）。不新增权限、不联网。
+        ClockProvider(scope, this, _timeState).let {
+            clockProvider = it
+            it.start()
         }
     }
 
@@ -1617,6 +1634,9 @@ class CarConnectionService : Service() {
     override fun onDestroy() {
         shutdown()
         touchSender.shutdown()
+        // issue #39：时钟广播接收器与采样协程跟随服务注销/取消。
+        clockProvider?.stop()
+        clockProvider = null
         try { unregisterReceiver(usbReceiver) } catch (_: Exception) {}
         networkCallback?.let {
             try { (getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager).unregisterNetworkCallback(it) }
