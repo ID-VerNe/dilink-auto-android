@@ -57,18 +57,31 @@ fun CarShell(service: CarConnectionService) {
     val videoReady by service.videoReady.collectAsState()
     val timeState by service.timeState.collectAsState()
     val altitudeState by service.altitudeState.collectAsState()
+    val weatherState by service.weatherState.collectAsState()
     val isConnected = state == CarConnectionService.State.STREAMING ||
             state == CarConnectionService.State.CONNECTED
 
-    // issue #39 / #40：顶部信息条收集「连接页 + 主屏」需要展示的 chip。
-    // 时间 chip + 海拔 chip（null 时省略，不占位）。MirrorScreen（投屏镜像页）走 Screen.APP 分支，
-    // 不渲染 InfoBar（见下方 when 分支），满足验收标准「镜像应用时不覆盖手机画面」。
-    val infoChips = remember(timeState, altitudeState) {
+    // issue #39 / #40 / #41：顶部信息条收集「连接页 + 主屏」需要展示的 chip。
+    // 时间 chip + 海拔 chip + 天气 chip。天气：state 为 null（从未成功）时也加 chip 渲染 `—`，
+    // 让用户知道此栏存在；altitudeState 本身为 null（provider 尚未初始化）时不加 chip。
+    // MirrorScreen（投屏镜像页）走 Screen.APP 分支，不渲染 InfoBar，满足验收标准 4。
+    val infoChips = remember(timeState, altitudeState, weatherState) {
         buildList {
             timeState?.let { add(InfoChip(it.text)) }
-            // 海拔：null（无有效数据）渲染为 `—`，仍占 chip 位，让用户知道此栏存在；
-            // altitudeState 本身为 null（provider 尚未初始化）时不加 chip。
             altitudeState?.let { add(InfoChip(com.dilinkauto.protocol.AltitudeFormat.formatAltitude(it.meters))) }
+            // 天气：把 WeatherUiState 转成 chip 文本；null（从未成功）渲染 `—`。
+            val weatherText = weatherState?.let {
+                com.dilinkauto.protocol.WeatherFormat.formatWeather(
+                    com.dilinkauto.protocol.WeatherData(
+                        city = it.city,
+                        condition = it.condition,
+                        temperature = it.temperature,
+                        updatedAtMs = it.updatedAtMs
+                    ),
+                    isStale = it.isStale
+                )
+            } ?: com.dilinkauto.protocol.WeatherFormat.formatWeather(null, isStale = false)
+            add(InfoChip(weatherText))
         }
     }
 

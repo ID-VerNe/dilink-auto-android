@@ -93,4 +93,46 @@ internal class CarPrefs(context: Context) {
             prefs.edit().putInt(AppPrefs.STARTUP_BITRATE, value).apply()
             _startupBitrate.value = value
         }
+
+    // ─── 天气（issue #41）───
+    //
+    // 60s API 的 base URL 必须可配置（官方主域名部署在 Deno Deploy，「部分地区可能被墙」，
+    // 追评一要求默认官方、不硬编码到 UI）。缓存字段（city/condition/temperature/updated_at）
+    // 让冷启动先渲染上次成功值再异步刷新，断网时保留旧值（验收标准 2）。
+
+    /** 60s 天气 API base URL，默认官方。可换成自部署实例。 */
+    var weatherApiBaseUrl: String
+        get() = prefs.getString(WEATHER_API_BASE_URL, DEFAULT_WEATHER_API_BASE_URL)
+            ?: DEFAULT_WEATHER_API_BASE_URL
+        set(value) = prefs.edit().putString(WEATHER_API_BASE_URL, value).apply()
+
+    /** 缓存的城市名（上次成功拉取的 `data.location.name`）。 */
+    var weatherCity: String
+        get() = prefs.getString(WEATHER_CITY, "") ?: ""
+        set(value) = prefs.edit().putString(WEATHER_CITY, value).apply()
+
+    /** 缓存的天气现象（上次成功的 `data.weather.condition`）。 */
+    var weatherCondition: String
+        get() = prefs.getString(WEATHER_CONDITION, "") ?: ""
+        set(value) = prefs.edit().putString(WEATHER_CONDITION, value).apply()
+
+    /** 缓存的温度（上次成功的 `data.weather.temperature`）。 */
+    var weatherTemperature: Int
+        get() = prefs.getInt(WEATHER_TEMPERATURE, Int.MIN_VALUE)
+        set(value) = prefs.edit().putInt(WEATHER_TEMPERATURE, value).apply()
+
+    /** 缓存的更新时间戳（上次成功的 `data.weather.updated_at`，ms）。0 = 从未成功。 */
+    var weatherUpdatedAtMs: Long
+        get() = prefs.getLong(WEATHER_UPDATED_AT, 0L)
+        set(value) = prefs.edit().putLong(WEATHER_UPDATED_AT, value).apply()
+
+    companion object {
+        // CarPrefs 是 internal，但 prefs key 跨实例共享同一个文件，放 companion 让测试可引用。
+        internal const val WEATHER_API_BASE_URL = "weather_api_base_url"
+        internal const val DEFAULT_WEATHER_API_BASE_URL = "https://60s.viki.moe/v2/weather"
+        internal const val WEATHER_CITY = "weather_city"
+        internal const val WEATHER_CONDITION = "weather_condition"
+        internal const val WEATHER_TEMPERATURE = "weather_temperature"
+        internal const val WEATHER_UPDATED_AT = "weather_updated_at"
+    }
 }
