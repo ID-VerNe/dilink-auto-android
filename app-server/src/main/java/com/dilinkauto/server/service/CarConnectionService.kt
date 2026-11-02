@@ -284,6 +284,17 @@ class CarConnectionService : Service() {
     /** 系统时钟采样与广播订阅（SRP：从本服务拆出，见 [ClockProvider]）。 */
     private var clockProvider: ClockProvider? = null
 
+    /**
+     * 车机海拔的 UI 出口（issue #40）。null = 无有效数据（无定位权限/无卫星/传感器缺失）。
+     * 由 [altitudeProvider] 在服务 [onCreate] 时启动；GPS 失锁保留上一次有效值，
+     * 彻底无更新时 UI 显示 `—`。运行时定位授权由 [com.dilinkauto.server.MainActivity] 请求。
+     */
+    private val _altitudeState = MutableStateFlow<AltitudeUiState?>(null)
+    val altitudeState: StateFlow<AltitudeUiState?> = _altitudeState.asStateFlow()
+
+    /** GPS 海拔采样与平滑（SRP：从本服务拆出，见 [AltitudeProvider]）。 */
+    private var altitudeProvider: AltitudeProvider? = null
+
     enum class State { IDLE, CONNECTING, CONNECTED, STREAMING }
 
     inner class LocalBinder : Binder() {
@@ -391,6 +402,12 @@ class CarConnectionService : Service() {
         // TIMEZONE_CHANGED 广播。注册/注销跟随服务生命周期（onDestroy）。不新增权限、不联网。
         ClockProvider(scope, this, _timeState).let {
             clockProvider = it
+            it.start()
+        }
+        // issue #40：GPS 海拔采样启动 —— 权限未授予时安全降级为 null（UI 显示 `—`），
+        // 不阻塞启动。运行时授权由 MainActivity 请求，授权后调 altitudeProvider.onPermissionResult()。
+        AltitudeProvider(scope, this, _altitudeState).let {
+            altitudeProvider = it
             it.start()
         }
     }
@@ -1459,6 +1476,14 @@ class CarConnectionService : Service() {
         _appInfoData.value = null
     }
 
+    /**
+     * issue #40：定位授权通过后由 [com.dilinkauto.server.MainActivity] 调用，
+     * 通知 [altitudeProvider] 恢复采样（首次 start 时未授权会保持 null）。
+     */
+    fun onLocationPermissionGranted() {
+        altitudeProvider?.onPermissionResult()
+    }
+
     fun requestAppInfo(packageName: String) {
         sendCommandToVd(ControlMsg.APP_INFO, packageName.toByteArray(Charsets.UTF_8))
         carLogSend("Requested app info: $packageName")
@@ -1637,6 +1662,9 @@ class CarConnectionService : Service() {
         // issue #39：时钟广播接收器与采样协程跟随服务注销/取消。
         clockProvider?.stop()
         clockProvider = null
+        // issue #40：GPS listener 跟随服务注销。
+        altitudeProvider?.stop()
+        altitudeProvider = null
         try { unregisterReceiver(usbReceiver) } catch (_: Exception) {}
         networkCallback?.let {
             try { (getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager).unregisterNetworkCallback(it) }
