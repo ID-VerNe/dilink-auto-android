@@ -40,6 +40,8 @@ import androidx.compose.ui.unit.dp
 import com.dilinkauto.protocol.SettingsFormat
 import com.dilinkauto.server.R
 import com.dilinkauto.server.service.CarConnectionService
+import com.dilinkauto.server.ui.InfoBar
+import com.dilinkauto.server.ui.InfoChip
 import com.dilinkauto.server.ui.theme.SuccessColor
 import com.dilinkauto.server.ui.theme.WarningColor
 
@@ -51,7 +53,7 @@ import com.dilinkauto.server.ui.theme.WarningColor
  * transitions to the streaming mode with nav bar, home, and apps.
  */
 @Composable
-fun CarLaunchScreen(service: CarConnectionService) {
+fun CarLaunchScreen(service: CarConnectionService, infoChips: List<InfoChip> = emptyList()) {
     val state by service.state.collectAsState()
     val phoneName by service.phoneName.collectAsState()
     val statusMessage by service.statusMessage.collectAsState()
@@ -84,6 +86,9 @@ fun CarLaunchScreen(service: CarConnectionService) {
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
     ) {
+        // issue #39：连接页顶部信息条（时间）。与主屏 InfoBar 同容器；
+        // 镜像页不进本函数（CarShell 在 showStreamingMode 分支处理），满足验收标准 5。
+        InfoBar(infoChips)
         BoxWithConstraints(
             modifier = Modifier.fillMaxSize().padding(40.dp),
             contentAlignment = Alignment.Center

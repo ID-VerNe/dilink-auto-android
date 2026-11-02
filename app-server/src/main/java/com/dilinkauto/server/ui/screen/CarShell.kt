@@ -29,6 +29,8 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import com.dilinkauto.server.R
 import com.dilinkauto.server.service.CarConnectionService
+import com.dilinkauto.server.ui.InfoBar
+import com.dilinkauto.server.ui.InfoChip
 import com.dilinkauto.server.ui.nav.PersistentBottomNavBar
 import com.dilinkauto.server.ui.nav.PersistentNavBar
 
@@ -53,8 +55,16 @@ fun CarShell(service: CarConnectionService) {
     val appList by service.appList.collectAsState()
     val statusMessage by service.statusMessage.collectAsState()
     val videoReady by service.videoReady.collectAsState()
+    val timeState by service.timeState.collectAsState()
     val isConnected = state == CarConnectionService.State.STREAMING ||
             state == CarConnectionService.State.CONNECTED
+
+    // issue #39：顶部信息条只收集「连接页 + 主屏」需要展示的 chip。
+    // MirrorScreen（投屏镜像页）走 Screen.APP 分支，不渲染 InfoBar（见下方 when 分支），
+    // 满足验收标准 5「镜像应用时不渲染时间条」。
+    val infoChips = remember(timeState) {
+        timeState?.let { listOf(InfoChip(it.text)) } ?: emptyList()
+    }
 
     // During a mid-stream rotation, onCarViewportChanged sets state to CONNECTING but
     // keeps the app list (a real disconnect clears it in handleDisconnect). Keep the
@@ -86,6 +96,9 @@ fun CarShell(service: CarConnectionService) {
         val configuration = LocalConfiguration.current
         val isLandscape = configuration.screenWidthDp > configuration.screenHeightDp
 
+        // issue #39：主屏（HOME）顶部渲染 InfoBar；镜像页（APP）不渲染（验收标准 5）。
+        val showInfoBar = currentScreen == Screen.HOME
+
         if (isLandscape) {
             Row(modifier = Modifier
                 .fillMaxSize()
@@ -103,14 +116,17 @@ fun CarShell(service: CarConnectionService) {
                     },
                     modifier = Modifier.zIndex(1f)
                 )
-                CarContentArea(
-                    service = service,
-                    currentScreen = currentScreen,
-                    videoReady = videoReady,
-                    statusMessage = statusMessage,
-                    launchApp = launchApp,
-                    modifier = Modifier.weight(1f).fillMaxHeight()
-                )
+                Column(modifier = Modifier.weight(1f).fillMaxHeight()) {
+                    if (showInfoBar) InfoBar(infoChips)
+                    CarContentArea(
+                        service = service,
+                        currentScreen = currentScreen,
+                        videoReady = videoReady,
+                        statusMessage = statusMessage,
+                        launchApp = launchApp,
+                        modifier = Modifier.weight(1f).fillMaxHeight()
+                    )
+                }
             }
         } else {
             Column(
@@ -118,6 +134,7 @@ fun CarShell(service: CarConnectionService) {
                     .fillMaxSize()
                     .background(MaterialTheme.colorScheme.background)
             ) {
+                if (showInfoBar) InfoBar(infoChips)
                 CarContentArea(
                     service = service,
                     currentScreen = currentScreen,
@@ -141,7 +158,7 @@ fun CarShell(service: CarConnectionService) {
         }
     } else {
         // Full-screen launch / connection screen — no nav bar, connection-focused
-        CarLaunchScreen(service = service)
+        CarLaunchScreen(service = service, infoChips = infoChips)
     }
 }
 
