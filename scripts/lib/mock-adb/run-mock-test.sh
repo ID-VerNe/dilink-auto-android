@@ -57,6 +57,10 @@ ok "py_compile 通过"
 bash scripts/lib/test-car-state-now.sh > /dev/null 2>&1 \
   && ok "car_state_now 接缝单测通过" || bad "car_state_now 接缝单测失败"
 
+# 判据单测（issue #46/#47 回归钉子）：vdlog 会话分段 + PNG 完整性/解码失败三态
+bash scripts/lib/test-asserts.sh > /dev/null 2>&1 \
+  && ok "E2E 判据单测通过" || bad "E2E 判据单测失败"
+
 step "2/4 层②构造：--list / --dry-run"
 bash scripts/e2e-dual-device.sh --list > /dev/null 2>&1 && ok "--list 通过" || bad "--list 失败"
 bash scripts/e2e-dual-device.sh --phone mockA --car mockB --scenario S01 --dry-run > /dev/null 2>&1 \
