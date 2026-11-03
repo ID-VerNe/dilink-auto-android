@@ -26,6 +26,75 @@ object AltitudeFormat {
     const val DEFAULT_EMA_ALPHA = 0.2f
 
     /**
+     * 垂直精度闸门上限（米，issue #50）。`Location.getVerticalAccuracyMeters()` 超过此值时，
+     * 说明该样本的垂直解算置信度已低于 ~100m，拿来上屏会让海拔乱跳，直接拒收。
+     */
+    const val MAX_VERTICAL_ACCURACY_M = 100f
+
+    /** 物理爬升速率上限（米/秒，issue #50）。民航客机爬升率约 3–4m/s，5m/s 留出余量。 */
+    const val MAX_CLIMB_RATE_MPS = 5.0
+
+    /** 跳变闸门的时间余量（米）。抵消 GPS 抖动，避免把 1 秒内的正常 ±50m 波动误判为跳变。 */
+    const val CLIMB_MARGIN_M = 50.0
+
+    /** bootstrap 初始化所需的最少样本数（issue #50）：前两个样本不上屏，凑齐 3 个再取中位数。 */
+    const val BOOTSTRAP_SAMPLES = 3
+
+    /** bootstrap 样本的允许离散度（米）：3 个样本两两差 ≤30m 才认为已稳定，可初始化。 */
+    const val BOOTSTRAP_SPREAD_M = 30.0
+
+    /**
+     * 垂直精度闸门（issue #50）。
+     *
+     * - 无垂直精度信息（`hasVerticalAccuracy() == false`）：放行，不能因缺字段把有效定位全拦掉。
+     * - `vAccMeters <= 0` 或 NaN：按「无效/未知」放行，不把 0 当成极高精度。
+     * - 有精度且 > [MAX_VERTICAL_ACCURACY_M]：拒收。
+     */
+    fun acceptVerticalAccuracy(hasVerticalAccuracy: Boolean, vAccMeters: Float): Boolean {
+        if (!hasVerticalAccuracy) return true
+        if (vAccMeters <= 0f || vAccMeters.isNaN()) return true
+        return vAccMeters <= MAX_VERTICAL_ACCURACY_M
+    }
+
+    /**
+     * 跳变闸门（issue #50）：判断两个海拔样本之间的变化是否可能由真实运动产生。
+     *
+     * 允许的最大变化量为 `MAX_CLIMB_RATE_MPS * Δt秒 + CLIMB_MARGIN_M`。例如静止 40m 的定位
+     * 在 180 秒后突然报 -3025m（Δh≈3065m，允许仅 950m）应判为物理不可能并拒收。
+     *
+     * `Δt <= 0`（时间戳相同、时钟回拨或负值）按 1 秒处理，避免除零并保留 [CLIMB_MARGIN_M] 的容差。
+     * `prev` 不存在时不调用本函数，由调用方走 bootstrap 初始化。
+     */
+    fun isJumpPlausible(
+        prevMeters: Double,
+        prevElapsedNanos: Long,
+        sampleMeters: Double,
+        sampleElapsedNanos: Long
+    ): Boolean {
+        val dtNanos = sampleElapsedNanos - prevElapsedNanos
+        val dtSeconds = if (dtNanos <= 0L) 1.0 else dtNanos / 1_000_000_000.0
+        val allowed = MAX_CLIMB_RATE_MPS * dtSeconds + CLIMB_MARGIN_M
+        return abs(sampleMeters - prevMeters) <= allowed
+    }
+
+    /** 三个样本的中位数（issue #50 bootstrap 初始化用），对单点异常不敏感。 */
+    fun medianOfThree(a: Double, b: Double, c: Double): Double =
+        maxOf(minOf(a, b), minOf(maxOf(a, b), c))
+
+    /**
+     * bootstrap 是否已可初始化（issue #50）：样本数 ≥ [BOOTSTRAP_SAMPLES]，
+     * 且全部样本的极差 ≤ [BOOTSTRAP_SPREAD_M]（等价于两两差 ≤30m）。
+     *
+     * 纯函数、不修改入参；调用方负责维护滑动窗口。
+     */
+    fun bootstrapReady(samples: List<Double>): Boolean {
+        if (samples.size < BOOTSTRAP_SAMPLES) return false
+        val min = samples.minOrNull() ?: return false
+        val max = samples.maxOrNull() ?: return false
+        return max - min <= BOOTSTRAP_SPREAD_M
+    }
+
+    /**
      * 判定一个定位是否可用于海拔显示。
      *
      * @param altitude 海拔米数；`null` 表示该定位 `hasAltitude() == false`（无卫星高度解算）。

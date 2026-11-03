@@ -417,7 +417,7 @@ class CarConnectionService : Service() {
         }
         // issue #40：GPS 海拔采样启动 —— 权限未授予时安全降级为 null（UI 显示 `—`），
         // 不阻塞启动。运行时授权由 MainActivity 请求，授权后调 altitudeProvider.onPermissionResult()。
-        AltitudeProvider(scope, this, _altitudeState).let {
+        AltitudeProvider(scope, this, _altitudeState, log = { carLogSend(it) }).let {
             altitudeProvider = it
             it.start()
         }
