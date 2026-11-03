@@ -107,8 +107,11 @@ scenario_asserts() {
   local out rc_cap
   out=$(screencap_variance car "$E2E_RUN_DIR/$E2E_SCENARIO_ID/screencap-after" 1.0)
   rc_cap=$?
-  if [ "$rc_cap" != "0" ]; then
-    bad "切换后 A screencap 采集失败/纯黑（rc=$rc_cap out=${out:-空}）"; rc=1
+  if [ "$rc_cap" = "2" ]; then
+    # rc=2 是采集环境错（传输截断/超时，screencap_variance 已内置重试），不是纯黑（issue #47）
+    bad "切换后 A screencap 采集环境错（rc=2，截断/超时；不是纯黑）out=${out:-空}"; rc=1
+  elif [ "$rc_cap" != "0" ]; then
+    bad "切换后 A 屏纯黑（rc=$rc_cap out=${out:-空}）——解码渲染面空，链路回归"; rc=1
   else
     local b=${S15_SD_BEFORE##*stddev=} a=${out##*stddev=}
     if [ -n "$b" ] && [ "$b" != "$a" ]; then

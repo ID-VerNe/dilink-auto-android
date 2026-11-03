@@ -223,12 +223,37 @@ wait_state_eq() { # <side> <STATE> [timeout_s=60]（软等待；超时转硬失�
 }
 
 # ── 画面非黑（PIL 灰度标准差；observability A2：>1.0 判非黑）────────────
-_png_ok() { # <file> → 0=有效 PNG（8 字节魔数）
+_png_magic() { # <file> → 0=PNG 魔数有效（前 8 字节）
   # screencap 失败时会把错误文本写进 stdout（实测 56B："Failed to take screenshot.
   # Status: -2\nCapturing failed.\n"），文件"非空"骗过 [ -s ] → 必须校验魔数
   # （2026-10-16 try8 根因：PIL.UnidentifiedImageError）。
   [ -f "$1" ] && printf '\x89PNG\r\n\x1a\n' | cmp -s -n 8 - "$1"
 }
+_png_complete() { # <file> → 0=PNG 有完整 IEND 尾部（issue #47：截断 PNG 不是纯黑）
+  # 网络 adb 的 exec-out 偶发丢尾部，文件仍带魔数却能骗过只查魔数的判据；PNG 以
+  # IEND 块结尾（末 8 字节 49 45 4E 44 AE 42 60 82），缺失即视为传输截断。
+  [ -s "$1" ] || return 1
+  tail -c 8 "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n' | grep -qi '^49454e44ae426082$'
+}
+_png_ok() { # <file> → 0=PNG 魔数有效且尾部完整（issue #47：截断 PNG 不能当纯黑）
+  _png_magic "$1" && _png_complete "$1"
+}
+
+png_variance() { # <png> <min_sd> → stdout `stddev=X.XXX`；0=非纯黑 1=纯黑 2=解码失败
+  python - "$1" "$2" <<'PY'
+import sys
+from PIL import Image, ImageStat
+try:
+    im = Image.open(sys.argv[1]).convert("L")
+    sd = ImageStat.Stat(im).stddev[0]
+except Exception as e:  # 解码/截断错误属于环境错，不能与纯黑混为一谈（issue #47）
+    print(f"png 解码失败: {e}", file=sys.stderr)
+    sys.exit(2)
+print(f"stddev={sd:.3f}")
+sys.exit(0 if sd > float(sys.argv[2]) else 1)
+PY
+}
+
 screencap_variance() { # <side> <prefix> [min_sd=1.0] [sf_display_id] → 0=非纯黑 1=纯黑 2=环境错
   # sf_display_id 是 screencap -d 的 uint64 编码值（**不是** logical id；语义见
   # vd_phys_display_id）。缺省截默认屏。会话中引擎会熄物理屏（dumpsys display 实证
@@ -241,20 +266,18 @@ screencap_variance() { # <side> <prefix> [min_sd=1.0] [sf_display_id] → 0=非�
   local png="$prefix.png"
   local TO=""; command -v timeout > /dev/null 2>&1 && TO="timeout 15"
   local dflag=""; [ -n "$disp" ] && dflag="-d $disp"
-  $TO adb -s "$serial" exec-out screencap $dflag -p > "$png" 2>/dev/null
-  if ! _png_ok "$png"; then
+  local attempt
+  for attempt in 1 2; do  # 传输截断重试一次（issue #47）
+    $TO adb -s "$serial" exec-out screencap $dflag -p > "$png" 2>/dev/null
+    _png_ok "$png" && break
+    rm -f "$png"
+  done
+  if [ ! -f "$png" ] || ! _png_ok "$png"; then
     local sz=""; [ -f "$png" ] && sz=$(wc -c < "$png" 2>/dev/null | tr -d ' ')
-    echo "screencap 未产出有效 PNG（side=$side${dflag:+ $dflag}，${sz:-0}B）" >&2
+    echo "screencap 未产出完整 PNG（side=$side${dflag:+ $dflag}，${sz:-0}B，已尝试 $attempt 次）" >&2
     rm -f "$png"; return 2
   fi
-  python - "$png" "$min_sd" <<'PY'
-import sys
-from PIL import Image, ImageStat
-im = Image.open(sys.argv[1]).convert("L")
-sd = ImageStat.Stat(im).stddev[0]
-print(f"stddev={sd:.3f}")
-sys.exit(0 if sd > float(sys.argv[2]) else 1)
-PY
+  png_variance "$png" "$min_sd"
   local rc=$?
   if [ "$rc" = "0" ]; then
     rm -f "$png"
@@ -276,7 +299,7 @@ screencap_vd() { # <label> <outdir> [min_sd=1.0] → stdout 打印 jpg 路径；
   mkdir -p "$outdir"
   local TO=""; command -v timeout > /dev/null 2>&1 && TO="timeout 15"
   $TO adb -s "$PHONE_SERIAL" exec-out screencap -d "$id" -p > "$png" 2>/dev/null
-  _png_ok "$png" || { rm -f "$png"; log_err "VD 截屏未产出有效 PNG（-d $id）；跳过"; return 2; }
+  _png_ok "$png" || { rm -f "$png"; log_err "VD 截屏未产出有效 PNG（-d $id，魔数/完整性校验未过，可能传输截断）；跳过"; return 2; }
   python - "$png" "$jpg" <<'PY'
 import sys
 from PIL import Image
@@ -378,26 +401,69 @@ assert_no_force_kill() { # <file>...（出现任一即回归；硬断言禁重�
   bad "发现 $total 次强制 kill：$*"
   return 1
 }
-wait_stream_alive() { # [timeout_s=20]（vdlog Pipeline 帧计数在窗口内增长）
-  # 重部署容错（2026-10-17 P1b S08 实证）：竞态重连/重部署会**重置**帧计数（新引擎
-  # 从 0 起）——旧会话尾部（1320）→ 新会话头部（120）会被单调判据误判「静止」。
-  # 检测到重置（b < a）时以新会话为基线继续观察增长；窗口内见到任意增长即过。
-  # 「重置到 0 且不出帧」仍判败（基线更新为 0，后续无增长 → 超时）——不过宽。
-  local t=${1:-20} a b
+# ── vdlog 会话分段（issue #46：帧计数必须按「当前会话」取值）──────────────
+# vd-server.log 是追加文件，一个文件里可能叠着多段会话（引擎重启/重部署）。分段
+# 起点取「最后一个 `Video on :9638`（新会话建流）」与「最后一个 `Pipeline exited`
+# （上一会话结束）」行号中的较大者：
+#   - 只认 Video on：引擎刚退出、新引擎还没建流时会退回上一会话，把它的停机汇总
+#     行（`Pipeline: 120 frames ... tex=0`）当成基线 → 误判「视频流静止」（S11/S13
+#     2026-11-03 首跑 120→120 的根因）；
+#   - 只认 Pipeline exited：行号可能落在 Video on 之前（2026-11-03 快照实测汇总行
+#     先于 exited 行），会放行上一会话的帧行。
+_vdlog_session_start() { # <file> → 当前会话分段起点行号（0=无任何分段标记）
+  local f=$1 l1 l2
+  l1=$(grep -nF 'Video on :9638' "$f" 2>/dev/null | tail -1 | cut -d: -f1)
+  l2=$(grep -nF 'Pipeline exited' "$f" 2>/dev/null | tail -1 | cut -d: -f1)
+  l1=${l1:-0}; l2=${l2:-0}
+  if [ "$l1" -ge "$l2" ]; then echo "$l1"; else echo "$l2"; fi
+}
+vdlog_frames_current() { # <file> → 当前会话最后一条 Pipeline: N frames 的 N（空=当前会话还没有帧行）
+  local f=$1 from n
+  from=$(_vdlog_session_start "$f")
+  n=$(tail -n +"$((from + 1))" "$f" 2>/dev/null | grep -oE 'Pipeline: [0-9]+ frames' | tail -1 | grep -oE '[0-9]+')
+  echo "${n:-}"
+}
+wait_stream_alive() { # [growth_window=20] [first_frame_budget=40]（当前会话帧计数在窗口内增长）
+  # 分段语义（issue #46）：基线只取**当前会话**的帧行，不把上一会话的停机汇总当基线。
+  #   1) 当前会话已有帧行 → 要求 growth_window（默认 20s）内继续增长（主判据）；
+  #   2) 当前会话没有帧行（新会话刚建流 / 上一会话已 exited 但新引擎未建流）→ 先给
+  #      first_frame_budget（默认 40s，覆盖黑屏误报重握手风暴 ~40s 的重部署窗口）等首帧；
+  #      首帧出现后再给 growth_window 确认增长；
+  #   3) 轮询中分段起点后移（引擎重启）→ 上一会话帧数作废，按新会话重置基线与预算。
+  # 失败文案按「当前会话没有帧行」与「有帧行但不增长」分开，避免再把重部署期误读成
+  # 「陈旧纹理黑屏回归」。
+  local win=${1:-20} ff=${2:-40}
+  local f=$E2E_VDLOG
   vdlog_snapshot > /dev/null 2>&1 || true
-  a=$(grep -oE 'Pipeline: [0-9]+ frames' "$E2E_VDLOG" 2>/dev/null | tail -1 | grep -oE '[0-9]+')
-  [ -z "$a" ] && { bad "vdlog 无帧计数行（Pipeline: N frames）"; return 1; }
-  local deadline=$((SECONDS + t))
+  [ -s "$f" ] || { bad "vdlog 快照为空（取不到引擎日志）"; return 2; }
+  local seg0 seg a b deadline
+  seg0=$(_vdlog_session_start "$f")
+  a=$(vdlog_frames_current "$f")
+  if [ -z "$a" ]; then deadline=$((SECONDS + ff)); else deadline=$((SECONDS + win)); fi
   while [ "$SECONDS" -lt "$deadline" ]; do
     sleep 2
     vdlog_snapshot > /dev/null 2>&1 || true
-    b=$(grep -oE 'Pipeline: [0-9]+ frames' "$E2E_VDLOG" 2>/dev/null | tail -1 | grep -oE '[0-9]+')
-    if [ -n "$b" ]; then
-      [ "$b" -gt "$a" ] && { ok "视频流存活（frames $a→$b）"; return 0; }
-      [ "$b" -lt "$a" ] && a=$b   # 计数重置 = 新会话已起；以新会话为基线继续观察
+    seg=$(_vdlog_session_start "$f")
+    if [ "$seg" != "$seg0" ]; then
+      # 新分段（引擎已重启）：上一会话帧数作废，按新会话重算预算
+      seg0=$seg; a=$(vdlog_frames_current "$f")
+      if [ -z "$a" ]; then deadline=$((SECONDS + ff)); else deadline=$((SECONDS + win)); fi
+      continue
+    fi
+    b=$(vdlog_frames_current "$f")
+    if [ -z "$a" ]; then
+      [ -n "$b" ] || continue                     # 仍在等首帧
+      a=$b; deadline=$((SECONDS + win)); continue  # 首帧出现，转入增长窗口
+    fi
+    if [ -n "$b" ] && [ "$b" -gt "$a" ]; then
+      ok "视频流存活（frames $a→$b）"; return 0
     fi
   done
-  bad "视频流静止（frames $a→${b:-$a}，tex 停止增长 = 陈旧纹理黑屏回归信号）"
+  if [ -z "$a" ]; then
+    bad "视频流未出帧（${ff}s 内当前会话无 Pipeline: N frames 行；引擎未起或未出帧）"
+  else
+    bad "视频流静止（frames $a→${b:-$a}，tex 停止增长 = 陈旧纹理黑屏回归信号）"
+  fi
   return 1
 }
 
