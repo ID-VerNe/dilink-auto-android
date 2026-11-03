@@ -13,6 +13,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.util.Locale
 
 /**
  * 车机主屏海拔的 UI 状态（issue #40）。
@@ -32,6 +33,10 @@ data class AltitudeUiState(val meters: Int?)
  * - 数据源：`LocationManager.GPS_PROVIDER` → `Location.getAltitude()`（米，WGS84 椭球高）。
  *   `requestLocationUpdates(1000ms, 0f, listener)`，只接受 [AltitudeFormat.acceptLocation] 为真的结果，
  *   避免拿过期缓存冒充实时（地库/隧道失锁场景）。
+ * - 输入闸门（issue #50）：先过 [AltitudeFormat.acceptVerticalAccuracy]（垂直精度 >100m 拒收），
+ *   再用 `elapsedRealtimeNanos` 做跳变闸门 [AltitudeFormat.isJumpPlausible]（物理不可能跳变拒收）。
+ * - bootstrap（issue #50）：首样本不直采上屏，先缓存最近样本；凑齐 3 个两两差 ≤30m 的样本后
+ *   取中位数初始化，再进入 EMA，避免冷启动瞬间把异常点显示出来。
  * - 平滑：EMA α=0.2 后四舍五入到整数米，避免 GPS 抖动（±10–20m）导致数字每帧跳。
  * - 失败态：权限拒绝 / Provider 关闭 / 无卫星 → `null` → UI 显示 `—`；恢复定位后自动回填。
  * - 不新增权限（`ACCESS_FINE_LOCATION` 已在 `AndroidManifest.xml:11` 声明），
@@ -43,7 +48,10 @@ data class AltitudeUiState(val meters: Int?)
 internal class AltitudeProvider(
     private val scope: CoroutineScope,
     private val context: Context,
-    private val sink: MutableStateFlow<AltitudeUiState?>
+    private val sink: MutableStateFlow<AltitudeUiState?>,
+    /** 诊断日志出口（默认 no-op，便于单测）；实际由 [CarConnectionService] 注入 `carLogSend`，
+     *  沿用 [CarLogWriter] 的开关，release 构建默认不产生噪声。 */
+    private val log: (String) -> Unit = {}
 ) {
     /** 只读出口，供 UI `collectAsState`。 */
     val state: StateFlow<AltitudeUiState?> = sink.asStateFlow()
@@ -51,6 +59,13 @@ internal class AltitudeProvider(
     private var locationManager: LocationManager? = null
     private var listener: LocationListener? = null
     @Volatile private var smoothed: Double? = null
+
+    /** bootstrap 滑动窗口（issue #50）：未初始化前缓存最近 [AltitudeFormat.BOOTSTRAP_SAMPLES] 个样本。 */
+    private val bootstrapSamples = ArrayDeque<Double>()
+
+    /** 最近一个「已采纳」样本的原始海拔（米）与其单调时钟时间戳，仅用于跳变闸门。 */
+    private var lastAcceptedMeters: Double = 0.0
+    private var lastAcceptedElapsedNanos: Long = 0L
 
     /**
      * 启动 GPS 采样。权限未授予时安全降级为「不注册、保持 null」。
@@ -105,19 +120,73 @@ internal class AltitudeProvider(
     }
 
     private fun handleLocation(location: Location) {
-        // location.time 是系统时钟（UTC 毫秒）；用 System.currentTimeMillis() 算年龄。
-        // 注意：用户改系统时间（issue #39 场景）会让年龄判定瞬间失真，但 GPS 1Hz 重采样
-        // 会在下一秒自愈，且 AltitudeFormat.acceptLocation 对负年龄按 0 处理（不拒收），
-        // 因此不在此引入额外的 elapsedRealtimeNanos 换算复杂度。
+        // 年龄判定仍用系统时钟（与 acceptLocation 的语义一致）；跳变闸门用单调时钟
+        // elapsedRealtimeNanos，避免用户改系统时间（issue #39 场景）让 Δt 失真。
         val ageMs = System.currentTimeMillis() - location.time
         val altitude = if (location.hasAltitude()) location.altitude else null
-        if (!AltitudeFormat.acceptLocation(altitude, ageMs)) {
-            // 过期或无高度解算 → 不更新平滑值，但也不清空（保留上一次有效值，避免地库短暂失锁就跳 `—`）。
-            // 只有彻底失锁（不再来 onLocationChanged）时 UI 才停留在旧值；连续无更新由调用方自行感知。
+        val hasVAcc = location.hasVerticalAccuracy()
+        val vAcc = if (hasVAcc) location.verticalAccuracyMeters else Float.NaN
+        val elapsedNanos = location.elapsedRealtimeNanos
+
+        fun diagnose(accepted: Boolean, reason: String) {
+            // 每样本一行（1Hz），由 CarLogWriter 的开关控制；release 默认关闭，不产生噪声。
+            val altText = altitude?.let { String.format(Locale.US, "%.1f", it) } ?: "none"
+            val vAccText = if (hasVAcc) String.format(Locale.US, "%.1f", vAcc) else "none"
+            log("[Altitude] alt=$altText vAcc=$vAccText ageMs=$ageMs " +
+                "accept=$accepted reason=$reason")
+        }
+
+        if (altitude == null) {
+            diagnose(accepted = false, reason = "no-altitude")
             return
         }
-        smoothed = AltitudeFormat.emaSmooth(smoothed, altitude!!)
+        if (!AltitudeFormat.acceptLocation(altitude, ageMs)) {
+            // 过期缓存 → 不更新平滑值、不更新时间戳，也不清空（避免地库短暂失锁就跳 `—`）。
+            diagnose(accepted = false, reason = "stale")
+            return
+        }
+        if (!AltitudeFormat.acceptVerticalAccuracy(hasVAcc, vAcc)) {
+            // 垂直精度太差（>100m）→ 拒收，保持上一次有效显示。
+            diagnose(accepted = false, reason = "vertical-accuracy")
+            return
+        }
+
+        if (smoothed == null) {
+            // ── bootstrap（issue #50）：前 3 个稳定样本取中位数初始化，首样本不直采上屏 ──
+            bootstrapSamples.addLast(altitude)
+            while (bootstrapSamples.size > AltitudeFormat.BOOTSTRAP_SAMPLES) {
+                bootstrapSamples.removeFirst()
+            }
+            if (!AltitudeFormat.bootstrapReady(bootstrapSamples)) {
+                diagnose(accepted = false, reason = "bootstrap-wait")
+                return
+            }
+            val initial = AltitudeFormat.medianOfThree(
+                bootstrapSamples[0], bootstrapSamples[1], bootstrapSamples[2]
+            )
+            smoothed = initial
+            lastAcceptedMeters = altitude
+            lastAcceptedElapsedNanos = elapsedNanos
+            sink.value = AltitudeUiState(meters = initial.toInt())
+            diagnose(accepted = true, reason = "bootstrap-init")
+            return
+        }
+
+        // ── 跳变闸门（issue #50）：相对最近一次「已采纳」样本做物理合理性判断 ──
+        if (!AltitudeFormat.isJumpPlausible(
+                lastAcceptedMeters, lastAcceptedElapsedNanos, altitude, elapsedNanos
+            )
+        ) {
+            // 物理不可能跳变 → 不更新平滑值、不更新时间戳。
+            diagnose(accepted = false, reason = "jump")
+            return
+        }
+
+        smoothed = AltitudeFormat.emaSmooth(smoothed, altitude)
+        lastAcceptedMeters = altitude
+        lastAcceptedElapsedNanos = elapsedNanos
         sink.value = AltitudeUiState(meters = smoothed!!.toInt())
+        diagnose(accepted = true, reason = "ema")
     }
 
     private fun hasPermission(): Boolean =
