@@ -42,6 +42,12 @@ internal class CarCommandRouter(
     private val requestSyncFrame: () -> Unit,
     private val repairLayerTree: () -> Unit,
     private val allowedPackages: Set<String> = emptySet(),
+    /**
+     * issue #48 取证的测试接缝：[moveTopApp] 的 API 门槛读取点。生产默认读
+     * [android.os.Build.VERSION.SDK_INT]；JVM 单测里该值是 0，必须能注入 29
+     * 才能覆盖移动命令序列与新增诊断日志。默认值保证行为不变。
+     */
+    private val sdkInt: () -> Int = { android.os.Build.VERSION.SDK_INT },
 ) {
     /** [healDisplay] 的并发去重：车机端每 15s 重试一次，叠加时不能嵌套执行。 */
     private val healInFlight = AtomicBoolean(false)
@@ -431,8 +437,9 @@ internal class CarCommandRouter(
         // subcommand is absent — am prints a usage error and exits non-zero. Skip the
         // whole feature on older levels so the foreground app is left in place rather
         // than a silent shell failure masking as success.
-        if (android.os.Build.VERSION.SDK_INT < 29) {
-            PipeLog.log("moveTopApp: skipping, am display move-stack requires API 29 (current ${android.os.Build.VERSION.SDK_INT})")
+        val api = sdkInt()
+        if (api < 29) {
+            PipeLog.log("moveTopApp: skipping, am display move-stack requires API 29 (current $api)")
             return
         }
         try {
@@ -458,6 +465,10 @@ internal class CarCommandRouter(
             if (!skip) {
                 PipeLog.log("Moving app $topComponent (Task $taskId) from display $fromDisplay to $toDisplay")
                 exec("am display move-stack $taskId $toDisplay")
+                // issue #48：断开清理只搬顶层任务，被搬回的 task 可能还带着 VD 的
+                // bounds/密度。这里只读一次目标 task 的配置落日志，给现场取证用；
+                // 命令、顺序与返回值都不变（move-stack 仍是 fire-and-forget）。
+                logMovedTaskConfig(taskId?.toIntOrNull(), toDisplay)
             } else {
                 PipeLog.log("moveTopApp: nothing to move (top=${topComponent ?: "<none>"}, task=${taskId ?: "-"}, self=$isSelf)")
             }
@@ -465,6 +476,124 @@ internal class CarCommandRouter(
             PipeLog.err("Failed to move app: ${e.message}")
         }
     }
+
+    /**
+     * issue #48 取证：`move-stack` 之后回读目标 task 的 `displayId / bounds /
+     * compat / densityDpi`，只落一条 `[teardown-move]` 日志。
+     *
+     * `am display move-stack` 是异步入队的（这里是 fire-and-forget 的 `exec`），
+     * 立刻 `dumpsys` 会读到迁移前的状态，所以先等一个很短的时间再读。任何字段
+     * 在当前 ROM 的 dump 里读不到都记 `<unknown>`，不猜测。探测本身也不改任何
+     * 状态：读失败只记日志，[moveTopApp] 的流程照旧返回。
+     */
+    private fun logMovedTaskConfig(taskId: Int?, toDisplay: Int) {
+        if (taskId == null || taskId <= 0) return
+        try {
+            Thread.sleep(TEARDOWN_PROBE_DELAY_MS)
+            val dump = execOut("dumpsys activity activities 2>/dev/null")
+            val located = dump?.let { findTaskSection(it, taskId) }
+            val block = located?.let { taskBlock(it.second, taskId) }
+            val display = located?.first?.toString() ?: "<unknown>"
+            val bounds = block?.let { extractBounds(it) } ?: "<unknown>"
+            val compat = block?.let { extractCompat(it) } ?: "<unknown>"
+            val density = block?.let { extractDensity(it) } ?: "<unknown>"
+            PipeLog.log(
+                "[teardown-move] task=$taskId moved-to=$toDisplay displayId=$display " +
+                    "bounds=$bounds compat=$compat densityDpi=$density"
+            )
+        } catch (e: Exception) {
+            PipeLog.err("[teardown-move] task=$taskId probe failed: ${e.message}")
+        }
+    }
+
+    /**
+     * issue #48 取证：cleanup 时打一行物理屏与 VD 残留任务的快照。
+     *
+     * 只读 `dumpsys window displays`（display#0 的 `init=/cur=`）与
+     * `dumpsys activity activities`（仍停留在 VD 上的 task id），不改任何状态。
+     * 目的：断开后「某些应用 DPI 不对」的现场，能直接看到物理屏配置是否被
+     * 覆写、哪些任务没有随顶层任务一起搬回。
+     */
+    fun logTeardownDisplaySnapshot(vdDisplayId: Int) {
+        try {
+            val windowDump = execOut("dumpsys window displays 2>/dev/null")
+            val zero = displayZeroConfig(windowDump)
+            val activitiesDump = execOut("dumpsys activity activities 2>/dev/null")
+            val residual = if (vdDisplayId >= 0) tasksInDisplay(activitiesDump, vdDisplayId) else emptyList()
+            PipeLog.log(
+                "[teardown-display] display#0 init=${zero?.first ?: "<unknown>"} cur=${zero?.second ?: "<unknown>"} " +
+                    "vd=$vdDisplayId residualTasks=${residual.joinToString(prefix = "[", postfix = "]")}"
+            )
+        } catch (e: Exception) {
+            PipeLog.err("[teardown-display] probe failed: ${e.message}")
+        }
+    }
+
+    /** 在 `dumpsys activity activities` 里定位包含 [taskId] 的 display 段。 */
+    private fun findTaskSection(dump: String, taskId: Int): Pair<Int, String>? {
+        val headers = DISPLAY_HEADER_RE.findAll(dump).toList()
+        for ((index, header) in headers.withIndex()) {
+            val start = header.range.last + 1
+            val end = headers.getOrNull(index + 1)?.range?.first ?: dump.length
+            val section = dump.substring(start, end)
+            // Task 头是 `#<id> `，ActivityRecord 行是 `t<id>}`；两者任一命中即可。
+            if (section.contains("t$taskId}") || Regex("Task\\{[^}]*#$taskId[ }]").containsMatchIn(section)) {
+                return header.groupValues[1].toIntOrNull()?.let { it to section }
+            }
+        }
+        return null
+    }
+
+    /** 取该 task 从头部到下一个 `* Task{` 之间的块（含它的 ActivityRecord 配置行）。 */
+    private fun taskBlock(section: String, taskId: Int): String? {
+        val header = Regex("Task\\{[^}]*#$taskId[ }]").find(section) ?: return null
+        val next = section.indexOf("* Task{", header.range.last + 1)
+        return section.substring(header.range.first, if (next > header.range.first) next else section.length)
+    }
+
+    /**
+     * `dumpsys window displays` 里 display#0 的 `init=` / `cur=`。
+     *
+     * 实机形态：`Display: mDisplayId=0` 下一行 `init=1368x3192 560dpi cur=1368x3192
+     * app=...`；按下一个 `mDisplayId=` 截段，避免读到 VD 的配置。
+     */
+    private fun displayZeroConfig(dump: String?): Pair<String, String>? {
+        if (dump == null) return null
+        val start = dump.indexOf("mDisplayId=0")
+        if (start < 0) return null
+        val next = dump.indexOf("mDisplayId=", start + 1).takeIf { it > start } ?: dump.length
+        val section = dump.substring(start, next)
+        val init = Regex("init=(\\S+\\s+\\d+dpi)").find(section)?.groupValues?.get(1)
+            ?: Regex("init=(\\S+)").find(section)?.groupValues?.get(1)
+            ?: return null
+        val cur = Regex("cur=(\\S+)").find(section)?.groupValues?.get(1) ?: "<unknown>"
+        return init to cur
+    }
+
+    /** 某 display 段里所有 Task 头中的 task id（issue #48：仍留在 VD 上的任务）。 */
+    private fun tasksInDisplay(dump: String?, id: Int): List<Int> {
+        val section = dump?.let { displaySection(it, id) } ?: return emptyList()
+        return TASK_ID_RE.findAll(section).mapNotNull { it.groupValues[1].toIntOrNull() }.toList()
+    }
+
+    /** `am task` 的 bounds：兼容 `bounds=[0,0][2340,1316]` 与 `mBounds=Rect(...)` 两种写法。 */
+    private fun extractBounds(block: String): String? =
+        Regex("(?:mBounds|bounds)=(\\[[^\\]]*\\](?:\\[[^\\]]*\\])?|\\([^)]*\\))")
+            .find(block)?.groupValues?.get(1)
+
+    /**
+     * 任务级兼容/窗口状态。不同 ROM 的 dump 字段名不一致，按已知键依次尝试：
+     * `mWindowingMode`（issue 取证命令里用到的字段）、`compat`、`mOverrideConfig`。
+     */
+    private fun extractCompat(block: String): String? =
+        Regex("mWindowingMode=([^\\s,}]+)").find(block)?.groupValues?.get(1)
+            ?: Regex("compat=([^\\s,}]+)").find(block)?.groupValues?.get(1)
+            ?: Regex("mOverrideConfig=([^\\n]+)").find(block)?.groupValues?.get(1)?.trim()?.take(80)
+
+    /** 任务级密度：优先 `densityDpi=`，回退到 `NNNdpi`（Configuration 的实机写法）。 */
+    private fun extractDensity(block: String): String? =
+        Regex("densityDpi=(\\d+)").find(block)?.groupValues?.get(1)
+            ?: Regex("(\\d+)dpi").find(block)?.groupValues?.get(1)
 
     /**
      * Slice a `dumpsys activity activities` dump down to one display's section —
@@ -533,6 +662,18 @@ internal class CarCommandRouter(
 
         /** `wm size -d <id>` 输出 "Physical size: 2340x1316" 里的首个 WxH。 */
         val WM_SIZE_RE = Regex("(\\d+)x(\\d+)")
+
+        /** `dumpsys activity activities` 的 `Display #<id> ` 段头（issue #48 回读用）。 */
+        val DISPLAY_HEADER_RE = Regex("Display #(\\d+) ")
+
+        /** `dumpsys activity activities` 的 Task 头 `Task{...#<id> ...}`（issue #48 残留任务列表）。 */
+        val TASK_ID_RE = Regex("Task\\{[^}]*#(\\d+)[ }]")
+
+        /**
+         * issue #48：`am display move-stack` 是异步入队的，回读前等一个很短的时间；
+         * 300ms 与其它复查点（[HEAL_VERIFY_MS]）同量级，不改变清理流程。
+         */
+        const val TEARDOWN_PROBE_DELAY_MS = 300L
 
         /**
          * `dumpsys activity activities` 的 Task 行：取花括号内文本，供

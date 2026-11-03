@@ -19,7 +19,9 @@ class CarCommandRouterDispatchTest {
 
     private class Rig(
         /** issue #21：部署端下传的白名单；空 = 不过滤（车机/桌面 ADB 路径）。 */
-        allowedPackages: Set<String> = emptySet()
+        allowedPackages: Set<String> = emptySet(),
+        /** issue #48：JVM 单测里 Build.VERSION.SDK_INT 是 0，需显式注入 29 才能走到 moveTopApp。 */
+        sdkInt: () -> Int = { 29 },
     ) {
         // 线程安全列表：quickSwitch / fillLaunchedApp 在后台线程里追加，
         // 测试线程同时读取（轮询断言），普通 ArrayList 会偶发 CME。
@@ -33,6 +35,9 @@ class CarCommandRouterDispatchTest {
         var appInfoResolve: String? = null
         var recentsDump: String? = null
         var activitiesDump: String? = null
+        var windowDisplaysDump: String? = null
+        /** 需要区分「移动前 / 移动后」两次 dump 时按序取用（issue #48）。 */
+        var activitiesDumpSequence: java.util.concurrent.ConcurrentLinkedQueue<String>? = null
 
         val router = CarCommandRouter(
             exec = { execs += it },
@@ -40,7 +45,9 @@ class CarCommandRouterDispatchTest {
                 execOuts += cmd
                 when {
                     cmd.startsWith("dumpsys activity recents") -> recentsDump
-                    cmd.startsWith("dumpsys activity activities") -> activitiesDump
+                    cmd.startsWith("dumpsys activity activities") ->
+                        activitiesDumpSequence?.poll() ?: activitiesDump
+                    cmd.startsWith("dumpsys window displays") -> windowDisplaysDump
                     cmd.startsWith("wm size") -> "Physical size: 2340x1316"
                     cmd.contains("resolve-activity") && cmd.contains("android.intent.action.MAIN") -> launchResolve
                     cmd.contains("resolve-activity") && cmd.contains("APPLICATION_DETAILS_SETTINGS") -> appInfoResolve
@@ -54,6 +61,7 @@ class CarCommandRouterDispatchTest {
             requestSyncFrame = { syncRequests.incrementAndGet() },
             repairLayerTree = { layerRepairs.incrementAndGet() },
             allowedPackages = allowedPackages,
+            sdkInt = sdkInt,
         )
     }
 
@@ -475,5 +483,79 @@ Display #7 (activities from top to bottom):
                 "am start --display 7 --task 34033 -n 'com.autonavi.minimap/com.autonavi.map.activity.SplashActivity'"
             )
         )
+    }
+
+    // ─── issue #48：断开清理只加取证日志，不改行为 ───
+
+    /** 捕获 stdout（[PipeLog.log] 直接写 System.out），用于断言新增的取证日志。 */
+    private fun captureStdout(block: () -> Unit): String {
+        val original = System.out
+        val buffer = java.io.ByteArrayOutputStream()
+        System.setOut(java.io.PrintStream(buffer, true))
+        try {
+            block()
+        } finally {
+            System.setOut(original)
+        }
+        return buffer.toString()
+    }
+
+    @Test
+    fun `teardown move keeps the move stack command sequence and logs the moved task config`() {
+        // issue #48：断开时 moveTopApp 仍然只发同一条 `am display move-stack`；
+        // 新增的只是移动后回读目标 task 配置的 `[teardown-move]` 日志。
+        val r = Rig()
+        r.activitiesDumpSequence = java.util.concurrent.ConcurrentLinkedQueue(
+            listOf(
+                """
+Display #7 (activities from top to bottom):
+  * Task{a11 #2048 type=standard A=10216:com.twitter.android U=0 visible=true visibleRequested=true mode=fullscreen translucent=false sz=1}
+    * ActivityRecord{751a1f5 u0 com.twitter.android/com.x.android.main.MainActivity t2048}
+""",
+                """
+Display #0 (activities from top to bottom):
+  * Task{a11 #2048 type=standard A=10216:com.twitter.android U=0 visible=true visibleRequested=true mode=fullscreen translucent=false sz=1}
+    bounds=[0,0][1368,3192]
+    mWindowingMode=fullscreen
+    densityDpi=560
+    * ActivityRecord{751a1f5 u0 com.twitter.android/com.x.android.main.MainActivity t2048}
+"""
+            )
+        )
+
+        val log = captureStdout { r.router.moveTopApp(7, 0) }
+
+        assertEquals("移动命令序列必须与修复前一致", listOf("am display move-stack 2048 0"), r.execs.toList())
+        assertTrue("必须仍先读源 display 段", r.execOuts.first().startsWith("dumpsys activity activities"))
+        assertTrue(log.contains("[teardown-move] task=2048 moved-to=0 displayId=0"))
+        assertTrue(log.contains("bounds=[0,0][1368,3192]"))
+        assertTrue(log.contains("compat=fullscreen"))
+        assertTrue(log.contains("densityDpi=560"))
+    }
+
+    @Test
+    fun `teardown display snapshot logs physical init cur and residual vd tasks`() {
+        // issue #48：cleanup 的取证行要能直接对比物理屏 init/cur，并列出没被搬回
+        // 物理屏、仍挂在 VD 上的任务。
+        val r = Rig()
+        r.windowDisplaysDump = """
+Display: mDisplayId=0
+  init=1368x3192 560dpi cur=1368x3192 app=1368x3192 560dpi
+Display: mDisplayId=7
+  init=2340x1316 240dpi cur=2340x1316 app=2340x1316 240dpi
+"""
+        r.activitiesDump = """
+Display #0 (activities from top to bottom):
+  * Task{a11 #2048 type=standard A=10216:com.twitter.android U=0 visible=true}
+    * ActivityRecord{751a1f5 u0 com.twitter.android/com.x.android.main.MainActivity t2048}
+Display #7 (activities from top to bottom):
+  * Task{e27 #34033 type=standard A=10265:com.autonavi.minimap U=0 visible=true}
+    * ActivityRecord{b68 u0 com.autonavi.minimap/com.autonavi.map.activity.SplashActivity t34033}
+"""
+
+        val log = captureStdout { r.router.logTeardownDisplaySnapshot(7) }
+
+        assertTrue(log.contains("[teardown-display] display#0 init=1368x3192 560dpi cur=1368x3192"))
+        assertTrue(log.contains("vd=7 residualTasks=[34033]"))
     }
 }
