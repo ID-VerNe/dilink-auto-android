@@ -8,6 +8,8 @@ import kotlinx.coroutines.*
 import java.io.EOFException
 import java.net.InetSocketAddress
 import java.nio.ByteBuffer
+import java.nio.channels.AsynchronousCloseException
+import java.nio.channels.ClosedChannelException
 import java.nio.channels.ServerSocketChannel
 import java.nio.channels.SocketChannel
 import java.util.concurrent.Callable
@@ -325,6 +327,16 @@ internal suspend fun commandRelayLoop(
     } catch (e: EOFException) {
         log.info("Command relay closed by peer (EOF)")
         RelayEnd.PEER_CLOSED
+    } catch (e: AsynchronousCloseException) {
+        // 本端 disconnect() 关 socket 时，正在阻塞的读线程被异步唤醒并抛此异常。
+        // 这是预期的收尾路径（与对端关闭同义），是 I 不是 E（issue #24）。
+        log.info("Command relay closed locally")
+        RelayEnd.STOPPED
+    } catch (e: ClosedChannelException) {
+        // 本端关闭后再次读已关通道（对端关闭时 readByteOrNull 返回 null，不会走到这里）。
+        // 同样是正常收尾，不记 E、不改变对外状态语义。
+        log.info("Command relay closed locally")
+        RelayEnd.STOPPED
     } catch (e: Exception) {
         log.error("Command relay error", e)
         RelayEnd.FAILED
