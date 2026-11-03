@@ -6,7 +6,7 @@
 
 实测车型:**比亚迪 秦PLUS DM-i 2023款 冠军版 55KM 领先型**。该款车机是 DiLink 4.0 低配方案 —— 骁龙 439(8x Cortex-A53 全小核、Adreno 505)、4GB RAM、16GB eMMC、1280x800 屏、仅 2.4GHz WiFi、Android 9 / API 28、H.264 硬件解码上限 1080p。本 fork 的性能调优全部围绕这套硬件展开。
 
-当前版本:**1.0.2**(`versionCode 61`)。
+当前版本:**1.0.3**(`versionCode 62`)。
 
 原本要解决的矛盾是:手机(小米 HyperOS 国行版等)装不了 Android Auto,而车机只支持 Android Auto —— 中间没有桥。DiLink-Auto 对任何 Android 10+ 手机都通用,有没有 Google 服务都行。
 
