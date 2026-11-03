@@ -14,6 +14,8 @@ import org.junit.Assert.fail
 import org.junit.Test
 import java.io.EOFException
 import java.io.IOException
+import java.nio.channels.AsynchronousCloseException
+import java.nio.channels.ClosedChannelException
 
 /**
  * issue #24 的回归钉子：命令 relay 必须把「正常断开」和「真实故障」分开记。
@@ -106,6 +108,36 @@ class CommandRelayLoopTest {
 
         assertTrue("relay 协程应处于已取消状态", job.isCancelled)
         assertTrue("disconnect 触发的取消是正常收尾，不能记 E：${log.errors}", log.errors.isEmpty())
+    }
+
+    @Test
+    fun `本端关闭通道抛 ClosedChannelException 时只记 I 且返回 STOPPED`() = runTest {
+        val log = RecordingLog()
+        val end = commandRelayLoop(
+            readType = { throw ClosedChannelException() },
+            shouldContinue = { true },
+            onMessage = { fail("本端已关闭，不应该再分发消息") },
+            log = log
+        )
+
+        assertEquals("本端关闭是正常收尾，应返回 STOPPED", RelayEnd.STOPPED, end)
+        assertEquals("本端关闭必须有一条 I 级日志：${log.infos}", 1, log.infos.size)
+        assertTrue("本端关闭不能记 E：${log.errors}", log.errors.isEmpty())
+    }
+
+    @Test
+    fun `本端异步关闭通道抛 AsynchronousCloseException 时只记 I 且返回 STOPPED`() = runTest {
+        val log = RecordingLog()
+        val end = commandRelayLoop(
+            readType = { throw AsynchronousCloseException() },
+            shouldContinue = { true },
+            onMessage = { fail("本端已异步关闭，不应该再分发消息") },
+            log = log
+        )
+
+        assertEquals("本端异步关闭是正常收尾，应返回 STOPPED", RelayEnd.STOPPED, end)
+        assertEquals("本端异步关闭必须有一条 I 级日志：${log.infos}", 1, log.infos.size)
+        assertTrue("本端异步关闭不能记 E：${log.errors}", log.errors.isEmpty())
     }
 
     @Test
