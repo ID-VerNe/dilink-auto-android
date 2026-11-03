@@ -79,11 +79,41 @@ scenario_ops() {
   # 主操作判向（见文件头偏差①）：reconnect 只做「重启 A 的 app」（rc 恒 0、
   # 语义纯净，不含 UI 驱动）；产品级成败看 60s 收敛窗口。
   run_op reconnect || { log_err "reconnect op 失败（重启 A 的 app）"; return 1; }
-  local deadline=$((SECONDS + 60)) cur=""
+  # occupy 后置 wait（issue #31）：进收敛窗口前先等 B 回 WAITING 或 A 端首次连接尝试。
+  # 失败证据（WiFi connect failed / Failed to connect ADB to / Connection error）要等
+  # A 端第一轮连接尝试失败后才产生——原版 reconnect 后约 2s 读到首判 IDLE 就 break，
+  # 证据还没产生。occupy_9637 已 force-stop B 的 client（ops.sh:528），reconnect 后
+  # car_state_now 走 B 进程缺失分支返 UNKNOWN（asserts.sh:185 改后）——首判不再 IDLE。
+  # op_neutral 已在 setup 清过 logcat，occupy 不产生连接尝试行，本轮命中的
+  # 'WiFi track: trying' 等都是 reconnect 后新产生（无需再 clear）。
+  local pre_dl=$((SECONDS + 30)) pre_ok=0 _f _pat
+  while [ "$SECONDS" -lt "$pre_dl" ]; do
+    [ "$(phone_state_now)" = "WAITING" ] && { pre_ok=1; break; }
+    _f=$(mktemp); logcat_dump car "$_f" > /dev/null 2>&1 || true
+    for _pat in 'WiFi track: trying' 'Failed to connect ADB to' 'WiFi connect failed:'; do
+      [ "$(countF "$_f" "$_pat")" -ge 1 ] && { pre_ok=1; rm -f "$_f"; break 2; }
+    done
+    rm -f "$_f"; sleep 1
+  done
+  [ "$pre_ok" = "1" ] && log_step "occupy 后置 wait 通过（B 回 WAITING 或 A 端连接尝试已发起）" \
+    || log_step "occupy 后置 wait 30s 未命中（继续进收敛窗口；无连接尝试证据时 asserts INCONCLUSIVE 兜底）"
+  # IDLE 稳定采样（issue #31）：连续 ≥3 次、跨 ≥6s 都是 IDLE 才 break；
+  # UNKNOWN / CONNECTING / CONNECTED 不 break 继续 sleep——reconnect 后初期 B 的
+  # client 被 occupy_9637 杀掉、尚未被 A 的 TCP ADB 轨 am start 重启，car_state_now
+  # 返 UNKNOWN，正好不再首判早退。STREAMING 立即 break（UNEXPECTED-PASS）。
+  # 进程拉起瞬间的假 IDLE 因不满足「跨 ≥6s」不触发。
+  local deadline=$((SECONDS + 60)) cur="" idle_streak=0 first_idle_t=0
   while [ "$SECONDS" -lt "$deadline" ]; do
     cur=$(car_state_now)
-    [ "$cur" = "STREAMING" ] && break
-    [ "$cur" = "IDLE" ] && break   # 已收敛到明确的失败终态，无需等满窗口
+    case "$cur" in
+      STREAMING) break ;;
+      IDLE)
+        [ "$idle_streak" -eq 0 ] && first_idle_t=$SECONDS
+        idle_streak=$((idle_streak + 1))
+        [ "$idle_streak" -ge 3 ] && [ $((SECONDS - first_idle_t)) -ge 6 ] && break
+        ;;
+      *) idle_streak=0 ;;   # UNKNOWN / CONNECTING / CONNECTED 重置计数
+    esac
     sleep 2
   done
   if [ "$cur" = "STREAMING" ]; then
@@ -108,6 +138,22 @@ scenario_asserts() {
   logcat_dump car   "$d/logcat-car.txt"   > /dev/null 2>&1 || true
   logcat_dump phone "$d/logcat-phone.txt" > /dev/null 2>&1 || true
   pull_clientlog "$d/client.log"          > /dev/null 2>&1 || true
+  # —— 前置门禁（issue #31）：先要求 A 端确有连接尝试证据 ——
+  # 没有连接尝试 = 没测到产品行为，判 INCONCLUSIVE（不 FAIL）。原版证据冻结过早
+  # （2s 早退），失败证据根本还没产生就判了「静默失败」。三串任一命中即视为有尝试
+  # （源码逐字：CarConnectionService.kt WiFi track / RemoteAdbController.kt:56 / :37）。
+  local attempt=0 _f _pat
+  for _f in "$d/logcat-car.txt" "$d/client.log" "$d/logcat-phone.txt"; do
+    [ -s "$_f" ] || continue
+    for _pat in 'WiFi track: trying' 'Failed to connect ADB to' 'WiFi connect failed:'; do
+      [ "$(countF "$_f" "$_pat")" -ge 1 ] && { attempt=1; break 2; }
+    done
+  done
+  if [ "$attempt" = "0" ]; then
+    E2E_SCENARIO_INCONCLUSIVE="A 端 logcat/client.log 无连接尝试证据（WiFi track: trying / Failed to connect ADB to / WiFi connect failed: 均未命中），无法判定是否按预期失败"
+    log_step "S21 INCONCLUSIVE：$E2E_SCENARIO_INCONCLUSIVE"
+    return 0
+  fi
   local hit=0 f pat
   for f in "$d/logcat-car.txt" "$d/client.log" "$d/logcat-phone.txt"; do
     for pat in 'Connection error:' 'WiFi connect failed:' 'watchdog: no frame received' 'Failed to connect ADB to'; do
@@ -143,8 +189,13 @@ scenario_asserts() {
       *nc*)
         bad "9637 仍被 nc 占用——冲突未解除（$holder）"; rc=1 ;;
       *)
-        if [ "$(phone_state_now)" = "WAITING" ]; then
-          ok "9637 由产品持守（phone=WAITING）——nc 退出后 client 重试 bind 自恢复，端口归正确属主"
+        # phone=WAITING = B 的 client 回到监听（9637 由产品持守，端口归正确属主）。
+        # issue #31 后 car_state_now 在 B 进程缺失时返 UNKNOWN；occupy_9637 杀过
+        # B 的 client 但 A 的 TCP ADB 轨会 am start 重启它（CarConnectionService.kt:826），
+        # 故收尾时 client 可能仍活（phone=WAITING）或已被 op_neutral force-stop（phone=IDLE）。
+        # 两种都属「nc 已退、9637 无冲突残留」——判 ok，不判缺陷态。
+        if [ "$(phone_state_now)" = "WAITING" ] || [ "$(phone_state_now)" = "IDLE" ]; then
+          ok "9637 归属正确（nc 退出后端口空闲或产品持守，phone=$(phone_state_now)）——无冲突残留"
         else
           bad "9637 仍 LISTEN 但属主/状态不明（holder=${holder:-<ss 无进程信息：shell 无权看 app 属主>} phone=$(phone_state_now)）"; rc=1
         fi ;;

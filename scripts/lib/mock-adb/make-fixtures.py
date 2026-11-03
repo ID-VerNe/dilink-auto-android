@@ -119,8 +119,8 @@ w("clientlog-ejected.log", """=== DiLink Auto Client log started 2026-10-15 23:0
 # ── B 的 client.log（会话中 client 被 force-stop/install -r 杀掉）───────
 # **2026-10-16 真机形态**：B 的 client 进程被杀 → client.log **突然停止增长**
 # （无断开处理行——进程没机会写）；A 端的断开日志也传不过来（B 死）。
-# car_state_now 走「B 端 client 进程不在 → IDLE」短路（2026-10-16 新增），
-# 不依赖本 fixture 的尾行。fixture 保真为「停在最后一条正常中继行」。
+# car_state_now 走「B 端 client 进程不在 → UNKNOWN」分支（issue #31 修正，
+# 原为 IDLE 短路），不依赖本 fixture 的尾行。fixture 保真为「停在最后一条正常中继行」。
 w("clientlog-killed.log", """=== DiLink Auto Client log started 2026-10-15 23:02:11 ===
 [23:02:11.004][I][ConnectionService] Listening for car connection on port 9637...
 [23:02:19.812][I][ConnectionService] Car connected (control, session #8), waiting for handshake
@@ -130,6 +130,32 @@ w("clientlog-killed.log", """=== DiLink Auto Client log started 2026-10-15 23:02
 [23:02:19.930][I][CarLog] [23:02:20.590][I] Handshake OK: MI 9 jarPath=/data/local/tmp/vd-server.jar connMethod=tcp vdDpi=480
 [23:02:20.150][I][CarLog] [23:02:20.810][I] All connections ready — connected
 [23:02:20.360][I][CarLog] [23:02:21.020][I] Video ready — streaming
+""")
+
+# ── B 的 client.log（S21：9637 被占，client 被 A 的 adb 轨 am start 拉起后
+#    bind 撞 nc → Connection error；后随连接失败断开 → Car disconnected (control)）─
+# car_state_now 阶段性产物（issue #31 mock 时间线）：
+#   reconnect_tick ≥4 时 cat 本文件 → 失败证据 + 末行 Car disconnected (control)
+#   → car_state_now 走状态行扫描命中 IDLE（双端进程在）。连接尝试串 WiFi track: trying
+#   在 A logcat（logcat-car-s21-fail.log）侧产出，本文件只放 B 侧串。
+w("clientlog-s21-fail.log", """=== DiLink Auto Client log started 2026-10-28 08:24:46 ===
+[08:24:46.100][I][ConnectionService] Listening for car connection on port 9637...
+[08:24:49.200][I][ConnectionService] Car connected (control, session #9), waiting for handshake
+[08:24:49.350][E][ConnectionService] Connection error: bind 9637 failed (Address already in use)
+[08:24:50.800][W][ConnectionService] ControlConn: reader: IOException: Connection reset by peer
+[08:24:50.810][I][ConnectionService] Car disconnected (control)
+[08:24:50.820][I][ConnectionService] cleanupSession: tearing down session #9
+[08:24:51.000][I][ConnectionService] Listening for car connection on port 9637...
+""")
+
+# ── A 的 logcat（S21：reconnect 后启动路径自动连接尝试 → 失败证据）────────
+# 连接尝试串（issue #31 INCONCLUSIVE 门禁的判据）：WiFi track: trying / Failed to
+# connect ADB to / WiFi connect failed: ——三串任一命中即视为「A 端确有连接尝试」。
+# 失败证据串与连接尝试串部分重叠（WiFi connect failed: 既是尝试也是失败）。
+w("logcat-car-s21-fail.log", """10-28 08:24:47.792 I/CarConnectionService: WiFi track: trying gateway 192.168.3.206
+10-28 08:24:48.100 E/RemoteAdbController: Failed to connect ADB to 192.168.3.206:5555
+10-28 08:24:49.500 W/CarConnectionService: WiFi connect failed: timeout connecting 192.168.3.206:9637
+10-28 08:24:50.900 I/ActivityManager: Displayed com.dilinkauto.server/.MainActivity: +420ms
 """)
 
 # ── vd-server.log（@FRAMES@/@TEX@ 由 mock 逐次读取时替换）──────────────

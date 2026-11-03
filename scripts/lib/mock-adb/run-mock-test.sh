@@ -53,12 +53,16 @@ for f in scripts/lib/*.py; do
 done
 ok "py_compile 通过"
 
+# 接缝单测（issue #31 回归钉子）：CAR_STATE_SAMPLER 注入验证 car_state_now 边界
+bash scripts/lib/test-car-state-now.sh > /dev/null 2>&1 \
+  && ok "car_state_now 接缝单测通过" || bad "car_state_now 接缝单测失败"
+
 step "2/4 层②构造：--list / --dry-run"
 bash scripts/e2e-dual-device.sh --list > /dev/null 2>&1 && ok "--list 通过" || bad "--list 失败"
 bash scripts/e2e-dual-device.sh --phone mockA --car mockB --scenario S01 --dry-run > /dev/null 2>&1 \
   && ok "--dry-run 通过" || bad "--dry-run 失败"
 
-step "3/4 层③回放：mock adb 跑 S01+S02+S03 全编排"
+step "3/4 层③回放：mock adb 跑 S01+S02+S03+S21 全编排"
 rm -rf "$STATE"; mkdir -p "$STATE"
 python "$MOCK/make-fixtures.py" > /dev/null 2>&1 || bad "fixture 生成失败"
 export DILINK_TEST_PIN_PHONE=1234 DILINK_TEST_PIN_CAR=1234
@@ -67,10 +71,10 @@ export MOCK_ADB_TRACE="$STATE/tap-trace.log"
 export PATH="$MOCK:$PATH"
 echo "  （mock adb 已置顶 PATH；真机不会被动）"
 RC=0
-bash scripts/e2e-dual-device.sh --phone mockA --car mockB --scenario S01,S02,S03 --skip-build \
+bash scripts/e2e-dual-device.sh --phone mockA --car mockB --scenario S01,S02,S03,S21 --skip-build \
   > "$STATE/run.log" 2>&1 || RC=$?
 tail -40 "$STATE/run.log" | sed 's/^/     /'
-if [ "$RC" = "0" ]; then ok "S01+S02+S03 回放退出码 0（全编排走通）"; else bad "回放退出码 $RC（见 $STATE/run.log）"; fi
+if [ "$RC" = "0" ]; then ok "S01+S02+S03+S21 回放退出码 0（全编排走通）"; else bad "回放退出码 $RC（见 $STATE/run.log）"; fi
 echo "  tap 轨迹（mock 按 fixture 节点边界判定的点击语义）："
 sed 's/^/     /' "$STATE/tap-trace.log" 2>/dev/null | head -12
 
@@ -78,8 +82,15 @@ step "4/4 产物断言"
 RUNDIR=$(ls -dt debug-logs/e2e/2026* 2>/dev/null | head -1)
 if [ -n "$RUNDIR" ] && [ -f "$RUNDIR/summary.txt" ]; then
   ok "summary.txt 在位（$RUNDIR/summary.txt）"
-  grep -E 'S01|场景|断言' "$RUNDIR/summary.txt" | sed 's/^/     /'
+  grep -E 'S01|S21|场景|断言' "$RUNDIR/summary.txt" | sed 's/^/     /'
   grep -q 'S01.*PASS' "$RUNDIR/summary.txt" && ok "S01 判定 PASS" || bad "S01 未判 PASS"
+  # S21（issue #31）：fixture 有连接尝试证据（WiFi track: trying / Failed to connect
+  # ADB to / WiFi connect failed:），应判 PASS(expected)，不判 INCONCLUSIVE 也不 FAIL。
+  grep -q 'S21.*PASS(expected)' "$RUNDIR/summary.txt" && ok "S21 判 PASS(expected)" \
+    || { grep -q 'S21.*INCONCLUSIVE' "$RUNDIR/summary.txt" && bad "S21 误判 INCONCLUSIVE（fixture 有连接尝试证据）" \
+         || bad "S21 未判 PASS(expected)（见 summary.txt S21 行）"; }
+  grep -q '失败证据命中' "$STATE/run.log" && ok "S21 失败证据命中（源码逐字串）" || bad "S21 未命中失败证据"
+  grep -q 'INCONCLUSIVE' "$STATE/run.log" && bad "S21 不应判 INCONCLUSIVE（fixture 有连接尝试）" || ok "S21 未误判 INCONCLUSIVE"
 else
   bad "找不到回放产物 summary.txt（RUNDIR=${RUNDIR:-无}）"
 fi
@@ -92,7 +103,7 @@ fi
 # 零残留：完整跑完（RC=0）时 mock 状态应已回中立（session/client_up/server_up 都被
 # op_neutral 的 force-stop 清掉）。中途 abort 的轮次不强求（preflight 失败就还没到 neutral）。
 if [ "$RC" = "0" ]; then
-  for f in session client_up server_up; do
+  for f in session client_up server_up occupied reconnect_tick; do
     [ -f "$STATE/$f" ] && bad "mock 状态残留：$f（restore 没跑干净）" || true
   done
   ok "mock 状态已回中立"

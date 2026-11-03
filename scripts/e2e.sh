@@ -350,7 +350,7 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 DUAL_RC=0
 DUAL_DIR=""
-DUAL_TOTAL=0; DUAL_PASS=0; DUAL_FAIL=0; DUAL_SKIP=0; DUAL_FLAKY=0
+DUAL_TOTAL=0; DUAL_PASS=0; DUAL_FAIL=0; DUAL_SKIP=0; DUAL_FLAKY=0; DUAL_INCONCLUSIVE=0
 DUAL_VERDICT="SKIP"
 DUAL_WHY=""
 FAILED_IDS=()
@@ -363,10 +363,11 @@ _dual_merge() { # <first_summary> <retry_summary|空>
     END {
       for (id in first) {
         f = first[id]; r = (id in retry) ? retry[id] : "-"
-        if (f ~ /^PASS/)         v = "PASS";
-        else if (f ~ /^SKIPPED/) v = "SKIP";
-        else if (r ~ /^PASS/)    v = "FLAKY";
-        else                     v = "FAIL";
+        if (f ~ /^PASS/)              v = "PASS";
+        else if (f ~ /^SKIPPED/)      v = "SKIP";
+        else if (f ~ /^INCONCLUSIVE/) v = "INCONCLUSIVE";
+        else if (r ~ /^PASS/)         v = "FLAKY";
+        else                          v = "FAIL";
         printf "%s\t%s\t%s\t%s\n", id, f, r, v;
       }
     }' "$1" "${2:-/dev/null}" | sort
@@ -426,15 +427,17 @@ run_dual() {
     [ -n "${id:-}" ] || continue
     DUAL_TOTAL=$((DUAL_TOTAL + 1))
     case "$v" in
-      PASS)  DUAL_PASS=$((DUAL_PASS + 1)) ;;
-      FLAKY) DUAL_PASS=$((DUAL_PASS + 1)); DUAL_FLAKY=$((DUAL_FLAKY + 1)); FAILED_IDS+=("$id(FLAKY)") ;;
-      SKIP)  DUAL_SKIP=$((DUAL_SKIP + 1)) ;;
-      *)     DUAL_FAIL=$((DUAL_FAIL + 1)); FAILED_IDS+=("$id") ;;
+      PASS)          DUAL_PASS=$((DUAL_PASS + 1)) ;;
+      FLAKY)         DUAL_PASS=$((DUAL_PASS + 1)); DUAL_FLAKY=$((DUAL_FLAKY + 1)); FAILED_IDS+=("$id(FLAKY)") ;;
+      SKIP)          DUAL_SKIP=$((DUAL_SKIP + 1)) ;;
+      INCONCLUSIVE)  DUAL_INCONCLUSIVE=$((DUAL_INCONCLUSIVE + 1)); FAILED_IDS+=("$id(INCONCLUSIVE)") ;;
+      *)             DUAL_FAIL=$((DUAL_FAIL + 1)); FAILED_IDS+=("$id") ;;
     esac
   done < <(_dual_merge "$OUT/dual-first.tsv" "$retryf")
 
   if [ "$DUAL_FAIL" -gt 0 ]; then DUAL_VERDICT="FAIL"
   elif [ "$DUAL_RC" = "2" ]; then DUAL_VERDICT="ENV_FAIL"; DUAL_WHY="退出码 2（环境/构建/解锁）"
+  elif [ "$DUAL_INCONCLUSIVE" -gt 0 ]; then DUAL_VERDICT="INCONCLUSIVE"; DUAL_WHY="有 $DUAL_INCONCLUSIVE 个场景无法判定（A 端无连接尝试证据），需人工 review"
   else DUAL_VERDICT="PASS"; fi
   return 0
 }
@@ -512,8 +515,9 @@ step "3/5 汇总判定"
 OVERALL="PASS"
 for _v in "$DUAL_VERDICT" "$DESKTOP_VERDICT"; do
   case "$_v" in
-    FAIL)     OVERALL="FAIL" ;;
-    ENV_FAIL) [ "$OVERALL" = "PASS" ] && OVERALL="ENV_FAIL" ;;
+    FAIL)         OVERALL="FAIL" ;;
+    ENV_FAIL)     [ "$OVERALL" = "PASS" ] && OVERALL="ENV_FAIL" ;;
+    INCONCLUSIVE) [ "$OVERALL" = "PASS" ] && OVERALL="INCONCLUSIVE" ;;
   esac
 done
 unset _v
@@ -536,7 +540,7 @@ ELAPSED=$((SECONDS - T0))
   if [ "$SUITE" != "desktop" ]; then
     echo "## 车机+手机（dual）— $DUAL_VERDICT"
     echo
-    echo "场景 $DUAL_TOTAL 个：通过 $DUAL_PASS（其中复跑救回 $DUAL_FLAKY）/ 失败 $DUAL_FAIL / 跳过 $DUAL_SKIP"
+    echo "场景 $DUAL_TOTAL 个：通过 $DUAL_PASS（其中复跑救回 $DUAL_FLAKY）/ 失败 $DUAL_FAIL / 跳过 $DUAL_SKIP / 无法判定 $DUAL_INCONCLUSIVE"
     [ -n "$DUAL_WHY" ] && echo && echo "> $DUAL_WHY"
     echo
     if [ -f "$DUAL_DIR/summary.txt" ]; then
@@ -560,7 +564,7 @@ ELAPSED=$((SECONDS - T0))
     echo
   fi
   if [ "${#FAILED_IDS[@]}" -gt 0 ]; then
-    echo "## 失败场景"
+    echo "## 需 review 的场景（失败 / 无法判定）"
     echo
     for id in "${FAILED_IDS[@]}"; do echo "- $id"; done
     echo
@@ -585,6 +589,7 @@ cat > "$OUT/verdict.json" <<JSON
     "scenarios_pass": $DUAL_PASS,
     "scenarios_fail": $DUAL_FAIL,
     "scenarios_skip": $DUAL_SKIP,
+    "scenarios_inconclusive": $DUAL_INCONCLUSIVE,
     "flaky": $DUAL_FLAKY,
     "failed_ids": "$(printf '%s ' "${FAILED_IDS[@]:-}" | sed 's/ $//')"
   },
@@ -606,8 +611,8 @@ echo
 hr
 printf '  E2E 结论：%s\n' "$OVERALL"
 if [ "$SUITE" != "desktop" ]; then
-  printf '  车机+手机 : %-9s 场景 %d 通过 / %d 失败 / %d 跳过' \
-    "$DUAL_VERDICT" "$DUAL_PASS" "$DUAL_FAIL" "$DUAL_SKIP"
+  printf '  车机+手机 : %-9s 场景 %d 通过 / %d 失败 / %d 跳过 / %d 无法判定' \
+    "$DUAL_VERDICT" "$DUAL_PASS" "$DUAL_FAIL" "$DUAL_SKIP" "$DUAL_INCONCLUSIVE"
   [ "$DUAL_FLAKY" -gt 0 ] && printf '（复跑救回 %d）' "$DUAL_FLAKY"
   echo
 fi
@@ -626,7 +631,8 @@ fi
 hr
 
 case "$OVERALL" in
-  PASS)     exit 0 ;;
-  FAIL)     exit 1 ;;
-  *)        exit 2 ;;
+  PASS)          exit 0 ;;
+  FAIL)          exit 1 ;;
+  INCONCLUSIVE)  exit 1 ;;   # 需人工 review，不是全绿（与 FAIL 同退出码，但 verdict 区分）
+  *)             exit 2 ;;   # ENV_FAIL / 用法 / 构建问题
 esac
