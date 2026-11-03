@@ -54,9 +54,14 @@ scenario_asserts() {
     [ "$rc" = "0" ] && ok "S11 判据①达成：产品恢复（STREAMING + 流存活 + 引擎单开 + 哨兵置上）"
   else
     cur_car=$(car_state_now); cur_phone=$(phone_state_now)
-    if [ "$cur_car" = "IDLE" ] && { [ "$cur_phone" = "WAITING" ] || [ "$cur_phone" = "IDLE" ]; }; then
-      # ② 干净降级——引擎必须真的没了（若产品又拉起新引擎却未成流，既非①也非②）
-      ok "S11 判据②达成：干净降级（car=IDLE phone=$cur_phone）"
+    # ② 干净降级——引擎必须真的没了（若产品又拉起新引擎却未成流，既非①也非②）。
+    # issue #31 后 car_state_now 的 B 进程缺失分支返 UNKNOWN 不再强行 IDLE：
+    # kill_engine 只杀 PipelineServer（ops.sh:350），不杀 client——client 存活子支路
+    # 走状态行扫描返 IDLE 不受影响；client 同死子支路（phone=IDLE）会走进程缺失分支
+    # 返 UNKNOWN，故 phone=IDLE 时也接受 car=UNKNOWN（真卡死时 phone 不会是 IDLE，
+    # 不担心把卡死掩盖）。
+    if { [ "$cur_car" = "IDLE" ] || [ "$cur_car" = "UNKNOWN" ]; } && { [ "$cur_phone" = "WAITING" ] || [ "$cur_phone" = "IDLE" ]; }; then
+      ok "S11 判据②达成：干净降级（car=$cur_car phone=$cur_phone）"
       if [ -z "$(engine_pid)" ]; then
         ok "引擎已退出（降级态）"
       else

@@ -175,15 +175,24 @@ phone_state_now() { # → IDLE|WAITING|CONNECTED|STREAMING|UNKNOWN
   echo "${ST:-UNKNOWN}"
 }
 car_state_now() { # → IDLE|CONNECTING|CONNECTED|STREAMING|UNKNOWN
+  # 可注入接缝（issue #31 回归钉子）：测试用 CAR_STATE_SAMPLER 注入假采样器，
+  # 绕过真实 adb 采样，单测 car_state_now 的状态判定边界。生产路径留空走原逻辑。
+  if [ -n "${CAR_STATE_SAMPLER:-}" ]; then "$CAR_STATE_SAMPLER"; return $?; fi
   # A 的日志经 TCP 中继进 B 的 client.log（tag=CarLog）；server 进程不在 → IDLE。
   if [ -z "$(dcar 'pgrep -f "[c]om.dilinkauto.server"' 2>/dev/null | tr -d '\r\n ')" ]; then
     echo IDLE; return 0
   fi
-  # 【2026-10-16 P1 预判新增】B 端 client 进程不在 → 日志源已死（client.log 不再
-  # 增长，最后状态行是死前的残留）且会话的一端已消失——A 端不可能仍在 STREAMING
-  # （S09 杀 client / S12 重装窗口）。B 活着时（含 S03 Eject 回 WAITING）不走此路。
+  # 【2026-10-16 P1 预判新增 → issue #31 修正】B 端 client 进程不在 = 日志源已死
+  # （client.log 不再增长，最后状态行是死前残留）且会话的一端已消失——既非「会话
+  # 已收敛到 IDLE」也非任何已知态。返回 UNKNOWN，让调用方（S21 ops 循环、
+  # wait_state_eq）继续轮询而非早退判 FAIL。S09 kill_client 后改为期望 car 回
+  # UNKNOWN（s09:39）；S11 client 同死子支路放宽接受 car=UNKNOWN（s11:57）。
+  # IDLE 只由「双端进程在 + 明确断开/空闲状态行」定义（下方 :194-200 的
+  # handleDisconnect / User disconnect / Car disconnected (control)）。
+  # A 端 server 缺失仍走上方 :179 返回 IDLE（中立态 / S10 kill_server 依赖此路；
+  # 改 :179 会让 _common.sh neutral_verified 在中立态 FAIL——全套 setup 崩）。
   if [ -z "$(dphone 'pgrep -f "[c]om.dilinkauto.client"' 2>/dev/null | tr -d '\r\n ')" ]; then
-    echo IDLE; return 0
+    echo UNKNOWN; return 0
   fi
   local f ST; f=$(mktemp)
   clientlog_snapshot "$f" > /dev/null 2>&1

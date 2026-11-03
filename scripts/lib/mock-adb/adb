@@ -85,17 +85,45 @@ exec_shell() {
         case "$w" in :[0-9][0-9][0-9][0-9]) p="${w#:}" ;; esac
       done
       mock_port_answer "$p" ;;
+    ss\ -ltnp*)
+      # op_neutral / S21 asserts 查 9637 属主。mock 不建模 ss -ltnp 进程列表，
+      # 但要区分 9637 谁在 LISTEN：occupied=1 → nc 占（holder 含 nc）；否则 client 持守。
+      # 抠端口；:9637 且 occupied → 回一行 "0 102 nc 9637"（含 nc，匹配 s21 case *nc*）；
+      # :9637 且 client_up → 回一行 "0 102 com.dilinkauto.client 9637"（无 nc，走产品持守）。
+      p=""
+      for w in $cmd; do
+        w=${w//\"/}; w=${w//;/}
+        case "$w" in :[0-9][0-9][0-9][0-9]) p="${w#:}" ;; esac
+      done
+      [ "$p" = "9637" ] || exit 0
+      if [ "$(flag occupied)" = "1" ]; then
+        echo "0 102 nc 0 0 *:9637 (*:*) users:((\"nc\",pid=99,fd=3))"
+      elif [ "$(flag client_up)" = "1" ]; then
+        echo "0 102 com.dilinkauto.client 0 0 *:9637 (*:*) users:((\"com.dilinkauto.client\",pid=4243,fd=5))"
+      fi
+      exit 0 ;;
     ss\ -ltn*|ss\ -tn*) mock_port_answer "" ;;
+    grep\ -E*|grep\ :\*) mock_port_answer "" ;;   # /proc/net/tcp 兜底探测（grep -E ":NNNN ..."）
+    grep\ :\*) mock_port_answer "" ;;
     tail\ -c*\ /sdcard/DiLinkAuto/client.log|cat\ /sdcard/DiLinkAuto/client.log*)
       mock_clientlog ;;
     cat\ /sdcard/DiLinkAuto/vd-server.log*|tail\ -c*\ /sdcard/DiLinkAuto/vd-server.log*)
       mock_vdlog ;;
     logcat\ -d)
-      { [ "$SERIAL" = "$PHONE" ] || is_phone_tcp "$SERIAL"; } && cat "$FIX/logcat-phone.log" || cat "$FIX/logcat-car.log" ;;
+      # S21（issue #31）：occupied + server_up + 未建流 → A 端连接尝试失败证据
+      # （WiFi track: trying / Failed to connect ADB to / WiFi connect failed:）。
+      # 仅 car 侧（dcar）产出；phone 侧仍走 logcat-phone.log（无 S21 失败串）。
+      if [ "$(flag occupied)" = "1" ] && [ "$(flag server_up)" = "1" ] && [ "$(flag session)" != "1" ] \
+         && { [ "$SERIAL" != "$PHONE" ] && ! is_phone_tcp "$SERIAL"; }; then
+        cat "$FIX/logcat-car-s21-fail.log"
+      else
+        { [ "$SERIAL" = "$PHONE" ] || is_phone_tcp "$SERIAL"; } && cat "$FIX/logcat-phone.log" || cat "$FIX/logcat-car.log"
+      fi ;;
     logcat\ -c) exit 0 ;;
     rm\ -f\ /sdcard/*)
       case "$cmd" in
         *stop-request*|*vd-server.log*) rm -f "$ST/session"; setflag disconnected ;;   # 删哨兵/引擎日志 = 会话终结信号
+        *e2e-occupy.pid*) rm -f "$ST/occupied" "$ST/reconnect_tick" ;;   # op_neutral 清占位 pid → 释放 9637（S21 收尾）
       esac
       exit 0 ;;
     ls\ /sdcard/DiLinkAuto/stop-request*)
@@ -103,14 +131,31 @@ exec_shell() {
     am\ force-stop*)
       case "$cmd" in
         *com.dilinkauto.client*)
-          # 会话中被杀 → car 侧控制口 EOF → handleDisconnect 进日志（client_killed 态）
+          # 会话中被杀 → car 侧控制口 EOF 打 handleDisconnect（client_killed 态）。
+          # 注意：op_neutral 会 force-stop B 的 client（ops.sh:100）——若仍 occupied 且
+          # 失败证据已就绪（tick≥4），视作 S21 收尾，释放 occupied/nc 占位（9637 归空）。
           if [ "$(flag session)" = "1" ] || [ "$(flag disconnected)" = "1" ]; then setflag client_killed; fi
+          if [ "$(flag occupied)" = "1" ] && [ "$(flag reconnect_tick)" -ge 4 ]; then
+            rm -f "$ST/occupied" "$ST/reconnect_tick"
+          fi
           rm -f "$ST/client_up" "$ST/session" "$ST/disconnected" "$ST/touches" ;;
-        *com.dilinkauto.server*) rm -f "$ST/server_up" "$ST/session" "$ST/disconnected" ;;
+        *com.dilinkauto.server*)
+          # op_reconnect force-stop A 的 server（ops.sh:262）——occupied=1 时不清 occupied
+          # （occupy 与 server 死活正交；nc 仍在 LISTEN）；S21 reconnect 流程靠此推进 tick
+          rm -f "$ST/server_up" "$ST/session" "$ST/disconnected" ;;
       esac
       exit 0 ;;
     monkey\ -p\ com.dilinkauto.client*) setflag client_up; rm -f "$ST/client_killed"; exit 0 ;;
-    monkey\ -p\ com.dilinkauto.server*) setflag server_up; exit 0 ;;
+    monkey\ -p\ com.dilinkauto.server*)
+      # op_reconnect 的 monkey 拉起 A 的 server（ops.sh:264）。S21（occupied=1）时递增
+      # reconnect_tick 推进 mock 时间线（issue #31）——每 tick ≈ 1 次 car_state_now 采样
+      # （sleep 2）。tick 0-2：client_up=0（B client 仍死）→ car 走进程缺失→UNKNOWN；
+      # tick 3：模拟 A 的 adb 轨 am start 拉起 B → client_up=1；tick ≥4：失败证据就绪。
+      if [ "$(flag occupied)" = "1" ]; then
+        local t; t=$(( $(flag reconnect_tick) + 1 )); setflag reconnect_tick "$t"
+        [ "$t" -ge 3 ] && setflag client_up   # A 的 TCP ADB 轨 am start 重启 B 的 client
+      fi
+      setflag server_up; exit 0 ;;
     input\ text*)
       # PIN/IP 输入：置 unlocked（dumpsys window 报 isKeyguardShowing=false）并
       # 重置 tap 计数——「自上次 text 以来第 2 次 tap」= op_connect 的 Connect 钮。
@@ -166,7 +211,7 @@ exec_shell() {
     svc\ wifi*|cmd\ wifi*|cmd\ display\ power-*|am\ broadcast*|am\ start*) exit 0 ;;
     ping\ -c*) exit 0 ;;
     echo\ \|\ nc\ -w*|*\ nc\ -w*) exit 0 ;;
-    setsid\ toybox\ nc*) exit 0 ;;
+    setsid\ toybox\ nc*) setflag occupied; exit 0 ;;   # occupy_9637 占住 9637（S21）
     echo\ *\>\ /sdcard/DiLinkAuto/*) exit 0 ;;
     cat\ /sdcard/DiLinkAuto/e2e-occupy.pid*) exit 0 ;;
     kill\ -9*) exit 0 ;;
@@ -176,6 +221,18 @@ exec_shell() {
 }
 
 mock_clientlog() {
+  # S21（issue #31）三态：occupied + server_up + 未建流时按 reconnect_tick 阶段产出：
+  #   tick 0-2（client_up=0，B client 仍死）：B 端 client.log 停在 idle（Listening 行）
+  #     ——但 car_state_now 此时走进程缺失→UNKNOWN，不读本文件。
+  #   tick ≥4（失败证据就绪）：cat clientlog-s21-fail.log（Connection error + Car
+  #     disconnected (control)）——car_state_now 走状态行扫描命中 IDLE。
+  # 真机形态（B 本地行）：[ts][I][Tag] msg；A 中继行 [ts][I][CarLog] [ts][I] msg。
+  if [ "$(flag occupied)" = "1" ] && [ "$(flag server_up)" = "1" ] && [ "$(flag session)" != "1" ]; then
+    if [ "$(flag client_up)" = "1" ] && [ "$(flag reconnect_tick)" -ge 4 ]; then
+      cat "$FIX/clientlog-s21-fail.log"; return
+    fi
+    cat "$FIX/clientlog-idle.log"; return   # client 未起 / tick<4：仍 LISTEN（WAITING）
+  fi
   # 四态（优先级从高到低）：
   #   killed     —— 会话中 client 进程被杀（force-stop/install -r）：car 看到
   #                 控制口 EOF 打 handleDisconnect；无重监听行（进程死了）。
@@ -265,8 +322,14 @@ log_mock() { echo "[mock-adb $(date +%H:%M:%S)] $*" >> "${MOCK_ADB_TRACE:-/dev/n
 mock_port_answer() {
   local port=$1
   if [ "$(flag session)" != "1" ]; then
-    if [ "$port" = "9637" ] && [ "$(flag client_up)" = "1" ]; then echo Y; else echo N; fi
-    return 0
+    # S21（issue #31）：occupied=1 时 9637 被 nc LISTEN（即使 client_up=0 也答 Y）
+    if [ "$port" = "9637" ]; then
+      if [ "$(flag occupied)" = "1" ]; then echo Y
+      elif [ "$(flag client_up)" = "1" ]; then echo Y
+      else echo N; fi
+      return 0
+    fi
+    echo N; return 0
   fi
   case "$port" in 9637|9638|9639|19647|"") echo Y ;; *) echo N ;; esac
 }

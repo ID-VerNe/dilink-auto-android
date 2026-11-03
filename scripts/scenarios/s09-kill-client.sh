@@ -35,8 +35,11 @@ scenario_asserts() {
   # 收尾清理全过（S03 同款断言集）：引擎退出（≤30s 观测窗）+ 9637 释放 +
   # 哨兵恢复基线 + 无强制 kill（vdlog 面）
   assert_teardown_clean || rc=1
-  # car 回 IDLE（A 的 server 进程还活着，但会话已断——日志末条状态行应是断开）
-  wait_state_eq car IDLE 30 || { bad "car 未回 IDLE（$(car_state_now)）"; rc=1; }
+  # car 回 UNKNOWN（A 的 server 进程还活着，但 B 的 client 被杀 = 日志源已死、
+  # car 侧状态不可观测——issue #31 后 car_state_now 进程缺失分支返 UNKNOWN 不再
+  # 强行 IDLE，比谎报 IDLE 诚实）。S09 注释 :18「client 一死…phone_state_now 进程
+  # 存亡优先，client 死后恒 IDLE」仍成立——那是 phone_state_now（未改）。
+  wait_state_eq car UNKNOWN 30 || { bad "car 未回 UNKNOWN（$(car_state_now)）"; rc=1; }
   # phone：client 进程已死 → phone_state_now 恒 IDLE（同时反证 kill_client 真的杀了进程）
   wait_state_eq phone IDLE 30 || { bad "phone 未回 IDLE（$(phone_state_now)）"; rc=1; }
   # 无 ANR/崩溃 + 无回归标记

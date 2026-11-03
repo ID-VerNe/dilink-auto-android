@@ -100,7 +100,7 @@ unset _fn
 hr() { printf '%s\n' "------------------------------------------------------------"; }
 step() { echo; echo "==================== [$(date +%H:%M:%S)] $* ===================="; }
 info() { echo "  · $*"; }
-PASS=0; FAIL=0; SKIPPED=0; ENV_BROKEN=0
+PASS=0; FAIL=0; SKIPPED=0; ENV_BROKEN=0; SCEN_INCONCLUSIVE=0
 # ok/bad 同时累加两套账：PASS/FAIL（本次运行总账，含编排层自身断言）与
 # E2E_PASS/E2E_FAIL（asserts.sh 场景台账——run_scenario 用其增量做 ledger 判定，见
 # §判定 dfail）。2026-10-16 修：此前覆盖 ok/bad 后 E2E_* 永不增长 → "ledger ✗=0"
@@ -538,6 +538,7 @@ run_scenario() { # <file>
   # shellcheck source=/dev/null
   . "$f" || { bad "$sid source 失败"; return 1; }
   E2E_SCENARIO_SKIP=""   # 场景可设它来申请 SKIPPED(env)（S21 无 nc / S22 找不到撤销入口）
+  E2E_SCENARIO_INCONCLUSIVE=""   # 场景设它来申请 INCONCLUSIVE（S21 A 端无连接尝试证据）
   # ── setup ──
   if ! scenario_setup; then
     bad "$sid setup 失败（未到 @pre 复合态）"
@@ -575,11 +576,17 @@ run_scenario() { # <file>
   #   @expect: fail ：判向全写在场景 ledger 里（按预期失败=ok、静默失败/无证据=bad、
   #                    主操作意外成功=bad）→ ledger 无 ✗ 且 ops 未失败 = PASS(expected)
   #   任一路径：场景设了 E2E_SCENARIO_SKIP → SKIPPED(env)，不计通过也不计失败
+  #             场景设了 E2E_SCENARIO_INCONCLUSIVE → INCONCLUSIVE（A 端无连接尝试
+  #             证据，无法判定产品是否按预期失败），不进 PASS/FAIL 账、退出码非 0
   local res dfail
   dfail=$((E2E_FAIL - f0))
   if [ -n "${E2E_SCENARIO_SKIP:-}" ]; then
     res="SKIPPED(env)"
     skip "$sid SKIPPED(env)：$E2E_SCENARIO_SKIP（未执行产品判定，不混入通过——P6）"
+  elif [ -n "${E2E_SCENARIO_INCONCLUSIVE:-}" ]; then
+    res="INCONCLUSIVE"
+    info "$sid INCONCLUSIVE：$E2E_SCENARIO_INCONCLUSIVE（A 端无连接尝试证据，需人工 review）"
+    freeze_scene "$sid-inconclusive"   # INCONCLUSIVE 现场也要冻结供 review（asserts return 0 不会经 :560 触发）
   elif [ "$exp" = "fail" ]; then
     if [ "$dfail" = "0" ] && [ "$ops_failed" = "0" ]; then
       res="PASS(expected)"; ok "$sid 按预期失败（@expect: fail 达成，证据在位）"
@@ -596,6 +603,7 @@ run_scenario() { # <file>
   case "$res" in
     PASS|PASS\(expected\)) SCEN_PASS=$((SCEN_PASS + 1)) ;;
     SKIPPED\(env\)) SKIPPED=$((SKIPPED + 1)) ;;
+    INCONCLUSIVE) SCEN_INCONCLUSIVE=$((SCEN_INCONCLUSIVE + 1)) ;;
     # 2026-10-16 修：此处不再手动 FAIL+1——res=FAIL 的三条路径都先经 bad()（已 +1），
     # 手动再 +1 会让「失败 N 项」比控制台 ✗ 行数虚高（mock S02 实测 1 ✗ 却报 3）。
     *) SCEN_FAIL=$((SCEN_FAIL + 1)) ;;
@@ -623,7 +631,7 @@ for f in "${SELECTED[@]}"; do
     p0_bad=0
     for i in "${!SUM_ID[@]}"; do
       [ "${SUM_PRI[$i]}" = "P0" ] || continue
-      case "${SUM_RES[$i]}" in PASS|PASS\(expected\)|SKIPPED*) ;; *) p0_bad=1 ;; esac
+      case "${SUM_RES[$i]}" in PASS|PASS\(expected\)|SKIPPED*|INCONCLUSIVE) ;; *) p0_bad=1 ;; esac
     done
     [ "$p0_bad" = "1" ] && P0_ALL_GREEN=0
   fi
@@ -642,7 +650,7 @@ step "7/9 汇总"
     printf '%-6s %-4s %-7s %-16s %s\n' "${SUM_ID[$i]}" "${SUM_PRI[$i]}" "${SUM_EXP[$i]}" "${SUM_RES[$i]}" "${SUM_SEC[$i]}"
   done
   echo
-  echo "场景：$SCEN_PASS 通过 / $SCEN_FAIL 失败 / 共 $SCEN_TOTAL"
+  echo "场景：$SCEN_PASS 通过 / $SCEN_FAIL 失败 / $SCEN_INCONCLUSIVE 无法判定 / 共 $SCEN_TOTAL"
   echo "断言：通过 $PASS 项，失败 $FAIL 项"
   echo "产物目录：$RUN"
 } | tee "$E2E_RUN_DIR/summary.txt"
@@ -656,11 +664,15 @@ neutral_verified && ok "收尾中立态核验通过" || bad "收尾中立态核�
 
 echo
 hr
-echo "结果：场景 $SCEN_PASS 通过 / $SCEN_FAIL 失败；断言 $PASS 通过 / $FAIL 失败"
+echo "结果：场景 $SCEN_PASS 通过 / $SCEN_FAIL 失败 / $SCEN_INCONCLUSIVE 无法判定；断言 $PASS 通过 / $FAIL 失败"
 echo "产物目录：$RUN（summary.txt / sequence.jsonl / freeze-*/ / neutral-archive/）"
-if [ "$FAIL" = "0" ] && [ "$SCEN_FAIL" = "0" ]; then
+if [ "$FAIL" = "0" ] && [ "$SCEN_FAIL" = "0" ] && [ "$SCEN_INCONCLUSIVE" = "0" ]; then
   echo "全部通过 ✓"
   exit 0
+fi
+if [ "$SCEN_FAIL" = "0" ] && [ "$SCEN_INCONCLUSIVE" -gt 0 ]; then
+  echo "有 $SCEN_INCONCLUSIVE 项无法判定（INCONCLUSIVE）——需人工 review，见 $RUN"
+  exit 1
 fi
 echo "有失败项——现场与冻结件见 $RUN"
 echo "排查入口：docs/e2e-dual-device-runbook.md"
