@@ -655,7 +655,12 @@ class PipelineServer(
         if (!cleanedUp.compareAndSet(false, true)) return
         running = false
         // 1. Global state first — these outlive this process if we die.
-        try { shell.exec("cmd window reset-letterbox-style") } catch (_: Exception) {}
+        // issue #48：失败不再静默 —— letterbox 残留会被用户描述成「显示尺寸/比例不对」，
+        // 至少要在日志里留下失败原因。命令、顺序不变（[PersistentShell.exec] 本身不抛，
+        // 这里的 catch 只在极端情况下兜底，不改变清理流程）。
+        try { shell.exec("cmd window reset-letterbox-style") } catch (e: Exception) {
+            err("[teardown-display] reset-letterbox-style failed: ${e.message}")
+        }
         if (displayId >= 0) {
             try { shell.exec("wm user-rotation -d $displayId free") } catch (_: Exception) {}
         }
@@ -665,6 +670,9 @@ class PipelineServer(
         displayController.setPhysicalDisplayPower(true)
         try { shell.exec("input keyevent 224") } catch (_: Exception) {}
         displayController.restoreIme()
+        // 3b. issue #48 取证：面板/IME 已恢复后再读快照，避免 dumpsys 拖慢恢复顺序。
+        // 只读：显示 display#0 的 init/cur 与仍留在 VD 上的 task id，不改任何状态。
+        carCommands.logTeardownDisplaySnapshot(displayId)
         // 4. Stop the LifeWriter thread before killing the shell — it may be mid-write.
         lifecycle.stop()
         // 4b. 屏障（2026-10-10，MI 9 实测）：上面的恢复命令是 fire-and-forget 写进
