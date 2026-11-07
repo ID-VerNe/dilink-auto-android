@@ -61,10 +61,10 @@ fun CarShell(service: CarConnectionService) {
     val isConnected = state == CarConnectionService.State.STREAMING ||
             state == CarConnectionService.State.CONNECTED
 
-    // issue #39 / #40 / #41：顶部信息条收集「连接页 + 主屏」需要展示的 chip。
-    // 时间 chip + 海拔 chip + 天气 chip。天气：state 为 null（从未成功）时也加 chip 渲染 `—`，
-    // 让用户知道此栏存在；altitudeState 本身为 null（provider 尚未初始化）时不加 chip。
-    // MirrorScreen（投屏镜像页）走 Screen.APP 分支，不渲染 InfoBar，满足验收标准 4。
+    // issue #39 / #40 / #41：常驻信息 chip：时间 + 海拔 + 天气。
+    // 天气：state 为 null（从未成功）时也加 chip 渲染 `—`，让用户知道此栏存在；
+    // altitudeState 本身为 null（provider 尚未初始化）时不加 chip。
+    // issue #54：这三项改为常驻 —— 横屏进左侧导航栏，竖屏进顶部信息条，不再随 Screen 切换隐藏。
     val infoChips = remember(timeState, altitudeState, weatherState) {
         buildList {
             timeState?.let { add(InfoChip(it.text)) }
@@ -115,10 +115,10 @@ fun CarShell(service: CarConnectionService) {
         val configuration = LocalConfiguration.current
         val isLandscape = configuration.screenWidthDp > configuration.screenHeightDp
 
-        // issue #39：主屏（HOME）顶部渲染 InfoBar；镜像页（APP）不渲染（验收标准 5）。
-        val showInfoBar = currentScreen == Screen.HOME
+        // issue #54：chip 落位只由方向决定，镜像页也常驻；不再用 currentScreen 作闸门。
+        val placement = ShellChrome.infoPlacement(isLandscape)
 
-        if (isLandscape) {
+        if (placement == InfoPlacement.LEFT_RAIL) {
             Row(modifier = Modifier
                 .fillMaxSize()
                 .background(MaterialTheme.colorScheme.background)
@@ -133,10 +133,12 @@ fun CarShell(service: CarConnectionService) {
                         service.disconnectFromPhone()
                         currentScreen = Screen.HOME
                     },
-                    modifier = Modifier.zIndex(1f)
+                    modifier = Modifier.zIndex(1f),
+                    // issue #54：chip 常驻左栏，不占内容区高度 —— 顺带消除了切页时
+                    // 内容区高度变化引起的视口重部署。
+                    chips = infoChips
                 )
                 Column(modifier = Modifier.weight(1f).fillMaxHeight()) {
-                    if (showInfoBar) InfoBar(infoChips)
                     CarContentArea(
                         service = service,
                         currentScreen = currentScreen,
@@ -153,7 +155,10 @@ fun CarShell(service: CarConnectionService) {
                     .fillMaxSize()
                     .background(MaterialTheme.colorScheme.background)
             ) {
-                if (showInfoBar) InfoBar(infoChips)
+                // issue #54：竖屏没有左栏，顶部信息条改为常驻（仅空 chip 时不渲染）。
+                if (ShellChrome.showTopInfoBar(isLandscape, chipsEmpty = infoChips.isEmpty())) {
+                    InfoBar(infoChips)
+                }
                 CarContentArea(
                     service = service,
                     currentScreen = currentScreen,

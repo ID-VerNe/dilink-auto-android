@@ -16,6 +16,8 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.dilinkauto.server.R
 import com.dilinkauto.server.service.CarViewport
+import com.dilinkauto.server.ui.InfoChip
+import com.dilinkauto.server.ui.InfoChipColumn
 import com.dilinkauto.server.ui.theme.NavBarBackgroundColor
 
 /**
@@ -91,17 +93,24 @@ private fun NavActionButtons(
     }
 }
 
+/**
+ * @param chips 常驻信息 chip（时间 / 海拔 / 天气）。issue #54 起横屏由 [CarShell] 传入，
+ *   与三个导航键同栏渲染；因为它在导航栏里，镜像页（`Screen.APP`）也不会被裁掉。
+ *   保持默认空列表可让其它调用点维持原样。
+ */
 @Composable
 fun PersistentNavBar(
     onBack: () -> Unit,
     onHome: () -> Unit,
     onDisconnect: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    chips: List<InfoChip> = emptyList()
 ) {
     val navBarDp = rememberNavBarSize()
 
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
+        // 有 chip 时 chip 与按键作为一个居中的整组，避免按键位置被顶到栏底后跳变。
         verticalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterVertically),
         modifier = modifier
             .width(navBarDp)
@@ -109,6 +118,7 @@ fun PersistentNavBar(
             .background(NavBarBackgroundColor)
             .padding(vertical = 12.dp, horizontal = 4.dp)
     ) {
+        InfoChipColumn(chips = chips, modifier = Modifier.padding(bottom = 4.dp))
         NavActionButtons(
             onBack = onBack, onHome = onHome, onDisconnect = onDisconnect,
             modifier = Modifier.padding(vertical = 4.dp)
