@@ -328,64 +328,82 @@ class VideoDecoder {
                         cachedKeyFrame = null
                     }
 
-                    // With 4-frame queue, catchup is unnecessary — frames arrive on time or get dropped.
+                    // issue #55：原实现每 1000/fps 毫秒只取 1 帧，消费速率被硬限在 30fps，
+                    // 4 槽接收队列因此没有任何突发余量；关键帧/积压帧一突发就丢帧，丢帧又触发
+                    // 「等下一个 IDR」的重同步，画面冻结数秒。下面先把单帧处理抽成函数，
+                    // 再按 FeedBurst 的上限一轮排空队列，用满解码器输入能力
+                    //（实测 decodeMs≈21.5ms/30 帧，远快于 30fps 输入）。
                     var skipCount = 0L
 
-                    while (running.get()) {
-                        // Drain output first to free decoder buffers before trying to feed
-                        drainOutput(decoder)
-
-                        val frame = try {
-                            frameQueue.poll(1000L / effectiveFps, TimeUnit.MILLISECONDS)
-                        } catch (_: InterruptedException) {
-                            continue
-                        } ?: continue
-
+                    fun feedOne(frame: FrameData) {
                         if (frame.isConfig) {
                             configData = frame.data
                             log("Feeding CONFIG (${frame.data.size} bytes)")
                             feedBuffer(decoder, frame.data, MediaCodec.BUFFER_FLAG_CODEC_CONFIG)
                             configFed = true
-                        } else if (!configFed) {
+                            return
+                        }
+                        if (!configFed) {
                             if (frameCount == 0L) log("Waiting for CONFIG before feeding video frames")
-                            continue
-                        } else {
-                            val isKey = frame.isKeyFrame
-                            // 参考链有洞时（issue #9），MediaCodec 用坏参考解 P 帧只会产马赛克。
-                            // 停喂 P 帧、只等 IDR：onFrameReceived 给关键帧队列优先，下一个 IDR
-                            // 很快到队头；能索要时还会经 onNeedsSyncFrame 让手机立刻补一个。
-                            if (!resync.shouldFeed(isKey)) {
-                                skipCount++
-                                if (skipCount <= 5 || skipCount % 30 == 0L) {
-                                    logW("Resync: skipping P-frame #$skipCount until next IDR")
-                                }
-                                continue
+                            return
+                        }
+                        val isKey = frame.isKeyFrame
+                        // 参考链有洞时（issue #9），MediaCodec 用坏参考解 P 帧只会产马赛克。
+                        // 停喂 P 帧、只等 IDR：onFrameReceived 给关键帧队列优先，下一个 IDR
+                        // 很快到队头；能索要时还会经 onNeedsSyncFrame 让手机立刻补一个。
+                        if (!resync.shouldFeed(isKey)) {
+                            skipCount++
+                            if (skipCount <= 5 || skipCount % 30 == 0L) {
+                                logW("Resync: skipping P-frame #$skipCount until next IDR")
                             }
-                            if (skipCount > 0) {
-                                log("Resync: resynced at IDR keyframe after skipping $skipCount P-frames")
-                                skipCount = 0L
-                            }
-                            if (isKey) {
-                                keyFramesFed++
-                                log("Feeding KEYFRAME #$keyFramesFed size=${frame.data.size} (fed=$frameCount rendered=$renderCount)")
-                            }
-                            val decodeStart = if (debugFrameStats) System.nanoTime() else 0L
-                            feedBuffer(decoder, frame.data, 0)
-                            if (debugFrameStats) windowDecodeNanos += System.nanoTime() - decodeStart
-                            frameCount++
-                            if (frameCount % 30 == 0L) {
-                                if (debugFrameStats) {
-                                    val decodeMs = windowDecodeNanos / 1_000_000.0
-                                    log("Fed $frameCount rendered=$renderCount drops=$dropCount inputFails=$inputFailCount keys_recv=$keyFramesReceived keys_fed=$keyFramesFed keys_drop=$keyFramesDropped queue=${frameQueue.size} skips=$skipCount resync=${resync.awaitingIdr} decodeMs=${"%.1f".format(decodeMs)}")
-                                    windowDecodeNanos = 0L
-                                } else {
-                                    log("Fed $frameCount rendered=$renderCount drops=$dropCount inputFails=$inputFailCount keys_recv=$keyFramesReceived keys_fed=$keyFramesFed keys_drop=$keyFramesDropped queue=${frameQueue.size} skips=$skipCount resync=${resync.awaitingIdr}")
-                                }
+                            return
+                        }
+                        if (skipCount > 0) {
+                            log("Resync: resynced at IDR keyframe after skipping $skipCount P-frames")
+                            skipCount = 0L
+                        }
+                        if (isKey) {
+                            keyFramesFed++
+                            log("Feeding KEYFRAME #$keyFramesFed size=${frame.data.size} (fed=$frameCount rendered=$renderCount)")
+                        }
+                        val decodeStart = if (debugFrameStats) System.nanoTime() else 0L
+                        feedBuffer(decoder, frame.data, 0)
+                        if (debugFrameStats) windowDecodeNanos += System.nanoTime() - decodeStart
+                        frameCount++
+                        if (frameCount % 30 == 0L) {
+                            if (debugFrameStats) {
+                                val decodeMs = windowDecodeNanos / 1_000_000.0
+                                log("Fed $frameCount rendered=$renderCount drops=$dropCount inputFails=$inputFailCount keys_recv=$keyFramesReceived keys_fed=$keyFramesFed keys_drop=$keyFramesDropped queue=${frameQueue.size} skips=$skipCount resync=${resync.awaitingIdr} decodeMs=${"%.1f".format(decodeMs)}")
+                                windowDecodeNanos = 0L
+                            } else {
+                                log("Fed $frameCount rendered=$renderCount drops=$dropCount inputFails=$inputFailCount keys_recv=$keyFramesReceived keys_fed=$keyFramesFed keys_drop=$keyFramesDropped queue=${frameQueue.size} skips=$skipCount resync=${resync.awaitingIdr}")
                             }
                         }
+                    }
 
-                        // Drain all available output
+                    while (running.get()) {
+                        // Drain output first to free decoder buffers before trying to feed
                         drainOutput(decoder)
+
+                        // 空闲时仍按帧间隔阻塞等待，避免忙等；一旦有帧就立刻进入排空循环。
+                        var frame = frameQueue.poll()
+                        if (frame == null) {
+                            frame = try {
+                                frameQueue.poll(1000L / effectiveFps, TimeUnit.MILLISECONDS)
+                            } catch (_: InterruptedException) {
+                                continue
+                            } ?: continue
+                        }
+
+                        var fedThisRound = 0
+                        while (frame != null) {
+                            feedOne(frame)
+                            fedThisRound++
+                            // 每喂一帧就排空一次输出，及时归还解码器输入缓冲。
+                            drainOutput(decoder)
+                            if (!FeedBurst.shouldContinue(fedThisRound, frameQueue.isNotEmpty())) break
+                            frame = frameQueue.poll()
+                        }
                     }
                     log("Feed thread exiting: fed=$frameCount rendered=$renderCount drops=$dropCount")
                 } finally {
