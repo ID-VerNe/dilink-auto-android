@@ -2,15 +2,18 @@
 
 ## Overview
 
-DiLink-Auto uses a custom binary protocol over **3 dedicated TCP connections** between phone and car, plus one internal lifecycle connection between the phone app and the VD server:
+DiLink-Auto 在手机与车机之间使用 **3 条专用 TCP 连接**（另有一条音频连接，其 wire 契约已定义但尚未绑定），手机 App 与 VD server 之间还有一条内部生命周期连接：
 
 | Connection | Port | Direction | Content |
 |------------|------|-----------|---------|
 | **Control + Data** | 9637 | Bidirectional | Handshake, heartbeat, app commands, app list, car logs, media metadata |
 | **Video** | 9638 | VD server -> Car | H.264 CONFIG + FRAME only |
 | **Input** | 9639 | Car -> VD server | Touch events only |
+| **Audio**（见下文） | 9640 | VD server -> Car | AAC-LC CONFIG + FRAME；S1 已有端口常量与载荷编解码，S3 才会 bind socket |
 | **Lifecycle** | 19647 | VD server -> Phone (localhost) | Display ready / stack empty / stop signals |
 | **ADB TCP** | 5555 | Car -> Phone (or Phone -> Car for dadb) | Persistent single-socket ADB for shell commands and car APK install |
+
+9640 刻意**不复用** 9638：`VideoFrameSender` 是单线程 + 有界队列的写侧，一个 1 MB 的 IDR 会把 341 B 的音频帧堵在队头后面。音频必须走独立连接，且音频连接失败不得拖垮整条视频会话。
 
 The VD server binds the video and input ports directly on `0.0.0.0:9638` and `0.0.0.0:9639`, so video frames and touch events flow directly between the VD server and the car without phone-side relaying. The phone app is not on the video or input data path. A deploy site that knows its own outbound address can pass a receiver IP in the trailing `CAR_HOST` argv slot (`VdDeployArgs.CAR_HOST_ANY` = `-` keeps the accept-any behaviour), which pins those two accepts to the peer the engine actually serves.
 
@@ -48,7 +51,7 @@ The lifecycle channel on `localhost:19647` is documented in [client.md](./client
 |----|------|------------|-----------|---------|
 | 0 | CONTROL | Control (9637) | Bidirectional | Handshake, heartbeat, app commands, VD lifecycle signals |
 | 1 | VIDEO | Video (9638) | VD server -> Car | H.264 encoded video frames |
-| 2 | AUDIO | (reserved) | Reserved | Reserved (not implemented) |
+| 2 | AUDIO | Audio (9640) | VD server -> Car | AAC-LC CONFIG + FRAME；载荷已定义，传输尚未绑定 |
 | 3 | DATA | Control (9637) | Bidirectional | App list, app info data, car logs, media metadata, log toggle |
 | 4 | INPUT | Input (9639) | Car -> VD server | Touch events (batched MOVE for multi-touch) |
 
@@ -65,7 +68,7 @@ The DATA channel multiplexes on the same TCP socket as CONTROL. VIDEO, INPUT and
 | deviceName           | UTF-8  |
 | screenWidth          | int32  |  car display width in pixels (after nav bar)
 | screenHeight         | int32  |  car display height in pixels
-| supportedFeatures    | int32  |  bitmask (FEATURE_VIDEO | FEATURE_AUDIO | ...)
+| supportedFeatures    | int32  |  **接收端**想要的能力位掩码；默认仅 FEATURE_VIDEO
 | displayMode          | byte   |  0=MIRROR, 1=VIRTUAL (default)
 | screenDpi            | int32  |  car display density (e.g. 160)
 | appVersionCode       | int32  |  car app version code (informational)
@@ -78,6 +81,8 @@ The DATA channel multiplexes on the same TCP socket as CONTROL. VIDEO, INPUT and
 ```
 
 Both trailing fields are appended after `appVersionName` and decode as `0` when absent, so older peers interoperate: a missing `dpiOverride` means auto-calibrate, a missing `bitrate` means the 4 Mbps default.
+
+`supportedFeatures` 默认只置 `FEATURE_VIDEO`。`FEATURE_AUDIO` 必须由 `HandshakeRequest.builder().supportedFeatures(...)` 显式开启，含义是「接收端想播且能解码音频」，与手机能不能采集无关。S1 之前默认值是 `FEATURE_VIDEO or FEATURE_AUDIO`，导致两个构造点（车机 `buildHandshakeRequest`、桌面端 `HandshakeFactory.build`）都在假广告一个根本没实现的音频通道（issue #67）。手机自身的能力由 `HandshakeResponse` 的尾字段 `supportedFeatures` 回传；protocol-core 的 `isAudioNegotiated(request, response)` 是唯一判据，要求 `accepted == true` **且**两侧都置了 `FEATURE_AUDIO`，之后才允许 bind 9640。接收端音频开关的置灰依据必须是手机的 response，绝不能用接收端自己的 `SDK_INT`：Android 11（SDK 30）的采集下限约束的是手机，不是车机（`app-server` 的 `minSdk` 为 26）。
 
 `dpiOverride` is a trailing field. `0` means auto-calibrate via `VideoConfig.calculateOptimalDpi` (the portrait-app-safe cap). A non-zero value in `[120, 480]` bypasses the cap and is used verbatim, fixing "UI too small" for landscape apps at the cost of squeezing portrait-only apps. The decoder's remaining-bytes guard reads `0` when the field is absent, so older car peers that do not send it decode as auto. The car coerces input through `VdDeployArgs.coerceDpiOverride` so the phone and car agree on what counts as a valid override.
 
@@ -101,12 +106,15 @@ Both trailing fields are appended after `appVersionName` and decode as `0` when 
 | vdDpi                | int32  |  DPI the VD will use (auto or override)
 | vdWidth              | int32  |  trailing field, recommended VD width, 0 = not provided
 | vdHeight             | int32  |  trailing field, recommended VD height, 0 = not provided
+| supportedFeatures    | int32  |  尾字段，**手机侧**采集能力位掩码，0 = 不支持音频
 +----------------------+--------+
 ```
 
 `vdWidth` / `vdHeight` are trailing fields carrying the phone-side recommended VirtualDisplay size — the output of `VdDimensions.compute`, which even-aligns the car viewport and then scales it up to the phone's **real physical** long edge. A Chinese-ROM IME hardcodes its width to the phone's physical pixel width regardless of VD density, so a viewport-sized VD crops the keyboard no matter what DPI is negotiated (a 1280 px canvas with a 1368 px keyboard chops the right edge).
 
 `0` means an older phone did not send the field. Deploy sites with no shell access to the phone — the desktop ADB path — MUST use these dims for the VirtualDisplay when they are `> 0`; the desktop's own viewport is the *encoder* size, not the VD size. The phone-side metrics must come from real physical display metrics (`WindowManager.maximumWindowMetrics` / `Display.getRealMetrics`), never `resources.displayMetrics`, which reports compat-scaled values in screen-compat mode.
+
+`supportedFeatures`（S1）是音频能力交换里**手机 / 采集侧**的那一半，追加在 `vdHeight` 之后，与 request 里的同名字段语义不同：request 说的是接收端想用什么，这里说的是手机能提供什么。老手机不带末尾这 4 字节时解码为 `0`，这是安全的回退方向 —— `isAudioNegotiated` 返回 false，没人会去连一个从未监听的端口。手机只有在自身 SDK 与采集探针允许 `REMOTE_SUBMIX` 时才在这里置 `FEATURE_AUDIO`。
 
 ### HEARTBEAT (0x03) / HEARTBEAT_ACK (0x04) -- Control connection only
 
@@ -191,6 +199,38 @@ H.264 NAL units representing a video frame.
 **Keyframe identification**: `H264NalParser.isKeyFrame` (protocol-core) is the single definition shared by the car decoder and the Windows pipeline: it scans only the first ~1 KB of a frame for a 3-byte (`00 00 01`) or 4-byte (`00 00 00 01`) Annex B start code and tests `nal_header & 0x1F == 5` — the type mask, not the whole byte, because a real encoder emits `0x65` (`nal_ref_idc = 3`).
 
 **Black-screen detection**: `BlackScreenDetector` lives in `:protocol-core` and is shared by the car decoder and the Windows `VideoDecodePipeline` — both ends face the same encoder failure (TCP alive, receiver parked on the last frame), so the policy has one definition. An encoder producing nothing emits very small I-frames, so a streak of keyframes below `keyframeMaxBytes` (2 KB) means the stream is black. Reaction is deliberately asymmetric: `alertStreak` (3) tiny keyframes only set a log flag, and `onSustainedBlackScreen` fires once the streak lasts `BLACK_SCREEN_SUSTAIN_MS` (3 s default; the receivers override it) — app/VD warm-up bursts are normal, and escalating on those is the reconnect storm that leaked VirtualDisplays. The monotonic clock is injected (`clock`), so protocol-core stays Android-free, and the escalation is latched to once per session until `reset()`.
+
+## 音频通道 Audio Channel (0x02)
+
+S1 已定义 wire 契约（issue #67，`Refs #13`）；生产者 / 消费者与 9640 socket 的绑定留到 S2/S3。载荷编解码放在 `AudioPayload`，纯 JVM，可以不依赖 Android 直接单测。
+
+### CONFIG (0x01) -- VD server -> Car
+
+在任何 FRAME 之前发一次。大端布局：
+
+```
++----------------------+--------+
+| codec                | byte   |  1 = AAC-LC（`AudioPayload.CODEC_AAC_LC`）
+| sampleRate           | int32  |  48000
+| channelCount         | byte   |  2（立体声）
+| bitrate              | int32  |  128000
+| csdLen               | byte   |  csd-0 长度（实测 2）
+| csd                  | bytes  |  MediaCodec 的 `csd-0`
++----------------------+--------+
+```
+
+`csd-0` 必须**带外**发送：裸 AAC 访问单元不带 ADTS 头，没有它解码器无法初始化。两侧都会拒绝 `csdLen` 与剩余字节数不符、未知 codec、非正的采样率 / 声道数、负的 bitrate，以及超过 `FrameCodec.MAX_PAYLOAD_SIZE` 的载荷。
+
+### FRAME (0x02) -- VD server -> Car
+
+```
++----------------------+--------+
+| ptsMs                | uint32 |  毫秒时间戳，无符号；到 2^32 回绕
+| aacFrame             | bytes  |  一帧裸 AAC-LC 访问单元（约 341 B）
++----------------------+--------+
+```
+
+48 kHz 的 AAC-LC 每帧 1024 samples = **21.333 ms / 46.875 帧每秒**（不是 20 ms / 50 fps）。`ptsMs` 只用于日志与欠载统计，本方案不做精确 A/V 同步；接收端使用抖动缓冲（默认 150 ms，可配 60~200 ms）自由跑播放。空载荷会被拒绝。采集静音期生产者仍按 46.875 fps 补发编码后的静音帧；若按 20 ms 节拍补帧，队列会膨胀约 300 ms 延迟（issue #13 真机稳定性实验结论）。
 
 ## Data Channel (0x03)
 
@@ -414,6 +454,7 @@ PROTOCOL_VERSION      = 1
 CONTROL_PORT          = 9637  (phone <-> car, handshake + heartbeat + commands + data)
 VIDEO_PORT            = 9638  (VD server binds 0.0.0.0 -> car connects)
 INPUT_PORT            = 9639  (VD server binds 0.0.0.0 -> car connects)
+AUDIO_PORT            = 9640  （S1 常量；S3 绑定，承载 AAC-LC CONFIG + FRAME）
 LIFECYCLE_PORT        = 19647 (VD server reverse-connects to phone localhost)
 ADB_PORT              = 5555  (standard ADB TCP port)
 TARGET_FPS            = 20
@@ -470,7 +511,7 @@ AUTH_SIGNATURE = 2
 AUTH_RSAPUBLICKEY = 3
 ```
 
-Feature bitmasks (for `supportedFeatures` in `HandshakeRequest`):
+能力位掩码（`HandshakeRequest.supportedFeatures` = 接收端想用什么；`HandshakeResponse` 尾字段同名字段 = 手机能采集什么）：
 
 ```
 FEATURE_VIDEO          = 0x01

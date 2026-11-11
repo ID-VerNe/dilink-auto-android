@@ -97,7 +97,8 @@ class MessagesTest {
             connectionMethod = CONNECTION_METHOD_USB_ADB,
             vdDpi = 160,
             vdWidth = 3192,
-            vdHeight = 1794
+            vdHeight = 1794,
+            supportedFeatures = FEATURE_VIDEO or FEATURE_AUDIO
         )
         val encoded = original.encode()
         val decoded = HandshakeResponse.decode(encoded)
@@ -114,15 +115,16 @@ class MessagesTest {
         assertEquals(original.vdDpi, decoded.vdDpi)
         assertEquals(original.vdWidth, decoded.vdWidth)
         assertEquals(original.vdHeight, decoded.vdHeight)
+        assertEquals(original.supportedFeatures, decoded.supportedFeatures)
     }
 
     /**
-     * 旧对端兼容：payload 在 vdDpi 之后截断（老手机没编 vdWidth/vdHeight 字段）
-     * 时必须解出 0，而不是抛 BufferUnderflow。桌面部署路径以 0 为"回退本端视口"
-     * 的信号，见 AdbDeploy.plan。
+     * 旧对端兼容：payload 在 vdDpi 之后截断（老手机没编 vdWidth/vdHeight，
+     * 也没有 S1 新增的 supportedFeatures）时必须全部解出 0，而不是抛
+     * BufferUnderflow。0 = 不支持音频，是安全的回退方向。
      */
     @Test
-    fun testHandshakeResponseTrailingVdDimsDefaultToZeroOnLegacyPayload() {
+    fun testHandshakeResponseTrailingFieldsDefaultToZeroOnLegacyPayload() {
         val full = HandshakeResponse(
             accepted = true,
             deviceName = "OldPhone",
@@ -130,15 +132,41 @@ class MessagesTest {
             displayHeight = 720,
             vdDpi = 200,
             vdWidth = 3192,
-            vdHeight = 1794
+            vdHeight = 1794,
+            supportedFeatures = FEATURE_VIDEO or FEATURE_AUDIO
         ).encode()
-        // 截到 vdDpi 字段末尾（丢弃 vdWidth/vdHeight）
-        val legacy = full.copyOfRange(0, full.size - 8)
+        // 截到 vdDpi 字段末尾（丢弃 vdWidth/vdHeight 两个 4B + supportedFeatures 4B）
+        val legacy = full.copyOfRange(0, full.size - 12)
         val decoded = HandshakeResponse.decode(legacy)
 
         assertEquals(200, decoded.vdDpi)
         assertEquals(0, decoded.vdWidth)
         assertEquals(0, decoded.vdHeight)
+        assertEquals(0, decoded.supportedFeatures)
+    }
+
+    /**
+     * 中间版本兼容：S1 之前 main 上的手机已经会编 vdWidth/vdHeight，但尚无
+     * trailing supportedFeatures 这 4 字节。新解码器读不到它必须回退 0，
+     * 不能把前面的 vdHeight 当能力位，也不能抛异常。
+     */
+    @Test
+    fun testHandshakeResponseMissingTrailingAudioFeatureDecodesAsZero() {
+        val full = HandshakeResponse(
+            accepted = true,
+            deviceName = "PreS1Phone",
+            displayWidth = 1280,
+            displayHeight = 720,
+            vdWidth = 3192,
+            vdHeight = 1794,
+            supportedFeatures = FEATURE_AUDIO
+        ).encode()
+        val preS1 = full.copyOfRange(0, full.size - 4)
+        val decoded = HandshakeResponse.decode(preS1)
+
+        assertEquals(3192, decoded.vdWidth)
+        assertEquals(1794, decoded.vdHeight)
+        assertEquals(0, decoded.supportedFeatures)
     }
 
     @Test

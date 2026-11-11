@@ -11,7 +11,7 @@ object Channel {
     /** Video stream: H.264 NAL units from phone to car */
     const val VIDEO: Byte = 1
 
-    /** Audio stream: Opus frames from phone to car */
+    /** 音频流：手机 -> 接收端的 AAC-LC 帧；载荷布局见 [AudioPayload]。 */
     const val AUDIO: Byte = 2
 
     /** Data messages: notifications, app list, metadata */

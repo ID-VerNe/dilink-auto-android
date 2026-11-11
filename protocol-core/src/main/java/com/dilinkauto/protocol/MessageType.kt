@@ -59,10 +59,18 @@ object VideoMsg {
     const val FRAME: Byte = 0x02  // H.264 frame (may contain multiple NAL units)
 }
 
-/** Audio channel message types */
+/**
+ * 音频通道（[Channel.AUDIO]，端口 [Ports.AUDIO_PORT]）的消息类型。
+ * payload 布局在 [AudioPayload]；传输层仍用 [FrameCodec] 的 6 字节帧头。
+ *
+ * CONFIG 必须先于任何 FRAME：它带 MediaCodec 的 `csd-0`（AAC-LC 48 kHz
+ * 立体声实测 2 字节）。裸 AAC 帧没有 ADTS 头，缺了 csd 解码器无法初始化
+ * （issue #13 双机实测）。FRAME 带一个无符号 32 位毫秒 PTS 加一帧裸 AAC
+ * 访问单元（48 kHz 下 1024 samples = 21.333 ms，平均约 341 B）。
+ */
 object AudioMsg {
-    const val CONFIG: Byte = 0x01  // Audio format config
-    const val FRAME: Byte = 0x02  // Audio frame
+    const val CONFIG: Byte = 0x01  // AudioPayload.encodeConfig
+    const val FRAME: Byte = 0x02  // AudioPayload.encodeFrame
 }
 
 /** Data channel message types */
