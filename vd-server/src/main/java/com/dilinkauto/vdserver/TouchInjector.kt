@@ -22,6 +22,8 @@ import java.lang.reflect.Method
  * unvalidated, so the table must stay bounded and index-safe no matter what the
  * wire carries. See [PointerCap] for the eviction policy.
  *
+ * issue #60：批量 MOVE 由 [injectMoveBatch] 一次发出，不再逐指针重复构造事件。
+ *
  * Extracted from [PipelineServer].
  */
 internal class TouchInjector(
@@ -41,6 +43,9 @@ internal class TouchInjector(
 
     /** Whether the InputManager reflection path is wired and ready. */
     val hasInjection: Boolean get() = inputManager != null && injectInputEventMethod != null
+
+    /** 一次批量 MOVE 里的单个指针更新（坐标已换算成 VD 像素）。 */
+    private data class PointerUpdate(val pointerId: Int, val x: Int, val y: Int, val pressure: Float)
 
     /**
      * Reflect into the InputManager service. Failure is non-fatal — touch
@@ -62,8 +67,64 @@ internal class TouchInjector(
     /** Decode a touch frame and inject it. */
     fun handleTouchFrame(f: FrameCodec.Frame) {
         when (f.messageType) {
-            InputMsg.TOUCH_MOVE_BATCH -> { val b = TouchMoveBatch.decode(f.payload); for (p in b.pointers) injectTouch(1, p.pointerId, (p.x * displayWidth).toInt(), (p.y * displayHeight).toInt(), p.pressure) }
-            InputMsg.TOUCH_DOWN, InputMsg.TOUCH_MOVE, InputMsg.TOUCH_UP -> { val e = TouchEvent.decode(f.payload); injectTouch(when(f.messageType){InputMsg.TOUCH_DOWN->0;InputMsg.TOUCH_MOVE->1;else->2}, e.pointerId, (e.x*displayWidth).toInt(), (e.y*displayHeight).toInt(), e.pressure) }
+            InputMsg.TOUCH_MOVE_BATCH -> {
+                val b = TouchMoveBatch.decode(f.payload)
+                injectMoveBatch(b.pointers.map {
+                    PointerUpdate(it.pointerId, (it.x * displayWidth).toInt(), (it.y * displayHeight).toInt(), it.pressure)
+                })
+            }
+            InputMsg.TOUCH_DOWN, InputMsg.TOUCH_MOVE, InputMsg.TOUCH_UP -> {
+                val e = TouchEvent.decode(f.payload)
+                val action = when (f.messageType) {
+                    InputMsg.TOUCH_DOWN -> ACTION_DOWN
+                    InputMsg.TOUCH_MOVE -> ACTION_MOVE
+                    else -> ACTION_UP
+                }
+                injectTouch(action, e.pointerId, (e.x * displayWidth).toInt(), (e.y * displayHeight).toInt(), e.pressure)
+            }
+        }
+    }
+
+    /**
+     * issue #60：整批 MOVE 只发一条 MotionEvent，携带全部指针的新坐标。
+     *
+     * 旧实现把批次里的每个指针各调一次 [injectTouch]，每次都构造一条「包含全部
+     * activePointers、但只有当前指针是新坐标」的 MOVE：同一次采样被拆成多条，中间态
+     * 还是上一帧的旧坐标，缩放之类的多指手势容易被判成抖动而触发 ACTION_CANCEL。
+     *
+     * 另外：任一 DOWN 丢失（网络/队列丢帧）后该 pointer 不会进 [activePointers]，
+     * 后续 MOVE 会退化成单指；这里遇到「没见过的 pointer 在 MOVE」时先补一条
+     * ACTION_POINTER_DOWN，避免一根手指整段失效。
+     */
+    private fun injectMoveBatch(updates: List<PointerUpdate>) {
+        if (updates.isEmpty()) return
+        // 反射通道不可用时 MOVE 无法表达（`input -d tap` 只有点按），保持旧行为：不落命令。
+        if (inputManager == null || injectInputEventMethod == null) return
+        val displayId = displayIdProvider()
+        try {
+            val missing = TouchBatchPlan.pointersMissingDown(
+                active = activePointers.keys,
+                moving = updates.map { it.pointerId },
+                maxPointers = MAX_POINTERS,
+            )
+            if (missing.isNotEmpty()) {
+                val byId = updates.associateBy { it.pointerId }
+                for (id in missing) {
+                    val u = byId[id] ?: continue
+                    logErr("Touch: pointerId=$id moved without DOWN — synthesizing ACTION_POINTER_DOWN")
+                    injectTouch(ACTION_DOWN, id, u.x, u.y, u.pressure)
+                }
+            }
+            for (u in updates) {
+                if (u.pointerId !in 0 until MAX_POINTERS) continue
+                PointerCap.put(activePointers, u.pointerId, floatArrayOf(u.x.toFloat(), u.y.toFloat(), u.pressure), MAX_POINTERS) { evicted ->
+                    logErr("Touch: >$MAX_POINTERS active pointers — evicting oldest pointerId=$evicted")
+                }
+            }
+            val pts = snapshotIntoPools() ?: return
+            emit(MotionEvent.ACTION_MOVE, pts.size, displayId)
+        } catch (e: Exception) {
+            logErr("Touch batch: ${e.message}")
         }
     }
 
@@ -87,31 +148,13 @@ internal class TouchInjector(
             PointerCap.put(activePointers, ptr, floatArrayOf(x.toFloat(), y.toFloat(), pressure), MAX_POINTERS) { evicted ->
                 logErr("Touch: >$MAX_POINTERS active pointers — evicting oldest pointerId=$evicted")
             }
-            val now = SystemClock.uptimeMillis()
-            // S-09: propsPool/coordsPool have exactly MAX_POINTERS slots; truncate the
-            // snapshot we index them with so an over-sized map can never go out of bounds.
-            val pts = activePointers.entries.take(MAX_POINTERS)
+            val pts = snapshotIntoPools() ?: return
             val ptrIndex = pts.indexOfFirst { it.key == ptr }
             if (ptrIndex < 0) return
 
-            for ((i, e) in pts.withIndex()) {
-                val k = e.key
-                val v = e.value
-                propsPool[i] = (propsPool[i] ?: MotionEvent.PointerProperties()).also {
-                    it.id = k
-                    it.toolType = MotionEvent.TOOL_TYPE_FINGER
-                }
-                coordsPool[i] = (coordsPool[i] ?: MotionEvent.PointerCoords()).also {
-                    it.x = v[0]
-                    it.y = v[1]
-                    it.pressure = v[2]
-                    it.size = 1f
-                }
-            }
-
             val ma = when (action) {
                 ACTION_DOWN -> {
-                    touchDownTime = now
+                    touchDownTime = SystemClock.uptimeMillis()
                     if (pts.size == 1) MotionEvent.ACTION_DOWN
                     else MotionEvent.ACTION_POINTER_DOWN or (ptrIndex shl MotionEvent.ACTION_POINTER_INDEX_SHIFT)
                 }
@@ -122,12 +165,7 @@ internal class TouchInjector(
                 else -> MotionEvent.ACTION_MOVE
             }
 
-            try {
-                val ev = MotionEvent.obtain(touchDownTime, now, ma, pts.size, propsPool, coordsPool, 0, 0, 1f, 1f, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0)
-                setDisplayIdMethod?.invoke(ev, displayId)
-                injectInputEventMethod!!.invoke(inputManager, ev, 0)
-                ev.recycle()
-            } catch (e: Exception) { logErr("Touch inject failed: ${e.message}") }
+            emit(ma, pts.size, displayId)
         } catch (e: Exception) {
             // S-09: no longer silent. A dropped exception here used to leave the frame
             // half-applied (map written, event never injected) with nothing in the log.
@@ -140,6 +178,41 @@ internal class TouchInjector(
         }
     }
 
+    /**
+     * 把 [activePointers] 快照进 propsPool/coordsPool，返回按索引顺序排列的指针列表。
+     *
+     * S-09：两个 pool 只有 MAX_POINTERS 个槽位，必须截断后再索引，超长表才不会越界。
+     */
+    private fun snapshotIntoPools(): List<Map.Entry<Int, FloatArray>>? {
+        val pts = activePointers.entries.take(MAX_POINTERS)
+        if (pts.isEmpty()) return null
+        for ((i, e) in pts.withIndex()) {
+            val v = e.value
+            propsPool[i] = propsPool[i].also {
+                it.id = e.key
+                it.toolType = MotionEvent.TOOL_TYPE_FINGER
+            }
+            coordsPool[i] = coordsPool[i].also {
+                it.x = v[0]
+                it.y = v[1]
+                it.pressure = v[2]
+                it.size = 1f
+            }
+        }
+        return pts
+    }
+
+    /** 用当前 pool 内容发一条事件；失败只记日志，不影响后续帧。 */
+    private fun emit(ma: Int, count: Int, displayId: Int) {
+        try {
+            val now = SystemClock.uptimeMillis()
+            val ev = MotionEvent.obtain(touchDownTime, now, ma, count, propsPool, coordsPool, 0, 0, 1f, 1f, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0)
+            setDisplayIdMethod?.invoke(ev, displayId)
+            injectInputEventMethod!!.invoke(inputManager, ev, 0)
+            ev.recycle()
+        } catch (e: Exception) { logErr("Touch inject failed: ${e.message}") }
+    }
+
     private fun execShell(cmd: String) = ShellExec.execShell(shellProvider(), cmd)
 
     internal companion object {
@@ -148,6 +221,7 @@ internal class TouchInjector(
 
         /** Local aliases for the wire actions handled here (see [handleTouchFrame]). */
         private const val ACTION_DOWN = 0
+        private const val ACTION_MOVE = 1
         private const val ACTION_UP = 2
     }
 }
