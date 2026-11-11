@@ -29,6 +29,9 @@ internal class CarTouchSender(
     private var dropCount = 0L
     private var sendCount = 0L
 
+    /** issue #64：多指 MOVE 批次单独计数，用于和手机端 `[TouchStats]` 对账。 */
+    private var multiBatchCount = 0L
+
     /**
      * Log-spam gate (audit R3-DRY-22): log the first [firstN] events, then
      * every [LOG_EVERY]-th. Single definition — the predicate used to be
@@ -58,7 +61,18 @@ internal class CarTouchSender(
             try {
                 conn.sendInput(InputMsg.TOUCH_MOVE_BATCH, payload)
                 sendCount++
-                if (shouldLog(sendCount, SEND_LOG_FIRST)) {
+                // issue #64：多指批次按「前 N 条 + 每 M 条」单独落日志。
+                // 手机端在 `TouchInjector` 里也有对应的 `[Touch] MOVE n=...`，
+                // 两边对不上就能判断是链路丢帧还是注入侧丢事件。
+                if (pointers.size >= 2) {
+                    multiBatchCount++
+                    if (multiBatchCount <= MULTI_LOG_FIRST || multiBatchCount % MULTI_LOG_EVERY == 0L) {
+                        log(
+                            "Touch multi #$multiBatchCount (${pointers.size} pointers ids=${pointers.map { it.pointerId }})",
+                            "I"
+                        )
+                    }
+                } else if (shouldLog(sendCount, SEND_LOG_FIRST)) {
                     log("Touch batch #$sendCount (${pointers.size} pointers)", "I")
                 }
             } catch (e: Exception) { log("Touch batch send failed: ${e.message}", "W") }
@@ -93,6 +107,7 @@ internal class CarTouchSender(
     fun resetCounters() {
         sendCount = 0
         dropCount = 0
+        multiBatchCount = 0
     }
 
     fun shutdown() { executor.shutdownNow() }
@@ -106,5 +121,9 @@ internal class CarTouchSender(
 
         /** After the first few, log every Nth event. */
         const val LOG_EVERY = 100L
+
+        /** issue #64：多指批次前 10 条全记，之后每 50 条记 1 条。 */
+        const val MULTI_LOG_FIRST = 10L
+        const val MULTI_LOG_EVERY = 50L
     }
 }
