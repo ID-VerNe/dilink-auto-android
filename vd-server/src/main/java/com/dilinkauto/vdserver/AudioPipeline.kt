@@ -258,6 +258,26 @@ internal class AudioPipeline(
             return false
         }
 
+        // AudioRecord 建出来还不产数据：必须先 startRecording()，否则 read() 要么恒返
+        // 0（只出静音帧却让 frameCount 照涨，伪装成功）要么返 ERROR_INVALID_OPERATION(-3)
+        // 让采集线程首轮即死。这里任何失败都走同一套收敛（safeRelease + fail + false），
+        // 绝不抛给调用方（R6）。
+        try {
+            rec.startRecording()
+            if (rec.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                val state = rec.recordingState
+                rec.safeRelease()
+                enc.safeRelease()
+                fail("AudioRecord startRecording failed (state=$state)")
+                return false
+            }
+        } catch (e: Exception) {
+            rec.safeRelease()
+            enc.safeRelease()
+            fail("AudioRecord startRecording failed: ${describe(e)}")
+            return false
+        }
+
         record = rec
         codec = enc
         running.set(true)
@@ -285,10 +305,8 @@ internal class AudioPipeline(
         }
         record?.safeRelease()
         record = null
-        codec?.let { c ->
-            runCatching { c.stop() }
-            runCatching { c.release() }
-        }
+        // safeRelease 内部已经 runCatching { stop() }，无需再补一次 stop()。
+        codec?.safeRelease()
         codec = null
         log("Audio: capture stopped (frames=${frames.get()}, silence=${silenceFrames.get()})")
     }
@@ -595,6 +613,12 @@ internal fun describe(e: Throwable): String =
 
 /** 释放 `AudioRecord`，任何异常都不穿透。 */
 private fun AudioRecord.safeRelease() {
+    runCatching { stop() }
+    runCatching { release() }
+}
+
+/** 释放 `MediaCodec`，任何异常都不穿透（未 start 过的编解码器 `stop()` 会抛，已被吞掉）。 */
+private fun MediaCodec.safeRelease() {
     runCatching { stop() }
     runCatching { release() }
 }
