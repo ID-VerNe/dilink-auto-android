@@ -97,7 +97,21 @@ class PipelineServer(
         displayHeight = displayHeight,
         displayIdProvider = { displayId },
         shellProvider = { shell.input },
-        logErr = { err(it) }
+        logErr = { err(it) },
+        // issue #64：成功路径的触控取证行带时钟（vd-server.log 本身没有时间戳）。
+        logInfo = { PipeLog.logClock(it) }
+    )
+    /**
+     * issue #64：周期采样 VD display 的窗口形态（`mLastNonfullscreenBounds`）。
+     *
+     * 启动时机在 `bindAndAccept` 成功之后：此时 `displayId` 已确定，也避开建屏期
+     * 那串 `am`/`wm` 命令，避免额外的 dumpsys 与建屏步骤抢 shell。停止顺序在
+     * cleanup 开头，确保它不会在 shell 关闭后再发 dumpsys。
+     */
+    private val windowMonitor = WindowStateMonitor(
+        execOut = { shell.execOutput(it) },
+        displayIdProvider = { displayId },
+        log = { PipeLog.logClock(it) }
     )
     private val displayController = DisplayPowerController(
         shellProvider = { shell.input },
@@ -240,6 +254,8 @@ class PipelineServer(
             startLifecycleReader(conns.phoneChannel)
             startTouchReader(conns.carInput)
             lifecycle.start()
+            // issue #64：连接建立后开始周期采样窗口形态，给「竖屏小窗」留时间线上的证据。
+            windowMonitor.start()
             // Signal pipeline to begin rendering with the car video channel
             carVideoChannel = conns.carVideo
             LockSupport.unpark(t)
@@ -657,6 +673,8 @@ class PipelineServer(
     private fun cleanup() {
         if (!cleanedUp.compareAndSet(false, true)) return
         running = false
+        // issue #64：先停窗口采样线程，后面的 shell 恢复命令与 close 才不会被 dumpsys 插队。
+        windowMonitor.stop()
         // 1. Global state first — these outlive this process if we die.
         // issue #48：失败不再静默 —— letterbox 残留会被用户描述成「显示尺寸/比例不对」，
         // 至少要在日志里留下失败原因。命令、顺序不变（[PersistentShell.exec] 本身不抛，

@@ -31,7 +31,9 @@ internal class TouchInjector(
     private val displayHeight: Int,
     private val displayIdProvider: () -> Int,
     private val shellProvider: () -> OutputStream?,
-    private val logErr: (String) -> Unit
+    private val logErr: (String) -> Unit,
+    /** issue #64：成功路径的诊断日志（带时钟，由 PipelineServer 注入）。 */
+    private val logInfo: (String) -> Unit = {}
 ) {
     private var inputManager: Any? = null
     private var injectInputEventMethod: Method? = null
@@ -40,6 +42,9 @@ internal class TouchInjector(
     private val propsPool = Array(MAX_POINTERS) { MotionEvent.PointerProperties() }
     private val coordsPool = Array(MAX_POINTERS) { MotionEvent.PointerCoords() }
     private var touchDownTime = 0L
+
+    /** issue #64：触控链路计数与节流日志，见 [TouchDiagnostics]。 */
+    private val diag = TouchDiagnostics(logInfo)
 
     /** Whether the InputManager reflection path is wired and ready. */
     val hasInjection: Boolean get() = inputManager != null && injectInputEventMethod != null
@@ -66,12 +71,14 @@ internal class TouchInjector(
 
     /** Decode a touch frame and inject it. */
     fun handleTouchFrame(f: FrameCodec.Frame) {
+        val now = SystemClock.uptimeMillis()
+        diag.noteFrame()
         when (f.messageType) {
             InputMsg.TOUCH_MOVE_BATCH -> {
                 val b = TouchMoveBatch.decode(f.payload)
                 injectMoveBatch(b.pointers.map {
                     PointerUpdate(it.pointerId, (it.x * displayWidth).toInt(), (it.y * displayHeight).toInt(), it.pressure)
-                })
+                }, now)
             }
             InputMsg.TOUCH_DOWN, InputMsg.TOUCH_MOVE, InputMsg.TOUCH_UP -> {
                 val e = TouchEvent.decode(f.payload)
@@ -80,7 +87,7 @@ internal class TouchInjector(
                     InputMsg.TOUCH_MOVE -> ACTION_MOVE
                     else -> ACTION_UP
                 }
-                injectTouch(action, e.pointerId, (e.x * displayWidth).toInt(), (e.y * displayHeight).toInt(), e.pressure)
+                injectTouch(action, e.pointerId, (e.x * displayWidth).toInt(), (e.y * displayHeight).toInt(), e.pressure, now)
             }
         }
     }
@@ -96,7 +103,7 @@ internal class TouchInjector(
      * 后续 MOVE 会退化成单指；这里遇到「没见过的 pointer 在 MOVE」时先补一条
      * ACTION_POINTER_DOWN，避免一根手指整段失效。
      */
-    private fun injectMoveBatch(updates: List<PointerUpdate>) {
+    private fun injectMoveBatch(updates: List<PointerUpdate>, nowMs: Long) {
         if (updates.isEmpty()) return
         // 反射通道不可用时 MOVE 无法表达（`input -d tap` 只有点按），保持旧行为：不落命令。
         if (inputManager == null || injectInputEventMethod == null) return
@@ -112,15 +119,17 @@ internal class TouchInjector(
                 for (id in missing) {
                     val u = byId[id] ?: continue
                     logErr("Touch: pointerId=$id moved without DOWN — synthesizing ACTION_POINTER_DOWN")
-                    injectTouch(ACTION_DOWN, id, u.x, u.y, u.pressure)
+                    injectTouch(ACTION_DOWN, id, u.x, u.y, u.pressure, nowMs, synthesized = true)
                 }
             }
             for (u in updates) {
                 if (u.pointerId !in 0 until MAX_POINTERS) continue
+                noteBounds(u.pointerId, u.x, u.y, nowMs)
                 PointerCap.put(activePointers, u.pointerId, floatArrayOf(u.x.toFloat(), u.y.toFloat(), u.pressure), MAX_POINTERS) { evicted ->
                     logErr("Touch: >$MAX_POINTERS active pointers — evicting oldest pointerId=$evicted")
                 }
             }
+            diag.noteMoveBatch(nowMs, updates.map { Triple(it.pointerId, it.x, it.y) })
             val pts = snapshotIntoPools() ?: return
             emit(MotionEvent.ACTION_MOVE, pts.size, displayId)
         } catch (e: Exception) {
@@ -128,18 +137,41 @@ internal class TouchInjector(
         }
     }
 
-    private fun injectTouch(action: Int, ptr: Int, x: Int, y: Int, pressure: Float) {
+    private fun injectTouch(
+        action: Int,
+        ptr: Int,
+        x: Int,
+        y: Int,
+        pressure: Float,
+        nowMs: Long,
+        synthesized: Boolean = false,
+    ) {
         val displayId = displayIdProvider()
-        if (inputManager == null || injectInputEventMethod == null) { try { if (action == ACTION_DOWN || action == ACTION_UP) execShell("input -d $displayId tap $x $y") } catch (_: Exception) {}; return }
+        if (inputManager == null || injectInputEventMethod == null) {
+            // issue #64：回退路径也记录按下/抬起，至少能看到事件到达了手机。
+            when (action) {
+                ACTION_DOWN -> if (synthesized) diag.noteSynthDown(nowMs, ptr, x, y) else diag.noteDown(nowMs, ptr, x, y, displayId)
+                ACTION_UP -> diag.noteUp(nowMs, ptr, x, y, displayId)
+            }
+            try { if (action == ACTION_DOWN || action == ACTION_UP) execShell("input -d $displayId tap $x $y") } catch (_: Exception) {}
+            return
+        }
         // S-09: pointerId is an unvalidated Int off the wire. The protocol encoder only
         // ever emits 0..MAX_POINTERS-1, but a corrupt or hostile frame can carry anything,
         // and propsPool/coordsPool are indexed by insertion order over the map below.
         // Reject the frame here instead of discovering it as an out-of-bounds index.
         if (ptr !in 0 until MAX_POINTERS) {
             logErr("Touch: dropping frame with pointerId=$ptr (expected 0 until $MAX_POINTERS)")
+            diag.noteRejectedId()
             return
         }
         try {
+            noteBounds(ptr, x, y, nowMs)
+            // issue #64：成功路径逐条记录 DOWN/UP；MOVE 太高频，只计数。
+            when (action) {
+                ACTION_DOWN -> if (synthesized) diag.noteSynthDown(nowMs, ptr, x, y) else diag.noteDown(nowMs, ptr, x, y, displayId)
+                ACTION_UP -> diag.noteUp(nowMs, ptr, x, y, displayId)
+            }
             // S-09: cap the table. activePointers only ever shed entries on UP, so one
             // dropped UP packet (or a frame with a bogus id) used to grow it forever —
             // and past MAX_POINTERS entries propsPool[i] threw inside the publish loop,
@@ -210,7 +242,22 @@ internal class TouchInjector(
             setDisplayIdMethod?.invoke(ev, displayId)
             injectInputEventMethod!!.invoke(inputManager, ev, 0)
             ev.recycle()
-        } catch (e: Exception) { logErr("Touch inject failed: ${e.message}") }
+        } catch (e: Exception) {
+            diag.noteInjectFail()
+            logErr("Touch inject failed: ${e.message}")
+        }
+    }
+
+    /**
+     * issue #64：映射到 VD 像素后的坐标越界（`x == width` / 负值等）。
+     *
+     * 注入本身不改行为（系统仍会自行裁剪），只落节流日志 —— 「某些页面顶部点不动」
+     * 的现场需要先排除「坐标根本不在 VD 内」这个前提。
+     */
+    private fun noteBounds(ptr: Int, x: Int, y: Int, nowMs: Long) {
+        if (x < 0 || y < 0 || x >= displayWidth || y >= displayHeight) {
+            diag.noteOutOfBounds(nowMs, ptr, x, y, displayWidth, displayHeight)
+        }
     }
 
     private fun execShell(cmd: String) = ShellExec.execShell(shellProvider(), cmd)

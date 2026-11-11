@@ -1,6 +1,8 @@
 package com.dilinkauto.vdserver
 
 import java.io.OutputStream
+import java.time.LocalTime
+import java.time.format.DateTimeFormatter
 
 /**
  * Logging and shell helpers shared by the VD server's pipeline collaborators
@@ -18,8 +20,22 @@ import java.io.OutputStream
  * is a DI seam so [PipelineServer] owns error routing.
  */
 internal object PipeLog {
+    /** 与 `FileLog` / `CarLogWriter` 的毫秒时间格式保持一致。 */
+    private val CLOCK_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm:ss.SSS")
+
     fun log(msg: String) { println("[Pipeline] $msg"); System.out.flush() }
     fun err(msg: String) { System.err.println("[Pipeline] $msg"); System.err.flush() }
+
+    /**
+     * issue #64：带时钟的诊断行。
+     *
+     * `vd-server.log` 由 shell `>>` 追加，本身没有时间戳；窗口/触控取证行必须自带
+     * `HH:mm:ss.SSS`，否则无法和车机端 `STALL` 行（`CarLogWriter` 已带时间）对齐
+     * 「卡顿发生在哪一刻」。只给新增诊断行使用，不改既有行的格式。
+     */
+    fun logClock(msg: String) {
+        log("${LocalTime.now().format(CLOCK_FORMAT)} $msg")
+    }
 }
 
 /**
