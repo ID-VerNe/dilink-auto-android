@@ -97,7 +97,16 @@ class VideoDecoder {
      */
     private val resync = ResyncPolicy()
 
+    /** 渲染停顿诊断（issue #58）：喂帧线程每轮 tick 一次，停顿超阈值时打一行 STALL 汇总。 */
+    private val renderStall = RenderStallDetector()
+
     private var frameCount = 0L
+
+    /**
+     * 网络线程累计收到的帧数。喂帧线程读它算 STALL 增量（issue #58），跨线程可见性靠
+     * `@Volatile`；它只做诊断，不作为控制流判据。
+     */
+    @Volatile
     private var receiveCount = 0L
 
     /**
@@ -257,6 +266,8 @@ class VideoDecoder {
             contentBlackHeal.reset()
             // 新编解码器没有旧参考链的包袱，重同步状态同样重新起算（issue #9）。
             resync.reset()
+            // 停顿诊断同样重新起算，避免把上一个会话的空档算进这一次（issue #58）。
+            renderStall.reset()
 
             val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
                 setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
@@ -384,6 +395,24 @@ class VideoDecoder {
                     while (running.get()) {
                         // Drain output first to free decoder buffers before trying to feed
                         drainOutput(decoder)
+                        // issue #58：记录「两次渲染推进之间的间隔」，停顿超阈值时留一条 STALL
+                        // 汇总行。卡顿是「停顿后恢复」，恢复必经这里，所以不会漏报。
+                        renderStall.onTick(
+                            nowMs = SystemClock.elapsedRealtime(),
+                            snap = RenderStallDetector.Snapshot(
+                                renders = renderCount,
+                                receive = receiveCount,
+                                fed = frameCount,
+                                drops = dropCount,
+                                inputFails = inputFailCount,
+                                keysDropped = keyFramesDropped,
+                                queueSize = frameQueue.size,
+                                awaitingIdr = resync.awaitingIdr,
+                                skips = skipCount,
+                            ),
+                        )?.let { r ->
+                            logW("STALL ${r.gapMs}ms renders=${r.fromRenders}->${r.toRenders} recv+=${r.receiveDelta} fed+=${r.fedDelta} drops+=${r.dropDelta} inputFails+=${r.inputFailDelta} keys_drop+=${r.keyDropDelta} queue=${r.queueSize} resync=${r.awaitingIdr} skips=${r.skips}")
+                        }
 
                         // 空闲时仍按帧间隔阻塞等待，避免忙等；一旦有帧就立刻进入排空循环。
                         var frame = frameQueue.poll()
