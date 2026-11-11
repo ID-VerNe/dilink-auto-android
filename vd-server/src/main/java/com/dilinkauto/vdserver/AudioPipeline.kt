@@ -136,7 +136,9 @@ internal class AudioPacing(
  * 第 [frameIndex] 帧（从 0 开始）的呈现时间戳，单位微秒 —— 喂给 `MediaCodec`
  * `queueInputBuffer` 用。
  *
- * 用 Long 运算，避免在 Int 域溢出（46.875 fps 下约 44 小时就会越过 2^31 个 sample）。
+ * 用 Long 运算。Int 域下 `frameIndex * samplesPerFrame * 1_000_000` 在第 3 帧
+ * （3072 samples × 1e6 = 3.07e9 > 2^31 = 2.147e9）就已经溢出；即便只看 sample 计数，
+ * 2^31 samples @ 48 kHz 也只有约 12.4 小时（44 739 s）。两者都说明这里必须是 Long。
  */
 internal fun ptsUsForFrame(frameIndex: Long, spec: AudioSpec): Long =
     frameIndex * spec.samplesPerFrame * 1_000_000L / spec.sampleRate

@@ -175,7 +175,9 @@ class AudioPipelineTest {
     @Test
     fun ptsUsesLongArithmeticSoLongSessionsDoNotOverflow() {
         val spec = AudioSpec.DEFAULT
-        // 约 59 小时（1000 万帧）：Int 域早在 44 小时前就越界了。
+        // 1000 万帧 ≈ 59.26 h —— 远超任何单次会话。Int 域长不了：µs 乘积在第 3 帧
+        // （3072 samples × 1e6 = 3.07e9 > 2^31）就已经溢出；即便只看 sample 计数，
+        // 2^31 samples @ 48 kHz 也只有约 12.4 h（44 739 s）。所以这里必须是 Long。
         val pts = ptsUsForFrame(10_000_000L, spec)
         assertEquals(213_333_333_333L, pts)
         assertTrue("must exceed Int.MAX_VALUE to prove Long math", pts > Int.MAX_VALUE.toLong())
