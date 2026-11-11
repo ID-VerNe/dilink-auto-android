@@ -193,6 +193,24 @@ internal class VirtualDisplayCreator(
         return dump.substring(start, end).contains("DefaultTaskDisplayArea")
     }
 
+    /**
+     * 锁定虚拟屏方向为横屏，阻止应用把 display 转成竖屏（issue #59）。
+     *
+     * VD 用 `displayWidth x displayHeight`（宽 > 高）创建，其坐标系下旋转 0 即横屏；
+     * 会话期内把「用户旋转」锁到 0 后，应用再声明 `screenOrientation=portrait` 也不能把
+     * display 转走 —— 否则 B 站这类锁竖屏的应用会渲染成居中的竖屏小窗（实车证据：
+     * `mLastNonFullscreenBounds=Rect(920, 51 - 1641, 1351)`）。
+     *
+     * 必须放在 [ensureDtaAttached] **之后**：那里的旋转往返（lock 1 → lock 0）需要
+     * display 还能自由改方向，先锁死会让往返失效。
+     * 复位由 PipelineServer teardown 里的 `wm user-rotation -d <id> free` 负责。
+     */
+    fun lockLandscapeRotation(targetDisplayId: Int = displayId) {
+        if (targetDisplayId < 0) { err("rotation lock skipped: display id unknown"); return }
+        execShell("wm user-rotation -d $targetDisplayId lock 0")
+        log("Locked VD rotation to 0 (landscape) — portrait apps keep the car's aspect ratio")
+    }
+
     /** Apply the letterbox style + disable screen-off / wake gestures for the session. */
     private fun configureDisplayEnvironment() {
         try {
