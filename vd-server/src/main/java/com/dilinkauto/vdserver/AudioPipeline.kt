@@ -378,17 +378,20 @@ internal class AudioPipeline(
         val tried = mutableListOf<String>()
         for (name in orderEncoderCandidates(audioEncoderCandidates())) {
             tried += name
-            val candidate = try {
-                MediaCodec.createByCodecName(name).also {
-                    it.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-                    it.start()
-                }
+            var candidate: MediaCodec? = null
+            try {
+                candidate = MediaCodec.createByCodecName(name)
+                candidate.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                candidate.start()
+                log("Audio: encoder=$name")
+                return candidate
             } catch (e: Exception) {
                 logErr("Audio: encoder '$name' unusable: ${describe(e)}")
+                // configure/start 失败时组件可能已经拿到 native 资源，必须显式释放：
+                // ROM 的候选表常有 3~4 个 AAC 编码器，逐个失败会逐个泄漏。
+                candidate?.safeRelease()
                 continue
             }
-            log("Audio: encoder=$name")
-            return candidate
         }
         logErr("Audio: no usable AAC encoder among $tried")
         return null
@@ -492,7 +495,17 @@ internal class AudioPipeline(
             return
         }
         buf.clear()
-        buf.put(pcm, 0, len)
+        // 长度由调用方保证（恒等于 frameBytes），但仍然包住：写缓冲失败若穿出去会杀掉
+        // 采集线程，而且这一格 input 槽会永远拿不回来。
+        try {
+            buf.put(pcm, 0, len)
+        } catch (e: Exception) {
+            logErr("Audio: filling input buffer failed: ${describe(e)}")
+            // 交回一个空缓冲把槽位还给编码器，否则每失败一次就少一格。
+            runCatching { enc.queueInputBuffer(inputId, 0, 0, ptsUsForFrame(frameIndex, spec), 0) }
+            droppedInputs.incrementAndGet()
+            return
+        }
         try {
             enc.queueInputBuffer(inputId, 0, len, ptsUsForFrame(frameIndex, spec), 0)
         } catch (e: Exception) {
