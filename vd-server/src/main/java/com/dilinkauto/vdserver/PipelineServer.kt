@@ -371,6 +371,9 @@ class PipelineServer(
             carCommands.ensureDisplayHasContent(displayId)
             // 校验 DTA 是否挂在 display 层树内（Flyme 偶发 reparent 事务丢失 → 0 层黑屏），必要时旋转往返修复
             vdCreator.ensureDtaAttached()
+            // issue #59：DTA 修复之后再锁定横屏方向 —— 锁竖屏的应用否则会把 VD 转成居中的
+            // 竖屏小窗（实车 mLastNonFullscreenBounds=Rect(920,51-1641,1351)）。
+            vdCreator.lockLandscapeRotation()
             // Physical panel power-off happens *after* the car connects — see below.
             val carVideo = acceptCarChannel(videoServer, 30000) ?: run { err("Car video timeout"); try { phoneChannel.close() } catch (_: Exception) {}; return null }
             val carInput = acceptCarChannel(inputServer, 30000) ?: run { err("Car input timeout"); try { phoneChannel.close() } catch (_: Exception) {}; try { carVideo.close() } catch (_: Exception) {}; return null }
