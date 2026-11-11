@@ -13,6 +13,8 @@ object Ports {
     const val DEFAULT_PORT = 9637     // 控制 + 数据（手机监听，接收端连接）
     const val VIDEO_PORT = 9638       // 仅视频（手机 -> 接收端）
     const val INPUT_PORT = 9639       // 仅输入（接收端 -> 手机）
+    /** 仅音频（手机 -> 接收端，AAC-LC），由 vd-server 监听；见 AudioPayload。 */
+    const val AUDIO_PORT = 9640
     const val LIFECYCLE_PORT = 19647  // vd-server 反向连回手机（localhost）
     const val ADB_PORT = 5555         // 标准 ADB TCP 端口（开发模式 + 自安装）
 }

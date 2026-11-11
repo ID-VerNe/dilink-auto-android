@@ -118,7 +118,16 @@ data class HandshakeRequest(
     val deviceName: String,
     val screenWidth: Int,
     val screenHeight: Int,
-    val supportedFeatures: Int = FEATURE_VIDEO or FEATURE_AUDIO,
+    /**
+     * **接收端（车机 / 桌面端）想用、且能用的**能力位，默认只有视频。
+     *
+     * [FEATURE_AUDIO] 必须由「确实有音频解码器、且用户已打开音频开关」的
+     * 调用方显式置位：S1 之前默认值是 `FEATURE_VIDEO or FEATURE_AUDIO`，
+     * 导致车机握手与桌面端握手两个构造点都在「假广告」一个根本没人实现的
+     * 9640 音频通道（issue #67，Refs #13）。手机不得从缺省位推断音频支持，
+     * 它自己的能力走 [HandshakeResponse.supportedFeatures] 单独回传。
+     */
+    val supportedFeatures: Int = FEATURE_VIDEO,
     val displayMode: Byte = DISPLAY_MODE_VIRTUAL,
     val screenDpi: Int = 160,
     val appVersionCode: Int,
@@ -209,6 +218,7 @@ data class HandshakeRequest(
             private var screenHeight: Int = 0
             private var screenDpi: Int = 160
             private var appVersionCode: Int = 0
+            private var supportedFeatures: Int = FEATURE_VIDEO
             private var targetFps: Int = VideoConfig.TARGET_FPS
             private var appVersionName: String = ""
             private var dpiOverride: Int = 0
@@ -218,6 +228,8 @@ data class HandshakeRequest(
             fun screenSize(width: Int, height: Int) = apply { screenWidth = width; screenHeight = height }
             fun screenDpi(value: Int) = apply { screenDpi = value }
             fun appVersionCode(value: Int) = apply { appVersionCode = value }
+            /** 显式开启：只有接收端确实能播放音频时才置 [FEATURE_AUDIO]。 */
+            fun supportedFeatures(value: Int) = apply { supportedFeatures = value }
             fun targetFps(value: Int) = apply { targetFps = value }
             /** Car only; the desktop config has no version *name*. */
             fun appVersionName(value: String) = apply { appVersionName = value }
@@ -230,6 +242,7 @@ data class HandshakeRequest(
                 screenHeight = screenHeight,
                 screenDpi = screenDpi,
                 appVersionCode = appVersionCode,
+                supportedFeatures = supportedFeatures,
                 targetFps = targetFps,
                 appVersionName = appVersionName,
                 dpiOverride = dpiOverride,
@@ -265,12 +278,24 @@ data class HandshakeResponse(
      * path already deployed with these values directly.
      */
     val vdWidth: Int = 0,
-    val vdHeight: Int = 0
+    val vdHeight: Int = 0,
+    /**
+     * **手机（采集端）实际能提供**的能力位。
+     *
+     * 与 [HandshakeRequest.supportedFeatures]（接收端想用什么）语义不同。
+     * 只有两侧都置了 [FEATURE_AUDIO]，接收端才会去连 9640；音频开关的置灰
+     * 依据是本字段，**不是**接收端自己的 `Build.VERSION.SDK_INT`：
+     * Android 11（SDK 30）的音频采集下限只约束手机，不约束车机（车机
+     * `minSdk` 为 26，见 issue #13 追评里的归属澄清）。
+     *
+     * 尾字段：老手机不带这 4 字节时解码为 0（不支持音频），这是安全的回退方向。
+     */
+    val supportedFeatures: Int = 0
 ) {
     fun encode(): ByteArray {
         val nameBytes = deviceName.toByteArray(Charsets.UTF_8)
         val jarPathBytes = vdServerJarPath.toByteArray(Charsets.UTF_8)
-        val buf = ByteBuffer.allocate(4 + 1 + 2 + nameBytes.size + 4 + 4 + 4 + 4 + 2 + jarPathBytes.size + 1 + 4 + 4 + 4)
+        val buf = ByteBuffer.allocate(4 + 1 + 2 + nameBytes.size + 4 + 4 + 4 + 4 + 2 + jarPathBytes.size + 1 + 4 + 4 + 4 + 4)
             .order(ByteOrder.BIG_ENDIAN)
         buf.putInt(protocolVersion)
         buf.put(if (accepted) 1.toByte() else 0.toByte())
@@ -284,6 +309,7 @@ data class HandshakeResponse(
         buf.putInt(vdDpi)
         buf.putInt(vdWidth)
         buf.putInt(vdHeight)
+        buf.putInt(supportedFeatures)
         return buf.array()
     }
 
@@ -303,6 +329,7 @@ data class HandshakeResponse(
             val vdDpi = if (buf.remaining() >= 4) buf.getInt() else VideoConfig.VIRTUAL_DISPLAY_DPI
             val vdW = if (buf.remaining() >= 4) buf.getInt() else 0
             val vdH = if (buf.remaining() >= 4) buf.getInt() else 0
+            val features = if (buf.remaining() >= 4) buf.getInt() else 0
             return HandshakeResponse(
                 protocolVersion = version,
                 accepted = accepted,
@@ -315,7 +342,8 @@ data class HandshakeResponse(
                 connectionMethod = connMethod,
                 vdDpi = vdDpi,
                 vdWidth = vdW,
-                vdHeight = vdH
+                vdHeight = vdH,
+                supportedFeatures = features
             )
         }
     }
