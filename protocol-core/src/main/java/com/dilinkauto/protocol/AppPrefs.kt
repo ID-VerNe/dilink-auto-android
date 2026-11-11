@@ -30,4 +30,9 @@ object AppPrefs {
     const val STARTUP_FPS = "startup_fps"
     const val STARTUP_BITRATE = "startup_bitrate"
     const val DEV_PHONE_IP = "dev_phone_ip"
+
+    // Car-side audio mirroring toggle (issue #72, Refs #13). Written by the
+    // settings switch, read when building the handshake request and by the S3
+    // audio-channel gate. Default is ON (issue #13 decision 3).
+    const val AUDIO_ENABLED = "audio_enabled"
 }

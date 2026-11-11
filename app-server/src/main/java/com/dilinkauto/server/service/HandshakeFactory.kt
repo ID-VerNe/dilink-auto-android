@@ -22,7 +22,8 @@ internal fun buildHandshakeRequest(
     screenDpi: Int,
     targetFps: Int,
     dpiOverride: Int,
-    bitrate: Int = 0
+    bitrate: Int = 0,
+    audioEnabled: Boolean
 ): HandshakeRequest {
     val pi = context.packageManager.getPackageInfo(context.packageName, 0)
     // Dimensions arrive pre-aligned from the caller (CarViewport.size), because
@@ -37,5 +38,9 @@ internal fun buildHandshakeRequest(
         .appVersionName(pi.versionName ?: "")
         .dpiOverride(dpiOverride)
         .bitrate(bitrate)
+        // 按用户开关声明音频位（issue #72）：只有确实打开了「音频镜像」的车机才
+        // advertise FEATURE_AUDIO，避免向手机假广告一个用户并不想要的 9640 通道。
+        // 位拼装在 [carRequestFeatures]，纯函数、已单测。
+        .supportedFeatures(carRequestFeatures(audioEnabled))
         .build()
 }

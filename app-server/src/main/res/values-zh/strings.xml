@@ -38,6 +38,12 @@
     <string name="wifi_adb_setup_title">Wi-Fi ADB 设置指南</string>
     <string name="wifi_adb_setup_desc">使用 Wi-Fi ADB 模式前，请先在手机上开启网络 ADB。详见 DiLink Auto 手机端应用。</string>
 
+    <!-- Audio mirroring (issue #72, Refs #13) -->
+    <string name="audio_mirror_title">音频镜像</string>
+    <string name="audio_mirror_desc_on">镜像期间手机自身静音，声音从车机播放</string>
+    <string name="audio_mirror_desc_off">音频不发送到车机</string>
+    <string name="audio_mirror_unsupported">手机系统不支持音频镜像（需 Android 11 及以上）</string>
+
     <!-- Startup DPI Override -->
     <string name="startup_dpi_title">启动 DPI</string>
     <string name="startup_dpi_desc">0 = 自动校准（适用于大多数车机）</string>

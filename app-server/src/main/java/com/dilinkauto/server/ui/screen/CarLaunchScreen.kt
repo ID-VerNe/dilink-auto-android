@@ -39,7 +39,9 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.dilinkauto.protocol.SettingsFormat
 import com.dilinkauto.server.R
+import com.dilinkauto.server.service.AudioSwitchBlockReason
 import com.dilinkauto.server.service.CarConnectionService
+import com.dilinkauto.server.service.audioSwitchState
 import com.dilinkauto.server.ui.InfoBar
 import com.dilinkauto.server.ui.InfoChip
 import com.dilinkauto.server.ui.theme.SuccessColor
@@ -62,6 +64,10 @@ fun CarLaunchScreen(service: CarConnectionService, infoChips: List<InfoChip> = e
     val startupDpi by service.carPrefs.startupDpiFlow.collectAsState()
     val startupFps by service.carPrefs.startupFpsFlow.collectAsState()
     val startupBitrate by service.carPrefs.startupBitrateFlow.collectAsState()
+    // 音频镜像（issue #72）：开关值来自 CarPrefs，置灰依据是手机端握手响应回传的
+    // 能力位（service.phoneAudioSupported），不是车机自身 SDK。
+    val audioEnabled by service.carPrefs.audioEnabledFlow.collectAsState()
+    val phoneAudioSupported by service.phoneAudioSupported.collectAsState()
 
     // Both layouts below render the very same card; hoisting the wiring here
     // keeps the 11-argument call and its callbacks in one place.
@@ -72,6 +78,9 @@ fun CarLaunchScreen(service: CarConnectionService, infoChips: List<InfoChip> = e
             statusMessage = statusMessage,
             devMode = devMode,
             onDevModeChange = { service.carPrefs.devMode = it },
+            audioEnabled = audioEnabled,
+            phoneAudioSupported = phoneAudioSupported,
+            onAudioEnabledChange = { service.carPrefs.audioEnabled = it },
             startupDpi = startupDpi,
             onStartupDpiChange = { service.carPrefs.startupDpi = it },
             startupFps = startupFps,
@@ -201,6 +210,9 @@ private fun ConnectionStatusCard(
     statusMessage: String,
     devMode: Boolean,
     onDevModeChange: (Boolean) -> Unit,
+    audioEnabled: Boolean,
+    phoneAudioSupported: Boolean,
+    onAudioEnabledChange: (Boolean) -> Unit,
     startupDpi: Int,
     onStartupDpiChange: (Int) -> Unit,
     startupFps: Int,
@@ -298,6 +310,52 @@ private fun ConnectionStatusCard(
                         onCheckedChange = onDevModeChange,
                         colors = SwitchDefaults.colors(
                             checkedTrackColor = WarningColor
+                        )
+                    )
+                }
+
+                Spacer(Modifier.height(12.dp))
+
+                // 音频镜像开关（issue #72, Refs #13）。置灰与原因文案由纯函数
+                // [audioSwitchState] 决定：手机端握手响应没回传音频位时置灰，
+                // 文案说明原因；否则显示「镜像期间手机自身静音」的预期行为说明。
+                val audioSwitch = audioSwitchState(
+                    phoneSupported = phoneAudioSupported,
+                    audioEnabled = audioEnabled
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            stringResource(R.string.audio_mirror_title),
+                            color = Color.White,
+                            style = MaterialTheme.typography.titleSmall
+                        )
+                        Text(
+                            when (audioSwitch.blockReason) {
+                                AudioSwitchBlockReason.PHONE_UNSUPPORTED ->
+                                    stringResource(R.string.audio_mirror_unsupported)
+                                AudioSwitchBlockReason.NONE ->
+                                    if (audioSwitch.checked) stringResource(R.string.audio_mirror_desc_on)
+                                    else stringResource(R.string.audio_mirror_desc_off)
+                            },
+                            color = when {
+                                audioSwitch.blockReason == AudioSwitchBlockReason.PHONE_UNSUPPORTED ->
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                audioSwitch.checked -> SuccessColor
+                                else -> MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    Switch(
+                        checked = audioSwitch.checked,
+                        onCheckedChange = onAudioEnabledChange,
+                        enabled = audioSwitch.clickable,
+                        colors = SwitchDefaults.colors(
+                            checkedTrackColor = SuccessColor
                         )
                     )
                 }

@@ -50,6 +50,22 @@ internal class CarPrefs(context: Context) {
             _devMode.value = value
         }
 
+    // ─── Audio mirroring (issue #72, Refs #13) ───
+    //
+    // 默认开（issue #13 决策记录 3）。StateFlow 镜像 + setter 唯一写入，范式同 devMode。
+    // 读取点是握手 request 构造（sendHandshake）与 S3 的 9640 绑定门，都按当前值取，
+    // 故改动在下次握手（或旋转重握手）生效，不在当前流内热切换。
+
+    private val _audioEnabled = MutableStateFlow(prefs.getBoolean(AppPrefs.AUDIO_ENABLED, true))
+    val audioEnabledFlow: StateFlow<Boolean> = _audioEnabled.asStateFlow()
+
+    var audioEnabled: Boolean
+        get() = prefs.getBoolean(AppPrefs.AUDIO_ENABLED, true)
+        set(value) {
+            prefs.edit().putBoolean(AppPrefs.AUDIO_ENABLED, value).apply()
+            _audioEnabled.value = value
+        }
+
     // ─── Startup video settings ───
 
     private val _startupDpi = MutableStateFlow(prefs.getInt(AppPrefs.STARTUP_DPI, 0))
