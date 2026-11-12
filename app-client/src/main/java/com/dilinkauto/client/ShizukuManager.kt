@@ -1,11 +1,10 @@
 package com.dilinkauto.client
 
 import android.content.Context
-import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.IBinder
 import android.util.Log
+import com.dilinkauto.client.ui.ShizukuNav
 import com.dilinkauto.protocol.VdProbeResult
 import moe.shizuku.server.IRemoteProcess
 import moe.shizuku.server.IShizukuService
@@ -23,8 +22,6 @@ import java.util.concurrent.TimeUnit
 object ShizukuManager {
 
     private const val TAG = "ShizukuManager"
-    private const val SHIZUKU_PACKAGE = "moe.shizuku.privileged.api"
-    private const val SHIZUKU_WEB_URL = "https://github.com/RikkaApps/Shizuku/releases"
     private const val REQUEST_CODE = 0
 
     @Volatile
@@ -43,7 +40,7 @@ object ShizukuManager {
 
         try {
             isInstalled = try {
-                context.packageManager.getPackageInfo(SHIZUKU_PACKAGE, 0)
+                context.packageManager.getPackageInfo(ShizukuNav.SHIZUKU_PACKAGE, 0)
                 true
             } catch (_: PackageManager.NameNotFoundException) {
                 false

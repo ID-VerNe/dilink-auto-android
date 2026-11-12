@@ -43,7 +43,6 @@ class ConnectionService : Service() {
     private var serviceRegistration: Discovery.ServiceRegistration? = null
     private var connectionLoopJob: Job? = null
     private var networkMonitor: ClientNetworkMonitor? = null
-    private lateinit var carAppInstaller: CarAppInstaller
     private lateinit var appListBuilder: AppListBuilder
     private lateinit var displayRestorer: PhoneDisplayRestorer
 
@@ -140,7 +139,6 @@ class ConnectionService : Service() {
         // A-M8: publish the subnet snapshot once here instead of enumerating
         // interfaces per scan; findCarAdb is additionally serialized (Mutex).
         refreshSubnetSnapshot()
-        carAppInstaller = CarAppInstaller(this) { msg -> _installStatusStatic.value = msg }
         appListBuilder = AppListBuilder(applicationContext, serviceScope)
         // No scope passed: the restorer owns a process-lifetime scope so a
         // Service.onDestroy() mid-restore cannot skip `cmd display power-reset`.
@@ -149,17 +147,7 @@ class ConnectionService : Service() {
 
     /** Snapshot the device's local IPv4 addresses for CarIpLocator's sweep (audit A-M8). */
     private fun refreshSubnetSnapshot() {
-        val localIps = try {
-            java.util.Collections.list(java.net.NetworkInterface.getNetworkInterfaces())
-                .flatMap { it.interfaceAddresses ?: emptyList() }
-                .map { it.address }
-                .filterIsInstance<java.net.Inet4Address>()
-                .mapNotNull { it.hostAddress }
-                .toList()
-        } catch (e: Exception) {
-            FileLog.w(TAG, "Subnet enumeration failed: ${e.message}")
-            emptyList()
-        }
+        val localIps = NetUtil.localIpv4Addresses()
         CarIpLocator.setLocalSubnetSnapshot(localIps)
         if (localIps.isNotEmpty()) {
             FileLog.i(TAG, "Local IPv4 snapshot for car scan: ${localIps.joinToString(", ")}")
@@ -719,48 +707,19 @@ class ConnectionService : Service() {
 
     // ─── Car App Install via ADB ───
 
-    private val _installStatus get() = _installStatusStatic
-
-    /**
-     * A-M9: double-taps (or a re-delivered ACTION_INSTALL_CAR) used to launch
-     * two concurrent install flows that pushed the same APK to the same remote
-     * path. Serialized with an in-flight guard; a second request is dropped
-     * with a status line instead of racing the first.
-     */
-    private val installInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
-
-    fun installCarApp(explicitIp: String? = null) {
-        val ip = explicitIp?.trim()?.takeIf { it.isNotEmpty() }
-        if (ip != null && !Ipv4Validator.isStrict(ip)) {
-            _installStatus.value = "Invalid IP: $ip"
-            FileLog.w(TAG, "installCarApp: rejecting malformed IP '$ip'")
-            return
-        }
-        if (!installInFlight.compareAndSet(false, true)) {
-            _installStatus.value = "Install already in progress"
-            FileLog.i(TAG, "installCarApp: already in progress — ignoring")
-            return
-        }
-        serviceScope.launch(Dispatchers.IO) {
-            try {
-                ensureAssetsReady()
-                installCoordinator.install(ip)
-            } finally {
-                installInFlight.set(false)
-            }
-        }
-    }
-
-    /** Built lazily: needs filesDir and the live connection's remote IP. */
-    private val installCoordinator: CarInstallCoordinator<dadb.Dadb> by lazy {
-        CarInstallCoordinator(
+    private val carAppInstallHost: CarAppInstallHost by lazy {
+        CarAppInstallHost(
             context = this,
-            apkFile = java.io.File(filesDir, "app-server.apk"),
-            installer = carAppInstaller,
+            scope = serviceScope,
             connectedCarIp = { controlConnection?.remoteAddress },
             onReinstalled = { appListBuilder.resetIconHashes() },
-            status = { msg -> _installStatus.value = msg }
+            ensureAssetsReady = { ensureAssetsReady() },
+            onStatus = { msg -> _installStatusStatic.value = msg }
         )
+    }
+
+    fun installCarApp(explicitIp: String? = null) {
+        carAppInstallHost.installCarApp(explicitIp)
     }
 
 
@@ -894,10 +853,10 @@ class ConnectionService : Service() {
         const val ACTION_START = "com.dilinkauto.client.START"
         const val ACTION_STOP = "com.dilinkauto.client.STOP"
         const val ACTION_INSTALL_CAR = "com.dilinkauto.client.INSTALL_CAR"
-        const val ACTION_ALLOWLIST_UPDATED = "com.dilinkauto.client.ALLOWLIST_UPDATED"
-        const val ALLOWLIST_PREFS = "dilinkauto_allowlist"
-        const val ALLOWLIST_PACKAGES_KEY = "allowed_packages"
-        const val ALLOWLIST_CONFIGURED_KEY = "allowlist_configured"
+        const val ACTION_ALLOWLIST_UPDATED = AllowlistRepository.ACTION_ALLOWLIST_UPDATED
+        const val ALLOWLIST_PREFS = AllowlistRepository.PREFS_NAME
+        const val ALLOWLIST_PACKAGES_KEY = AllowlistRepository.KEY_PACKAGES
+        const val ALLOWLIST_CONFIGURED_KEY = AllowlistRepository.KEY_CONFIGURED
         const val NOTIFICATION_ID = 1001
 
         /** Propagate log toggle to car. Called from settings UI and onCreate. */

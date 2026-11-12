@@ -16,8 +16,8 @@ import com.dilinkauto.client.FileLog
  * re-seeding would overwrite their choices.
  */
 internal class AllowlistSeeder(
-    private val packagesKey: String,
-    private val configuredKey: String
+    private val packagesKey: String = AllowlistRepository.KEY_PACKAGES,
+    private val configuredKey: String = AllowlistRepository.KEY_CONFIGURED
 ) {
 
     /**
