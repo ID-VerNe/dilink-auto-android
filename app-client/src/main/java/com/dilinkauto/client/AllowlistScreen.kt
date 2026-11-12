@@ -23,6 +23,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import com.dilinkauto.client.service.AllowlistRepository
 import com.dilinkauto.client.service.ConnectionService
 import com.dilinkauto.client.service.LauncherApps
 import kotlinx.coroutines.Dispatchers
@@ -55,30 +56,13 @@ fun AllowlistScreen(onBack: () -> Unit) {
         }
     }
 
-    val prefs = remember { context.getSharedPreferences(ConnectionService.ALLOWLIST_PREFS, Context.MODE_PRIVATE) }
-    var allowed by remember { mutableStateOf(prefs.getStringSet(ConnectionService.ALLOWLIST_PACKAGES_KEY, null) ?: emptySet()) }
+    val allowlistRepo = remember { AllowlistRepository(context) }
+    var allowed by remember { mutableStateOf(allowlistRepo.getAllowedPackages() ?: emptySet()) }
     var query by rememberSaveable { mutableStateOf("") }
 
     fun persist(next: Set<String>) {
         allowed = next
-        prefs.edit()
-            .putStringSet(ConnectionService.ALLOWLIST_PACKAGES_KEY, next)
-            .putBoolean(ConnectionService.ALLOWLIST_CONFIGURED_KEY, true)
-            .apply()
-        // Re-send so the car grid updates immediately while a session is live.
-        // Plain startService, NOT startForegroundService (audit A-L21): a
-        // running service is already foregrounded, and upgrading here would
-        // re-arm the "must call startForeground within 5s" contract for an
-        // action that never posts a notification. Skipped entirely when the
-        // service is stopped — starting it just to deliver a list refresh
-        // would resurrect a stopped service in a non-foreground state; the
-        // persisted selection is read on the next session start anyway.
-        if (ConnectionService.serviceState.value != com.dilinkauto.client.service.SessionState.IDLE) {
-            val intent = Intent(context, ConnectionService::class.java).apply {
-                action = ConnectionService.ACTION_ALLOWLIST_UPDATED
-            }
-            context.startService(intent)
-        }
+        allowlistRepo.saveAllowedPackages(next)
     }
 
     val filtered = remember(apps, query) {

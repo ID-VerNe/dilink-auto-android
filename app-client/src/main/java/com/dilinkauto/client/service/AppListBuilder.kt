@@ -59,6 +59,8 @@ internal class AppListBuilder(
         return if (allowed != null) allApps.filter { it.packageName in allowed } else allApps
     }
 
+    private val allowlistRepo = AllowlistRepository(context)
+
     /**
      * 当前「允许上车」的包名集合；`null` = 从未配置（全量放行）。
      *
@@ -68,23 +70,13 @@ internal class AppListBuilder(
      * 共用同一份读取/首启播种逻辑，保证「引擎看到的集合」= 「发给车机的集合」。
      */
     internal fun allowedPackages(): Set<String>? {
-        val pm = context.packageManager
-        val prefs = context.getSharedPreferences(ConnectionService.ALLOWLIST_PREFS, Context.MODE_PRIVATE)
-        if (!prefs.getBoolean(ConnectionService.ALLOWLIST_CONFIGURED_KEY, false)) {
-            allowlistSeeder.seedIfNeeded(pm, prefs)
-        }
-        return prefs.getStringSet(ConnectionService.ALLOWLIST_PACKAGES_KEY, null)
+        return allowlistRepo.getAllowedPackages(context.packageManager, seedIfUnconfigured = true)
     }
 
     /** Clear the icon-hash cache so the next [sendAppList] re-sends every icon. */
     fun resetIconHashes() {
         iconGate.reset()
     }
-
-    private val allowlistSeeder = AllowlistSeeder(
-        packagesKey = ConnectionService.ALLOWLIST_PACKAGES_KEY,
-        configuredKey = ConnectionService.ALLOWLIST_CONFIGURED_KEY
-    )
 
     companion object {
         private const val TAG = "AppListBuilder"
