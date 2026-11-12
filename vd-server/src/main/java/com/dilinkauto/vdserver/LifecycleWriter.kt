@@ -25,7 +25,7 @@ internal class LifecycleWriter(private val running: () -> Boolean) {
     /** Set once the phone-side lifecycle channel is accepted. */
     @Volatile var channel: SocketChannel? = null
 
-    private val thread = Thread({
+    private val thread = daemonThread("LifeWriter", start = false) {
         android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
         while (running()) {
             val buf = try { queue.take() } catch (_: InterruptedException) { break }
@@ -44,7 +44,7 @@ internal class LifecycleWriter(private val running: () -> Boolean) {
                 // pipeline — which is what toggling blocking mode to write would do.
             }
         }
-    }, "LifeWriter").apply { isDaemon = true }
+    }
 
     fun start() = thread.start()
 

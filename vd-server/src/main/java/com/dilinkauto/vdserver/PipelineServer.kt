@@ -254,7 +254,7 @@ class PipelineServer(
             // S-06: must be a daemon. It used to be a plain thread, so a pipeline thread
             // parked in LockSupport.park() forever (see runPipeline) kept the shell-UID
             // JVM — and with it the VirtualDisplay and both 0.0.0.0 binds — alive.
-            val t = Thread({ runPipeline() }, "Pipeline").apply { isDaemon = true }
+            val t = daemonThread("Pipeline", start = false) { runPipeline() }
             pipelineThread = t
             t.start()
             // S-M9: bounded wait. runPipeline countDown()s in a finally, so an EGL/GL init
@@ -315,73 +315,22 @@ class PipelineServer(
      * 选一个**真正能跑**的 H.264 编码器并完成 start（成功时 [encoder]/[encoderSurface]
      * 为一对可用实例）。
      *
-     * 旧写法是 `createEncoderByType()` 盲取框架排序里的第一个 video/avc 编码器。
-     * 2026-10-10 MI 9（Android 15 移植 ROM）实机缺陷：该 ROM 的 media_codecs.xml
-     * 把遗留组件 `OMX.qcom.video.encoder.avc` 排在 `c2.qti.avc.encoder` 之前，而前者
-     * 在 configure 时抛 `CodecException`（message 为空；logcat 真因
-     * `venc_dev: Unsupported eColorFormat 0x7f000789`，即不支持 COLOR_FormatSurface）
-     * —— 采集管线整体起不来，而空消息让 vd-server.log 只剩一行 "Fatal: encoder: "。
-     *
-     * 现在按 [orderEncoderCandidates] 排序后逐个 create → configure →
-     * createInputSurface → start，第一个成功者胜出；全部失败时抛出的异常**聚合每个
-     * 候选与失败原因**（可直接从 vd-server.log 定位，不再依赖 logcat）。
+     * 委托给 [VideoEncoderSelector] 完成候选枚举、排序与启动。
      */
     private fun setupEncoder() {
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, encodeWidth, encodeHeight)
-        format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-        format.setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
-        format.setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-        format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, I_FRAME_INTERVAL)
-        format.setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
-        format.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileMain)
-        format.setInteger(MediaFormat.KEY_LATENCY, 0); format.setInteger(MediaFormat.KEY_PRIORITY, 0)
-        format.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0); format.setInteger(MediaFormat.KEY_OPERATING_RATE, fps)
-        format.setLong("repeat-previous-frame-after", 500_000L)
-
-        val tried = mutableListOf<String>()
-        for (name in orderEncoderCandidates(avcEncoderCandidates())) {
-            try {
-                val codec = MediaCodec.createByCodecName(name)
-                try {
-                    codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-                    encoderSurface = codec.createInputSurface()
-                    codec.start()
-                } catch (e: Exception) {
-                    // 半成品实例必须释放：失败的 codec 已占用底层组件（真机上
-                    // OMX.qcom 的失败实例不释放会占住 concurrent-instances 名额）。
-                    runCatching { codec.release() }
-                    throw e
-                }
-                encoder = codec
-                log(
-                    "Encoder: $name ${encodeWidth}x${encodeHeight} CBR@${bitrate / 1_000_000}Mbps Main ${fps}fps" +
-                        if (tried.isEmpty()) "" else "（跳过不可用: ${tried.joinToString(", ")}）"
-                )
-                return
-            } catch (e: Exception) {
-                // 失败原因保留在聚合信息里；空 message 的 CodecException 用类名兜底。
-                val why = e.message?.trim().takeUnless { it.isNullOrEmpty() } ?: e.javaClass.simpleName
-                tried += "$name($why)"
-            }
-        }
-        throw IOException("没有可用的 H.264 编码器；候选与失败原因: ${tried.joinToString("; ")}")
-    }
-
-    /**
-     * 枚举框架里所有 video/avc 编码器（名字 + 是否纯软实现），保留框架原顺序。
-     *
-     * 用 `ALL_CODECS`：本缺陷的教训正是"框架排序里的第一个"不可靠 —— 拿全量列表
-     * 自己排序 + 逐个真尝试（见 [orderEncoderCandidates] 与 [setupEncoder]）。
-     */
-    private fun avcEncoderCandidates(): List<Pair<String, Boolean>> {
-        val infos = MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos
-        val out = ArrayList<Pair<String, Boolean>>(infos.size)
-        for (info in infos) {
-            if (!info.isEncoder) continue
-            if (info.supportedTypes.none { it.equals(MediaFormat.MIMETYPE_VIDEO_AVC, ignoreCase = true) }) continue
-            out += info.name to info.isSoftwareOnly
-        }
-        return out
+        val selected = VideoEncoderSelector.selectAndCreate(
+            width = encodeWidth,
+            height = encodeHeight,
+            bitrate = bitrate,
+            fps = fps,
+            iFrameInterval = I_FRAME_INTERVAL
+        )
+        encoder = selected.codec
+        encoderSurface = selected.surface
+        log(
+            "Encoder: ${selected.name} ${encodeWidth}x${encodeHeight} CBR@${bitrate / 1_000_000}Mbps Main ${fps}fps" +
+                if (selected.skipped.isEmpty()) "" else "（跳过不可用: ${selected.skipped.joinToString(", ")}）"
+        )
     }
 
     // ── VD Creation ──
@@ -423,41 +372,17 @@ class PipelineServer(
     )
 
     private fun bindAndAccept(): ConnectionSet? {
-        val videoServer: ServerSocketChannel; val inputServer: ServerSocketChannel
-        try {
-            videoServer = ServerSocketChannel.open(); videoServer.configureBlocking(false); videoServer.socket().reuseAddress = true
-            videoServer.socket().bind(InetSocketAddress("0.0.0.0", Ports.VIDEO_PORT)); log("Video on :${Ports.VIDEO_PORT}")
-            inputServer = ServerSocketChannel.open(); inputServer.configureBlocking(false); inputServer.socket().reuseAddress = true
-            inputServer.socket().bind(InetSocketAddress("0.0.0.0", Ports.INPUT_PORT)); log("Input on :${Ports.INPUT_PORT}")
-        } catch (e: Exception) { err("Bind: ${e.message}"); return null }
-        // S3-PA（issue #73）：第三次 bind 单独处理 —— 音频是可选能力，9640 被占用时只降级，
-        // 绝不能连累 9638/9639 的视频会话（D2「无条件尝试绑定、失败静默降级」）。
-        // 只绑不 accept：accept 被刻意推迟到 run() 的 unpark 之后。
-        val audioServer: ServerSocketChannel? = run {
-            var ch: ServerSocketChannel? = null
-            try {
-                ch = ServerSocketChannel.open(); ch.configureBlocking(false); ch.socket().reuseAddress = true
-                ch.socket().bind(InetSocketAddress("0.0.0.0", Ports.AUDIO_PORT))
-                log("Audio on :${Ports.AUDIO_PORT} (listen only)")
-                ch
-            } catch (e: Exception) {
-                err("Audio bind on :${Ports.AUDIO_PORT} failed: ${e.message} — audio disabled for this session")
-                runCatching { ch?.close() }
-                null
-            }
-        }
-        // S-06: the two listening sockets are closed in ONE finally around the whole body.
-        //
-        // They used to be closed per-branch, and the accept-timeout branches only closed
-        // the phone channel. A 30s video/input timeout therefore returned null with
-        // 0.0.0.0:9638 and 0.0.0.0:9639 still bound by a zombie shell-UID process —
-        // which also still held the VirtualDisplay and the applied panel/letterbox
-        // state — so the next session could not bind and only a force-stop helped.
-        //
-        // S3-PA（issue #73）：第三条（9640）同样不允许在 return null 时泄漏 —— 任何 null
-        // 返回都在这个 finally 里关掉它。唯一例外是「视频已就绪」的成功路径：此时它随
-        // ConnectionSet 交给 run() 做短超时 accept（见 ConnectionSet.audioServer），
-        // 由 run() 的 finally 负责关闭。
+        val bounds = PortAcceptor.bindServers(
+            videoPort = Ports.VIDEO_PORT,
+            inputPort = Ports.INPUT_PORT,
+            audioPort = Ports.AUDIO_PORT,
+            onLog = { log(it) },
+            onErr = { err(it) }
+        ) ?: return null
+
+        val videoServer = bounds.videoServer
+        val inputServer = bounds.inputServer
+        val audioServer = bounds.audioServer
         var handedOff = false
         try {
             val phoneChannel = connectToPhoneHost() ?: return null
@@ -478,16 +403,6 @@ class PipelineServer(
             val carInput = acceptCarChannel(inputServer, 30000) ?: run { err("Car input timeout"); try { phoneChannel.close() } catch (_: Exception) {}; try { carVideo.close() } catch (_: Exception) {}; return null }
             log("Car connected: video=${carVideo.remoteAddress} input=${carInput.remoteAddress}")
             // Power the physical panel off only now — after the car holds both channels.
-            //
-            // This used to run *before* the accepts, i.e. possibly facing a 30s
-            // accept timeout, which produced two failure modes:
-            //  - a slow car found the phone already dark, so the user stared at a
-            //    black phone before anything was actually broken;
-            //  - being killed during that window meant cleanup() had to re-power a
-            //    panel we had switched off for a session that never started, and any
-            //    interruption of cleanup left it off permanently.
-            // Now the panel only goes dark once a live stream exists to replace it,
-            // and a car that fails to connect never costs the user their screen.
             displayController.setPhysicalDisplayPower(false)
             handedOff = true
             return ConnectionSet(carVideo, carInput, phoneChannel, audioServer)
@@ -522,32 +437,17 @@ class PipelineServer(
         ch.configureBlocking(true); while (buf.hasRemaining()) ch.write(buf); ch.configureBlocking(false)
     }
 
-    private fun acceptCarChannel(server: ServerSocketChannel, timeoutMs: Int): SocketChannel? {
-        val deadline = System.currentTimeMillis() + timeoutMs
-        while (running && System.currentTimeMillis() < deadline) {
-            val a = server.accept()
-            if (a != null) {
-                // S-01: refuse peers that are not the receiver we are serving. The
-                // first accept used to win unconditionally, so any host on the
-                // phone's WiFi could drive touch injection and am start/pm
-                // uninstall as shell UID. A refused peer is closed and we keep
-                // waiting for the real one until the timeout.
-                if (!isAllowedPeer(a)) {
-                    err("Refused car channel from ${a.remoteAddress} (expected ${carHost ?: "ANY"})")
-                    try { a.close() } catch (_: Exception) {}
-                    continue
-                }
-                a.configureBlocking(false)
-                val s = a.socket()
-                s.sendBufferSize = SOCKET_BUF_BYTES
-                s.receiveBufferSize = SOCKET_BUF_BYTES
-                s.tcpNoDelay = true
-                return a
+    private fun acceptCarChannel(server: ServerSocketChannel, timeoutMs: Int): SocketChannel? =
+        PortAcceptor.acceptCarChannel(
+            server = server,
+            timeoutMs = timeoutMs,
+            socketBufBytes = SOCKET_BUF_BYTES,
+            isAllowedPeer = { isAllowedPeer(it) },
+            isRunning = { running },
+            onRefusedPeer = { a ->
+                err("Refused car channel from ${a.remoteAddress} (expected ${carHost ?: "ANY"})")
             }
-            Thread.sleep(50)
-        }
-        return null
-    }
+        )
 
     /**
      * S3-PA（issue #73）：9640 accept 成功后才启动采集。
@@ -688,7 +588,11 @@ class PipelineServer(
 
     // ── Lifecycle + Touch ──
 
-    private fun startLifecycleReader(ch: SocketChannel) { Thread({ try { readLifecycleCommands(ch) } catch (e: Exception) { if (running) err("Lifecycle: ${e.message}") } }, "Lifecycle").apply { isDaemon = true }.start() }
+    private fun startLifecycleReader(ch: SocketChannel) {
+        daemonThread("Lifecycle", start = true) {
+            try { readLifecycleCommands(ch) } catch (e: Exception) { if (running) err("Lifecycle: ${e.message}") }
+        }
+    }
     private fun readLifecycleCommands(ch: SocketChannel) {
         val r = NioReader(ch, 4096, frameIntervalNanos / 1_000_000)
         try {
@@ -708,7 +612,11 @@ class PipelineServer(
         }
     }
 
-    private fun startTouchReader(carInput: SocketChannel) { Thread({ try { readTouchAndCommands(carInput) } catch (e: Exception) { err("Touch: ${e.message}") } }, "TouchReader").apply { isDaemon = true }.start() }
+    private fun startTouchReader(carInput: SocketChannel) {
+        daemonThread("TouchReader", start = true) {
+            try { readTouchAndCommands(carInput) } catch (e: Exception) { err("Touch: ${e.message}") }
+        }
+    }
 
     /**
      * Watchdog: when the lifecycle channel breaks, readLifecycleCommands sets
@@ -724,7 +632,7 @@ class PipelineServer(
      * setPhysicalDisplayPower uses — and does NOT depend on Shizuku.
      */
     private fun startWatchdog() {
-        Thread({
+        daemonThread("Watchdog", start = true) {
             while (running) {
                 // 停止哨兵：部署序列 / PhoneDisplayRestorer 写文件请求优雅停止。
                 // 不能用信号——ART 的 app_process 收 SIGTERM 直接终止、不跑 shutdown
@@ -741,7 +649,7 @@ class PipelineServer(
             }
             val deadline = System.currentTimeMillis() + WATCHDOG_GRACE_MS
             while (System.currentTimeMillis() < deadline) {
-                if (cleanedUp.get()) return@Thread
+                if (cleanedUp.get()) return@daemonThread
                 try { Thread.sleep(200) } catch (_: InterruptedException) { break }
             }
             if (!cleanedUp.get()) {
@@ -752,7 +660,7 @@ class PipelineServer(
                 try { Thread.sleep(500) } catch (_: Exception) {}
                 Runtime.getRuntime().halt(1)
             }
-        }, "Watchdog").apply { isDaemon = true }.start()
+        }
     }
 
     private fun readTouchAndCommands(ch: SocketChannel) {
@@ -866,23 +774,6 @@ class PipelineServer(
         log("Cleanup complete")
     }
 }
-
-/**
- * 编码器候选排序（纯函数，单测锁定契约 —— 见 `EncoderCandidateOrderTest`）。
- *
- * 排序键（稳定排序，同键保留框架给出的原顺序）：
- *  1. 非纯软实现优先（`isSoftwareOnly=false`，硬编性能）；
- *  2. 同组内 Codec2（`c2.` 前缀）优先于遗留 OMX（`OMX.` 前缀）—— 新设备上的
- *     OMX 封装常是陈旧/残缺实现。2026-10-10 MI 9 实机：`OMX.qcom.video.encoder.avc`
- *     在 configure 即失败（不支持 COLOR_FormatSurface），`c2.qti.avc.encoder` 正常。
- *
- * 排序只决定"先试谁"，正确性由 [PipelineServer.setupEncoder] 的逐个真尝试兜底：
- * 靠前的候选失败会自动落到下一个，直到 `c2.android`（软编）之类的最后防线。
- */
-internal fun orderEncoderCandidates(candidates: List<Pair<String, Boolean>>): List<String> =
-    candidates
-        .sortedWith(compareBy({ it.second }, { if (it.first.startsWith("c2.")) 0 else 1 }))
-        .map { it.first }
 
 /**
  * 消费停止哨兵（协议见 [VdDeploy.gracefulStopCommand]）：文件存在则**删除并返回

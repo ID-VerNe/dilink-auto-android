@@ -102,7 +102,7 @@ internal object ShellExec {
      */
     fun startOutputDrain(p: Process, onLine: ((String) -> Unit)? = null) {
         for ((name, stream) in listOf("out" to p.inputStream, "err" to p.errorStream)) {
-            Thread({
+            daemonThread("ShellDrain-$name", start = true) {
                 try {
                     stream.bufferedReader().forEachLine { line ->
                         PipeLog.log("sh<$name| $line")
@@ -110,7 +110,7 @@ internal object ShellExec {
                     }
                 }
                 catch (_: Exception) {}
-            }, "ShellDrain-$name").also { it.isDaemon = true; it.start() }
+            }
         }
     }
 }

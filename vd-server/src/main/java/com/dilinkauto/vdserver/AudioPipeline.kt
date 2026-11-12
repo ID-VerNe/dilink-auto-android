@@ -15,143 +15,6 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.LockSupport
 
 /**
- * 音频采集与编码规格（issue #13 方案 A / 分节 S2）。
- *
- * 参数取自 #13 的双机实测：AAC-LC / 48 kHz / 立体声 / 128 kbps。48 kHz 下每帧
- * 1024 samples，即 **21.333 ms / 46.875 fps** —— 这个节拍是硬约束，不是随手挑的
- * 数字：补帧若按 20 ms 走，每秒会多发 7~8 帧，播放端队列从 5 涨到 13~15
- * （约 +300 ms 延迟，见 #13 §2.5 F2）。
- *
- * 派生量都从 [samplesPerFrame] 与 [sampleRate] 算出来，避免多处硬编码互相漂移。
- */
-internal data class AudioSpec(
-    val sampleRate: Int = SAMPLE_RATE,
-    val channelCount: Int = CHANNEL_COUNT,
-    val bitrate: Int = BITRATE,
-    val samplesPerFrame: Int = SAMPLES_PER_FRAME
-) {
-    init {
-        require(sampleRate > 0) { "sampleRate must be > 0: $sampleRate" }
-        require(channelCount in 1..MAX_CHANNELS) {
-            "channelCount must be in 1..$MAX_CHANNELS: $channelCount"
-        }
-        require(bitrate > 0) { "bitrate must be > 0: $bitrate" }
-        require(samplesPerFrame > 0) { "samplesPerFrame must be > 0: $samplesPerFrame" }
-    }
-
-    /** 一帧的 PCM 字节数（16-bit）。48 kHz 立体声 → 4096 B。 */
-    val frameBytes: Int get() = samplesPerFrame * channelCount * BYTES_PER_SAMPLE
-
-    /** 一帧的时长（纳秒）。1024 samples @ 48 kHz → 21_333_333 ns。 */
-    val frameDurationNanos: Long get() =
-        samplesPerFrame.toLong() * 1_000_000_000L / sampleRate
-
-    /** 帧率。1024 samples @ 48 kHz → 46.875。 */
-    val framesPerSecond: Double get() = sampleRate.toDouble() / samplesPerFrame
-
-    companion object {
-        const val SAMPLE_RATE = 48_000
-        const val CHANNEL_COUNT = 2
-        const val BITRATE = 128_000
-        const val SAMPLES_PER_FRAME = 1024
-        const val MAX_CHANNELS = 2
-        const val BYTES_PER_SAMPLE = 2
-
-        val DEFAULT = AudioSpec()
-    }
-}
-
-/**
- * 静音期补帧节拍（纯逻辑，单测锁定 —— 见 `AudioPipelineTest`）。
- *
- * ## 为什么需要它（#13 R10）
- *
- * `AudioRecord(REMOTE_SUBMIX)` 在**没有任何 active player** 时 `read()` 会永久阻塞
- * 且不产全零帧（E10）。播放端于是持续欠载：实测 3 s 内一次 800 ms 断流就打出
- * `starved=88` / 恢复耗时 706 ms；按节拍补静音帧后 `starved=0` / `underrun=0`。
- *
- * 边界很重要：**只要有 active 的 submix 播放流，即使 `AudioTrack.stop()` 停写，
- * AudioFlinger 仍会持续产零帧** —— 补帧只在「所有 player 消失」时兜底，不是常态路径。
- *
- * ## 为什么要有封顶（#13 R13）
- *
- * 读阻塞很久后（熄屏瞬间、ROM 调度抖动）不该把积压一次性灌进编码器：那会让播放端
- * 队列瞬间膨胀。所以最多连补 [maxCatchUpFrames] 帧，落后更多就直接对齐到当前时刻的
- * 下一拍 —— 宁可让时间轴出现一小段空隙，也不制造延迟尖峰。
- */
-internal class AudioPacing(
-    private val frameDurationNanos: Long,
-    private val maxCatchUpFrames: Int = DEFAULT_MAX_CATCH_UP_FRAMES
-) {
-    init {
-        require(frameDurationNanos > 0) { "frameDurationNanos must be > 0: $frameDurationNanos" }
-        require(maxCatchUpFrames > 0) { "maxCatchUpFrames must be > 0: $maxCatchUpFrames" }
-    }
-
-    /** 下一拍的到期时刻；[NOT_STARTED] 表示还没有基准（首帧永远由真实数据触发）。 */
-    private var nextDueNanos = NOT_STARTED
-
-    /**
-     * 真实 PCM 帧产出：把节拍基准推到「现在 + 一个帧间隔」。
-     *
-     * 采集正常流时每 21.333 ms 调一次，因此 [silenceFramesDue] 始终返回 0 —— 补帧不会
-     * 在正常路径上触发。
-     */
-    fun onRealData(nowNanos: Long) {
-        nextDueNanos = nowNanos + frameDurationNanos
-    }
-
-    /**
-     * 无数据时本轮应当补发几个静音帧（`0..maxCatchUpFrames`）。
-     *
-     * 首次调用只建立基准并返回 0：不能让管线在还没收到任何真实数据时就抢先补帧。
-     */
-    fun silenceFramesDue(nowNanos: Long): Int {
-        if (nextDueNanos == NOT_STARTED) {
-            nextDueNanos = nowNanos + frameDurationNanos
-            return 0
-        }
-        if (nowNanos < nextDueNanos) return 0
-        // 已到期的拍数（含当前这一拍）。
-        val behind = (nowNanos - nextDueNanos) / frameDurationNanos + 1
-        val due = if (behind > maxCatchUpFrames) maxCatchUpFrames else behind.toInt()
-        nextDueNanos += due.toLong() * frameDurationNanos
-        // 落后超过封顶：不再逐帧追赶，直接对齐到当前时刻之后的第一拍。
-        if (nextDueNanos <= nowNanos) nextDueNanos = nowNanos + frameDurationNanos
-        return due
-    }
-
-    companion object {
-        private const val NOT_STARTED = -1L
-
-        /**
-         * 最多连补 2 帧（约 43 ms）。超过这个量说明读阻塞了很久，逐帧追赶只会把延迟
-         * 堆到播放端队列里（R13），不如对齐。
-         */
-        const val DEFAULT_MAX_CATCH_UP_FRAMES = 2
-    }
-}
-
-/**
- * 第 [frameIndex] 帧（从 0 开始）的呈现时间戳，单位微秒 —— 喂给 `MediaCodec`
- * `queueInputBuffer` 用。
- *
- * 用 Long 运算。Int 域下 `frameIndex * samplesPerFrame * 1_000_000` 在第 3 帧
- * （3072 samples × 1e6 = 3.07e9 > 2^31 = 2.147e9）就已经溢出；即便只看 sample 计数，
- * 2^31 samples @ 48 kHz 也只有约 12.4 小时（44 739 s）。两者都说明这里必须是 Long。
- */
-internal fun ptsUsForFrame(frameIndex: Long, spec: AudioSpec): Long =
-    frameIndex * spec.samplesPerFrame * 1_000_000L / spec.sampleRate
-
-/**
- * 一帧全零 PCM，用于静音期补帧。
- *
- * 不设 RMS 阈值判静音：两台调试机的采集幅度差 5.8 倍（munch peak 2040 / MI 9 peak
- * 351，#13 R12），绝对幅度不可移植；这里只区分「有帧 / 无帧」。
- */
-internal fun silenceFrame(spec: AudioSpec): ByteArray = ByteArray(spec.frameBytes)
-
-/**
  * 音频采集 + AAC-LC 编码管线（issue #13 方案 A / 分节 S2）。
  *
  * ## 为什么能用 REMOTE_SUBMIX
@@ -283,9 +146,8 @@ internal class AudioPipeline(
         record = rec
         codec = enc
         running.set(true)
-        thread = Thread({ captureLoop(rec, enc) }, "AudioCapture").apply {
-            isDaemon = true
-            start()
+        thread = daemonThread("AudioCapture", start = true) {
+            captureLoop(rec, enc)
         }
         log(
             "Audio: capture started (${spec.sampleRate}Hz/${spec.channelCount}ch/" +
