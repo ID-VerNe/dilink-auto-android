@@ -1,11 +1,12 @@
 package com.dilinkauto.server.decoder
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * 钉住车机端音频播放的日志契约（issue #73 分节 PB）。
+ * 钉住车机端音频播放的日志契约与纯算法（issue #73 分节 PB、issue #84 / Refs #79）。
  *
  * 为什么只测这一件事：`AudioPlayer` 的其余部分全是 `MediaCodec` / `AudioTrack` I/O，
  * 在无 Robolectric 的纯 JVM 单测里跑不起来（框架类返回默认值）。而**日志行格式是
@@ -22,29 +23,58 @@ class AudioPlayerPolicyTest {
     @Test
     fun `stat line matches the frozen S6 grep contract`() {
         val line = audioPlayerStatLine(
-            decoded = 469, starved = 3, underrun = 2, maxRecoverMs = 45, queue = 9
+            decoded = 469, starved = 3, underrun = 2, maxRecoverMs = 45, queue = 9, silence = 12
         )
         assertEquals(
-            "[AudioPlayer] decoded=469 starved=3 underrun=2 maxRecoverMs=45 queue=9",
+            "[AudioPlayer] decoded=469 starved=3 underrun=2 maxRecoverMs=45 queue=9 silence=12",
             line,
         )
     }
 
     @Test
     fun `stat line starts with the greppable prefix`() {
-        val line = audioPlayerStatLine(0, 0, 0, 0, 0)
+        val line = audioPlayerStatLine(0, 0, 0, 0, 0, 0)
         assertTrue(line.startsWith(contractPrefix))
-        assertEquals("[AudioPlayer] decoded=0 starved=0 underrun=0 maxRecoverMs=0 queue=0", line)
+        assertEquals("[AudioPlayer] decoded=0 starved=0 underrun=0 maxRecoverMs=0 queue=0 silence=0", line)
     }
 
     @Test
     fun `field names are stable and space separated`() {
-        val line = audioPlayerStatLine(1, 2, 3, 4, 5)
+        val line = audioPlayerStatLine(1, 2, 3, 4, 5, 6)
         // 逐字段核对：字段名一旦改名，S6 的 assert 会静默失配
         assertTrue(line.contains(" decoded="))
         assertTrue(line.contains(" starved="))
         assertTrue(line.contains(" underrun="))
         assertTrue(line.contains(" maxRecoverMs="))
         assertTrue(line.contains(" queue="))
+        assertTrue(line.contains(" silence="))
+    }
+
+    @Test
+    fun `silence default argument is zero`() {
+        val line = audioPlayerStatLine(10, 0, 0, 0, 1)
+        assertEquals("[AudioPlayer] decoded=10 starved=0 underrun=0 maxRecoverMs=0 queue=1 silence=0", line)
+    }
+
+    @Test
+    fun `isPcmSilent correctly identifies all zeros buffer`() {
+        assertTrue(isPcmSilent(ByteArray(0)))
+        assertTrue(isPcmSilent(ByteArray(1024)))
+        assertTrue(isPcmSilent(ByteArray(4096)))
+    }
+
+    @Test
+    fun `isPcmSilent detects non zero samples at various positions`() {
+        val buf = ByteArray(1024)
+        buf[0] = 1
+        assertFalse(isPcmSilent(buf))
+
+        val bufMid = ByteArray(1024)
+        bufMid[512] = -1
+        assertFalse(isPcmSilent(bufMid))
+
+        val bufEnd = ByteArray(1024)
+        bufEnd[1023] = 0x80.toByte()
+        assertFalse(isPcmSilent(bufEnd))
     }
 }
