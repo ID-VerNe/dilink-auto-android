@@ -101,42 +101,17 @@ object ShizukuManager {
     /**
      * Open the Shizuku app so the user can manage authorization manually.
      */
+    @Deprecated("Use ShizukuNav.openShizukuApp instead", ReplaceWith("com.dilinkauto.client.ui.ShizukuNav.openShizukuApp(context)"))
     fun openShizukuApp(context: Context) {
-        try {
-            val intent = context.packageManager.getLaunchIntentForPackage(SHIZUKU_PACKAGE)
-            if (intent != null) {
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                context.startActivity(intent)
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to open Shizuku: ${e.message}")
-        }
+        com.dilinkauto.client.ui.ShizukuNav.openShizukuApp(context)
     }
 
     /**
-     * Send the user somewhere they can install Shizuku (audit UX-13: the
-     * not-installed settings row looked tappable and silently did nothing).
-     *
-     * Prefers the local store app via the `market:` scheme — that resolves on
-     * Chinese ROMs without Google Play — and falls back to the project's
-     * GitHub releases, which is also where the ADB start-up instructions live.
+     * Send the user somewhere they can install Shizuku.
      */
+    @Deprecated("Use ShizukuNav.openShizukuStorePage instead", ReplaceWith("com.dilinkauto.client.ui.ShizukuNav.openShizukuStorePage(context)"))
     fun openShizukuStorePage(context: Context) {
-        val market = Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=$SHIZUKU_PACKAGE"))
-            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        try {
-            context.startActivity(market)
-            return
-        } catch (e: Exception) {
-            Log.w(TAG, "No market app for Shizuku, opening web page: ${e.message}")
-        }
-        try {
-            val web = Intent(Intent.ACTION_VIEW, Uri.parse(SHIZUKU_WEB_URL))
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            context.startActivity(web)
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to open Shizuku install page: ${e.message}")
-        }
+        com.dilinkauto.client.ui.ShizukuNav.openShizukuStorePage(context)
     }
 
     private fun getService(): IShizukuService? {

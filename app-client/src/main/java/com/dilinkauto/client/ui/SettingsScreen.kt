@@ -195,13 +195,13 @@ fun SettingsScreen(
                 // lies about being interactive (audit UX-13).
                 onClick = {
                     when {
-                        shizukuAvailable -> ShizukuManager.openShizukuApp(context)
+                        shizukuAvailable -> ShizukuNav.openShizukuApp(context)
                         shizukuInstalled -> {
                             ShizukuManager.requestPermission()
-                            ShizukuManager.openShizukuApp(context)
+                            ShizukuNav.openShizukuApp(context)
                             permissionsKey++
                         }
-                        else -> ShizukuManager.openShizukuStorePage(context)
+                        else -> ShizukuNav.openShizukuStorePage(context)
                     }
                 }
             )

@@ -65,7 +65,7 @@ fun MainScreen(
 ) {
     val serviceState by ConnectionService.serviceState.collectAsState()
     val installStatus by ConnectionService.installStatusFlow.collectAsState()
-    val isRunning = serviceState != ConnectionService.State.IDLE
+    val isRunning = serviceState != com.dilinkauto.client.service.SessionState.IDLE
     val isSamsung = remember { android.os.Build.MANUFACTURER.equals("samsung", ignoreCase = true) }
     var samsungWarningDismissed by remember { mutableStateOf(false) }
 
@@ -206,7 +206,7 @@ fun MainScreen(
 }
 
 @Composable
-fun StatusCard(state: ConnectionService.State) {
+fun StatusCard(state: com.dilinkauto.client.service.SessionState) {
     // NetworkInterface enumeration is a blocking syscall — off the composition
     // thread (audit A-L22), mirroring AllowlistScreen's load pattern: state
     // starts empty and LaunchedEffect fills it on IO.
@@ -216,18 +216,18 @@ fun StatusCard(state: ConnectionService.State) {
     }
 
     val (color, title, subtitle) = when (state) {
-        ConnectionService.State.IDLE -> Triple(
+        com.dilinkauto.client.service.SessionState.IDLE -> Triple(
             Color(0xFF757575), stringResource(R.string.status_stopped), stringResource(R.string.status_stopped_desc)
         )
-        ConnectionService.State.WAITING -> Triple(
+        com.dilinkauto.client.service.SessionState.WAITING -> Triple(
             Color(0xFFFFA726), stringResource(R.string.status_waiting),
             if (ipAddresses.isNotEmpty()) stringResource(R.string.status_listening, ipAddresses.joinToString(", "))
             else stringResource(R.string.status_waiting_desc)
         )
-        ConnectionService.State.CONNECTED -> Triple(
+        com.dilinkauto.client.service.SessionState.CONNECTED -> Triple(
             Color(0xFF2196F3), stringResource(R.string.status_connected), stringResource(R.string.status_connected_desc)
         )
-        ConnectionService.State.STREAMING -> Triple(
+        com.dilinkauto.client.service.SessionState.STREAMING -> Triple(
             Color(0xFF4CAF50), stringResource(R.string.status_streaming), stringResource(R.string.status_streaming_desc)
         )
     }

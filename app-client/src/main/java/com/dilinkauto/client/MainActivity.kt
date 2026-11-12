@@ -69,7 +69,7 @@ class MainActivity : ComponentActivity() {
         // PhoneDisplayRestorer) from resurrecting a service the user just stopped
         // (audit A-L21).
         if (onboardingCompleted && !userStopped &&
-            ConnectionService.serviceState.value == ConnectionService.State.IDLE
+            ConnectionService.serviceState.value == com.dilinkauto.client.service.SessionState.IDLE
         ) {
             startConnectionService()
         }

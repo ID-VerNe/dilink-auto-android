@@ -29,6 +29,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
+typealias State = SessionState
+
 class ConnectionService : Service() {
 
     private var serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -40,8 +42,7 @@ class ConnectionService : Service() {
     private var targetBitrate = VideoConfig.DEFAULT_BITRATE
     private var serviceRegistration: Discovery.ServiceRegistration? = null
     private var connectionLoopJob: Job? = null
-    private var networkCallback: ConnectivityManager.NetworkCallback? = null
-    private var networkChangeDebounce: Job? = null
+    private var networkMonitor: ClientNetworkMonitor? = null
     private lateinit var carAppInstaller: CarAppInstaller
     private lateinit var appListBuilder: AppListBuilder
     private lateinit var displayRestorer: PhoneDisplayRestorer
@@ -114,8 +115,6 @@ class ConnectionService : Service() {
         )
     }
 
-    enum class State { IDLE, WAITING, CONNECTED, STREAMING }
-
     override fun onBind(intent: Intent?): IBinder? = null
 
     private var packageRemovedReceiver: BroadcastReceiver? = null
@@ -129,7 +128,7 @@ class ConnectionService : Service() {
         activeConnection = null
         _serviceState.value = State.IDLE
         acquireWakeLock()
-        registerNetworkCallback()
+        setupNetworkMonitor()
         registerPackageRemovedReceiver()
         deployAssets()
         logDeviceInfo()
@@ -262,54 +261,33 @@ class ConnectionService : Service() {
         return crc
     }
 
-    private fun registerNetworkCallback() {
+    private fun setupNetworkMonitor() {
         val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
-        val request = NetworkRequest.Builder()
-            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
-            .build()
-        val callback = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) {
-                FileLog.i(TAG, "Network available: $network")
-                networkChangeDebounce?.cancel()
-                // Re-publish the local-IPv4 snapshot: the sweep must not inherit
-                // the previous network's addresses (audit A-M8).
-                refreshSubnetSnapshot()
-                val state = _serviceState.value
-                if (state == State.WAITING) {
-                    FileLog.i(TAG, "New network while WAITING — restarting listen loop")
-                    cleanupSession()
-                    connectionLoopJob?.cancel()
-                    startConnectionLoop()
-                }
-            }
-            override fun onLost(network: Network) {
-                // Only react if the lost network is the one our connection uses.
-                // Ignore unrelated network drops (mobile data, other WiFi, etc.)
-                val conn = controlConnection
-                if (conn != null && conn.isConnected) {
-                    val cm2 = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
-                    val activeNet = cm2.activeNetwork
-                    // If another network is still active and our connection has it, ignore
-                    if (activeNet != null && activeNet != network) {
-                        FileLog.i(TAG, "Network lost: $network (not our active network $activeNet — ignoring)")
-                        return
+        networkMonitor = ClientNetworkMonitor(
+            connectivityManager = cm,
+            scope = serviceScope,
+            listener = object : ClientNetworkMonitor.Listener {
+                override fun onNetworkAvailable(network: Network) {
+                    refreshSubnetSnapshot()
+                    val state = _serviceState.value
+                    if (state == State.WAITING) {
+                        FileLog.i(TAG, "New network while WAITING — restarting listen loop")
+                        cleanupSession()
+                        connectionLoopJob?.cancel()
+                        startConnectionLoop()
                     }
                 }
-                FileLog.i(TAG, "Network lost: $network — debouncing before reacting")
-                // Debounce: delay 3s before reacting to transient network flaps.
-                // 4G changes can cause brief hotspot resets that recover immediately.
-                networkChangeDebounce?.cancel()
-                networkChangeDebounce = serviceScope.launch {
-                    delay(3000)
-                    if (controlConnection?.isConnected != true) {
-                        FileLog.i(TAG, "Network lost confirmed — resetting connection")
-                    }
+
+                override fun onNetworkLostConfirmed(network: Network) {
                     resetConnectionForNetworkChange()
                 }
+
+                override fun isConnectionActive(): Boolean {
+                    val conn = controlConnection
+                    return conn != null && conn.isConnected
+                }
             }
-        }
-        cm.registerNetworkCallback(request, callback)
-        networkCallback = callback
+        ).apply { start() }
     }
 
     private fun resetConnectionForNetworkChange() {
@@ -643,7 +621,6 @@ class ConnectionService : Service() {
             if (!client.isConnected) {
                 if (client.acceptConnection(VirtualDisplayClient.SERVER_PORT)) {
                     FileLog.i(TAG, "VD server lifecycle connected (displayId=${client.displayId})")
-                    InputInjectionService.instance?.setVirtualDisplay(client.displayId, vdWidth, vdHeight)
                     withContext(Dispatchers.Main) {
                         _serviceState.value = State.STREAMING
                         updateNotification(R.string.notification_streaming)
@@ -687,78 +664,20 @@ class ConnectionService : Service() {
      * reverse-connect to localhost:19647 as usual.
      */
     private suspend fun startVdServerViaShizuku(carWidth: Int, carHeight: Int, vdWidth: Int, vdHeight: Int, dpi: Int = VideoConfig.DEFAULT_FALLBACK_DPI, jarCrc: Long = -1L) {
-        if (!ShizukuManager.isAvailable) {
-            FileLog.w(TAG, "Shizuku not available — cannot start VD server")
-            return
-        }
         try {
-            // 同上：使用绝对路径常量，避免拼出影子目录导致引擎加载旧 jar
-            val dir = java.io.File(VdDeploy.DIR_PATH)
-            if (!dir.exists()) dir.mkdirs()
-            val jarPath = VdDeploy.JAR_PATH
-            val logPath = VdDeploy.LOG_PATH
-            // VD dims (vdWidth/vdHeight) are the scaled-up values (preserves the
-            // IME-crop fix for Chinese ROMs that hardcode IME width to phone
-            // physical width). Encode dims (carWidth/carHeight) are the car-native
-            // viewport clamped to 1920x1080: the Snapdragon 439 VPU caps hardware
-            // AVC decode at 1080p. Encoding larger forces software decode on the
-            // car's 8x A53 (single-digit fps). Car-native is also 1:1 with the car's
-            // pixels, so no downscale on decode.
-            //
-            // background=true → `setsid app_process ... >>log 2>&1 &`. The car
-            // ADB path uses background=false (`exec app_process`) because the ADB
-            // shell stream must stay attached to the engine (the car's
-            // TcpAdbConnection has no stream-demux reader). Shizuku is different:
-            // execBackground is fire-and-forget and Shizuku tracks the parent sh
-            // PID. With `exec app_process ... &`, the parent sh exits immediately
-            // after backgrounding and Shizuku reaps the process group, killing the
-            // engine before its first stdout flush — vd-server.log stays at 0
-            // bytes. `setsid` detaches the engine into its own session so it
-            // survives the parent sh's exit.
-            // issue #21：引擎读不到本 App 的 allowlist prefs，部署时把「允许上车」的包名
-            // 集合经 argv 下传，建屏恢复（ensureContent）才不会把白名单外的私有应用
-            // 拉到车机屏。null = 从未配置（全量放行），此时不下传，保持引擎原有行为。
             val allowedPackages = appListBuilder.allowedPackages().orEmpty()
-            val plan = VdDeploy.buildDeployPlan(
-                jarPath = jarPath,
-                logPath = logPath,
-                vdWidth = vdWidth, vdHeight = vdHeight, dpi = dpi,
-                encodeWidth = carWidth, encodeHeight = carHeight,
-                phoneHost = "127.0.0.1", fps = targetFps,
-                bitrate = targetBitrate,
-                background = true,
-                // S-01: pin the engine's 9638/9639 accepts to the receiver we are
-                // serving. The phone knows the car's IP from the control
-                // connection's remote address; without this any host on the
-                // phone's WiFi could drive the shell-UID engine.
+            val outcome = ShizukuVdDeployer.deploy(
+                carWidth = carWidth,
+                carHeight = carHeight,
+                vdWidth = vdWidth,
+                vdHeight = vdHeight,
+                dpi = dpi,
+                targetFps = targetFps,
+                targetBitrate = targetBitrate,
                 carHost = controlConnection?.remoteAddress ?: VdDeployArgs.CAR_HOST_ANY,
                 allowedPackages = allowedPackages
-            )
+            ) ?: return
 
-            // Order, convergence rule and the force-kill fallback all live in
-            // the shared deploy sequence (protocol-core) so this path can no
-            // longer drift from the car's two ADB paths or the desktop path.
-            val executor = object : VdDeployExecutor {
-                override suspend fun shellSync(command: String) {
-                    ShizukuManager.execAndWait(command)
-                }
-
-                override suspend fun launch(command: String): Boolean {
-                    // Fire-and-forget: Shizuku tracks the parent sh PID, not the
-                    // engine, so there is no launch status to observe here. The
-                    // `setsid ... &` form in the plan (background=true) keeps the
-                    // engine alive past the parent sh's exit — see VdDeploy.commandLine.
-                    //
-                    // A-M7: execBackground returns false when Shizuku is gone or
-                    // the process could not be spawned; propagating it stops the
-                    // "VD server started" log from being printed for an engine
-                    // that never launched.
-                    return ShizukuManager.execBackground(command)
-                }
-
-                override suspend fun probe(): VdProbeResult = ShizukuManager.probeVdServer()
-            }
-            val outcome = vdRunDeploySequence(plan, executor)
             if (outcome.forcedKill) {
                 FileLog.w(TAG, "Previous VD server did not exit in time — forced kill used")
             }
@@ -810,12 +729,9 @@ class ConnectionService : Service() {
      */
     private val installInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
 
-    /** IPv4 literal (what the car-side ADB service actually listens on). */
-    private val IPV4_REGEX = Regex("^((25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.){3}(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)$")
-
     fun installCarApp(explicitIp: String? = null) {
         val ip = explicitIp?.trim()?.takeIf { it.isNotEmpty() }
-        if (ip != null && !IPV4_REGEX.matches(ip)) {
+        if (ip != null && !Ipv4Validator.isStrict(ip)) {
             _installStatus.value = "Invalid IP: $ip"
             FileLog.w(TAG, "installCarApp: rejecting malformed IP '$ip'")
             return
@@ -906,7 +822,6 @@ class ConnectionService : Service() {
         val conn = controlConnection
         controlConnection = null
         activeConnection = null
-        InputInjectionService.instance?.clearVirtualDisplay()
         appListBuilder.resetIconHashes() // Force resend icons on reconnect
         _serviceState.value = State.WAITING
         val ime = savedDefaultIme
@@ -959,13 +874,8 @@ class ConnectionService : Service() {
 
     override fun onDestroy() {
         stopEverything()
-        networkCallback?.let {
-            try {
-                val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
-                cm.unregisterNetworkCallback(it)
-            } catch (_: Exception) {}
-        }
-        networkCallback = null
+        networkMonitor?.stop()
+        networkMonitor = null
         packageRemovedReceiver?.let {
             try { unregisterReceiver(it) } catch (_: Exception) {}
         }
