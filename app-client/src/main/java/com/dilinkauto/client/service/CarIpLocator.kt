@@ -2,6 +2,7 @@ package com.dilinkauto.client.service
 
 import android.net.wifi.WifiManager
 import com.dilinkauto.client.FileLog
+import com.dilinkauto.protocol.Ipv4Validator
 import com.dilinkauto.protocol.Ports
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -105,7 +106,7 @@ object CarIpLocator {
                 val out = neighProcess.inputStream.bufferedReader().readText()
                 for (line in out.lines()) {
                     val ip = line.split("\\s+".toRegex()).firstOrNull() ?: continue
-                    if (!ip.matches(Regex("\\d+\\.\\d+\\.\\d+\\.\\d+"))) continue
+                    if (!Ipv4Validator.isLoose(ip)) continue
                     if (subnetIps.contains(ip)) continue
                     if (probe(ip, CAR_ADB_PORT)) {
                         FileLog.i(TAG, "Found car ADB at $ip (neighbor)")

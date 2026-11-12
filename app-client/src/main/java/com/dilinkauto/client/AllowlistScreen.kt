@@ -73,7 +73,7 @@ fun AllowlistScreen(onBack: () -> Unit) {
         // service is stopped — starting it just to deliver a list refresh
         // would resurrect a stopped service in a non-foreground state; the
         // persisted selection is read on the next session start anyway.
-        if (ConnectionService.serviceState.value != ConnectionService.State.IDLE) {
+        if (ConnectionService.serviceState.value != com.dilinkauto.client.service.SessionState.IDLE) {
             val intent = Intent(context, ConnectionService::class.java).apply {
                 action = ConnectionService.ACTION_ALLOWLIST_UPDATED
             }
