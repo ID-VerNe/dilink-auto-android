@@ -364,20 +364,20 @@ class Connection(
                 // FLUSH_GRACE_MS to drain, then finish the teardown.
                 scope.launch {
                     delay(FLUSH_GRACE_MS)
-                    writerJob?.cancel()
-                    writeQueue.close()
-                    reader.close()
-                    try { channel.close() } catch (_: Exception) {}
-                    try { disconnectListener?.invoke() } catch (_: Exception) {}
+                    performTeardown()
                 }
                 return
             }
-            writerJob?.cancel()
-            writeQueue.close()
-            reader.close()
-            try { channel.close() } catch (_: Exception) {}
-            try { disconnectListener?.invoke() } catch (_: Exception) {}
+            performTeardown()
         }
+    }
+
+    private fun performTeardown() {
+        writerJob?.cancel()
+        writeQueue.close()
+        reader.close()
+        try { channel.close() } catch (_: Exception) {}
+        try { disconnectListener?.invoke() } catch (_: Exception) {}
     }
 
     companion object {
