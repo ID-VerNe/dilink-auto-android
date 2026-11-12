@@ -18,7 +18,6 @@ import java.util.concurrent.atomic.AtomicInteger;
  *   UsbAdbConnection adb = new UsbAdbConnection(context);
  *   if (adb.connect(usbDevice)) {
  *       String output = adb.shell("ls /data/local/tmp");
- *       adb.push(inputStream, "/data/local/tmp/file.jar");
  *       adb.shellNoWait("CLASSPATH=... app_process ...");
  *       adb.close();
  *   }
@@ -33,7 +32,6 @@ public class UsbAdbConnection {
     private final AtomicInteger nextLocalId = new AtomicInteger(1);
     private final ConcurrentHashMap<Integer, CompletableFuture<Void>> pendingOpens = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Integer, BlockingQueue<byte[]>> streamData = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<Integer, BlockingQueue<byte[]>> streamAcks = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Integer, Integer> streamPeerIds = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Integer, Boolean> streamClosed = new ConcurrentHashMap<>();
     private volatile boolean connected = false;
@@ -245,93 +243,6 @@ public class UsbAdbConnection {
         return localId;
     }
 
-    /**
-     * Read output from a non-blocking shell stream.
-     */
-    public String readStream(int localId, long timeoutMs) {
-        BlockingQueue<byte[]> queue = streamData.get(localId);
-        if (queue == null) return null;
-        StringBuilder sb = new StringBuilder();
-        long deadline = System.currentTimeMillis() + timeoutMs;
-        while (System.currentTimeMillis() < deadline) {
-            try {
-                byte[] data = queue.poll(100, TimeUnit.MILLISECONDS);
-                if (data != null) sb.append(new String(data));
-            } catch (InterruptedException e) { break; }
-        }
-        return sb.toString();
-    }
-
-    /**
-     * Push a file to the phone via ADB SYNC protocol.
-     * Simplified: uses shell cat redirect (works reliably, slightly slower than SYNC).
-     */
-    public boolean push(InputStream input, String remotePath) {
-        try {
-            // Read entire file into memory (JAR is ~20KB)
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            byte[] buf = new byte[16384];
-            int len;
-            while ((len = input.read(buf)) != -1) {
-                baos.write(buf, 0, len);
-            }
-            byte[] fileData = baos.toByteArray();
-            log("Pushing " + fileData.length + " bytes to " + remotePath);
-
-            // Open shell stream for cat redirect
-            int localId = nextLocalId.getAndIncrement();
-            BlockingQueue<byte[]> queue = new LinkedBlockingQueue<>();
-            BlockingQueue<byte[]> ackQueue = new LinkedBlockingQueue<>();
-            streamData.put(localId, queue);
-            streamAcks.put(localId, ackQueue);
-            streamClosed.put(localId, false);
-
-            CompletableFuture<Void> openFuture = new CompletableFuture<>();
-            pendingOpens.put(localId, openFuture);
-
-            sendRaw(AdbProtocol.encodeOpen(localId, "shell:cat > " + remotePath));
-            openFuture.get(10, TimeUnit.SECONDS);
-
-            Integer peerId = streamPeerIds.get(localId);
-            if (peerId == null) {
-                logE("push: no peer ID");
-                cleanup(localId);
-                return false;
-            }
-
-            // Write file data in chunks
-            int offset = 0;
-            while (offset < fileData.length) {
-                int chunkSize = Math.min(maxPayload, fileData.length - offset);
-                byte[] chunk = new byte[chunkSize];
-                System.arraycopy(fileData, offset, chunk, 0, chunkSize);
-                sendRaw(AdbProtocol.encodeWrite(localId, peerId, chunk));
-                offset += chunkSize;
-
-                // Wait for OKAY (flow control) on the dedicated ack queue.
-                // A null ack before the timeout means the device stopped
-                // acknowledging — abort instead of continuing to blast data.
-                try {
-                    byte[] ack = ackQueue.poll(5, TimeUnit.SECONDS);
-                    if (ack == null) {
-                        logE("push: ack timeout at offset " + offset + ", aborting");
-                        break;
-                    }
-                } catch (InterruptedException e) { break; }
-            }
-
-            // Close the stream (signals EOF to cat)
-            sendRaw(AdbProtocol.encodeClose(localId, peerId));
-            Thread.sleep(500); // Let shell finish writing
-            cleanup(localId);
-            log("Push complete: " + remotePath);
-            return true;
-        } catch (Exception e) {
-            logE("push failed: " + e.getMessage());
-            return false;
-        }
-    }
-
     public boolean isConnected() {
         return connected;
     }
@@ -339,16 +250,13 @@ public class UsbAdbConnection {
     public void close() {
         closed = true;
         connected = false;
-        // Unblock any shell()/push() polls stuck on streamClosed.get()==null:
-        // mark every stream closed and drop an empty token on each data/ack queue
+        // Unblock any shell() polls stuck on streamClosed.get()==null:
+        // mark every stream closed and drop an empty token on each data queue
         // so poll() returns instead of blocking until the 30s deadline.
         for (Integer id : streamClosed.keySet()) {
             streamClosed.put(id, true);
         }
         for (BlockingQueue<byte[]> q : streamData.values()) {
-            q.offer(new byte[0]);
-        }
-        for (BlockingQueue<byte[]> q : streamAcks.values()) {
             q.offer(new byte[0]);
         }
         Thread t = readerThread;
@@ -367,7 +275,6 @@ public class UsbAdbConnection {
             connection = null;
         }
         streamData.clear();
-        streamAcks.clear();
         streamPeerIds.clear();
         streamClosed.clear();
         pendingOpens.clear();
@@ -500,12 +407,6 @@ public class UsbAdbConnection {
                 if (future != null) {
                     future.complete(null);
                 }
-                // Route the ack to the dedicated ack queue (flow control for push())
-                // — kept separate from streamData so it can't be mistaken for cat stderr.
-                BlockingQueue<byte[]> ackQueue = streamAcks.get(arg1);
-                if (ackQueue != null) {
-                    ackQueue.offer(new byte[0]);
-                }
                 break;
 
             case AdbProtocol.A_WRTE:
@@ -582,7 +483,6 @@ public class UsbAdbConnection {
 
     private void cleanup(int localId) {
         streamData.remove(localId);
-        streamAcks.remove(localId);
         streamPeerIds.remove(localId);
         streamClosed.remove(localId);
         pendingOpens.remove(localId);

@@ -460,24 +460,20 @@ enum class AppCategory(val id: Byte) {
 data class AppListMessage(val apps: List<AppInfo>) {
     fun encode(): ByteArray {
         val appBuffers = apps.map { app ->
-            requireUtf8Prefix(app.packageName)
-            requireUtf8Prefix(app.appName)
-            requireUtf8Prefix(app.iconHash)
             val pkgBytes = app.packageName.toByteArray(Charsets.UTF_8)
             val nameBytes = app.appName.toByteArray(Charsets.UTF_8)
             val iconBytes = app.iconPng
             val hashBytes = app.iconHash.toByteArray(Charsets.UTF_8)
             ByteBuffer.allocate(2 + pkgBytes.size + 2 + nameBytes.size + 1 + 4 + iconBytes.size + 2 + hashBytes.size)
                 .order(ByteOrder.BIG_ENDIAN)
-                .putShort(pkgBytes.size.toShort())
-                .apply { put(pkgBytes) }
-                .putShort(nameBytes.size.toShort())
-                .apply { put(nameBytes) }
-                .put(app.category.id)
-                .putInt(iconBytes.size)
-                .apply { put(iconBytes) }
-                .putShort(hashBytes.size.toShort())
-                .apply { put(hashBytes) }
+                .apply {
+                    putUtf8(app.packageName)
+                    putUtf8(app.appName)
+                    put(app.category.id)
+                    putInt(iconBytes.size)
+                    put(iconBytes)
+                    putUtf8(app.iconHash)
+                }
                 .array()
         }
         val totalSize = 2 + appBuffers.sumOf { it.size }
@@ -528,15 +524,14 @@ data class MediaMetadata(
     val durationMs: Long
 ) {
     fun encode(): ByteArray {
-        val fields = listOf(title, artist, album)
-        fields.forEach { requireUtf8Prefix(it) }
-        val fieldBytes = fields.map { it.toByteArray(Charsets.UTF_8) }
-        val totalSize = fieldBytes.sumOf { 2 + it.size } + 8
+        val titleBytes = title.toByteArray(Charsets.UTF_8)
+        val artistBytes = artist.toByteArray(Charsets.UTF_8)
+        val albumBytes = album.toByteArray(Charsets.UTF_8)
+        val totalSize = 2 + titleBytes.size + 2 + artistBytes.size + 2 + albumBytes.size + 8
         val buf = ByteBuffer.allocate(totalSize).order(ByteOrder.BIG_ENDIAN)
-        fieldBytes.forEach { bytes ->
-            buf.putShort(bytes.size.toShort())
-            buf.put(bytes)
-        }
+        buf.putUtf8(title)
+        buf.putUtf8(artist)
+        buf.putUtf8(album)
         buf.putLong(durationMs)
         return buf.array()
     }
@@ -636,15 +631,12 @@ data class AppInfoDataMessage(
         val pkgBytes = packageName.toByteArray(Charsets.UTF_8)
         val nameBytes = appName.toByteArray(Charsets.UTF_8)
         val verBytes = versionName.toByteArray(Charsets.UTF_8)
-        requireUtf8Prefix(packageName)
-        requireUtf8Prefix(appName)
-        requireUtf8Prefix(versionName)
-        val buf = java.nio.ByteBuffer.allocate(
+        val buf = ByteBuffer.allocate(
             2 + pkgBytes.size + 2 + nameBytes.size + 2 + verBytes.size + 8 + 8 + 4
-        )
-        buf.putShort(pkgBytes.size.toShort()); buf.put(pkgBytes)
-        buf.putShort(nameBytes.size.toShort()); buf.put(nameBytes)
-        buf.putShort(verBytes.size.toShort()); buf.put(verBytes)
+        ).order(ByteOrder.BIG_ENDIAN)
+        buf.putUtf8(packageName)
+        buf.putUtf8(appName)
+        buf.putUtf8(versionName)
         buf.putLong(versionCode)
         buf.putLong(installTime)
         buf.putInt(targetSdk)
@@ -653,7 +645,7 @@ data class AppInfoDataMessage(
 
     companion object {
         fun decode(data: ByteArray): AppInfoDataMessage {
-            val buf = java.nio.ByteBuffer.wrap(data)
+            val buf = ByteBuffer.wrap(data)
             val packageName = buf.readShortLengthPrefixed()
             val appName = buf.readShortLengthPrefixed()
             val versionName = buf.readShortLengthPrefixed()
