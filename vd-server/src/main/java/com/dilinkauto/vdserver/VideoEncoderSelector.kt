@@ -84,7 +84,7 @@ internal object VideoEncoderSelector {
                 return SelectedEncoder(codec, surface, name, tried)
             } catch (e: Exception) {
                 // 失败原因保留在聚合信息里；空 message 的 CodecException 用类名兜底。
-                val why = e.message?.trim().takeUnless { it.isNullOrEmpty() } ?: e.javaClass.simpleName
+                val why = e.describe()
                 tried += "$name($why)"
             }
         }

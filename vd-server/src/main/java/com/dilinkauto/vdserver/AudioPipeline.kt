@@ -102,7 +102,7 @@ internal class AudioPipeline(
         val rec = try {
             createRecord()
         } catch (e: Exception) {
-            fail("AudioRecord init failed: ${describe(e)}")
+            fail("AudioRecord init failed: ${e.describe()}")
             null
         }
         if (rec == null) {
@@ -113,7 +113,7 @@ internal class AudioPipeline(
         val enc = try {
             createEncoder()
         } catch (e: Exception) {
-            fail("AAC encoder init failed: ${describe(e)}")
+            fail("AAC encoder init failed: ${e.describe()}")
             rec.safeRelease()
             null
         }
@@ -139,7 +139,7 @@ internal class AudioPipeline(
         } catch (e: Exception) {
             rec.safeRelease()
             enc.safeRelease()
-            fail("AudioRecord startRecording failed: ${describe(e)}")
+            fail("AudioRecord startRecording failed: ${e.describe()}")
             return false
         }
 
@@ -221,55 +221,10 @@ internal class AudioPipeline(
 
     /**
      * 逐个真尝试 AAC 编码器，直到有一个能 `configure` + `start`。
-     *
-     * 与视频侧同一个教训：盲取框架排序里的第一个组件会撞上 ROM 里的陈旧实现（MI 9 的
-     * `OMX.qcom.video.encoder.avc` 在 configure 就抛**空 message** 的 `CodecException`）。
-     * 所以这里复用视频的同一份排序策略 [orderEncoderCandidates]（非纯软实现优先、同组
-     * `c2.` 优先于 `OMX.`、稳定排序），再用逐个真尝试兜底。
+     * 委托给 [AudioEncoderSelector]。
      */
-    private fun createEncoder(): MediaCodec? {
-        val format = MediaFormat.createAudioFormat(
-            MediaFormat.MIMETYPE_AUDIO_AAC, spec.sampleRate, spec.channelCount
-        ).apply {
-            setInteger(
-                MediaFormat.KEY_AAC_PROFILE,
-                MediaCodecInfo.CodecProfileLevel.AACObjectLC
-            )
-            setInteger(MediaFormat.KEY_BIT_RATE, spec.bitrate)
-            // 输入缓冲给两帧的余量，避免部分读场景下编码器频繁要缓冲。
-            setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, spec.frameBytes * 2)
-        }
-        val tried = mutableListOf<String>()
-        for (name in orderEncoderCandidates(audioEncoderCandidates())) {
-            tried += name
-            var candidate: MediaCodec? = null
-            try {
-                candidate = MediaCodec.createByCodecName(name)
-                candidate.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-                candidate.start()
-                log("Audio: encoder=$name")
-                return candidate
-            } catch (e: Exception) {
-                logErr("Audio: encoder '$name' unusable: ${describe(e)}")
-                // configure/start 失败时组件可能已经拿到 native 资源，必须显式释放：
-                // ROM 的候选表常有 3~4 个 AAC 编码器，逐个失败会逐个泄漏。
-                candidate?.safeRelease()
-                continue
-            }
-        }
-        logErr("Audio: no usable AAC encoder among $tried")
-        return null
-    }
-
-    /** `audio/mp4a-latm` 的全部编码器候选（含纯软实现，作为最后防线）。 */
-    private fun audioEncoderCandidates(): List<Pair<String, Boolean>> =
-        MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos
-            .filter { info ->
-                info.isEncoder && info.supportedTypes.any {
-                    it.equals(MediaFormat.MIMETYPE_AUDIO_AAC, ignoreCase = true)
-                }
-            }
-            .map { it.name to it.isSoftwareOnly }
+    private fun createEncoder(): MediaCodec? =
+        AudioEncoderSelector.selectAndCreate(spec, log = log, logErr = logErr)
 
     // ── 主循环 ──
 
@@ -330,7 +285,7 @@ internal class AudioPipeline(
                 if (!didWork) LockSupport.parkNanos(IDLE_SLEEP_NANOS)
             }
         } catch (e: Exception) {
-            logErr("Audio: capture loop died: ${describe(e)}")
+            logErr("Audio: capture loop died: ${e.describe()}")
         } catch (e: Throwable) {
             // OutOfMemoryError / 编码器 native 崩坏：记一行就走，绝不穿透到会话层。
             logErr("Audio: capture loop fatal: ${e.javaClass.simpleName}: ${e.message}")
@@ -342,7 +297,7 @@ internal class AudioPipeline(
         val inputId = try {
             enc.dequeueInputBuffer(0)
         } catch (e: Exception) {
-            logErr("Audio: dequeueInputBuffer failed: ${describe(e)}")
+            logErr("Audio: dequeueInputBuffer failed: ${e.describe()}")
             return
         }
         if (inputId < 0) {
@@ -355,7 +310,7 @@ internal class AudioPipeline(
                 return
             }
         } catch (e: Exception) {
-            logErr("Audio: getInputBuffer failed: ${describe(e)}")
+            logErr("Audio: getInputBuffer failed: ${e.describe()}")
             return
         }
         buf.clear()
@@ -364,7 +319,7 @@ internal class AudioPipeline(
         try {
             buf.put(pcm, 0, len)
         } catch (e: Exception) {
-            logErr("Audio: filling input buffer failed: ${describe(e)}")
+            logErr("Audio: filling input buffer failed: ${e.describe()}")
             // 交回一个空缓冲把槽位还给编码器，否则每失败一次就少一格。
             runCatching { enc.queueInputBuffer(inputId, 0, 0, ptsUsForFrame(frameIndex, spec), 0) }
             droppedInputs.incrementAndGet()
@@ -373,7 +328,7 @@ internal class AudioPipeline(
         try {
             enc.queueInputBuffer(inputId, 0, len, ptsUsForFrame(frameIndex, spec), 0)
         } catch (e: Exception) {
-            logErr("Audio: queueInputBuffer failed: ${describe(e)}")
+            logErr("Audio: queueInputBuffer failed: ${e.describe()}")
         }
     }
 
@@ -389,7 +344,7 @@ internal class AudioPipeline(
             val outputId = try {
                 enc.dequeueOutputBuffer(info, 0)
             } catch (e: Exception) {
-                logErr("Audio: dequeueOutputBuffer failed: ${describe(e)}")
+                logErr("Audio: dequeueOutputBuffer failed: ${e.describe()}")
                 return handled
             }
             when {
@@ -414,7 +369,7 @@ internal class AudioPipeline(
         val outBuf = try {
             enc.getOutputBuffer(outputId)
         } catch (e: Exception) {
-            logErr("Audio: getOutputBuffer failed: ${describe(e)}")
+            logErr("Audio: getOutputBuffer failed: ${e.describe()}")
             null
         }
         try {
@@ -463,7 +418,7 @@ internal class AudioPipeline(
             ByteArray(buf.remaining()).also { buf.get(it) }
         }
     } catch (e: Exception) {
-        logErr("Audio: reading csd-0 failed: ${describe(e)}")
+        logErr("Audio: reading csd-0 failed: ${e.describe()}")
         null
     }
 
@@ -479,23 +434,8 @@ internal class AudioPipeline(
     }
 }
 
-/**
- * 把异常变成可读的一行。
- *
- * `CodecException` 的 message 可能是**空串**（MI 9 的 `OMX.qcom.video.encoder.avc` 就是），
- * 只打 message 会得到一行 `Fatal: encoder: `，现场无法定位 —— 所以空 message 回退到类名。
- */
-internal fun describe(e: Throwable): String =
-    e.message?.trim().takeUnless { it.isNullOrEmpty() } ?: e.javaClass.simpleName
-
 /** 释放 `AudioRecord`，任何异常都不穿透。 */
 private fun AudioRecord.safeRelease() {
-    runCatching { stop() }
-    runCatching { release() }
-}
-
-/** 释放 `MediaCodec`，任何异常都不穿透（未 start 过的编解码器 `stop()` 会抛，已被吞掉）。 */
-private fun MediaCodec.safeRelease() {
     runCatching { stop() }
     runCatching { release() }
 }
