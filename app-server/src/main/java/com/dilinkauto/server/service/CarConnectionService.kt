@@ -209,6 +209,26 @@ class CarConnectionService : Service() {
             Thread(r, "CarDecoderLifecycle").apply { isDaemon = true }
         }
 
+    /**
+     * Audio lifecycle executor (S3-PB, issue #73).
+     *
+     * `AudioPlayer.stop()` joins the playback thread (bounded by
+     * `STOP_JOIN_TIMEOUT_MS = 2000`), and every one of its call sites can run on
+     * Main: this service's scope is `Dispatchers.Main`, so both
+     * [disconnectAllConnections] entry points (`startConnection`, `connectToPhone`)
+     * and the audio connection's `onDisconnect` (whose EOF grace path is
+     * `scope.launch`, and that connection holds this service's scope) land there.
+     * An inline `stop()` therefore pinned the main thread for up to 2 s — the same
+     * shape `stopDecoderAsync()` exists to avoid for video.
+     *
+     * Every audio start/stop goes through this single thread instead. Its FIFO
+     * queue is what preserves ordering: "stop, then disconnect 9640" is one task
+     * here (the playback thread cannot decode after the socket closes), and a new
+     * session's `start()` can only run after the previous session's `stop()`.
+     * See [AudioLifecycle.kt] for the full rationale.
+     */
+    private val audioExecutor: ExecutorService = newAudioExecutor()
+
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private val usbPermissionAction = "com.dilinkauto.server.USB_PERMISSION"
 
@@ -820,8 +840,15 @@ class CarConnectionService : Service() {
      *
      * ## 断链处置
      *
-     * `onDisconnect` 只记日志并 `audioPlayer.stop()` —— 音频断了不影响视频，视频断了
-     * 由 [handleDisconnect] 统一收音频位（见 [disconnectAllConnections]）。
+     * `onDisconnect` 只记日志并停播 —— 音频断了不影响视频，视频断了由
+     * [handleDisconnect] 统一收音频位（见 [disconnectAllConnections]）。
+     *
+     * ## 线程口径
+     *
+     * `start()` / `stop()` 都经 [audioExecutor] 排队（理由见 [AudioLifecycle.kt]）：
+     * 本函数的 `onDisconnect` 回调会在 Main 上跑，`audioPlayer.stop()` 的 2s 有界 join
+     * 不能落在那里。`audio.start()`（`Connection` 的网络启动）仍就地调用，只有播放器
+     * 的起停被挪走。
      */
     private fun connectAudioIfEnabled(host: String) {
         if (!carShouldConnectAudio(carPrefs.audioEnabled, _phoneAudioSupported.value)) {
@@ -838,20 +865,36 @@ class CarConnectionService : Service() {
                 audioConnection = audio
                 audio.onLog { msg -> carLogSend("AudioConn: $msg") }
                 // 音频断链绝不 handleDisconnect：视频会话由视频连接自己的 onDisconnect 管。
+                // stop() 走 [audioExecutor]：该回调可能是 Main（EOF 宽限分支由服务主 scope
+                // 派发），不能让 2s 的 join 钉住主线程。
+                // 身份校验：本连接若已被 disconnectAllConnections 摘掉（它会把字段置 null 并
+                // 自行排队停播），迟到的回调不得再去停**下一会话**的播放。
                 audio.onDisconnect {
                     carLogSend("Audio: connection lost — stopping playback (video unaffected)", "W")
-                    audioPlayer.stop()
+                    if (audioConnection === audio) {
+                        submitAudioLifecycle(audioExecutor) { audioPlayer.stop() }
+                    }
                 }
                 audio.onFrames(Channel.AUDIO) { handleAudioFrame(it) }
                 audio.start(enableHeartbeat = false)
-                audioPlayer.start()
-                carLogSend("Audio: connection established — playback started")
+                // start() 也走 [audioExecutor]：与排队的 stop() 串行，保证新会话的播放线程
+                // 一定在上一个会话停干净之后才起（否则迟到的 stop 会把它停掉）。
+                // 仍要复查 isConnected：9640 若在排队期间就断了，onDisconnect 已排好停播，
+                // 这里再起播放线程就是「对着死 socket 解码」，且不会再有人来停它。
+                submitAudioLifecycle(audioExecutor) {
+                    if (audio.isConnected) {
+                        audioPlayer.start()
+                        carLogSend("Audio: connection established — playback started")
+                    } else {
+                        carLogSend("Audio: 9640 dropped before playback started — not starting", "W")
+                    }
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 // 独立 catch：只有日志，绝不进 handleDisconnect（R6）。
                 carLogSend("Audio: connect failed (video unaffected): ${e.message}", "W")
-                audioPlayer.stop()
+                submitAudioLifecycle(audioExecutor) { audioPlayer.stop() }
                 audioConnection = null
             }
         }
@@ -928,10 +971,14 @@ class CarConnectionService : Service() {
         controlConnection?.disconnect()
         controlConnection = null
         // 音频位追加在最后（S3-PB）：既有三条的拆解顺序一字未动。
-        // 先停播放（幂等、有界 join），再断 9640，避免播放线程在 socket 关闭后还在解码。
-        audioPlayer.stop()
-        audioConnection?.disconnect()
+        // 停播必须**先于**断开 9640，否则播放线程会在 socket 关闭后仍解码；但 stop()
+        // 会 join 播放线程（≤2s），而本函数有 Main 调用路径。于是两步作为**同一个任务**
+        // 交给 [audioExecutor]：调用线程立即返回，先后由任务内的语句顺序保证。start()
+        // 也在同一条串行队列上，故没有「迟到的 stop 停掉新会话播放」的窗口。
+        // 取舍与理由见 [AudioLifecycle.kt]。
+        val audio = audioConnection
         audioConnection = null
+        submitAudioTeardown(audioExecutor, stop = { audioPlayer.stop() }, disconnect = { audio?.disconnect() })
     }
 
     // ─── Track B: USB ───
@@ -1739,6 +1786,11 @@ class CarConnectionService : Service() {
         _state.value = State.IDLE
         logWriter.shutdown()
         decoderExecutor.shutdown()
+        // 音频的「停播 → 断开 9640」已排在 [audioExecutor] 上；这里只关执行器、不等待
+        // （`ACTION_STOP` / `onDestroy` 都在 Main，等待就等于把 P1 挪回来）。`shutdown()`
+        // 仍会跑完已排队的任务，只是拒绝新任务。口径与上面 video 的
+        // `stopDecoderAsync()` + `decoderExecutor.shutdown()` 完全一致。
+        audioExecutor.shutdown()
         scope.cancel()
     }
 
