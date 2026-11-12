@@ -82,11 +82,23 @@ class Connection(
 
     private var readerJob: Job? = null
     private var writerJob: Job? = null
-    private var heartbeatJob: Job? = null
-    private var watchdogJob: Job? = null
 
     @Volatile
     private var lastFrameReceivedAt = System.currentTimeMillis()
+
+    private val keepAlive = ConnectionKeepAlive(
+        scope = scope,
+        isConnected = { connected.get() },
+        getLastFrameReceivedAt = { lastFrameReceivedAt },
+        sendHeartbeat = {
+            enqueueFrame(FrameCodec.Frame(Channel.CONTROL, ControlMsg.HEARTBEAT, ByteArray(0)))
+        },
+        onDisconnect = { reason ->
+            disconnectReason = reason
+            disconnect()
+        },
+        log = { msg -> log(msg) }
+    )
 
     val isConnected: Boolean get() = connected.get() && channel.isOpen
 
@@ -236,35 +248,7 @@ class Connection(
         }
 
         if (enableHeartbeat) {
-            heartbeatJob = scope.launch(Dispatchers.IO) {
-                while (isActive && connected.get()) {
-                    delay(heartbeatIntervalMs)
-                    if (!connected.get()) break
-                    try {
-                        enqueueFrame(FrameCodec.Frame(Channel.CONTROL, ControlMsg.HEARTBEAT, ByteArray(0)))
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (e: Throwable) {
-                        disconnectReason = "heartbeat: ${e.javaClass.simpleName}: ${e.message}"
-                        log(disconnectReason)
-                        disconnect()
-                        break
-                    }
-                }
-            }
-
-            watchdogJob = scope.launch(Dispatchers.IO) {
-                while (isActive && connected.get()) {
-                    delay(heartbeatIntervalMs)
-                    val elapsed = System.currentTimeMillis() - lastFrameReceivedAt
-                    if (elapsed > heartbeatTimeoutMs) {
-                        disconnectReason = "watchdog: no frame received for ${elapsed}ms (timeout=${heartbeatTimeoutMs}ms)"
-                        log(disconnectReason)
-                        disconnect()
-                        break
-                    }
-                }
-            }
+            keepAlive.start(heartbeatIntervalMs, heartbeatTimeoutMs)
         }
     }
 
@@ -371,8 +355,7 @@ class Connection(
             } else disconnectReason
             log("disconnect() reason=$caller")
             readerJob?.cancel()
-            heartbeatJob?.cancel()
-            watchdogJob?.cancel()
+            keepAlive.stop()
             if (disconnectReason.startsWith("reader: EOF")) {
                 // Graceful peer close (DISCONNECT then FIN): frames already queued
                 // — e.g. our DISCONNECT_ACK — are still deliverable for a short
@@ -398,9 +381,9 @@ class Connection(
     }
 
     companion object {
-        private const val HEARTBEAT_INTERVAL_MS = 3000L
-        private const val HEARTBEAT_TIMEOUT_MS = 10000L
-        private const val CONNECT_TIMEOUT_MS = 10000L
+        private const val HEARTBEAT_INTERVAL_MS = ConnectionKeepAlive.DEFAULT_HEARTBEAT_INTERVAL_MS
+        private const val HEARTBEAT_TIMEOUT_MS = ConnectionKeepAlive.DEFAULT_HEARTBEAT_TIMEOUT_MS
+        const val CONNECT_TIMEOUT_MS = ConnectionFactory.CONNECT_TIMEOUT_MS
 
         /** Grace period for the writer to drain queued frames on a graceful peer close. */
         private const val FLUSH_GRACE_MS = 500L
@@ -418,7 +401,7 @@ class Connection(
         const val SOCKET_BUF_BYTES = 524288
 
         suspend fun connect(host: String, port: Int, scope: CoroutineScope): Connection =
-            connect(host, port, scope, CONNECT_TIMEOUT_MS)
+            ConnectionFactory.connect(host, port, scope)
 
         /**
          * @param timeoutMs deadline for the TCP handshake. A black-holed SYN used
@@ -431,45 +414,12 @@ class Connection(
             scope: CoroutineScope,
             timeoutMs: Long = CONNECT_TIMEOUT_MS
         ): Connection =
-            withContext(Dispatchers.IO) {
-                val channel = SocketChannel.open()
-                try {
-                    channel.configureBlocking(false)
-                    channel.connect(InetSocketAddress(host, port))
-                    val deadline = System.currentTimeMillis() + timeoutMs
-                    while (!channel.finishConnect()) {
-                        if (System.currentTimeMillis() > deadline) {
-                            throw IOException("Connect to $host:$port timed out after ${timeoutMs}ms")
-                        }
-                        delay(50)
-                    }
-                    Connection(channel, scope)
-                } catch (e: Exception) {
-                    try { channel.close() } catch (_: Exception) {}
-                    throw e
-                }
-            }
+            ConnectionFactory.connect(host, port, scope, timeoutMs)
 
         suspend fun accept(
             port: Int,
             scope: CoroutineScope
-        ): Connection = withContext(Dispatchers.IO) {
-            val channel = ServerSocketChannel.open()
-            channel.configureBlocking(false)
-            channel.socket().reuseAddress = true
-            channel.socket().bind(InetSocketAddress(port))
-            try {
-                while (isActive) {
-                    val accepted = channel.accept()
-                    if (accepted != null) {
-                        return@withContext Connection(accepted, scope)
-                    }
-                    delay(100)
-                }
-                throw java.util.concurrent.CancellationException("Cancelled while accepting")
-            } finally {
-                channel.close()
-            }
-        }
+        ): Connection =
+            ConnectionFactory.accept(port, scope)
     }
 }
