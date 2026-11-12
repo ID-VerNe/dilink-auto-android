@@ -147,6 +147,19 @@ class PipelineServer(
     private val inputSurfaceReady = CountDownLatch(1)
     @Volatile private var carVideoChannel: SocketChannel? = null
     /**
+     * S3-PA（issue #73）：9640 accept 成功且 [AudioPipeline.start] 成功后才被赋值。
+     *
+     * 为 null 表示本会话没有音频（无人连接 / 采集失败），这是 D2 下的正常状态。
+     * cleanup() 在 [signalPipelineStop] **之前**关它（决策 4：先停音频、再停视频）。
+     */
+    @Volatile private var audioPipeline: AudioPipeline? = null
+
+    /**
+     * S3-PA（issue #73）：9640 的写端。与 [audioPipeline] 同生共死，但必须**分开**关：
+     * `AudioPipeline.close()` 只停采集线程，不碰 socket；写线程与 channel 归 sink 管。
+     */
+    @Volatile private var audioSink: SocketAudioSink? = null
+    /**
      * 车机端索要 IDR 的请求位（issue #9）。
      *
      * CarCommandRouter 在 Lifecycle/TouchReader 线程收到 REQUEST_SYNC_FRAME 只置位；
@@ -181,6 +194,14 @@ class PipelineServer(
 
         /** S-M8：cleanup() 等 Pipeline 线程退出的上限；超时不阻塞，宁可泄漏 EGL。 */
         private const val PIPELINE_JOIN_TIMEOUT_MS = 2000L
+
+        /**
+         * S3-PA（issue #73）：9640 的 accept 超时。
+         *
+         * 3s 是「不让主线程无限等」与「给慢车机足够握手时间」的折中。它只在视频已开始
+         * 渲染后由主线程等待（见 run()），失败即静默降级，不拖慢视频启动。
+         */
+        private const val AUDIO_ACCEPT_TIMEOUT_MS = 3000
 
         /** S-L2：把任意 fps（含 0/负数/荒谬值）钳进 [VideoConfig.MIN_FPS]..[VideoConfig.MAX_FPS]。 */
         fun coerceFps(fps: Int): Int = fps.coerceIn(VideoConfig.MIN_FPS, VideoConfig.MAX_FPS)
@@ -259,6 +280,31 @@ class PipelineServer(
             // Signal pipeline to begin rendering with the car video channel
             carVideoChannel = conns.carVideo
             LockSupport.unpark(t)
+            // S3-PA（issue #73）：9640 的 accept 放在视频已经开始渲染之后。
+            //
+            // 决策 3 的落点修正：把它塞进 bindAndAccept() 的串行 accept 之后，会因 D2 下
+            // 「9640 无人连」是常态而给**每个会话**的视频启动白加 ≤3s 黑屏。放在 unpark
+            // 之后，这段 ≤3s 只落在主线程自己身上（下一步本来就阻塞在 t.join()），视频
+            // 零延迟。accept 失败/超时/!running → 不启动采集，会话照常继续。
+            //
+            // S-06：监听 socket 的所有权在这里从 bindAndAccept() 移交过来（见其 finally
+            // 里的 handedOff），因此**关闭责任也一起移交** —— 用 finally 兜住，无论
+            // accept 抛异常还是 startAudio 失败，9640 都不会跨会话泄漏。
+            val audioServer = conns.audioServer
+            if (audioServer == null) {
+                err("Audio: ${Ports.AUDIO_PORT} not bound this session, audio disabled")
+            } else {
+                try {
+                    val carAudio = acceptCarChannel(audioServer, AUDIO_ACCEPT_TIMEOUT_MS)
+                    if (carAudio != null) {
+                        startAudio(carAudio)
+                    } else {
+                        err("Audio: no receiver on ${Ports.AUDIO_PORT} within ${AUDIO_ACCEPT_TIMEOUT_MS}ms, audio disabled (capture not started)")
+                    }
+                } finally {
+                    runCatching { audioServer.close() }
+                }
+            }
             try { t.join() } catch (_: InterruptedException) {}
         } finally {
             cleanup()
@@ -359,7 +405,22 @@ class PipelineServer(
 
     // ── Connection ──
 
-    data class ConnectionSet(val carVideo: SocketChannel, val carInput: SocketChannel, val phoneChannel: SocketChannel)
+    data class ConnectionSet(
+        val carVideo: SocketChannel,
+        val carInput: SocketChannel,
+        val phoneChannel: SocketChannel,
+        /**
+         * S3-PA（issue #73）：9640 的**监听** socket，null = 本次没绑上（端口被占用等）。
+         *
+         * accept 被刻意推迟到 `run()` 的 `LockSupport.unpark(t)` 之后（决策 3 落点修正），
+         * 否则 D2 下「9640 无人连」会给每个会话的视频启动平白加 ≤3s。所以这里只带回
+         * 绑好的监听 socket，accept 与关闭都由 `run()` 完成。
+         *
+         * 与 brief 里 `carAudio: SocketChannel?` 的写法不同：accept 发生在返回之后，
+         * 用一个恒为 null 的字段没有意义。
+         */
+        val audioServer: ServerSocketChannel?
+    )
 
     private fun bindAndAccept(): ConnectionSet? {
         val videoServer: ServerSocketChannel; val inputServer: ServerSocketChannel
@@ -369,6 +430,22 @@ class PipelineServer(
             inputServer = ServerSocketChannel.open(); inputServer.configureBlocking(false); inputServer.socket().reuseAddress = true
             inputServer.socket().bind(InetSocketAddress("0.0.0.0", Ports.INPUT_PORT)); log("Input on :${Ports.INPUT_PORT}")
         } catch (e: Exception) { err("Bind: ${e.message}"); return null }
+        // S3-PA（issue #73）：第三次 bind 单独处理 —— 音频是可选能力，9640 被占用时只降级，
+        // 绝不能连累 9638/9639 的视频会话（D2「无条件尝试绑定、失败静默降级」）。
+        // 只绑不 accept：accept 被刻意推迟到 run() 的 unpark 之后。
+        val audioServer: ServerSocketChannel? = run {
+            var ch: ServerSocketChannel? = null
+            try {
+                ch = ServerSocketChannel.open(); ch.configureBlocking(false); ch.socket().reuseAddress = true
+                ch.socket().bind(InetSocketAddress("0.0.0.0", Ports.AUDIO_PORT))
+                log("Audio on :${Ports.AUDIO_PORT} (listen only)")
+                ch
+            } catch (e: Exception) {
+                err("Audio bind on :${Ports.AUDIO_PORT} failed: ${e.message} — audio disabled for this session")
+                runCatching { ch?.close() }
+                null
+            }
+        }
         // S-06: the two listening sockets are closed in ONE finally around the whole body.
         //
         // They used to be closed per-branch, and the accept-timeout branches only closed
@@ -376,6 +453,12 @@ class PipelineServer(
         // 0.0.0.0:9638 and 0.0.0.0:9639 still bound by a zombie shell-UID process —
         // which also still held the VirtualDisplay and the applied panel/letterbox
         // state — so the next session could not bind and only a force-stop helped.
+        //
+        // S3-PA（issue #73）：第三条（9640）同样不允许在 return null 时泄漏 —— 任何 null
+        // 返回都在这个 finally 里关掉它。唯一例外是「视频已就绪」的成功路径：此时它随
+        // ConnectionSet 交给 run() 做短超时 accept（见 ConnectionSet.audioServer），
+        // 由 run() 的 finally 负责关闭。
+        var handedOff = false
         try {
             val phoneChannel = connectToPhoneHost() ?: return null
             try { sendDisplayReady(phoneChannel); log("Display ready sent") } catch (e: Exception) { err("Display ready: ${e.message}"); try { phoneChannel.close() } catch (_: Exception) {}; return null }
@@ -406,10 +489,14 @@ class PipelineServer(
             // Now the panel only goes dark once a live stream exists to replace it,
             // and a car that fails to connect never costs the user their screen.
             displayController.setPhysicalDisplayPower(false)
-            return ConnectionSet(carVideo, carInput, phoneChannel)
+            handedOff = true
+            return ConnectionSet(carVideo, carInput, phoneChannel, audioServer)
         } finally {
-            try { videoServer.close() } catch (_: Exception) {}
-            try { inputServer.close() } catch (_: Exception) {}
+            runCatching { videoServer.close() }
+            runCatching { inputServer.close() }
+            // 9640 监听 socket 在成功路径上要留给 run() 做 accept（由 run() 的 finally 关）；
+            // 只有 return null 的路径才在这里关掉它（S-06：null 返回不许漏 bind）。
+            if (!handedOff) audioServer?.let { runCatching { it.close() } }
         }
     }
 
@@ -460,6 +547,44 @@ class PipelineServer(
             Thread.sleep(50)
         }
         return null
+    }
+
+    /**
+     * S3-PA（issue #73）：9640 accept 成功后才启动采集。
+     *
+     * ## 为什么必须等到 accept 之后（决策 3）
+     *
+     * `AudioRecord(REMOTE_SUBMIX)` 一旦创建，手机本机播放就会被路由走 —— 用户即使没
+     * 要音频、甚至根本没有接收端，手机也会变哑。该资源只在 `AudioPipeline.start()`
+     * 内部的 `createRecord()` 里创建，所以**不调 start 就等于不静音**。这里只有拿到
+     * 真实 socket 才走到 start；accept 失败/超时没有任何副作用。
+     *
+     * `start()` 返回 false（`AudioRecord`/编码器不可用）时同样静默降级：关掉 socket、
+     * 记一行日志，视频会话不受影响（R6）。
+     */
+    private fun startAudio(carAudio: SocketChannel) {
+        val sink = SocketAudioSink(carAudio).also { it.start() }
+        val pipeline = AudioPipeline(sink = sink)
+        if (!pipeline.start()) {
+            err("Audio: pipeline start failed (${pipeline.startFailure ?: "unknown"}), channel closed")
+            runCatching { sink.close() }
+            runCatching { carAudio.close() }
+            return
+        }
+        audioSink = sink
+        audioPipeline = pipeline
+        log("Audio: channel accepted from ${carAudio.remoteAddress}")
+        // 与 cleanup() 的竞态兜底：watchdog 可能在 start() 建 AudioRecord/编码器的那一百多毫秒
+        // 里发现管线已死并跑完 cleanup()（它先置 running=false，再关 audioPipeline —— 那时还是
+        // null）。若此处才赋值，采集线程会活过一个已经结束的会话，9640 也不会被关。
+        // 双重关闭是安全的：AudioPipeline.close() 与 SocketAudioSink.close() 都幂等。
+        if (cleanedUp.get()) {
+            err("Audio: session cleaned up during start, closing capture and channel")
+            runCatching { pipeline.close() }
+            runCatching { sink.close() }
+            audioPipeline = null
+            audioSink = null
+        }
     }
 
     /** Host part of the accepted socket's remote address, or null when unknown. */
@@ -705,6 +830,26 @@ class PipelineServer(
         shell.awaitIdle()
         // Now kill the shell
         shell.close()
+        // S3-PA（issue #73）决策 4：先停音频、再停视频。
+        //
+        // 音频必须在 signalPipelineStop() 之前关：AudioPipeline.close() 自己有 1.5s 的有界
+        // join（AudioPipeline.CLOSE_JOIN_TIMEOUT_MS），与视频那条 2s 预算串联而非叠加在同一
+        // 段里，cleanup 的总耗时仍可控。放在之前还保证采集线程先停，不会在 VD/编码器已经
+        // 拆掉的窗口里继续读 REMOTE_SUBMIX。
+        //
+        // 顺序是「先采集、后写端」：采集停掉之后不会再有 onFrame 进来，此时关 sink 才能让
+        // 写线程排空退出并真正关掉 9640 的 socket（sink 是 channel 的唯一属主）。
+        audioPipeline?.let { p ->
+            // AudioPipeline.close() 自己会打一行 `Audio: capture stopped (frames=..., silence=...)`。
+            runCatching { p.close() }.onFailure { err("Audio: close failed: ${describe(it)}") }
+        }
+        audioPipeline = null
+        audioSink?.let { s ->
+            runCatching { s.close() }
+                .onFailure { err("Audio: sink close failed: ${describe(it)}") }
+            log("Audio: sink closed (sent=${s.sentFrames}, configs=${s.sentConfigs}, dropped=${s.droppedFrames}, failed=${s.failed})")
+        }
+        audioSink = null
         // S-M8/S-06: ask the pipeline thread to exit (running=false + unpark) and wait for it
         // (bounded) BEFORE touching the encoder — the render loop may still be inside a
         // native dequeueOutputBuffer/eglSwapBuffers call, which is what used to race
