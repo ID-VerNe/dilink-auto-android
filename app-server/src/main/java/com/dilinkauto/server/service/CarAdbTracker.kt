@@ -1,0 +1,322 @@
+package com.dilinkauto.server.service
+
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbManager
+import android.os.Build
+import com.dilinkauto.protocol.AppTargets
+import com.dilinkauto.protocol.Ports
+import com.dilinkauto.protocol.VdDeploy
+import com.dilinkauto.protocol.adb.UsbAdbConnection
+import com.dilinkauto.server.R
+import com.dilinkauto.server.adb.RemoteAdbController
+import kotlinx.coroutines.*
+import java.io.File
+
+/**
+ * 负责 USB 与 TCP ADB 双轨探测、权限管理、连接建立及 ADB 命令执行（从 [CarConnectionService] 剥离以遵循 SRP）。
+ */
+internal class CarAdbTracker(
+    private val context: Context,
+    private val carPrefs: CarPrefs,
+    private val scope: CoroutineScope,
+    private val log: (msg: String, level: String) -> Unit = { _, _ -> },
+    private val setStatusMessage: (resId: Int, formatArgs: Array<out Any>) -> Unit,
+    private val getPhoneHost: () -> String?,
+    private val isHandshakeDone: () -> Boolean,
+    private val isVdServerStarted: () -> Boolean,
+    private val deployVdServer: () -> Unit,
+    private val deployVdServerDirect: suspend (RemoteAdbController) -> Unit,
+    private val onAdbReady: () -> Unit,
+    private val onUsbDetachedMidSession: () -> Unit,
+) {
+    @Volatile var usbReady: Boolean = false
+        internal set
+
+    @Volatile var adbController: RemoteAdbController? = null
+        internal set
+
+    @Volatile var usbAdb: UsbAdbConnection? = null
+        private set
+
+    @Volatile private var usbConnecting = false
+    @Volatile private var tcpAdbConnecting = false
+    @Volatile private var lastAdbHost: String? = null
+    var noAdbCount: Int = 0
+        internal set
+
+    val usbPermissionAction = "com.dilinkauto.server.USB_PERMISSION"
+
+    private var receiverRegistered = false
+
+    private val usbReceiver = object : BroadcastReceiver() {
+        override fun onReceive(ctx: Context, intent: Intent) {
+            when (intent.action) {
+                UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
+                    val device = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE)
+                    if (device != null) {
+                        onUsbDeviceAttached(device)
+                        startUsbTrack(scope)
+                    }
+                }
+                UsbManager.ACTION_USB_DEVICE_DETACHED -> {
+                    log("USB device detached", "I")
+                    val wasAdbTrack = usbAdb != null
+                    usbAdb?.close()
+                    usbAdb = null
+                    usbReady = false
+                    if (wasAdbTrack) {
+                        onUsbDetachedMidSession()
+                    }
+                }
+                usbPermissionAction -> {
+                    val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+                    val device = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE)
+                    if (granted && device != null) {
+                        log("USB permission granted", "I")
+                        connectUsbAdb(device)
+                    } else {
+                        log("USB permission denied", "I")
+                    }
+                }
+            }
+        }
+    }
+
+    fun registerUsbReceiver() {
+        if (receiverRegistered) return
+        val filter = IntentFilter().apply {
+            addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
+            addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
+            addAction(usbPermissionAction)
+        }
+        if (Build.VERSION.SDK_INT >= 33) {
+            context.registerReceiver(usbReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            context.registerReceiver(usbReceiver, filter)
+        }
+        receiverRegistered = true
+    }
+
+    fun unregisterUsbReceiver() {
+        if (!receiverRegistered) return
+        try {
+            context.unregisterReceiver(usbReceiver)
+        } catch (_: Exception) {}
+        receiverRegistered = false
+    }
+
+    fun startUsbTrack(trackScope: CoroutineScope) {
+        if (usbReady) return
+        if (carPrefs.devMode) {
+            log("Development mode active — using TCP ADB instead of USB", "I")
+            startTcpAdbTrack(trackScope)
+            return
+        }
+        trackScope.launch(Dispatchers.IO) {
+            val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
+            for (device in usbManager.deviceList.values) {
+                if (UsbAdbConnection.findAdbInterface(device) != null) {
+                    log("USB track: found existing device ${device.productName}", "I")
+                    withContext(Dispatchers.Main) { onUsbDeviceAttached(device) }
+                    return@launch
+                }
+            }
+            log("USB track: no device found, waiting for attach broadcast", "I")
+        }
+    }
+
+    fun startTcpAdbTrack(trackScope: CoroutineScope) {
+        if (tcpAdbConnecting) return
+        val phoneHost = getPhoneHost()
+        if (adbController?.isConnected == true && lastAdbHost == phoneHost) {
+            if (!usbReady) {
+                usbReady = true
+                log("Dev mode: TCP ADB still connected — usbReady restored", "I")
+                onAdbReady()
+            }
+            return
+        }
+        if (adbController?.isConnected == true && lastAdbHost != phoneHost && phoneHost != null) {
+            log("Dev mode: phone IP changed $lastAdbHost -> $phoneHost, reconnecting TCP ADB", "I")
+            adbController?.disconnect()
+            adbController = null
+            lastAdbHost = null
+        }
+        tcpAdbConnecting = true
+        trackScope.launch(Dispatchers.IO) {
+            try {
+                var attempts = 0
+                while (isActive && !usbReady && attempts < 60) {
+                    val host = getPhoneHost()
+                    if (host != null) {
+                        log("Dev mode: TCP ADB connecting to $host:${Ports.ADB_PORT} (attempt ${attempts + 1})", "I")
+                        connectTcpAdb(host)
+                        if (adbController?.isConnected == true) {
+                            lastAdbHost = host
+                        }
+                        return@launch
+                    }
+                    delay(1000)
+                    attempts++
+                }
+                if (!usbReady) {
+                    log("Dev mode: could not determine phone IP after ${attempts}s", "I")
+                }
+            } finally {
+                tcpAdbConnecting = false
+            }
+        }
+    }
+
+    suspend fun connectTcpAdb(host: String) {
+        if (usbReady) return
+        if (adbController?.isConnected == true) {
+            log("Dev mode: TCP ADB already connected, skipping duplicate", "I")
+            return
+        }
+
+        setStatusMessage(R.string.status_connecting_tcp_adb, arrayOf(host))
+        val keyDir = File(context.filesDir, "adb_keys")
+        val controller = RemoteAdbController(
+            phoneHost = host,
+            adbPort = Ports.ADB_PORT,
+            virtualDisplayId = -1,
+            keyDir = keyDir
+        )
+
+        if (!controller.connect()) {
+            setStatusMessage(R.string.status_tcp_adb_failed, emptyArray())
+            log("Dev mode: TCP ADB connection failed to $host:${Ports.ADB_PORT}", "I")
+            return
+        }
+
+        adbController = controller
+        setStatusMessage(R.string.status_tcp_adb_connected, emptyArray())
+        log("Dev mode: TCP ADB connected to $host:${Ports.ADB_PORT}", "I")
+
+        usbReady = true
+        noAdbCount = 0
+
+        if (isHandshakeDone() && !isVdServerStarted()) {
+            log("TCP ADB ready — deploying VD server immediately", "I")
+            deployVdServerDirect(controller)
+        }
+        try { controller.shell("am start -n ${AppTargets.PHONE_MAIN_ACTIVITY}") } catch (_: Exception) {}
+        log("Dev mode: phone app launched via TCP ADB", "I")
+
+        onAdbReady()
+    }
+
+    fun onUsbDeviceAttached(device: UsbDevice) {
+        if (UsbAdbConnection.findAdbInterface(device) == null) return
+        carPrefs.userDisconnected = false
+
+        val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
+        if (usbManager.hasPermission(device)) {
+            log("USB device with permission: ${device.productName}", "I")
+            connectUsbAdb(device)
+        } else {
+            log("Requesting USB permission for: ${device.productName}", "I")
+            val pi = PendingIntent.getBroadcast(
+                context, 0,
+                Intent(usbPermissionAction), PendingIntent.FLAG_IMMUTABLE
+            )
+            usbManager.requestPermission(device, pi)
+        }
+    }
+
+    fun onUsbDeviceFromActivity(device: UsbDevice) {
+        onUsbDeviceAttached(device)
+    }
+
+    fun connectUsbAdb(device: UsbDevice) {
+        if (usbReady || usbConnecting) {
+            log("USB ADB already ${if (usbReady) "connected" else "connecting"} — skipping", "I")
+            return
+        }
+        usbConnecting = true
+        scope.launch(Dispatchers.IO) {
+            setStatusMessage(R.string.status_connecting_usb, emptyArray())
+            val adb = UsbAdbConnection(context)
+            adb.setLogSink { msg -> log(msg, "I") }
+            if (!adb.connect(device)) {
+                usbConnecting = false
+                setStatusMessage(R.string.status_usb_failed, emptyArray())
+                log("USB ADB connection failed", "I")
+                return@launch
+            }
+            usbAdb = adb
+            setStatusMessage(R.string.status_usb_connected, emptyArray())
+            log("USB ADB connected", "I")
+            noAdbCount = 0
+
+            val keyInfo = adb.keyDiagnostic()
+            adb.shell("echo ${VdDeploy.shellQuote(keyInfo)} > /data/local/tmp/car-adb-key.log")
+            log("ADB key: $keyInfo", "I")
+
+            adb.shell("am start -n ${AppTargets.PHONE_MAIN_ACTIVITY}")
+            log("Phone app launched via USB ADB", "I")
+
+            usbConnecting = false
+            usbReady = true
+
+            if (isHandshakeDone() && !isVdServerStarted()) {
+                log("USB ADB ready after handshake — deploying VD server", "I")
+                deployVdServer()
+            }
+
+            onAdbReady()
+        }
+    }
+
+    fun isAdbAvailable(): Boolean {
+        val tcpOk = adbController?.isConnected == true
+        val usbOk = usbAdb?.isConnected == true
+        if (!tcpOk && !usbOk) {
+            log("isAdbAvailable: tcp=${adbController != null}.${adbController?.isConnected} usb=${usbAdb != null}.${usbAdb?.isConnected}", "I")
+        }
+        return tcpOk || usbOk
+    }
+
+    fun resetAdbController() {
+        adbController?.disconnect()
+        adbController = null
+        lastAdbHost = null
+        usbReady = false
+        log("ADB controller reset — will reconnect on next state pass", "I")
+    }
+
+    fun resetAdbReadiness() {
+        if (usbAdb?.isConnected != true) {
+            usbReady = false
+            if (usbAdb == null) usbConnecting = false
+        }
+    }
+
+    fun executeAdb(command: String, noWait: Boolean): Boolean {
+        return when {
+            adbController?.isConnected == true -> {
+                if (noWait) adbController!!.shellNoWait(command)
+                else adbController!!.shell(command)
+            }
+            usbAdb?.isConnected == true -> {
+                if (noWait) usbAdb!!.shellNoWait(command) >= 0
+                else { usbAdb!!.shell(command); true }
+            }
+            else -> false
+        }
+    }
+
+    fun destroy() {
+        unregisterUsbReceiver()
+        usbAdb?.close()
+        usbAdb = null
+        adbController?.disconnect()
+        adbController = null
+    }
+}
