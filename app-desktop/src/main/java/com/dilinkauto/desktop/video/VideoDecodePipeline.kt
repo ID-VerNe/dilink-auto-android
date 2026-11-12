@@ -1,6 +1,8 @@
 package com.dilinkauto.desktop.video
 
+import com.dilinkauto.protocol.BackoffPolicy
 import com.dilinkauto.protocol.BlackScreenDetector
+import com.dilinkauto.protocol.DecodeLivenessTracker
 import com.dilinkauto.protocol.FrameCodec
 import com.dilinkauto.protocol.H264NalParser
 import com.dilinkauto.protocol.VideoMsg
@@ -119,12 +121,8 @@ class VideoDecodePipeline(
         decodingAliveCheck = { decodingAlive() }
     }
 
-    /** [decodingAlive] 的采样基线：上次看到的 framesDecoded 值及其时间戳（ms）。 */
-    @Volatile
-    private var decodeAliveCount = 0L
-
-    @Volatile
-    private var decodeAliveAtMs = 0L
+    /** [decodingAlive] 的存活判定器（audit D-M4，统一对齐 protocol-core / 车机端 DecodeLiveness）。 */
+    private val liveness = DecodeLivenessTracker(DECODE_ALIVE_WINDOW_MS)
 
     /**
      * 解码线程是否还在出帧（最近 [DECODE_ALIVE_WINDOW_MS] 内 [framesDecoded] 有增长）。
@@ -134,18 +132,8 @@ class VideoDecodePipeline(
      * 窗口再判（真的停摆会在 2s 后翻成 false）。
      */
     private fun decodingAlive(): Boolean {
-        val now = System.nanoTime() / 1_000_000L
-        val n = framesDecoded.get()
-        if (n != decodeAliveCount) {
-            decodeAliveCount = n
-            decodeAliveAtMs = now
-            return true
-        }
-        if (decodeAliveAtMs == 0L) {
-            decodeAliveAtMs = now
-            return true
-        }
-        return now - decodeAliveAtMs < DECODE_ALIVE_WINDOW_MS
+        val nowMs = System.nanoTime() / 1_000_000L
+        return liveness.isAlive(framesDecoded.get(), nowMs)
     }
 
     /** 最近一次收到的 CONFIG，供解码器重建时重放。 */
@@ -183,6 +171,7 @@ class VideoDecodePipeline(
     fun start() {
         if (running) return
         running = true
+        liveness.reset()
         decodeThread = Thread({ decodeLoop() }, "VideoDecode").apply {
             isDaemon = true
             start()
@@ -277,6 +266,7 @@ class VideoDecodePipeline(
     fun stop() {
         if (!running) return
         running = false
+        liveness.reset()
         gate = null
         pipe?.close()
         decodeThread?.interrupt()
@@ -404,18 +394,14 @@ class VideoDecodePipeline(
     }
 
     /**
-     * 第 [rebuilds] 次重建前要睡多久（audit D-M3）。
+     * 第 [rebuilds] 次重建前要睡多久（audit D-M3，统一引用 [BackoffPolicy.TOLERANT]）。
      *
      * 前 [BACKOFF_ESCALATE_AFTER] 次保持 [REBUILD_BACKOFF_MS] 的紧凑恢复
      * （正常的单次码流抖动值得快速爬起来），之后每次翻倍直到
      * [REBUILD_BACKOFF_MAX_MS] 封顶。抽成纯函数是为了能单测退避曲线 ——
      * 这条曲线的形状直接决定"持续失败时是否空转"。
      */
-    internal fun rebuildBackoffMs(rebuilds: Long): Long {
-        if (rebuilds <= BACKOFF_ESCALATE_AFTER) return REBUILD_BACKOFF_MS
-        val doublings = (rebuilds - BACKOFF_ESCALATE_AFTER).coerceAtMost(MAX_BACKOFF_DOUBLINGS.toLong())
-        return (REBUILD_BACKOFF_MS shl doublings.toInt()).coerceAtMost(REBUILD_BACKOFF_MAX_MS)
-    }
+    internal fun rebuildBackoffMs(rebuilds: Long): Long = BackoffPolicy.TOLERANT.compute(rebuilds)
 
     companion object {
         /** Windows 上的 D3D11 硬解加速器名（FFmpeg 的 `-hwaccel` 取值）。 */
@@ -437,19 +423,19 @@ class VideoDecodePipeline(
          * 解码线程确实卡住了（不是帧率抖动）。比黑屏窗口（10s）短得多，所以
          * 「内容黑但正常解码」永远进不了升级分支。
          */
-        private const val DECODE_ALIVE_WINDOW_MS = 2_000L
+        private const val DECODE_ALIVE_WINDOW_MS = DecodeLivenessTracker.DEFAULT_WINDOW_MS
 
         private const val STOP_JOIN_TIMEOUT_MS = 2_000L
-        private const val REBUILD_BACKOFF_MS = 500L
+        private const val REBUILD_BACKOFF_MS = BackoffPolicy.DEFAULT_BASE_MS
 
-        /** 从第几次重建开始加倍退避（audit D-M3）。 */
+        /** 从第几次重建开始加倍退避（audit D-M3，对应 [BackoffPolicy.TOLERANT]）。 */
         private const val BACKOFF_ESCALATE_AFTER = 3L
 
         /** 退避上限（audit D-M3）：8s —— 足够让编码器/网络缓过来，又不至于让用户等太久。 */
-        private const val REBUILD_BACKOFF_MAX_MS = 8_000L
+        private const val REBUILD_BACKOFF_MAX_MS = BackoffPolicy.DEFAULT_MAX_MS
 
         /** 500ms 翻几次到 8s：500→1000→2000→4000→8000，共 4 次。 */
-        private const val MAX_BACKOFF_DOUBLINGS = 4
+        private const val MAX_BACKOFF_DOUBLINGS = BackoffPolicy.DEFAULT_MAX_DOUBLINGS
 
         /** 连续重建到这个次数就向上升级（audit D-M3）。 */
         private const val MAX_REBUILDS = 30L
