@@ -28,6 +28,7 @@ import com.dilinkauto.server.CarCrashReport
 import com.dilinkauto.server.adb.RemoteAdbController
 import com.dilinkauto.server.adb.WifiGatewayProbe
 import com.dilinkauto.protocol.adb.UsbAdbConnection
+import com.dilinkauto.server.decoder.AudioPlayer
 import com.dilinkauto.server.decoder.VideoDecoder
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
@@ -57,7 +58,17 @@ class CarConnectionService : Service() {
     @Volatile private var controlConnection: Connection? = null
     @Volatile private var videoConnection: Connection? = null
     @Volatile private var inputConnection: Connection? = null
+    /**
+     * 9640 音频连接（S3-PB，issue #73）。**独立于 control/video/input**：
+     * 建立失败、断链都只记日志，绝不进 [handleDisconnect]（见 [connectAudioIfEnabled]）。
+     */
+    @Volatile private var audioConnection: Connection? = null
     val videoDecoder = VideoDecoder()
+    /**
+     * 车机端音频播放器（S3-PB，issue #73）。形状同 [videoDecoder]：网络线程入队、
+     * 专用播放线程按 21.333 ms 节拍消费；`logSink` 在 [onCreate] 接到 `carLogSend`。
+     */
+    val audioPlayer = AudioPlayer()
     @Volatile internal var adbController: RemoteAdbController? = null
     @Volatile internal var phoneHost: String? = null
     private lateinit var notifier: ForegroundNotifier
@@ -345,6 +356,7 @@ class CarConnectionService : Service() {
         logWriter.setEnabled(com.dilinkauto.server.BuildConfig.DEBUG)
         logWriter.start()
         videoDecoder.logSink = { msg -> carLogSend(msg) }
+        audioPlayer.logSink = { msg -> carLogSend(msg) }
         // issue #9：参考链断裂时向手机索要一个 IDR，别等下一个自然 GOP 边界。
         // 解码器的缺口可能来自网络线程或喂帧线程 → 这里做全局限流；真正发命令
         // 走 sendCommandToVd（自己切 IO 协程），回调本身必须立即返回。
@@ -789,6 +801,82 @@ class CarConnectionService : Service() {
     }
 
     /**
+     * 建立 9640 音频连接（S3-PB，issue #73 / Refs #13）。
+     *
+     * ## 为什么与 [connectVideoAndInput] 完全隔离
+     *
+     * `connectVideoAndInput` 的 `catch` 直接 `handleDisconnect()`（`:803-804`），那是
+     * 整会话状态机 teardown。音频是**可选能力**：9640 连不上（端口未绑、PA 未合并、
+     * 手机不支持）绝不许拆掉视频会话（R6）。所以这里是独立函数、独立 `scope.launch`、
+     * 独立 `try/catch`，**任何失败只 `carLogSend`，绝不调 `handleDisconnect()`**，
+     * 也不写任何被状态机读取的字段（`wifiReady` / `checkAndAdvance` 一律不碰）。
+     *
+     * 门槛由纯函数 [carShouldConnectAudio] 给定：用户开关（`carPrefs.audioEnabled`，
+     * S4 落地）+ 手机握手响应里的音频能力位。后者**直接复用 S4 已有的单一真源**
+     * [phoneAudioSupported]（S4 在 `HANDSHAKE_RESPONSE` 分支由 `phoneSupportsAudio`
+     * 算出），本节**不另存一份原始位状态** —— 两处表达同一信息会漂移。
+     * 时序上 `VD_PORTS_BOUND`（本函数的调用点）必然晚于 `HANDSHAKE_RESPONSE`，
+     * 故读到的就是本会话的能力位。
+     *
+     * ## 断链处置
+     *
+     * `onDisconnect` 只记日志并 `audioPlayer.stop()` —— 音频断了不影响视频，视频断了
+     * 由 [handleDisconnect] 统一收音频位（见 [disconnectAllConnections]）。
+     */
+    private fun connectAudioIfEnabled(host: String) {
+        if (!carShouldConnectAudio(carPrefs.audioEnabled, _phoneAudioSupported.value)) {
+            carLogSend(
+                "Audio: not connecting — enabled=${carPrefs.audioEnabled} " +
+                    "phoneSupported=${_phoneAudioSupported.value}"
+            )
+            return
+        }
+        scope.launch(Dispatchers.IO) {
+            try {
+                carLogSend("Audio: connecting to ${Ports.AUDIO_PORT}...")
+                val audio = Connection.connect(host, Ports.AUDIO_PORT, scope)
+                audioConnection = audio
+                audio.onLog { msg -> carLogSend("AudioConn: $msg") }
+                // 音频断链绝不 handleDisconnect：视频会话由视频连接自己的 onDisconnect 管。
+                audio.onDisconnect {
+                    carLogSend("Audio: connection lost — stopping playback (video unaffected)", "W")
+                    audioPlayer.stop()
+                }
+                audio.onFrames(Channel.AUDIO) { handleAudioFrame(it) }
+                audio.start(enableHeartbeat = false)
+                audioPlayer.start()
+                carLogSend("Audio: connection established — playback started")
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // 独立 catch：只有日志，绝不进 handleDisconnect（R6）。
+                carLogSend("Audio: connect failed (video unaffected): ${e.message}", "W")
+                audioPlayer.stop()
+                audioConnection = null
+            }
+        }
+    }
+
+    /**
+     * 9640 入帧：CONFIG 缓存进 [audioPlayer]，FRAME 入队。
+     *
+     * 解码在网络线程上被 `AudioPlayer.onFrame` 拒绝（队列满丢最旧 / 无 CONFIG 丢弃），
+     * 播放由专用线程按 21.333 ms 节拍完成 —— 这里只做 O(1) 的入队，不阻塞读线程。
+     */
+    private fun handleAudioFrame(frame: FrameCodec.Frame) {
+        try {
+            when (frame.messageType) {
+                AudioMsg.CONFIG -> audioPlayer.configure(AudioPayload.decodeConfig(frame.payload))
+                AudioMsg.FRAME -> audioPlayer.onFrame(AudioPayload.decodeFrame(frame.payload))
+                else -> carLogSend("Audio: unknown messageType=0x${Integer.toHexString(frame.messageType.toInt() and 0xFF)}", "W")
+            }
+        } catch (e: Exception) {
+            // 对端载荷畸形时只丢这一帧，绝不把异常穿进读协程（那会断掉 9640）。
+            carLogSend("Audio: frame decode failed: ${e.message}", "W")
+        }
+    }
+
+    /**
  * Clears the USB-ADB readiness flags when no USB device is actually connected.
  *
  * Shared by [startConnection] and [handleDisconnect], which previously each had
@@ -812,7 +900,12 @@ class CarConnectionService : Service() {
     }
 
     /**
-     * Drops the video/input/control connections and nulls the handles.
+     * Drops the video/input/control/audio connections and nulls the handles.
+     *
+     * The audio leg is torn down here as well (S3-PB, issue #73) but **its ordering
+     * relative to the existing three is untouched** — its lines are appended last,
+     * after control, so a session teardown still closes video/input/control exactly
+     * as before this change.
      *
      * @param clearListeners also detach the disconnect callbacks. Needed when
      *   tearing down mid-stream on purpose, so [handleDisconnect] does not run
@@ -826,6 +919,7 @@ class CarConnectionService : Service() {
             videoConnection?.clearDisconnectListener()
             inputConnection?.clearDisconnectListener()
             controlConnection?.clearDisconnectListener()
+            audioConnection?.clearDisconnectListener()
         }
         videoConnection?.disconnect()
         videoConnection = null
@@ -833,6 +927,11 @@ class CarConnectionService : Service() {
         inputConnection = null
         controlConnection?.disconnect()
         controlConnection = null
+        // 音频位追加在最后（S3-PB）：既有三条的拆解顺序一字未动。
+        // 先停播放（幂等、有界 join），再断 9640，避免播放线程在 socket 关闭后还在解码。
+        audioPlayer.stop()
+        audioConnection?.disconnect()
+        audioConnection = null
     }
 
     // ─── Track B: USB ───
@@ -1081,7 +1180,8 @@ class CarConnectionService : Service() {
                 _phoneName.value = response.deviceName
                 // 手机端回传的能力位（issue #72, Refs #13）：置灰依据只看这一位，
                 // 不看车机自身 SDK_INT。它是尾字段，老手机解为 0 → 音频置灰，
-                // 属安全回退方向。S3 的 9640 绑定门也会复用同一判据。
+                // 属安全回退方向。S3 的 9640 连接门（connectAudioIfEnabled）**复用**
+                // 这一字段作为单一真源，不另存原始位。
                 _phoneAudioSupported.value = phoneSupportsAudio(response.supportedFeatures)
                 carLogSend("Peer features=0x${response.supportedFeatures.toString(16)} audioSupported=${_phoneAudioSupported.value}")
                 // Peer-supplied dims go straight into MediaFormat and into the
@@ -1116,6 +1216,10 @@ class CarConnectionService : Service() {
                 val host = phoneHost
                 if (host != null) {
                     connectVideoAndInput(host)
+                    // S3-PB（issue #73）：音频连接与 video/input **完全独立** —— 独立函数、
+                    // 独立 try/catch、失败只记日志（见 connectAudioIfEnabled 的 KDoc）。
+                    // 放在 connectVideoAndInput 之后启动，不改变视频连接的既有路径。
+                    connectAudioIfEnabled(host)
                 } else {
                     carLogSend("ERROR: phoneHost is null when VD_PORTS_BOUND received")
                 }
