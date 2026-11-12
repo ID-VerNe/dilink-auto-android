@@ -538,24 +538,21 @@ internal class CarCommandRouter(
      * 的有上界切法 —— 只收窄，字段名与日志格式不变。
      */
     private fun findTaskSection(dump: String, taskId: Int): Pair<Int, String>? {
+        val headerMatcher = ActivityDumpParser.taskHeaderMatcher(taskId)
         for (header in DISPLAY_HEADER_RE.findAll(dump)) {
             val displayId = header.groupValues[1].toIntOrNull() ?: continue
             val section = ActivityDumpParser.displaySection(dump, displayId) ?: continue
             // Task 头是 `#<id> `，ActivityRecord 行是 `t<id>}`；两者任一命中即可。
-            if (section.contains("t$taskId}") || taskHeaderRegex(taskId).containsMatchIn(section)) {
+            if (section.contains("t$taskId}") || headerMatcher.containsMatchIn(section)) {
                 return displayId to section
             }
         }
         return null
     }
 
-    /** 段内含指定 task 的 `* Task{…#<id> …}` 头（issue #77：只认 task 头，排除引用行）。 */
-    private fun taskHeaderRegex(taskId: Int) =
-        Regex("(?m)^[ \\t]*\\*[ \\t]*Task\\{[^}]*#$taskId[ }]")
-
     /** 取该 task 从头部到下一个 `* Task{` 之间的块（含它的 ActivityRecord 配置行）。 */
     private fun taskBlock(section: String, taskId: Int): String? {
-        val header = taskHeaderRegex(taskId).find(section) ?: return null
+        val header = ActivityDumpParser.taskHeaderMatcher(taskId).find(section) ?: return null
         val next = section.indexOf("* Task{", header.range.last + 1)
         return section.substring(header.range.first, if (next > header.range.first) next else section.length)
     }
