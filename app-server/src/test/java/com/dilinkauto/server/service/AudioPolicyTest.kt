@@ -85,4 +85,32 @@ class AudioPolicyTest {
         assertEquals(false, state.checked)
         assertEquals(AudioSwitchBlockReason.PHONE_UNSUPPORTED, state.blockReason)
     }
+
+    // ─── 连接门：carShouldConnectAudio（issue #73 / S3-PB）───
+    //
+    // 参数是 Boolean 而非原始能力位：位解释只发生在 S4 的 `phoneSupportsAudio`
+    // 一处（其位语义已由本文件上半段单测钉住），连接门不再持有第二份能力位状态。
+
+    @Test
+    fun `connect gate needs both the switch and phone support`() {
+        assertTrue(carShouldConnectAudio(audioEnabled = true, phoneSupported = true))
+        // 开关关 → 不连，即便手机支持
+        assertFalse(carShouldConnectAudio(audioEnabled = false, phoneSupported = true))
+        // 手机不支持 → 不连，即便开关开（老手机响应恒为 0 → phoneSupport=false）
+        assertFalse(carShouldConnectAudio(audioEnabled = true, phoneSupported = false))
+        assertFalse(carShouldConnectAudio(audioEnabled = false, phoneSupported = false))
+    }
+
+    @Test
+    fun `connect gate composes with phoneSupportsAudio over the raw feature bits`() {
+        // 端到端：原始能力位 → phoneSupportsAudio → 连接门。0x02 = FEATURE_AUDIO。
+        assertTrue(carShouldConnectAudio(true, phoneSupportsAudio(0x02)))
+        assertTrue(carShouldConnectAudio(true, phoneSupportsAudio(0x01 or 0x02)))
+        // 只有视频位 / 无位 → 不连
+        assertFalse(carShouldConnectAudio(true, phoneSupportsAudio(0x01)))
+        assertFalse(carShouldConnectAudio(true, phoneSupportsAudio(0x00)))
+        // 高位全置但无音频位 → 不连；加上音频位 → 连
+        assertFalse(carShouldConnectAudio(true, phoneSupportsAudio(0x7FFFFFFC)))
+        assertTrue(carShouldConnectAudio(true, phoneSupportsAudio(0x7FFFFFFE)))
+    }
 }

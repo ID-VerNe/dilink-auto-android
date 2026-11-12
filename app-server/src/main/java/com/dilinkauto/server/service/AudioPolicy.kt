@@ -76,3 +76,19 @@ internal fun audioSwitchState(phoneSupported: Boolean, audioEnabled: Boolean): A
             blockReason = AudioSwitchBlockReason.PHONE_UNSUPPORTED,
         )
     }
+
+/**
+ * 车机是否应当去连 9640（S3-PB 的连接门，issue #73 / Refs #13）。
+ *
+ * 两个条件缺一不可：
+ * - `audioEnabled`：用户自己的开关（S4 落地，默认开）。关掉就不去连，即便手机支持。
+ * - `phoneSupported`：手机（采集端）是否支持音频 —— **直接复用 S4 已有的单一真源**
+ *   `CarConnectionService.phoneAudioSupported`（它自己由 [phoneSupportsAudio] 从
+ *   握手响应的能力位算出，S4 已落地并单测）。本节**不另存原始能力位**：那是同一信息
+ *   的第二份状态，会与 `phoneAudioSupported` 漂移。
+ *
+ * 抽成纯函数的原因同 [phoneSupportsAudio]：`carPrefs` 在纯 JVM 上返回 null，
+ * `CarConnectionService` 是 Service，连接门若内联就无法单测。
+ */
+internal fun carShouldConnectAudio(audioEnabled: Boolean, phoneSupported: Boolean): Boolean =
+    audioEnabled && phoneSupported
