@@ -87,4 +87,28 @@ class WindowStateParserTest {
 
         assertTrue("小窗消失必须导致指纹变化", before != after)
     }
+
+    /**
+     * issue #77 的墓碑：同一 task 的引用行（`rootOfTask=` / `topDisplayFocusedRootTask=`）不得
+     * 让同一 id 被解析多次，`[Window]` 的 `n=` 才等于真实 task 数。
+     *
+     * 修复前 `parseDisplay(#0)` 返回 3 个条目（`[1,1,1]`）—— 一个 `* Task{` 头加两条引用行。
+     * 修复后只有 1 个（`[1]`）。期望值是字面量，不由被测函数反推。
+     */
+    @Test
+    fun `issue 77 counts a task header once when reference lines repeat it`() {
+        val withReferences = """
+            ACTIVITY MANAGER ACTIVITIES (dumpsys activity activities)
+            Display #0 (activities from top to bottom):
+              * Task{aaa111 #1 type=home U=0 visible=true visibleRequested=true mode=fullscreen}
+                rootOfTask=true task=Task{aaa111 #1 type=home}
+                topDisplayFocusedRootTask=Task{aaa111 #1 type=home}
+        """.trimIndent()
+
+        val tasks = WindowStateParser.parseDisplay(withReferences, 0)
+
+        assertEquals(listOf(1), tasks.map { it.taskId })
+        assertEquals("模式与可见性必须取自 task 头，而不是引用行", "fullscreen", tasks.single().windowingMode)
+        assertEquals(true, tasks.single().visibleRequested)
+    }
 }

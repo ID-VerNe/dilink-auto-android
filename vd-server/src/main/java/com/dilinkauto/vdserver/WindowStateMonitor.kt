@@ -124,8 +124,10 @@ internal class WindowStateMonitor(
 internal object WindowStateParser {
     /** 解析指定 display 段内的所有 task；display 不存在时返回空列表。 */
     fun parseDisplay(dump: String, displayId: Int): List<TaskWindow> {
-        val section = displaySection(dump, displayId) ?: return emptyList()
-        val headers = TASK_HEADER_RE.findAll(section).toList()
+        val section = ActivityDumpParser.displaySection(dump, displayId) ?: return emptyList()
+        // issue #77：切段与「只认 task 头」统一走 ActivityDumpParser；同一 id 只取首次出现，
+        // 否则 `rootOfTask=true task=Task{…#N …}` 这类引用会让同一 task 被解析多次。
+        val headers = ActivityDumpParser.taskHeaders(section)
         if (headers.isEmpty()) return emptyList()
         val out = ArrayList<TaskWindow>(headers.size)
         for ((index, header) in headers.withIndex()) {
@@ -150,18 +152,6 @@ internal object WindowStateParser {
     fun fingerprint(tasks: List<TaskWindow>): String = tasks.joinToString("|") {
         "${it.taskId},${it.component},${it.windowingMode},${it.visibleRequested},${it.bounds},${it.lastNonfullscreenBounds}"
     }
-
-    /** 与 `CarCommandRouter` 的 displaySection 同义：从 `Display #<id> ` 切到下一个段头。 */
-    private fun displaySection(dump: String, id: Int): String? {
-        val marker = "Display #$id "
-        val start = dump.indexOf(marker)
-        if (start < 0) return null
-        val next = dump.indexOf("Display #", start + marker.length)
-        return if (next >= 0) dump.substring(start, next) else dump.substring(start)
-    }
-
-    /** Task 头 `Task{...#<id> ...}`；activity 按 top→bottom 排列，首个即顶层。 */
-    private val TASK_HEADER_RE = Regex("""Task\{[^}]*#(\d+)[ }]""")
 
     /** ActivityRecord 行：抓组件名（如 `com.bilibili.app.in/.MainActivity`）。 */
     private val ACTIVITY_RE = Regex("""ActivityRecord\{[^}]*?\s([A-Za-z0-9_.]+/[A-Za-z0-9_.$]+)\s+t\d+\}""")

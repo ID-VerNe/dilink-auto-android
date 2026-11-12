@@ -529,24 +529,33 @@ internal class CarCommandRouter(
         }
     }
 
-    /** 在 `dumpsys activity activities` 里定位包含 [taskId] 的 display 段。 */
+    /**
+     * 在 `dumpsys activity activities` 里定位包含 [taskId] 的 display 段。
+     *
+     * issue #77：这里原本也把「最后一个 display 段」一路切到字符串末尾（与本 issue 的同根因），
+     * 于是 `ActivityTaskSupervisor state:` 里对物理屏顶层任务的引用会被算进它前面那个 display 段，
+     * `[teardown-move] displayId=` 可能报错 display。现在统一用 [ActivityDumpParser.displaySection]
+     * 的有上界切法 —— 只收窄，字段名与日志格式不变。
+     */
     private fun findTaskSection(dump: String, taskId: Int): Pair<Int, String>? {
-        val headers = DISPLAY_HEADER_RE.findAll(dump).toList()
-        for ((index, header) in headers.withIndex()) {
-            val start = header.range.last + 1
-            val end = headers.getOrNull(index + 1)?.range?.first ?: dump.length
-            val section = dump.substring(start, end)
+        for (header in DISPLAY_HEADER_RE.findAll(dump)) {
+            val displayId = header.groupValues[1].toIntOrNull() ?: continue
+            val section = ActivityDumpParser.displaySection(dump, displayId) ?: continue
             // Task 头是 `#<id> `，ActivityRecord 行是 `t<id>}`；两者任一命中即可。
-            if (section.contains("t$taskId}") || Regex("Task\\{[^}]*#$taskId[ }]").containsMatchIn(section)) {
-                return header.groupValues[1].toIntOrNull()?.let { it to section }
+            if (section.contains("t$taskId}") || taskHeaderRegex(taskId).containsMatchIn(section)) {
+                return displayId to section
             }
         }
         return null
     }
 
+    /** 段内含指定 task 的 `* Task{…#<id> …}` 头（issue #77：只认 task 头，排除引用行）。 */
+    private fun taskHeaderRegex(taskId: Int) =
+        Regex("(?m)^[ \\t]*\\*[ \\t]*Task\\{[^}]*#$taskId[ }]")
+
     /** 取该 task 从头部到下一个 `* Task{` 之间的块（含它的 ActivityRecord 配置行）。 */
     private fun taskBlock(section: String, taskId: Int): String? {
-        val header = Regex("Task\\{[^}]*#$taskId[ }]").find(section) ?: return null
+        val header = taskHeaderRegex(taskId).find(section) ?: return null
         val next = section.indexOf("* Task{", header.range.last + 1)
         return section.substring(header.range.first, if (next > header.range.first) next else section.length)
     }
@@ -570,10 +579,10 @@ internal class CarCommandRouter(
         return init to cur
     }
 
-    /** 某 display 段里所有 Task 头中的 task id（issue #48：仍留在 VD 上的任务）。 */
+    /** 某 display 段里所有 task id（issue #48：仍留在 VD 上的任务；issue #77 去重、不跨屏）。 */
     private fun tasksInDisplay(dump: String?, id: Int): List<Int> {
-        val section = dump?.let { displaySection(it, id) } ?: return emptyList()
-        return TASK_ID_RE.findAll(section).mapNotNull { it.groupValues[1].toIntOrNull() }.toList()
+        val section = dump?.let { ActivityDumpParser.displaySection(it, id) } ?: return emptyList()
+        return ActivityDumpParser.taskIdsInSection(section)
     }
 
     /** `am task` 的 bounds：兼容 `bounds=[0,0][2340,1316]` 与 `mBounds=Rect(...)` 两种写法。 */
@@ -596,19 +605,16 @@ internal class CarCommandRouter(
             ?: Regex("(\\d+)dpi").find(block)?.groupValues?.get(1)
 
     /**
-     * Slice a `dumpsys activity activities` dump down to one display's section —
-     * the text from `Display #<id> ` up to the next `Display #` header.
+     * 切出 `Display #<id> ` 段（issue #77）。
      *
-     * Both [checkStackEmpty] and [moveTopApp] need exactly this window and used
-     * to inline it twice. Returns null when the display has no section at all.
+     * 逻辑与 `WindowStateParser` 共用，已合并到 [ActivityDumpParser.displaySection]：
+     * 修复前这里和 `WindowStateMonitor` 各有一份逐字相同的实现，且都用「下一个 `Display #`」
+     * 作唯一结束标记 —— 目标 display 是最后一个时一路吃到字符串末尾，把物理屏的
+     * `Display: mDisplayId=0 …` 与 task 引用一起吞进来（跨屏泄漏），与 `TASK_ID_RE`
+     * 同时命中 task 头与引用行叠加，构成 issue #77 的「重复计数 + 跨屏泄漏」。
      */
-    private fun displaySection(dump: String, id: Int): String? {
-        val marker = "Display #$id "
-        val start = dump.indexOf(marker)
-        if (start < 0) return null
-        val next = dump.indexOf("Display #", start + marker.length)
-        return if (next >= 0) dump.substring(start, next) else dump.substring(start)
-    }
+    private fun displaySection(dump: String, id: Int): String? =
+        ActivityDumpParser.displaySection(dump, id)
 
     /**
      * 该 display 段的顶层 Task 是否 `visibleRequested=true`。
@@ -665,9 +671,6 @@ internal class CarCommandRouter(
 
         /** `dumpsys activity activities` 的 `Display #<id> ` 段头（issue #48 回读用）。 */
         val DISPLAY_HEADER_RE = Regex("Display #(\\d+) ")
-
-        /** `dumpsys activity activities` 的 Task 头 `Task{...#<id> ...}`（issue #48 残留任务列表）。 */
-        val TASK_ID_RE = Regex("Task\\{[^}]*#(\\d+)[ }]")
 
         /**
          * issue #48：`am display move-stack` 是异步入队的，回读前等一个很短的时间；
