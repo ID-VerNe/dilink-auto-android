@@ -128,6 +128,17 @@ class PipelineServer(
         err = { err(it) }
     )
     private val lifecycle = LifecycleWriter { running }
+    private val watchdog = ProcessWatchdog(
+        isRunning = { running },
+        isCleanedUp = { cleanedUp.get() },
+        onStopRequested = {
+            running = false
+            pipelineThread?.let { LockSupport.unpark(it) }
+        },
+        onForceCleanup = { cleanup() },
+        log = { log(it) },
+        err = { err(it) }
+    )
     private val carCommands = CarCommandRouter(
         exec = { shell.exec(it) },
         execOut = { shell.execOutput(it) },
@@ -178,7 +189,7 @@ class PipelineServer(
          * 所以拉长到 3s 只影响「自然刷新」节奏，不拖慢断链恢复。
          */
         private const val I_FRAME_INTERVAL = 3
-        private const val WATCHDOG_GRACE_MS = 3000L
+        private const val WATCHDOG_GRACE_MS = ProcessWatchdog.WATCHDOG_GRACE_MS
         private const val SOCKET_BUF_BYTES = Connection.SOCKET_BUF_BYTES // single source: protocol-core
 
         /** S-M9：主线程等 EGL/GL 初始化的上限。超时即致命，绝不久久挂起。 */
@@ -619,48 +630,10 @@ class PipelineServer(
     }
 
     /**
-     * Watchdog: when the lifecycle channel breaks, readLifecycleCommands sets
-     * running=false and calls cleanup() in its finally block. But if the
-     * pipeline thread is stuck in a native MediaCodec call (dequeueOutputBuffer
-     * after stop()), the run() finally { cleanup() } never executes, and the
-     * physical panel stays powered off → phone is unusable (black screen).
-     *
-     * This daemon polls running and cleanedUp. If running went false but
-     * cleanup did not complete within GRACE_MS, it forces cleanup() directly
-     * and then System.exit(1) so the JVM ShutdownHook also fires. The forced
-     * path restores the panel via DisplayControl reflection — same mechanism
-     * setPhysicalDisplayPower uses — and does NOT depend on Shizuku.
+     * Watchdog: 委托给 [ProcessWatchdog] 进行停止哨兵文件轮询与强制退出监控。
      */
     private fun startWatchdog() {
-        daemonThread("Watchdog", start = true) {
-            while (running) {
-                // 停止哨兵：部署序列 / PhoneDisplayRestorer 写文件请求优雅停止。
-                // 不能用信号——ART 的 app_process 收 SIGTERM 直接终止、不跑 shutdown
-                // hook，cleanup 会被整体跳过（2026-10-10 MI 9 实测，见 VdDeploy 类头）。
-                // 这里置 running=false 后各等待点（accept 轮询 / park 切片 / bind 重试）
-                // 会在 ≤100ms 内退出，run() 走到 finally，cleanup 完整执行。
-                if (consumeStopRequest()) {
-                    log("Stop request detected (${VdDeploy.STOP_REQUEST_PATH}) — graceful shutdown")
-                    running = false
-                    pipelineThread?.let { LockSupport.unpark(it) }
-                    break
-                }
-                try { Thread.sleep(500) } catch (_: InterruptedException) { break }
-            }
-            val deadline = System.currentTimeMillis() + WATCHDOG_GRACE_MS
-            while (System.currentTimeMillis() < deadline) {
-                if (cleanedUp.get()) return@daemonThread
-                try { Thread.sleep(200) } catch (_: InterruptedException) { break }
-            }
-            if (!cleanedUp.get()) {
-                err("Watchdog: cleanup did not complete within ${WATCHDOG_GRACE_MS}ms — forcing panel restore + exit")
-                try { cleanup() } catch (e: Exception) { err("Watchdog cleanup error: ${e.message}") }
-                // Give cleanup's setPhysicalDisplayPower(true) time to land before
-                // halt() tears the process down (halt bypasses ShutdownHook).
-                try { Thread.sleep(500) } catch (_: Exception) {}
-                Runtime.getRuntime().halt(1)
-            }
-        }
+        watchdog.start()
     }
 
     private fun readTouchAndCommands(ch: SocketChannel) {
@@ -749,12 +722,12 @@ class PipelineServer(
         // 写线程排空退出并真正关掉 9640 的 socket（sink 是 channel 的唯一属主）。
         audioPipeline?.let { p ->
             // AudioPipeline.close() 自己会打一行 `Audio: capture stopped (frames=..., silence=...)`。
-            runCatching { p.close() }.onFailure { err("Audio: close failed: ${describe(it)}") }
+            runCatching { p.close() }.onFailure { err("Audio: close failed: ${it.describe()}") }
         }
         audioPipeline = null
         audioSink?.let { s ->
             runCatching { s.close() }
-                .onFailure { err("Audio: sink close failed: ${describe(it)}") }
+                .onFailure { err("Audio: sink close failed: ${it.describe()}") }
             log("Audio: sink closed (sent=${s.sentFrames}, configs=${s.sentConfigs}, dropped=${s.droppedFrames}, failed=${s.failed})")
         }
         audioSink = null
@@ -773,22 +746,6 @@ class PipelineServer(
         virtualDisplay?.let { try { it.release() } catch (_: Exception) {} }
         log("Cleanup complete")
     }
-}
-
-/**
- * 消费停止哨兵（协议见 [VdDeploy.gracefulStopCommand]）：文件存在则**删除并返回
- * true**——删除是给外部的"已受理"信号（可选观察），删不掉也不影响停止（残留由
- * 下一次启动的 `run()` 开头兜底清理）。不存在则返回 false。
- *
- * Top-level 且路径可注入：vd-server 的单测在纯 JVM 上跑，用临时目录验证
- * "不存在→false / 存在→true 且被删除 / 二次调用→false"的契约；watchdog 的
- * 线程集成不在单测范围内。
- */
-internal fun consumeStopRequest(path: String = VdDeploy.STOP_REQUEST_PATH): Boolean {
-    val f = File(path)
-    if (!f.exists()) return false
-    runCatching { f.delete() }
-    return true
 }
 
 /**

@@ -233,10 +233,10 @@ class AudioPipelineTest {
     fun describeFallsBackToTheClassNameForEmptyMessages() {
         // MI 9 的 OMX.qcom.video.encoder.avc 在 configure 时抛空 message 的 CodecException，
         // 只打 message 会得到一行 `Audio: encoder 'x' unusable: ` —— 现场无法定位。
-        assertEquals("boom", describe(RuntimeException("boom")))
-        assertEquals("RuntimeException", describe(RuntimeException("")))
-        assertEquals("RuntimeException", describe(RuntimeException("   ")))
-        assertEquals("IllegalStateException", describe(IllegalStateException()))
+        assertEquals("boom", RuntimeException("boom").describe())
+        assertEquals("RuntimeException", RuntimeException("").describe())
+        assertEquals("RuntimeException", RuntimeException("   ").describe())
+        assertEquals("IllegalStateException", IllegalStateException().describe())
     }
 
     @Test
