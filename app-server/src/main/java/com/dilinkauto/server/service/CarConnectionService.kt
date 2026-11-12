@@ -252,6 +252,17 @@ class CarConnectionService : Service() {
     private val _phoneName = MutableStateFlow("")
     val phoneName: StateFlow<String> = _phoneName.asStateFlow()
 
+    /**
+     * 手机（采集端）握手响应回传的能力位里是否含音频位（issue #72, Refs #13）。
+     *
+     * 默认 false：握手响应到达前能力未知，设置页音频开关按「手机不支持」置灰 ——
+     * 这是安全回退方向，与老手机不带尾字段（解为 0）同路。
+     * 只在 [handleControlFrame] 的 HANDSHAKE_RESPONSE 分支更新；判定逻辑在纯函数
+     * [phoneSupportsAudio] 里，服务层零 Compose，UI 经 `collectAsState` 读取。
+     */
+    private val _phoneAudioSupported = MutableStateFlow(false)
+    val phoneAudioSupported: StateFlow<Boolean> = _phoneAudioSupported.asStateFlow()
+
     private val _appList = MutableStateFlow<List<AppInfo>>(emptyList())
     val appList: StateFlow<List<AppInfo>> = _appList.asStateFlow()
 
@@ -733,7 +744,8 @@ class CarConnectionService : Service() {
             screenDpi = dpi,
             targetFps = targetFps,
             dpiOverride = carPrefs.startupDpi,
-            bitrate = carPrefs.startupBitrate
+            bitrate = carPrefs.startupBitrate,
+            audioEnabled = carPrefs.audioEnabled
         )
         ctrl.sendControl(ControlMsg.HANDSHAKE_REQUEST, handshake.encode())
     }
@@ -1067,6 +1079,11 @@ class CarConnectionService : Service() {
                 val response = HandshakeResponse.decode(frame.payload)
                 carLogSend("Handshake OK: ${response.deviceName} jarPath=${response.vdServerJarPath} connMethod=${response.connectionMethod} vdDpi=${response.vdDpi}")
                 _phoneName.value = response.deviceName
+                // 手机端回传的能力位（issue #72, Refs #13）：置灰依据只看这一位，
+                // 不看车机自身 SDK_INT。它是尾字段，老手机解为 0 → 音频置灰，
+                // 属安全回退方向。S3 的 9640 绑定门也会复用同一判据。
+                _phoneAudioSupported.value = phoneSupportsAudio(response.supportedFeatures)
+                carLogSend("Peer features=0x${response.supportedFeatures.toString(16)} audioSupported=${_phoneAudioSupported.value}")
                 // Peer-supplied dims go straight into MediaFormat and into the
                 // rotation guard (`newVpW == vdWidth`). A zero/negative/absurd
                 // value crashes the decoder or permanently suppresses the

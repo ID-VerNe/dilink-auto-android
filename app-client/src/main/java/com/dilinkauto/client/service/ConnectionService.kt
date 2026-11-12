@@ -609,7 +609,11 @@ class ConnectionService : Service() {
             // 裁切——桌面自己的视口是编码尺寸，不是 VD 尺寸（2026-10-09 实锤：
             // 桌面按 1280x720 建 VD，IME 1368px 键盘行被切 88px）。
             vdWidth = vdWidth,
-            vdHeight = vdHeight
+            vdHeight = vdHeight,
+            // 采集端能力位（issue #72, Refs #13）。代理判据 = SDK_INT >= 30，理由与
+            // 已知误报见 [phoneAudioFeatures] 的 KDoc —— 此处无法拿到真实
+            // REMOTE_SUBMIX 结果（响应构造早于 vd-server 部署），不假装精确。
+            supportedFeatures = phoneAudioFeatures(Build.VERSION.SDK_INT)
         )
         handshakeJob?.cancel()
         handshakeJob = serviceScope.launch(Dispatchers.IO) {
