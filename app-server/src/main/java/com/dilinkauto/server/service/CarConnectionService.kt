@@ -179,8 +179,9 @@ class CarConnectionService : Service() {
      * 上一次向手机索要 IDR 的时刻（elapsedRealtime，issue #9）。
      *
      * [VideoDecoder] 在网络线程与喂帧线程都可能报告参考链缺口，这里用 CAS 做成
-     * 全局 ≥[SYNC_FRAME_REQUEST_MIN_INTERVAL_MS] 的限流，避免丢帧风暴时把 CONTROL
-     * 通道刷满。
+     * 全局 ≥[VideoConfig.SYNC_FRAME_REQUEST_MIN_INTERVAL_MS] 的限流，避免丢帧风暴时把 CONTROL
+     * 通道刷满。闸门取值与判定与手机端共用同一份（[VideoConfig.syncFrameRequestAllowed]），
+     * 否则两端阈值漂移会形成「车机放行、手机吞掉」的死区（issue #75）。
      */
     private val lastSyncFrameRequestMs = AtomicLong(0L)
     /**
@@ -380,14 +381,29 @@ class CarConnectionService : Service() {
         // issue #9：参考链断裂时向手机索要一个 IDR，别等下一个自然 GOP 边界。
         // 解码器的缺口可能来自网络线程或喂帧线程 → 这里做全局限流；真正发命令
         // 走 sendCommandToVd（自己切 IO 协程），回调本身必须立即返回。
+        //
+        // 闸门阈值与手机端**共用** VideoConfig.SYNC_FRAME_REQUEST_MIN_INTERVAL_MS：车机 500ms /
+        // 手机 1000ms 的不一致曾形成死区，车机放行的请求到手机被静默吞掉，车机只能干等
+        // 一个自然 GOP（issue #75）。被本闸门挡下时也留一行日志，事后能区分
+        // 「没请求」/「被限流」/「已发出」。
         videoDecoder.onNeedsSyncFrame = {
             val now = SystemClock.elapsedRealtime()
-            val prev = lastSyncFrameRequestMs.get()
-            if (now - prev >= SYNC_FRAME_REQUEST_MIN_INTERVAL_MS &&
-                lastSyncFrameRequestMs.compareAndSet(prev, now)
-            ) {
+            var prev = lastSyncFrameRequestMs.get()
+            var granted = false
+            // CAS 循环：并发丢帧（网络线程 + 喂帧线程）下失败即重读 prev，
+            // 保证每轮都拿最新的「上次放行时刻」判定，节流日志里的间隔不会是过期值。
+            while (VideoConfig.syncFrameRequestAllowed(now, prev)) {
+                if (lastSyncFrameRequestMs.compareAndSet(prev, now)) {
+                    granted = true
+                    break
+                }
+                prev = lastSyncFrameRequestMs.get()
+            }
+            if (granted) {
                 carLogSend("[VideoDecoder] requesting IDR from phone (reference chain broken)")
                 sendCommandToVd(ControlMsg.REQUEST_SYNC_FRAME)
+            } else {
+                carLogSend("[VideoDecoder] IDR request throttled (last request ${now - prev}ms ago, min ${VideoConfig.SYNC_FRAME_REQUEST_MIN_INTERVAL_MS}ms)")
             }
         }
         // issue #15：解码还活着但码流持续是黑（VD 顶层没有可见窗口）。此时不重建 VD
@@ -1934,17 +1950,15 @@ class CarConnectionService : Service() {
         internal const val MAX_BLACK_SCREEN_REBUILDS = 2
 
         /**
-         * 向手机索要 IDR 的最小间隔（issue #9）。车机端一次参考链缺口可能对应
-         * 连续多次丢帧，500ms 足以把重复请求挡掉，又不会让真正的第二次缺口等太久。
-         */
-        internal const val SYNC_FRAME_REQUEST_MIN_INTERVAL_MS = 500L
-
-        /**
          * 视口变化合并窗口（issue #22）。旋转动画/分屏拖动会在数百毫秒内连续上报
          * 多个尺寸；700ms 的静默期既能把它们合成一次重握手，又不会让真正的旋转
          * 明显延迟（issue 建议 500–800ms）。
          */
         internal const val VIEWPORT_REHANDSHAKE_DEBOUNCE_MS = 700L
+
+        // 向手机索要 IDR 的最小间隔（issue #9）已迁到 :protocol-core 的
+        // VideoConfig.SYNC_FRAME_REQUEST_MIN_INTERVAL_MS —— 车机与手机共用同一常量与同一
+        // 判定（VideoConfig.syncFrameRequestAllowed），是本 issue #75 的单一来源。
     }
 }
 
