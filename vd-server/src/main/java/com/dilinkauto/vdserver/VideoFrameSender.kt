@@ -3,10 +3,6 @@ package com.dilinkauto.vdserver
 import com.dilinkauto.protocol.Channel
 import com.dilinkauto.protocol.FrameCodec
 import com.dilinkauto.protocol.VideoMsg
-import java.util.ArrayDeque
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.locks.ReentrantLock
-import kotlin.concurrent.withLock
 
 /**
  * 有界发送队列 + 独立写线程：编码线程只做入队，绝不在 socket 写上空转。
@@ -33,7 +29,7 @@ import kotlin.concurrent.withLock
  * - 写抛异常（即 [FrameCodec.writeAll] 的 5s 无进展）→ [failed] 置位、队列清空、
  *   写线程退出；调用方看到 [failed] 后结束本轮管线，交给会话层重连。
  *
- * 纯 JVM 实现，不引用任何 Android 类型，便于单测。
+ * 纯 JVM 实现，不引用任何 Android 类型，便于单测。委托给 [AsyncSocketSender] 实现通用收敛。
  */
 internal class VideoFrameSender(
     /** 队列容量（帧）。默认 8 帧 ≈ 2Mbps/20fps 下 400ms 的抖动余量。 */
@@ -49,35 +45,38 @@ internal class VideoFrameSender(
 
     private class Pending(val msgType: Byte, val payload: ByteArray, val key: Boolean)
 
-    private val lock = ReentrantLock()
-    private val notEmpty = lock.newCondition()
-    private val queue = ArrayDeque<Pending>(capacity)
-
-    @Volatile private var running = true
-
-    /** 写线程因异常退出后置位；调用方据此结束管线。 */
-    @Volatile var failed = false
-        private set
-
     @Volatile private var maxWriteNanos = 0L
     @Volatile private var dropped = 0L
-    @Volatile private var writer: Thread? = null
 
     /** 最近一帧写耗时；不随 [sampleStats] 归零，供观察与测试读取。 */
     @Volatile var lastWriteNanos = 0L
         private set
 
-    init {
-        require(capacity > 0) { "capacity must be > 0" }
-    }
+    private val sender: AsyncSocketSender<Pending> = AsyncSocketSender<Pending>(
+        capacity = capacity,
+        threadName = "VideoSend",
+        writeItem = { item ->
+            writeFrame(FrameCodec.Frame(Channel.VIDEO, item.msgType, item.payload))
+        },
+        closeChannel = closeChannel,
+        onWriteFailed = { e ->
+            PipeLog.err("VideoSend: write failed, session should reconnect: ${e.message}")
+        },
+        onItemSent = { s, _, took ->
+            lastWriteNanos = took
+            s.withLock {
+                if (took > maxWriteNanos) maxWriteNanos = took
+            }
+        }
+    )
+
+    /** 写线程因异常退出后置位；调用方据此结束管线。 */
+    val failed: Boolean
+        get() = sender.failed
 
     /** 启动写线程。重复调用返回已启动的实例（幂等）。 */
     fun start() {
-        if (writer != null) return
-        writer = Thread({ writerLoop() }, "VideoSend").apply {
-            isDaemon = true
-            start()
-        }
+        sender.start()
     }
 
     /**
@@ -88,23 +87,18 @@ internal class VideoFrameSender(
     fun offer(msgType: Byte, payload: ByteArray, key: Boolean): Boolean {
         // CONFIG 与关键帧同等保护：丢了它车机解码器会一直花屏到下一个自然 IDR。
         val protectedFrame = key || msgType == VideoMsg.CONFIG
-        lock.withLock {
-            if (!running || failed) return false
-            if (queue.size >= capacity) {
-                if (protectedFrame) {
-                    // 直播优先：驱逐最老的 P 帧，把位置让给关键帧。
-                    val victim = queue.firstOrNull { !it.key }
-                    if (victim != null) queue.remove(victim) else queue.pollFirst()
-                    dropped++
-                } else {
-                    // 队列满且新帧是 P 帧：丢新帧，队列里更老的帧已经在路上。
-                    dropped++
-                    return false
-                }
+        return sender.enqueue(Pending(msgType, payload, protectedFrame)) { q ->
+            if (protectedFrame) {
+                // 直播优先：驱逐最老的 P 帧，把位置让给关键帧。
+                val victim = q.firstOrNull { !it.key }
+                if (victim != null) q.remove(victim) else q.removeFirst()
+                dropped++
+                true
+            } else {
+                // 队列满且新帧是 P 帧：丢新帧，队列里更老的帧已经在路上。
+                dropped++
+                false
             }
-            queue.addLast(Pending(msgType, payload, protectedFrame))
-            notEmpty.signal()
-            return true
         }
     }
 
@@ -114,7 +108,7 @@ internal class VideoFrameSender(
      * 编码线程每轮调用一次：`maxWriteNanos` 喂给 [AdaptiveBitrate]，
      * `dropped` 用来触发一次（限流的）IDR 请求。
      */
-    fun sampleStats(): Stats = lock.withLock {
+    fun sampleStats(): Stats = sender.withLock {
         val s = Stats(maxWriteNanos, dropped)
         maxWriteNanos = 0L
         dropped = 0L
@@ -122,60 +116,14 @@ internal class VideoFrameSender(
     }
 
     /** 当前队列深度，仅用于日志。 */
-    val queued: Int get() = lock.withLock { queue.size }
+    val queued: Int get() = sender.queued
 
     override fun close() {
-        running = false
-        // 写线程可能正卡在 FrameCodec.writeAll 的 parkNanos 自旋里（最长 5s），
-        // 关掉 channel 才能让它立刻抛 AsynchronousCloseException 退出。
-        runCatching { closeChannel() }
-        lock.withLock { notEmpty.signalAll() }
-        val t = writer
-        writer = null
-        if (t != null) {
-            runCatching { t.interrupt() }
-            // 有界 join：PipelineServer.cleanup() 等管线线程只有 2s 预算。
-            runCatching { t.join(CLOSE_JOIN_TIMEOUT_MS) }
-        }
-    }
-
-    private fun writerLoop() {
-        try {
-            while (true) {
-                val item = lock.withLock {
-                    while (running && queue.isEmpty()) {
-                        notEmpty.await(POLL_MILLIS, TimeUnit.MILLISECONDS)
-                    }
-                    if (queue.isEmpty()) null else queue.pollFirst()
-                } ?: break
-
-                val startedAt = System.nanoTime()
-                try {
-                    writeFrame(FrameCodec.Frame(Channel.VIDEO, item.msgType, item.payload))
-                } catch (e: Exception) {
-                    failed = true
-                    lock.withLock { queue.clear() }
-                    PipeLog.err("VideoSend: write failed, session should reconnect: ${e.message}")
-                    return
-                }
-                val took = System.nanoTime() - startedAt
-                lastWriteNanos = took
-                if (took > maxWriteNanos) maxWriteNanos = took
-            }
-        } catch (_: InterruptedException) {
-            // close() 主动打断：正常退出路径。
-            Thread.currentThread().interrupt()
-        }
+        sender.close()
     }
 
     companion object {
         /** 默认容量：8 帧。太小吸收不了抖动，太大只会增加延迟。 */
         const val DEFAULT_CAPACITY = 8
-
-        /** 写线程空闲时等待下一帧的轮询粒度（同时用来周期性检查 running）。 */
-        private const val POLL_MILLIS = 100L
-
-        /** close() 等写线程退出的上限，必须小于 PipelineServer 的 2s join 预算。 */
-        private const val CLOSE_JOIN_TIMEOUT_MS = 1500L
     }
 }

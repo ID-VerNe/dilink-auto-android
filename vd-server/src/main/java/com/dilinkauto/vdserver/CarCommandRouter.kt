@@ -49,8 +49,7 @@ internal class CarCommandRouter(
      */
     private val sdkInt: () -> Int = { android.os.Build.VERSION.SDK_INT },
 ) {
-    /** [healDisplay] 的并发去重：车机端每 15s 重试一次，叠加时不能嵌套执行。 */
-    private val healInFlight = AtomicBoolean(false)
+    private val healer = VdDisplayHealer(execOut, displayId, repairLayerTree)
 
     /**
      * [recheckLayersAfterFill] 的并发去重（issue #19）。
@@ -138,104 +137,24 @@ internal class CarCommandRouter(
 
     /** Ping the phone when the last VD activity finishes, so it can stop mirroring. */
     private fun checkStackEmpty() {
-        Thread({
+        daemonThread("StackCheck") {
             try {
                 Thread.sleep(300) // 等 keyevent 生效后再查询
                 val id = displayId()
-                val sec = displaySection(execOut("dumpsys activity activities 2>/dev/null") ?: "", id)
+                val sec = ActivityDumpParser.displaySection(execOut("dumpsys activity activities 2>/dev/null") ?: "", id)
                 val empty = sec == null || sec.lines().none { it.contains("Task{") }
                 PipeLog.log("checkStackEmpty: display=$id empty=$empty")
                 if (empty) onStackEmpty()
             } catch (e: Exception) { PipeLog.err("checkStackEmpty: ${e.message}") }
-        }, "StackCheck").start()
+        }
     }
 
     /**
      * VD 内容持续纯黑时的显示自愈阶梯（issue #15）。
-     *
-     * 实车证据（issue #15）：一个会话里连续启动第 4 个应用后，该 display 的顶层
-     * task 停在 `visible=true visibleRequested=false ... translucent=true`、且没有
-     * `topResumedActivity=`，编码器随之持续输出极小 I 帧（车机侧 32 秒纯黑）；同时
-     * `input -d <vd> keyevent 3/4`（0x11/0x12）在该 ROM 上对该 display 完全无效，
-     * 手机侧没有任何恢复手段，用户只能断连重连。
-     *
-     * 阶梯（每步复查，成功即返回，避免多余的 display 抖动）：
-     *  1. `am start --display <id> --task <taskId> -n <cmp>`：把"已存在但没 resume"的
-     *     顶层任务重新拉到本 display 前台（[quickSwitch] 的同一形态命令已在实机验证
-     *     可把任务迁移到指定 display）；
-     *  2. `am display move-stack <taskId> 0` → `... <id>` 往返：让 WM 重新把任务关联
-     *     到该 display（往返期间任务短暂落到手机物理屏，而会话期间物理屏已被
-     *     `cmd display power-off 0` 熄灭，用户不可见）；
-     *  3. [repairLayerTree]：WM 判据都正常但画面仍黑时才怀疑 SF 层树（Flyme DTA
-     *     孤立），复跑创建期那套旋转往返修复。
-     *
-     * 全程后台线程（3 次 dumpsys + 2 次 move-stack 合计数百毫秒，绝不阻塞
-     * TouchReader）；[healInFlight] 去重。display 段里连 Task 都没有时**不做任何事**
-     * —— 那是 [checkStackEmpty] 的"空栈自动断开"语义，不能在这里把用户踢回桌面。
+     * 委托给 [VdDisplayHealer] 统一执行。
      */
     private fun healDisplay() {
-        if (!healInFlight.compareAndSet(false, true)) {
-            PipeLog.log("healDisplay: already in flight, skip")
-            return
-        }
-        Thread({
-            try {
-                val id = displayId()
-                if (id < 0) { PipeLog.log("healDisplay: skipped, display id unknown"); return@Thread }
-                val sec = displaySection(execOut("dumpsys activity activities 2>/dev/null") ?: "", id)
-                PipeLog.log("healDisplay: display=$id before='${summarizeDisplay(sec)}'")
-                if (sec == null || !sec.contains("Task{")) {
-                    PipeLog.log("healDisplay: display=$id has no task — leave the empty-stack semantics alone")
-                    return@Thread
-                }
-                if (isTopTaskVisible(sec)) {
-                    // WM 侧看起来是可见的，但车机持续报内容黑 —— 现场日志（issue #15）
-                    // 出现过"会话结束 dump 已恢复 visibleRequested=true、画面仍是黑"，
-                    // 所以这里不能直接返回，要走最后的层树检查（健康的 DTA 检查零副作用）。
-                    PipeLog.log("healDisplay: display=$id top task visible in WM but content is black — verify layer tree")
-                } else {
-                    val m = TOP_ACTIVITY_RE.find(sec)
-                    val cmp = m?.groupValues?.get(1)
-                    val taskId = m?.groupValues?.get(2)?.toIntOrNull()
-                    if (cmp.isNullOrBlank() || taskId == null || taskId <= 0) {
-                        PipeLog.log("healDisplay: no top ActivityRecord in display=$id, falling through to layer-tree repair")
-                    } else {
-                        val out = execOut("am start --display $id --task $taskId -n ${VdDeploy.shellQuote(cmp)}")
-                        PipeLog.log("healDisplay: step1 am start -> ${out?.trim()?.replace(Regex("\\s+"), " ")?.take(200) ?: "<no output>"}")
-                        Thread.sleep(HEAL_VERIFY_MS)
-                        val after1 = displaySection(execOut("dumpsys activity activities 2>/dev/null") ?: "", id)
-                        PipeLog.log("healDisplay: after step1='${summarizeDisplay(after1)}'")
-                        if (after1 != null && isTopTaskVisible(after1)) {
-                            PipeLog.log("healDisplay: recovered by step1 (re-front task $taskId)")
-                            return@Thread
-                        }
-                        execOut("am display move-stack $taskId 0")
-                        Thread.sleep(HEAL_VERIFY_MS)
-                        execOut("am display move-stack $taskId $id")
-                        Thread.sleep(HEAL_VERIFY_MS)
-                        val after2 = displaySection(execOut("dumpsys activity activities 2>/dev/null") ?: "", id)
-                        PipeLog.log("healDisplay: after step2='${summarizeDisplay(after2)}'")
-                        if (after2 != null && isTopTaskVisible(after2)) {
-                            PipeLog.log("healDisplay: recovered by step2 (move-stack round trip)")
-                            return@Thread
-                        }
-                    }
-                }
-                PipeLog.log("healDisplay: step3 layer-tree repair")
-                repairLayerTree()
-                val after3 = displaySection(execOut("dumpsys activity activities 2>/dev/null") ?: "", id)
-                PipeLog.log("healDisplay: after step3='${summarizeDisplay(after3)}'")
-                if (after3 != null && isTopTaskVisible(after3)) {
-                    PipeLog.log("healDisplay: recovered by step3 (layer-tree repair)")
-                } else {
-                    PipeLog.err("healDisplay: still black after the whole ladder — see the dumps above")
-                }
-            } catch (e: Exception) {
-                PipeLog.err("healDisplay: ${e.message}")
-            } finally {
-                healInFlight.set(false)
-            }
-        }, "DisplayHeal").start()
+        healer.healDisplay()
     }
 
     /**
@@ -263,19 +182,19 @@ internal class CarCommandRouter(
     fun ensureDisplayHasContent(id: Int) {
         if (id < 0) return
         try {
-            val sec = displaySection(execOut("dumpsys activity activities 2>/dev/null") ?: "", id)
-            if (sec != null && sec.contains("Task{") && isTopTaskVisible(sec)) {
+            val sec = ActivityDumpParser.displaySection(execOut("dumpsys activity activities 2>/dev/null") ?: "", id)
+            if (sec != null && sec.contains("Task{") && ActivityDumpParser.isTopTaskVisible(sec)) {
                 PipeLog.log("ensureContent: display=$id already has a visible task")
                 return
             }
-            val current = sec?.let { TOP_ACTIVITY_RE.find(it) }?.groupValues?.get(2)?.toIntOrNull()
+            val current = sec?.let { ActivityDumpParser.TOP_ACTIVITY_RE.find(it) }?.groupValues?.get(2)?.toIntOrNull()
             val recents = execOut("dumpsys activity recents 2>/dev/null")
                 ?.let { RecentsParser.parse(it) } ?: emptyList()
             // issue #21：建屏恢复属于系统替用户做的动作，只在车机白名单内挑选目标；
             // 白名单外的应用（银行/相册/Shizuku 管理器等）不得被拉到车机屏。
             val target = RecentsParser.pickQuickSwitchTarget(recents, current, SELF_PACKAGE, allowedPackages)
             PipeLog.log(
-                "ensureContent: display=$id has no visible window (before='${summarizeDisplay(sec)}'), " +
+                "ensureContent: display=$id has no visible window (before='${ActivityDumpParser.summarizeDisplay(sec)}'), " +
                     "${recents.size} live tasks, allowlist=" +
                     (allowedPackages.size.takeIf { it > 0 }?.toString() ?: "<not handed down>") +
                     ", target=" +
@@ -287,13 +206,13 @@ internal class CarCommandRouter(
             }
             val out = execOut("am start --display $id --task ${target.taskId} -n ${VdDeploy.shellQuote(target.component)}")
             PipeLog.log("ensureContent: am start -> ${out?.trim()?.replace(Regex("\\s+"), " ")?.take(200) ?: "<no output>"}")
-            Thread.sleep(HEAL_VERIFY_MS)
-            val after = displaySection(execOut("dumpsys activity activities 2>/dev/null") ?: "", id)
-            if (after != null && isTopTaskVisible(after)) {
+            Thread.sleep(VdDisplayHealer.HEAL_VERIFY_MS)
+            val after = ActivityDumpParser.displaySection(execOut("dumpsys activity activities 2>/dev/null") ?: "", id)
+            if (after != null && ActivityDumpParser.isTopTaskVisible(after)) {
                 PipeLog.log("ensureContent: restored ${target.packageName} (Task ${target.taskId}) on display=$id")
                 fillTask(target.taskId, id)
             } else {
-                PipeLog.err("ensureContent: ${target.packageName} did not become display $id's visible task (after='${summarizeDisplay(after)}')")
+                PipeLog.err("ensureContent: ${target.packageName} did not become display $id's visible task (after='${ActivityDumpParser.summarizeDisplay(after)}')")
             }
         } catch (e: Exception) {
             PipeLog.err("ensureContent: ${e.message}")
@@ -314,14 +233,14 @@ internal class CarCommandRouter(
      * 切换」一致。整段异步（两个 dumpsys 各几百毫秒），绝不阻塞 TouchReader。
      */
     private fun quickSwitch() {
-        Thread({
+        daemonThread("QuickSwitch") {
             try {
                 val id = displayId()
                 val recents = execOut("dumpsys activity recents 2>/dev/null")
                     ?.let { RecentsParser.parse(it) } ?: emptyList()
                 val activities = execOut("dumpsys activity activities 2>/dev/null")
-                val current = activities?.let { displaySection(it, id) }
-                    ?.let { TOP_ACTIVITY_RE.find(it) }?.groupValues?.get(2)?.toIntOrNull()
+                val current = activities?.let { ActivityDumpParser.displaySection(it, id) }
+                    ?.let { ActivityDumpParser.TOP_ACTIVITY_RE.find(it) }?.groupValues?.get(2)?.toIntOrNull()
                 val target = RecentsParser.pickQuickSwitchTarget(recents, current, SELF_PACKAGE)
                 PipeLog.log(
                     "quickSwitch: ${recents.size} live tasks, current=$current, target=" +
@@ -336,7 +255,7 @@ internal class CarCommandRouter(
                     recheckLayersAfterFill()
                 }
             } catch (e: Exception) { PipeLog.err("quickSwitch: ${e.message}") }
-        }, "QuickSwitch").start()
+        }
     }
 
     /**
@@ -354,14 +273,14 @@ internal class CarCommandRouter(
      * 失败只记日志 —— 窗口小不是错误，不值得惊动车机。
      */
     private fun fillLaunchedApp(pkg: String) {
-        Thread({
+        daemonThread("FillDisplay") {
             try {
                 val id = displayId()
                 if (id >= 0) {
                     var taskId: Int? = null
                     for (attempt in 1..FILL_RETRIES) {
-                        val sec = displaySection(execOut("dumpsys activity activities 2>/dev/null") ?: "", id)
-                        val m = sec?.let { TOP_ACTIVITY_RE.find(it) }
+                        val sec = ActivityDumpParser.displaySection(execOut("dumpsys activity activities 2>/dev/null") ?: "", id)
+                        val m = sec?.let { ActivityDumpParser.TOP_ACTIVITY_RE.find(it) }
                         val comp = m?.groupValues?.get(1)
                         if (comp != null && comp.startsWith("$pkg/")) {
                             taskId = m.groupValues[2].toIntOrNull()
@@ -379,7 +298,7 @@ internal class CarCommandRouter(
                     }
                 }
             } catch (e: Exception) { PipeLog.err("launchApp fill: ${e.message}") }
-        }, "FillDisplay").start()
+        }
     }
 
     /**
@@ -390,9 +309,9 @@ internal class CarCommandRouter(
      */
     private fun fillTask(taskId: Int, id: Int) {
         val size = execOut("wm size -d $id 2>/dev/null")
-        val dims = WM_SIZE_RE.find(size ?: "")
-        val w = dims?.groupValues?.get(1)?.toIntOrNull()
-        val h = dims?.groupValues?.get(2)?.toIntOrNull()
+        val dims = ActivityDumpParser.parseWmSize(size)
+        val w = dims?.first
+        val h = dims?.second
         if (taskId <= 0 || w == null || h == null) {
             PipeLog.log("fill: skipping task $taskId (display $id size='${size?.trim() ?: "<null>"}')")
             return
@@ -444,12 +363,12 @@ internal class CarCommandRouter(
         }
         try {
             val dump = execOut("dumpsys activity activities 2>/dev/null") ?: return
-            val sec = displaySection(dump, fromDisplay)
+            val sec = ActivityDumpParser.displaySection(dump, fromDisplay)
             if (sec == null) {
                 PipeLog.log("moveTopApp: no 'Display #$fromDisplay' section found, skip")
                 return
             }
-            val match = TOP_ACTIVITY_RE.find(sec)
+            val match = ActivityDumpParser.TOP_ACTIVITY_RE.find(sec)
             val topComponent = match?.groupValues?.get(1)
             val taskId = match?.groupValues?.get(2)
             // 跳过自家控制端：DiLinkAuto 自己的 Activity 搬进 VD 没有镜像价值
@@ -491,12 +410,12 @@ internal class CarCommandRouter(
         try {
             Thread.sleep(TEARDOWN_PROBE_DELAY_MS)
             val dump = execOut("dumpsys activity activities 2>/dev/null")
-            val located = dump?.let { findTaskSection(it, taskId) }
-            val block = located?.let { taskBlock(it.second, taskId) }
+            val located = dump?.let { ActivityDumpParser.findTaskSection(it, taskId) }
+            val block = located?.let { ActivityDumpParser.taskBlock(it.second, taskId) }
             val display = located?.first?.toString() ?: "<unknown>"
-            val bounds = block?.let { extractBounds(it) } ?: "<unknown>"
-            val compat = block?.let { extractCompat(it) } ?: "<unknown>"
-            val density = block?.let { extractDensity(it) } ?: "<unknown>"
+            val bounds = block?.let { ActivityDumpParser.extractBounds(it) } ?: "<unknown>"
+            val compat = block?.let { ActivityDumpParser.extractCompat(it) } ?: "<unknown>"
+            val density = block?.let { ActivityDumpParser.extractDensity(it) } ?: "<unknown>"
             PipeLog.log(
                 "[teardown-move] task=$taskId moved-to=$toDisplay displayId=$display " +
                     "bounds=$bounds compat=$compat densityDpi=$density"
@@ -517,9 +436,9 @@ internal class CarCommandRouter(
     fun logTeardownDisplaySnapshot(vdDisplayId: Int) {
         try {
             val windowDump = execOut("dumpsys window displays 2>/dev/null")
-            val zero = displayZeroConfig(windowDump)
+            val zero = ActivityDumpParser.displayZeroConfig(windowDump)
             val activitiesDump = execOut("dumpsys activity activities 2>/dev/null")
-            val residual = if (vdDisplayId >= 0) tasksInDisplay(activitiesDump, vdDisplayId) else emptyList()
+            val residual = if (vdDisplayId >= 0) ActivityDumpParser.tasksInDisplay(activitiesDump, vdDisplayId) else emptyList()
             PipeLog.log(
                 "[teardown-display] display#0 init=${zero?.first ?: "<unknown>"} cur=${zero?.second ?: "<unknown>"} " +
                     "vd=$vdDisplayId residualTasks=${residual.joinToString(prefix = "[", postfix = "]")}"
@@ -527,116 +446,6 @@ internal class CarCommandRouter(
         } catch (e: Exception) {
             PipeLog.err("[teardown-display] probe failed: ${e.message}")
         }
-    }
-
-    /**
-     * 在 `dumpsys activity activities` 里定位包含 [taskId] 的 display 段。
-     *
-     * issue #77：这里原本也把「最后一个 display 段」一路切到字符串末尾（与本 issue 的同根因），
-     * 于是 `ActivityTaskSupervisor state:` 里对物理屏顶层任务的引用会被算进它前面那个 display 段，
-     * `[teardown-move] displayId=` 可能报错 display。现在统一用 [ActivityDumpParser.displaySection]
-     * 的有上界切法 —— 只收窄，字段名与日志格式不变。
-     */
-    private fun findTaskSection(dump: String, taskId: Int): Pair<Int, String>? {
-        val headerMatcher = ActivityDumpParser.taskHeaderMatcher(taskId)
-        for (header in DISPLAY_HEADER_RE.findAll(dump)) {
-            val displayId = header.groupValues[1].toIntOrNull() ?: continue
-            val section = ActivityDumpParser.displaySection(dump, displayId) ?: continue
-            // Task 头是 `#<id> `，ActivityRecord 行是 `t<id>}`；两者任一命中即可。
-            if (section.contains("t$taskId}") || headerMatcher.containsMatchIn(section)) {
-                return displayId to section
-            }
-        }
-        return null
-    }
-
-    /** 取该 task 从头部到下一个 `* Task{` 之间的块（含它的 ActivityRecord 配置行）。 */
-    private fun taskBlock(section: String, taskId: Int): String? {
-        val header = ActivityDumpParser.taskHeaderMatcher(taskId).find(section) ?: return null
-        val next = section.indexOf("* Task{", header.range.last + 1)
-        return section.substring(header.range.first, if (next > header.range.first) next else section.length)
-    }
-
-    /**
-     * `dumpsys window displays` 里 display#0 的 `init=` / `cur=`。
-     *
-     * 实机形态：`Display: mDisplayId=0` 下一行 `init=1368x3192 560dpi cur=1368x3192
-     * app=...`；按下一个 `mDisplayId=` 截段，避免读到 VD 的配置。
-     */
-    private fun displayZeroConfig(dump: String?): Pair<String, String>? {
-        if (dump == null) return null
-        val start = dump.indexOf("mDisplayId=0")
-        if (start < 0) return null
-        val next = dump.indexOf("mDisplayId=", start + 1).takeIf { it > start } ?: dump.length
-        val section = dump.substring(start, next)
-        val init = Regex("init=(\\S+\\s+\\d+dpi)").find(section)?.groupValues?.get(1)
-            ?: Regex("init=(\\S+)").find(section)?.groupValues?.get(1)
-            ?: return null
-        val cur = Regex("cur=(\\S+)").find(section)?.groupValues?.get(1) ?: "<unknown>"
-        return init to cur
-    }
-
-    /** 某 display 段里所有 task id（issue #48：仍留在 VD 上的任务；issue #77 去重、不跨屏）。 */
-    private fun tasksInDisplay(dump: String?, id: Int): List<Int> {
-        val section = dump?.let { ActivityDumpParser.displaySection(it, id) } ?: return emptyList()
-        return ActivityDumpParser.taskIdsInSection(section)
-    }
-
-    /** `am task` 的 bounds：兼容 `bounds=[0,0][2340,1316]` 与 `mBounds=Rect(...)` 两种写法。 */
-    private fun extractBounds(block: String): String? =
-        Regex("(?:mBounds|bounds)=(\\[[^\\]]*\\](?:\\[[^\\]]*\\])?|\\([^)]*\\))")
-            .find(block)?.groupValues?.get(1)
-
-    /**
-     * 任务级兼容/窗口状态。不同 ROM 的 dump 字段名不一致，按已知键依次尝试：
-     * `mWindowingMode`（issue 取证命令里用到的字段）、`compat`、`mOverrideConfig`。
-     */
-    private fun extractCompat(block: String): String? =
-        Regex("mWindowingMode=([^\\s,}]+)").find(block)?.groupValues?.get(1)
-            ?: Regex("compat=([^\\s,}]+)").find(block)?.groupValues?.get(1)
-            ?: Regex("mOverrideConfig=([^\\n]+)").find(block)?.groupValues?.get(1)?.trim()?.take(80)
-
-    /** 任务级密度：优先 `densityDpi=`，回退到 `NNNdpi`（Configuration 的实机写法）。 */
-    private fun extractDensity(block: String): String? =
-        Regex("densityDpi=(\\d+)").find(block)?.groupValues?.get(1)
-            ?: Regex("(\\d+)dpi").find(block)?.groupValues?.get(1)
-
-    /**
-     * 切出 `Display #<id> ` 段（issue #77）。
-     *
-     * 逻辑与 `WindowStateParser` 共用，已合并到 [ActivityDumpParser.displaySection]：
-     * 修复前这里和 `WindowStateMonitor` 各有一份逐字相同的实现，且都用「下一个 `Display #`」
-     * 作唯一结束标记 —— 目标 display 是最后一个时一路吃到字符串末尾，把物理屏的
-     * `Display: mDisplayId=0 …` 与 task 引用一起吞进来（跨屏泄漏），与 `TASK_ID_RE`
-     * 同时命中 task 头与引用行叠加，构成 issue #77 的「重复计数 + 跨屏泄漏」。
-     */
-    private fun displaySection(dump: String, id: Int): String? =
-        ActivityDumpParser.displaySection(dump, id)
-
-    /**
-     * 该 display 段的顶层 Task 是否 `visibleRequested=true`。
-     *
-     * 只取段内第一个 Task{}（activity 按 top→bottom 排列，首个即顶层）。判据来自
-     * issue #15 的现场差异：健康时 `visible=true visibleRequested=true` 且带
-     * `topResumedActivity=`；黑屏时同一行是 `visible=true visibleRequested=false`。
-     * `visibleRequested=false` 表示窗口容器没有请求可见 —— 无论 WM 是否还标着
-     * `visible=true`，该 display 上都不会有内容被合成。
-     */
-    private fun isTopTaskVisible(section: String): Boolean {
-        val inner = TOP_TASK_RE.find(section)?.groupValues?.get(1) ?: return false
-        return inner.contains("visibleRequested=true")
-    }
-
-    /**
-     * 把 display 段压成单行并保留足够长度，供 [healDisplay] 落盘。
-     *
-     * 全局 [ShellExec] 只记 400 字符摘要，`visibleRequested` 之后的 ActivityRecord
-     * 列表、`isSleeping`、bounds 全被截掉 —— issue #15 就是因为这个截断无法在
-     * "WM 未 resume"与"SF 层树脱同步"之间实锤。只在这一条路径上放开到 2000 字符。
-     */
-    private fun summarizeDisplay(section: String?): String {
-        if (section == null) return "<no section>"
-        return section.trim().replace(Regex("\\s+"), " ").take(HEAL_DUMP_LOG_CHARS)
     }
 
     private companion object {
@@ -649,48 +458,22 @@ internal class CarCommandRouter(
         val SELF_PACKAGE = AppTargets.PHONE_MAIN_ACTIVITY.substringBefore('/')
 
         /**
-         * `dumpsys activity activities` 里的 ActivityRecord 行：捕获 组件 与 所在
-         * task id。在某个 display 段内首个匹配即该段顶层（ActivityRecord 按
-         * top→bottom 排列）：[moveTopApp] 用组件判断要不要搬，[quickSwitch]
-         * 用 task id 排除「当前顶层」。
-         */
-        val TOP_ACTIVITY_RE = Regex("ActivityRecord\\{[^ ]+ [^ ]+ ([^/ ]+/[^ } ]+) t(\\d+)\\}")
-
-        /**
          * 「铺满 VD」的轮询预算：8 × 300ms ≈ 2.4s，覆盖 am start 的异步落地
          * （见 [fillLaunchedApp]）。
          */
         const val FILL_RETRIES = 8
         const val FILL_POLL_MS = 300L
 
-        /** `wm size -d <id>` 输出 "Physical size: 2340x1316" 里的首个 WxH。 */
-        val WM_SIZE_RE = Regex("(\\d+)x(\\d+)")
-
-        /** `dumpsys activity activities` 的 `Display #<id> ` 段头（issue #48 回读用）。 */
-        val DISPLAY_HEADER_RE = Regex("Display #(\\d+) ")
-
         /**
          * issue #48：`am display move-stack` 是异步入队的，回读前等一个很短的时间；
-         * 300ms 与其它复查点（[HEAL_VERIFY_MS]）同量级，不改变清理流程。
+         * 300ms 与其它复查点同量级，不改变清理流程。
          */
         const val TEARDOWN_PROBE_DELAY_MS = 300L
-
-        /**
-         * `dumpsys activity activities` 的 Task 行：取花括号内文本，供
-         * [isTopTaskVisible] 读 `visibleRequested`（issue #15）。
-         */
-        val TOP_TASK_RE = Regex("Task\\{([^}]*)\\}")
-
-        /** [healDisplay] 每步复查前的等待：am start / move-stack 落地都是异步的。 */
-        const val HEAL_VERIFY_MS = 400L
 
         /**
          * [recheckLayersAfterFill] 的等待：实车是 `am task resize` 之后约 1.6s 才
          * 观察到 DTA 被踢出层树（issue #19），1.5s 会早于故障发生，取 1.8s 留余量。
          */
         const val LAYER_RECHECK_DELAY_MS = 1_800L
-
-        /** 自愈路径落盘的 display 段长度上限，见 [summarizeDisplay]。 */
-        const val HEAL_DUMP_LOG_CHARS = 2000
     }
 }

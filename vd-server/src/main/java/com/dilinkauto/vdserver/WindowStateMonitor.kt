@@ -48,7 +48,7 @@ internal class WindowStateMonitor(
     fun start() {
         if (running) return
         running = true
-        thread = Thread({ loop() }, "WindowState").apply { isDaemon = true; start() }
+        thread = daemonThread("WindowState", start = true) { loop() }
     }
 
     /** 幂等停止；最多等 500ms，绝不把 cleanup 挂住。 */

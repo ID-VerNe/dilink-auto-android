@@ -5,9 +5,6 @@ import com.dilinkauto.protocol.AudioPayload
 import com.dilinkauto.protocol.Channel
 import com.dilinkauto.protocol.FrameCodec
 import java.nio.channels.SocketChannel
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.locks.ReentrantLock
-import kotlin.concurrent.withLock
 
 /**
  * [AudioPipeline.Sink] 的 9640 落链（issue #73 / S3-PA）。
@@ -28,7 +25,7 @@ import kotlin.concurrent.withLock
  * 之后所有 FRAME 都是噪声——因此队头是 CONFIG 时改丢它后面最老的那一帧
  * （[audioEvictIndex]）。被丢的帧计入 [droppedFrames]。
  *
- * 纯 JVM 实现（socket 通过 [writeFrame] 注入），便于单测。
+ * 纯 JVM 实现（socket 通过 [writeFrame] 注入），便于单测。委托给 [AsyncSocketSender] 实现通用收敛。
  */
 internal class SocketAudioSink internal constructor(
     /** 队列容量（帧）。默认 48 帧 ≈ 1.02s @46.875fps 的抖动余量。 */
@@ -48,23 +45,6 @@ internal class SocketAudioSink internal constructor(
         closeChannel = { try { channel.close() } catch (_: Exception) {} }
     )
 
-    private val lock = ReentrantLock()
-    private val notEmpty = lock.newCondition()
-
-    /**
-     * Kotlin 的 [ArrayDeque]（非 `java.util`）—— 需要按**下标**移除（见
-     * [audioEvictIndex] 的「保 CONFIG、丢它后面那帧」），`java.util.ArrayDeque`
-     * 只有 `remove(Object)`。
-     */
-    private val queue = ArrayDeque<FrameCodec.Frame>(capacity)
-
-    @Volatile private var running = true
-
-    /** 写线程因异常退出后置位；调用方据此结束音频而不影响视频会话。 */
-    @Volatile
-    var failed = false
-        private set
-
     /** 已成功写到 socket 的 FRAME 帧数（不含 CONFIG）。周期日志与 S6 的线性增长判据用它。 */
     @Volatile
     var sentFrames = 0L
@@ -80,23 +60,43 @@ internal class SocketAudioSink internal constructor(
     var droppedFrames = 0L
         private set
 
-    @Volatile private var writer: Thread? = null
+    private val sender: AsyncSocketSender<FrameCodec.Frame> = AsyncSocketSender<FrameCodec.Frame>(
+        capacity = capacity,
+        threadName = "AudioSend",
+        writeItem = { frame ->
+            writeFrame(frame)
+        },
+        closeChannel = closeChannel,
+        onWriteFailed = { e ->
+            PipeLog.err("AudioSend: write failed, audio disabled: ${e.message}")
+        },
+        onItemSent = { s, frame, _ ->
+            if (frame.messageType == AudioMsg.CONFIG) {
+                sentConfigs++
+            } else {
+                val n = sentFrames + 1
+                sentFrames = n
+                // S6 依赖的可 grep 周期行：帧数 + 时间（logClock 前缀 HH:mm:ss.SSS）。
+                if (n % FRAME_LOG_INTERVAL == 0L) {
+                    PipeLog.logClock(
+                        "Audio: sent frames=$n configs=$sentConfigs dropped=$droppedFrames queued=${s.queued}"
+                    )
+                }
+            }
+        }
+    )
 
-    init {
-        require(capacity > 0) { "capacity must be > 0" }
-    }
+    /** 写线程因异常退出后置位；调用方据此结束音频而不影响视频会话。 */
+    val failed: Boolean
+        get() = sender.failed
 
     /** 启动写线程。重复调用返回已启动的实例（幂等）。 */
     fun start() {
-        if (writer != null) return
-        writer = Thread({ writerLoop() }, "AudioSend").apply {
-            isDaemon = true
-            start()
-        }
+        sender.start()
     }
 
     /** 当前队列深度，仅用于日志。 */
-    val queued: Int get() = lock.withLock { queue.size }
+    val queued: Int get() = sender.queued
 
     override fun onConfig(config: AudioPayload.Config) {
         offer(audioConfigFrame(config))
@@ -111,88 +111,28 @@ internal class SocketAudioSink internal constructor(
      *
      * 不做任何 socket I/O，对采集线程是常数级开销（仅一次加锁 + 至多一次驱逐）。
      */
-    private fun offer(frame: FrameCodec.Frame): Boolean = lock.withLock {
-        if (!running || failed) return false
-        if (queue.size >= capacity) {
-            // audioEvictIndex 只看「队头是不是 CONFIG」，不关心新来的是什么类型：
-            // 音频每一帧等权，丢最旧能把延迟贴回当前时刻（与视频的丢 P 帧策略不同）。
-            val idx = audioEvictIndex(queue.size, queue.first().messageType == AudioMsg.CONFIG)
-            if (idx == null) {
-                // 队列里只剩一个 CONFIG：宁丢新帧，也不能丢 csd。
-                droppedFrames++
-                return false
-            }
-            queue.removeAt(idx)
+    private fun offer(frame: FrameCodec.Frame): Boolean = sender.enqueue(frame) { q ->
+        // audioEvictIndex 只看「队头是不是 CONFIG」，不关心新来的是什么类型：
+        // 音频每一帧等权，丢最旧能把延迟贴回当前时刻（与视频的丢 P 帧策略不同）。
+        val idx = audioEvictIndex(q.size, q.first().messageType == AudioMsg.CONFIG)
+        if (idx == null) {
+            // 队列里只剩一个 CONFIG：宁丢新帧，也不能丢 csd。
             droppedFrames++
+            false
+        } else {
+            q.removeAt(idx)
+            droppedFrames++
+            true
         }
-        queue.addLast(frame)
-        notEmpty.signal()
-        true
     }
 
     override fun close() {
-        running = false
-        // 写线程可能正卡在 FrameCodec.writeAll 的 parkNanos 自旋里（最长 10s），
-        // 关掉 channel 才能让它立刻抛 AsynchronousCloseException 退出。
-        runCatching { closeChannel() }
-        lock.withLock { notEmpty.signalAll() }
-        val t = writer
-        writer = null
-        if (t != null) {
-            runCatching { t.interrupt() }
-            // 有界 join：PipelineServer.cleanup() 给管线线程只有 2s 预算，
-            // 音频关闭（AudioPipeline.close 的 1.5s + 这里的 1.5s）合计须小于它之外
-            // 的预算——实际两者串行，但都在 cleanup 关音频那一步里，见 cleanup()。
-            runCatching { t.join(CLOSE_JOIN_TIMEOUT_MS) }
-        }
-    }
-
-    private fun writerLoop() {
-        try {
-            while (true) {
-                val frame = lock.withLock {
-                    while (running && queue.isEmpty()) {
-                        notEmpty.await(POLL_MILLIS, TimeUnit.MILLISECONDS)
-                    }
-                    if (queue.isEmpty()) null else queue.removeFirst()
-                } ?: break
-
-                try {
-                    writeFrame(frame)
-                } catch (e: Exception) {
-                    failed = true
-                    lock.withLock { queue.clear() }
-                    PipeLog.err("AudioSend: write failed, audio disabled: ${e.message}")
-                    return
-                }
-                if (frame.messageType == AudioMsg.CONFIG) {
-                    sentConfigs++
-                    continue
-                }
-                val n = sentFrames + 1
-                sentFrames = n
-                // S6 依赖的可 grep 周期行：帧数 + 时间（logClock 前缀 HH:mm:ss.SSS）。
-                if (n % FRAME_LOG_INTERVAL == 0L) {
-                    PipeLog.logClock(
-                        "Audio: sent frames=$n configs=$sentConfigs dropped=$droppedFrames queued=${queued}"
-                    )
-                }
-            }
-        } catch (_: InterruptedException) {
-            // close() 主动打断：正常退出路径。
-            Thread.currentThread().interrupt()
-        }
+        sender.close()
     }
 
     companion object {
         /** 默认容量：48 帧 ≈ 1.02s。太小吸收不了抖动，太大只增加延迟。 */
         const val DEFAULT_CAPACITY = 48
-
-        /** 写线程空闲时等待下一帧的轮询粒度（同时用来周期性检查 running）。 */
-        private const val POLL_MILLIS = 100L
-
-        /** close() 等写线程退出的上限，必须小于 PipelineServer 的 2s join 预算。 */
-        private const val CLOSE_JOIN_TIMEOUT_MS = 1500L
 
         /** 每写出多少帧打一行周期日志（48kHz/1024samples → 120 帧 ≈ 2.56s）。 */
         const val FRAME_LOG_INTERVAL = 120L
