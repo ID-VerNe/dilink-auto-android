@@ -68,7 +68,7 @@ class AppIconStore(
          * 解压炸弹的另一种形态是"合法尺寸、但被刻意撑大的 PNG"（极大 palette /
          * ancillary chunk）。1MB 足够任何真实图标（512x512 的 PNG 通常 < 300KB）。
          */
-        const val MAX_ICON_BYTES = 1 shl 20
+        const val MAX_ICON_BYTES = 1048576 // 1 shl 20 (1 MB)
 
         /**
          * 默认解码器：把 PNG 字节解成 [BufferedImage]。失败（或不合法）返回 null，
