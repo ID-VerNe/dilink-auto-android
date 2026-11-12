@@ -16,25 +16,32 @@
 # 不假通过（S6 是「脚本先落地」，真机判据待两台设备回签，见 issue #79）。
 #
 # ── 五条判据（#13 §4.5）──────────────────────────────────────────────────
-#   1. vd-server 侧音频帧计数 > 0 且窗口内增长（名义 ≈46.875 帧/s）
-#   2. app-server 侧 decoded > 0、无突发时 starved == 0、underrun 不随时间增长
+#   1. vd-server 侧音频帧计数 > 0 且窗口内增长（名义 ≈46.875 帧/s；判据 = 两点增长
+#      + 速率下限 ≥20 帧/s，**非严格线性拟合**）
+#   2. app-server 侧 decoded > 0、starved == 0（会话全程累计口径，含起播期）、
+#      underrun 不随时间增长（delta 口径，容忍起播期恒定噪声）
 #   3. 静音期补帧计数 > 0 且 starved == 0（F2 判据）
 #   4. screen_off 后 10s 内音频帧仍增长（覆盖 R7）
-#   5. 音频通道失败/降级时视频会话仍存活（降级判据）
+#   5. 音频通道失败/降级时视频会话仍存活（降级判据：双端 STREAMING + 9638 ESTABLISHED）
 #
-# ── 防假绿墓碑（S2 第三轮评审 P0 机理，**本场景存在的理由**）──────────────
+# ── 组合判据的真实覆盖面：传输 + 解码链路失败（S2 第三轮评审 P0 机理是立项理由）──────
 # `.agents/teamwork/reviewer_70_s2_r3/handoff.md` P0-1：采集线程曾漏掉
 # `AudioRecord.startRecording()`，`read()` 恒返 0 → 采集线程只按 46.875 帧/s 节拍
-# 补**静音帧**，`frameCount` **照样**线性增长。于是判据 #1 **单独不成立**——
-# 「只出静音帧」这种静默失败会被判成成功。**故判据 #1 必须与判据 #2（播放端真的
-# 解出了帧）组合**，本场景两条一起记账，缺一即 FAIL（下方「组合判据」）。
+# 补**静音帧**，`frameCount` **照样**增长。故判据 #1 **单独不足以判成功**。
 #
-# 残留局限（诚实标注，不夸大覆盖）：PB 的日志契约
-# （decoded / starved / underrun / maxRecoverMs / queue）**不含静音/幅度字段**，
-# 故「只出静音帧」理论上仍可能同时骗过 #1 与 #2。唯一能直接区分的是 vd-server 终局行
+# 本场景的「组合判据」= 判据 #1（vd 帧 >0 且增长）∧ 判据 #2（播放端 decoded >0），
+# 二者同时成立才 ok。它**真正兜住的是传输 / 解码链路断裂**：9640 未绑 / 无接收端 /
+# 连接断 / 解码器建不起来 → decoded==0 → 组合判据 FAIL。这有价值，但**不是所引 P0**。
+#
+# **它兜不住所引的 P0**：源侧只出静音帧时，AAC 照样编码出帧 → vd frames 增长（#1 过），
+# 车机 feedDecoder 成功 → decodedFrames++（#2 也过）→ 组合判据**照绿**。
+# PB 日志契约（decoded / starved / underrun / maxRecoverMs / queue）**不含静音/幅度字段**，
+# **源侧静音（漏 `startRecording`）不可由本场景区分，需人工听觉回签**（issue #79）。
+#
+# 残留局限（诚实标注，不夸大覆盖）：唯一能直接区分静音的是 vd-server 终局行
 # `Audio: capture stopped (frames=N, silence=M)` 的 silence 计数（silence≈frames =
 # 纯静音），而该行只在会话结束（scenario_restore）时产生、asserts 窗口内取不到
-# → 判据 #3 的「补帧计数 > 0」降为观测项（见下方 judgement 3 说明与 issue #79）。
+# → 判据 #3 的「补帧计数 >0」降为观测项（见下方 judgement 3 说明与 issue #79）。
 #
 # ── 日志契约（正则集中在本常量区，禁止在断言里散落 —— S6 立项明确要求「避免猜测正则」）──
 # PA 周期行（PR #78，vd-server/.../SocketAudioSink.kt:177，每 120 FRAME 一行 ≈2.56s）：
@@ -200,10 +207,18 @@ scenario_asserts() {
       bad "判据2 播放端 decoded 非 >0（decoded=${dec:-无}）——解码器未出帧"
       rc=1
     fi
+    # 判据 #2 的 starved 口径（**显式声明，不是 delta**）：`starved` 是 PB 会话内累计值
+    # （AudioPlayer.kt:303 `starvedFrames.incrementAndGet`，仅 start() 时清零），**不回零**。
+    # 本判据取绝对值 ⇒ **要求会话全程零欠载**（含起播期），非只看窗口增量。
+    # 依据：§4.5 判据 #2 原文即「无突发时 starved == 0」，且 §2.5 A1/A2/A3 无突发组
+    # 实测 starved 均为 0（起播期噪声只出现在 `underrun`=3，非 starved）。故此处与
+    # `underrun` 的 delta 口径**有意不对称**：`underrun` 容忍起播期恒定噪声，`starved`
+    # 不容忍。若真机首跑因起播期 starved 假红（FLAKY 复跑仍红），按实测校准为 delta
+    # 口径——**校准须留证据**，不得为过而静默放宽。
     if [ "$star" = "0" ]; then
-      ok "判据2 无突发时 starved == 0（starved=$star）"
+      ok "判据2 会话全程 starved == 0（无突发且无起播欠载；starved=$star）"
     else
-      bad "判据2 无突发时 starved ≠ 0（starved=${star:-无}）——播放端欠载"
+      bad "判据2 会话累计 starved ≠ 0（starved=${star:-无}）——播放端欠载（含起播期，见上口径说明）"
       rc=1
     fi
     if [ -n "$p0" ]; then
@@ -221,12 +236,14 @@ scenario_asserts() {
     else
       log_step "判据2 underrun 增长判据：熄灭前无播放端统计行（PB 未出/未连接），跳过对照（非通过，见上）"
     fi
-    # 「组合判据」——防假绿核心：vd 帧增长 **且** 播放端已解码，两条同时成立才算
-    # 排除了「只出静音帧」的部分风险（见脚本头墓碑）。
+    # 「组合判据」——覆盖**传输 + 解码链路失败**：vd 帧增长 **且** 播放端已解码，两条
+    # 同时成立才 ok。它兜的是 9640 未绑 / 无接收端 / 连接断 / 解码器未起（decoded==0）；
+    # **它兜不住源侧只出静音帧**（漏 `startRecording`）——那种情况 decoded 照样 >0，
+    # 需人工听觉回签（详见脚本头）。**不宣称防静音假绿。**
     if [ -n "$f1" ] && [ -n "$dec" ] && [ "$dec" -gt 0 ]; then
-      ok "组合判据 防假绿：vd 帧增长 且 播放端 decoded>0（#1 ∧ #2 同时成立）"
+      ok "组合判据 传输+解码链路成立：vd 帧增长 且 播放端 decoded>0（#1 ∧ #2）"
     else
-      bad "组合判据 防假绿未成立：vd 帧=${f1:-无} / decoded=${dec:-无}（判据 #1 单独不足以排除「只出静音帧」）"
+      bad "组合判据 传输/解码链路未成立：vd 帧=${f1:-无} / decoded=${dec:-无}（帧发出但未达/未解码）"
       rc=1
     fi
   fi
@@ -250,18 +267,18 @@ scenario_asserts() {
   fi
 
   # ── 判据 #5：音频降级时视频会话仍存活 ──
+  # 音频路径状态（started/disabled/absent）**只作诊断，不产 ok**：无论哪种状态视频
+  # 会话都可能存活，把它记成 ok 是恒真记账（两分支恒 ok，`ast=absent` 也被误称「降级
+  # 判据成立」）。本场景也没有构造音频降级的 op（既有 op 无音频降级注入），故降级路径
+  # **本轮未被构造**，如实记为观测项。判据 #5 的可自动断言半边 = 音频链路异常时视频轨
+  # 不被拖垮：下面直接核 9638 ESTABLISHED（音频与视频同会话，音频在跑就是同场检验）。
   local ast
   ast=$(_s23_vd_audio_state)
-  log_step "判据5 音频状态诊断：$ast（started=采集中；disabled=9640 无接收端/未绑；absent=无音频行）"
-  if [ "$ast" = "started" ]; then
-    ok "判据5 音频路径 started（无降级），且会话仍存活（见上双端 STREAMING）"
-  else
-    ok "判据5 音频路径 $ast（降级），视频会话仍存活（双端 STREAMING）——降级判据成立"
-  fi
+  log_step "判据5 音频状态诊断：$ast（started=采集中；disabled=9640 无接收端/未绑；absent=无音频行）；降级路径无 op 可构造，本轮未触发"
   if [ "$(port_established "$PHONE_SERIAL" 9638)" = "Y" ]; then
-    ok "判据5 9638 视频轨仍 ESTABLISHED（音频未拖垮视频）"
+    ok "判据5 9638 视频轨 ESTABLISHED（音频未拖垮视频；音频状态=$ast，见上诊断）"
   else
-    bad "判据5 9638 无 ESTABLISHED——视频轨受影响"
+    bad "判据5 9638 无 ESTABLISHED——视频轨受影响（音频状态=$ast）"
     rc=1
   fi
 
