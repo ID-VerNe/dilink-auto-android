@@ -51,6 +51,41 @@ object VideoConfig {
     const val TARGET_SW_DP = 600  // smallest-width dp for VD size calculation
     const val DEFAULT_FALLBACK_DPI = 160
 
+    // ─── IDR 补帧请求闸门（两端单一来源，issue #75）───
+
+    /**
+     * 向对端索要 IDR 的最小间隔（毫秒），**车机与手机共用这一个值**。
+     *
+     * 车机（app-server）与手机（vd-server）各有一道 IDR 请求闸门。历史上两端各写各的：
+     * 车机 500ms、手机 1000ms，于是「距上次授予 500–999ms」的补帧请求会被车机放行、
+     * 又被手机静默吞掉，车机只能干等下一个自然 GOP（`I_FRAME_INTERVAL`=3s）。实测
+     * 长会话每约 50s 冻结 2.4–2.9s（issue #75 现场日志：747ms 间隔的请求被吞后干等
+     * 2372ms）。
+     *
+     * 死区存在 ⟺ 车机闸门 < 手机闸门。收敛到**同一个值**即两端决策一致，死区为空；
+     * 只把一侧调成另一侧的值也能消死区，但既然两端判定语义相同，就没有理由留两份。
+     *
+     * 取 1000 而非 500 的理由：手机侧 1s 是 issue #3 用来打断「IDR 突发打满链路 → 更多
+     * 丢帧 → 更多 IDR」正反馈的闸门，issue #70 又把自然 GOP 拉到 3s，方向一致。降到
+     * 500 会把 IDR 突发上限翻倍，重新冲击仍 OPEN 的 P1（issue #55），而现场 6 次整 GOP
+     * 冻结里只有 1 次能靠它救回（另 5 次是车机自己 500ms 闸门吞掉的重复缺口，与阈值无关）。
+     */
+    const val SYNC_FRAME_REQUEST_MIN_INTERVAL_MS = 1000L
+
+    /**
+     * 单端 IDR 请求闸门：距上次**放行**不足 [minIntervalMs]（默认即共用的
+     * [SYNC_FRAME_REQUEST_MIN_INTERVAL_MS]）即拒绝。[lastRequestMs] 为 0 表示本会话尚未放行过
+     * （两端都用 0 当哨兵）。
+     *
+     * 两端共用这一个判定，是「车机放行 ⇒ 手机不吞」的结构性保证；一旦分散成两份实现
+     * 或两个常量，就会再次漂移出 500–999ms 死区（issue #75）。
+     */
+    fun syncFrameRequestAllowed(
+        nowMs: Long,
+        lastRequestMs: Long,
+        minIntervalMs: Long = SYNC_FRAME_REQUEST_MIN_INTERVAL_MS,
+    ): Boolean = lastRequestMs == 0L || nowMs - lastRequestMs >= minIntervalMs
+
     /**
      * Calculate optimal Virtual Display DPI for car display.
      *

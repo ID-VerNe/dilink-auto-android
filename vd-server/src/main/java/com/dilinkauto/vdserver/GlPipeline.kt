@@ -86,8 +86,8 @@ internal class GlPipeline(
 
     // Write-loop policy (5s deadline + 100us backoff) now comes from FrameCodec.
 
-    /** 上一次请求 IDR 的时刻；丢帧/降码率触发的 IDR 请求必须 ≥1s 一次（issue #3）。 */
-    private var lastSyncRequestNanos = 0L
+    /** 上一次**授予** IDR 请求的时刻（elapsedRealtime，ms）；0 = 本会话尚未授予过。 */
+    private var lastSyncRequestMs = 0L
 
     /**
      * Initialize EGL/GLES on the current thread, create the SurfaceTexture
@@ -214,18 +214,23 @@ internal class GlPipeline(
                     lastWriteMs = stats.maxWriteNanos / 1_000_000
                     if (adaptive.onFrameWritten(stats.maxWriteNanos)) {
                         applyBitrate(encoder, adaptive.currentBitrate)
-                        if (adaptive.needsSyncFrame) { requestSyncFrameThrottled(encoder); adaptive.onBitrateApplied() }
+                        if (adaptive.needsSyncFrame) { requestSyncFrameThrottled(encoder, "bitrate drop"); adaptive.onBitrateApplied() }
                     }
                 }
                 if (stats.dropped > 0) {
                     sendDrops += stats.dropped
-                    requestSyncFrameThrottled(encoder)
+                    requestSyncFrameThrottled(encoder, "sendDrops")
                 }
                 // 车机端报告参考链断裂（issue #9）：它那边已经在丢 P 帧等 IDR 了，
                 // 这里尽快补一个同步帧，别让车机等到下一个自然 GOP 边界。
+                //
+                // 日志必须区分「授予」与「被限流」：issue #75 之前这一行在限流**之前**
+                // 无条件打印，把被吞掉的请求也记成「car requested IDR」，导致 vd-server.log
+                // 里的计数与真实 IDR 数（22 vs 车机侧 0x33=22，其中 1 次并未产生 IDR）对不上。
                 if (consumeSyncRequest()) {
-                    PipeLog.log("Pipeline: car requested IDR")
-                    requestSyncFrameThrottled(encoder)
+                    if (requestSyncFrameThrottled(encoder, "car request")) {
+                        PipeLog.log("Pipeline: car requested IDR (granted)")
+                    }
                 }
                 if (sender.failed) {
                     // 写线程 5s 无进展已退出：video 链路确实死了，结束管线交给会话层重连。
@@ -251,20 +256,29 @@ internal class GlPipeline(
     }
 
     /**
-     * 请求一个 IDR，但**限流到 ≥1s 一次**。
+     * 请求一个 IDR，但**限流到 ≥[VideoConfig.SYNC_FRAME_REQUEST_MIN_INTERVAL_MS] 一次**。
      *
      * 现场日志（issue #3）：丢帧/降码率后立刻索要 IDR 会在大 I 帧上再卡一次写，
      * 下一次采样又降码率——小正反馈。自然 IDR 的节奏由
      * [PipelineServer] 的 `I_FRAME_INTERVAL` 决定（issue #70 起改为 3s），这里只负责
      * 「丢过帧、参考链断了」时的尽快修复，不必每帧都发。
      *
-     * 帧头布局与写截止时间在 [FrameCodec]（protocol-core）。
+     * 闸门判定与车机端共用 [VideoConfig.syncFrameRequestAllowed] / [VideoConfig.SYNC_FRAME_REQUEST_MIN_INTERVAL_MS]
+     * （issue #75）：两端取值一旦不一致就会出现「车机放行、手机吞掉」的死区。
+     *
+     * @param reason 触发来源（日志用）：`car request` / `sendDrops` / `bitrate drop`。
+     * @return true 表示本次**真的**调用了 encoder.setParameters（授予）；false 表示被
+     *   本闸门拒绝（此时留一条节流日志，不再静默 return）。
      */
-    private fun requestSyncFrameThrottled(enc: MediaCodec) {
-        val now = System.nanoTime()
-        if (lastSyncRequestNanos != 0L && now - lastSyncRequestNanos < SYNC_REQUEST_MIN_INTERVAL_NANOS) return
-        lastSyncRequestNanos = now
+    private fun requestSyncFrameThrottled(enc: MediaCodec, reason: String): Boolean {
+        val now = SystemClock.elapsedRealtime()
+        if (!VideoConfig.syncFrameRequestAllowed(now, lastSyncRequestMs)) {
+            PipeLog.log("Pipeline: IDR request throttled ($reason, last grant ${now - lastSyncRequestMs}ms ago)")
+            return false
+        }
+        lastSyncRequestMs = now
         requestSyncFrame(enc)
+        return true
     }
     private fun applyBitrate(enc: MediaCodec, br: Int) { try { val p = Bundle(); p.putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, br); enc.setParameters(p) } catch (_: Exception) {} }
     private fun requestSyncFrame(enc: MediaCodec) { try { val p = Bundle(); p.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0); enc.setParameters(p) } catch (_: Exception) {} }
@@ -298,8 +312,8 @@ internal class GlPipeline(
         stTexture?.release(); stTexture = null
     }
 
-    companion object {
-        /** IDR 请求的最小间隔：丢帧/降码率后不每帧都索要大 I 帧（issue #3）。 */
-        private const val SYNC_REQUEST_MIN_INTERVAL_NANOS = 1_000_000_000L
-    }
+    // IDR 请求闸门（取值 + 判定 + 上次授予时刻）都来自 :protocol-core 的
+    // VideoConfig.SYNC_FRAME_REQUEST_MIN_INTERVAL_MS / VideoConfig.syncFrameRequestAllowed，
+    // 与车机端共用一份——见 GlPipeline.requestSyncFrameThrottled 与 issue #75。
+    // 这里刻意不再保留手机端私有的间隔常量：两端各写一个私有值正是死区的成因。
 }
