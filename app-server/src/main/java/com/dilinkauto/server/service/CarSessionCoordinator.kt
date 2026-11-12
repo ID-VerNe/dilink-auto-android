@@ -776,9 +776,12 @@ internal class CarSessionCoordinator(
     }
 
     fun sanitizePeerDimension(value: Int, fallback: Int): Int =
-        value.takeIf { it in CarConnectionService.MIN_PEER_DIMENSION..CarConnectionService.MAX_PEER_DIMENSION } ?: fallback
+        Companion.sanitizePeerDimension(value, fallback)
 
     companion object {
         const val VIEWPORT_REHANDSHAKE_DEBOUNCE_MS = 700L
+
+        fun sanitizePeerDimension(value: Int, fallback: Int): Int =
+            value.takeIf { it in CarConnectionService.MIN_PEER_DIMENSION..CarConnectionService.MAX_PEER_DIMENSION } ?: fallback
     }
 }

@@ -1,5 +1,6 @@
 package com.dilinkauto.desktop.apps
 
+import com.dilinkauto.protocol.AppIconLimits
 import java.awt.image.BufferedImage
 import java.io.ByteArrayInputStream
 import java.util.concurrent.ConcurrentHashMap
@@ -53,22 +54,22 @@ class AppIconStore(
 
     companion object {
         /**
-         * 单张图标解码前的宽高上限（audit D-M5）。
+         * 单张图标解码前的宽高上限（audit D-M5，引用 [AppIconLimits.MAX_ICON_DIM]）。
          *
          * PNG 是压缩格式，"几十 KB 的文件"完全可以是几千像素宽的位图 ——
          * 一张 8000x8000 的解码结果是 ~256MB 的 BufferedImage，而唯一的旧边界
          * （协议帧 128MB）远不够拦。应用列表图标 512 已经远超实际需要（手机
          * 启动器图标最大 192dp，约 1080px 的极端情况也不过 512 的一倍）。
          */
-        const val MAX_ICON_DIM = 512
+        const val MAX_ICON_DIM = AppIconLimits.MAX_ICON_DIM
 
         /**
-         * 单张图标的**原始字节**上限（audit D-M5）。
+         * 单张图标的**原始字节**上限（audit D-M5，引用 [AppIconLimits.MAX_ICON_BYTES]）。
          *
          * 解压炸弹的另一种形态是"合法尺寸、但被刻意撑大的 PNG"（极大 palette /
          * ancillary chunk）。1MB 足够任何真实图标（512x512 的 PNG 通常 < 300KB）。
          */
-        const val MAX_ICON_BYTES = 1048576 // 1 shl 20 (1 MB)
+        const val MAX_ICON_BYTES = AppIconLimits.MAX_ICON_BYTES
 
         /**
          * 默认解码器：把 PNG 字节解成 [BufferedImage]。失败（或不合法）返回 null，
@@ -79,12 +80,12 @@ class AppIconStore(
          * 超限直接拒解码 —— 炸弹在分配位图**之前**就被挡住。
          */
         fun decodePng(png: ByteArray): BufferedImage? {
-            if (png.size > MAX_ICON_BYTES) return null
+            if (png.size > AppIconLimits.MAX_ICON_BYTES) return null
             val header = runCatching { readHeader(png) }.getOrNull() ?: return null
             val (width, height) = header
             // getWidth/getHeight 在 header 不完整时可能返回 -1：同样按"拒解码"处理
             if (width <= 0 || height <= 0) return null
-            if (width > MAX_ICON_DIM || height > MAX_ICON_DIM) return null
+            if (width > AppIconLimits.MAX_ICON_DIM || height > AppIconLimits.MAX_ICON_DIM) return null
             return runCatching { ImageIO.read(ByteArrayInputStream(png)) }.getOrNull()
         }
 

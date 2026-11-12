@@ -41,7 +41,17 @@ class CarConnectionService : Service() {
     val audioPlayer = AudioPlayer()
 
     internal val carPrefs: CarPrefs by lazy { CarPrefs(this) }
-    internal val vdDeployer: VdServerDeployer by lazy { VdServerDeployer(this) }
+    internal val vdDeployer: VdServerDeployer by lazy {
+        VdServerDeployer(
+            resources = resources,
+            scope = scope,
+            carPrefs = carPrefs,
+            adbTrackerProvider = { adbTracker },
+            sessionCoordinatorProvider = { sessionCoordinator },
+            setStatusMessage = { resId, args -> setStatusMessage(resId, *args) },
+            logSink = { msg, lvl -> carLogSend(msg, lvl) },
+        )
+    }
 
     internal val appListReceiver: CarAppListReceiver by lazy {
         CarAppListReceiver(this) { msg, lvl -> carLogSend(msg, lvl) }
@@ -57,8 +67,8 @@ class CarConnectionService : Service() {
             getPhoneHost = { sessionCoordinator.phoneHost },
             isHandshakeDone = { sessionCoordinator.handshakeDone },
             isVdServerStarted = { sessionCoordinator.vdServerStarted },
-            deployVdServer = { deployVdServer() },
-            deployVdServerDirect = { deployVdServerDirect(it) },
+            deployVdServer = { vdDeployer.deploy() },
+            deployVdServerDirect = { vdDeployer.deployDirect(it) },
             onAdbReady = {
                 if (sessionCoordinator.state.value == State.IDLE) {
                     sessionCoordinator.startConnection()
@@ -98,7 +108,7 @@ class CarConnectionService : Service() {
             logWriter = logWriter,
             appListReceiver = appListReceiver,
             adbTrackerProvider = { adbTracker },
-            deployVdServer = { deployVdServer() },
+            deployVdServer = { vdDeployer.deploy() },
             updateNotification = { updateNotification(it) },
         )
     }
@@ -138,56 +148,13 @@ class CarConnectionService : Service() {
     private val binder = LocalBinder()
     override fun onBind(intent: Intent?): IBinder = binder
 
-    // ─── Delegated properties for external callers & deployer ───
-    var phoneHost: String?
-        get() = sessionCoordinator.phoneHost
-        internal set(v) { sessionCoordinator.phoneHost = v }
-
-    var vdServerStarted: Boolean
-        get() = sessionCoordinator.vdServerStarted
-        internal set(v) { sessionCoordinator.vdServerStarted = v }
-
-    var noAdbCount: Int
-        get() = adbTracker.noAdbCount
-        internal set(v) { adbTracker.noAdbCount = v }
-
-    var adbController: RemoteAdbController?
-        get() = adbTracker.adbController
-        internal set(v) { adbTracker.adbController = v }
-
-    var vdWidth: Int
-        get() = sessionCoordinator.vdWidth
-        internal set(v) { sessionCoordinator.vdWidth = v }
-
-    var vdHeight: Int
-        get() = sessionCoordinator.vdHeight
-        internal set(v) { sessionCoordinator.vdHeight = v }
-
-    var targetFps: Int
-        get() = sessionCoordinator.targetFps
-        internal set(v) { sessionCoordinator.targetFps = v }
-
-    var handshakeVdDpi: Int
-        get() = sessionCoordinator.handshakeVdDpi
-        internal set(v) { sessionCoordinator.handshakeVdDpi = v }
-
-    var vdServerJarPath: String
-        get() = sessionCoordinator.vdServerJarPath
-        internal set(v) { sessionCoordinator.vdServerJarPath = v }
-
+    // ─── External UI Facade Methods ───
     fun setStartupFps(value: Int) = sessionCoordinator.setStartupFps(value)
     fun connectManual(host: String, port: Int = Ports.DEFAULT_PORT) = sessionCoordinator.connectManual(host, port)
-    fun deployVdServer() = vdDeployer.deploy()
-    internal suspend fun deployVdServerDirect(controller: RemoteAdbController) = vdDeployer.deployDirect(controller)
-    internal fun isAdbAvailable(): Boolean = adbTracker.isAdbAvailable()
-    internal fun resetAdbController() = adbTracker.resetAdbController()
-    internal fun executeAdb(command: String, noWait: Boolean): Boolean = adbTracker.executeAdb(command, noWait)
-    internal suspend fun connectTcpAdb(host: String) = adbTracker.connectTcpAdb(host)
     fun onUsbDeviceFromActivity(device: UsbDevice) = adbTracker.onUsbDeviceFromActivity(device)
 
     fun onMirrorSurfaceCreated(surface: Surface) = sessionCoordinator.onMirrorSurfaceCreated(surface)
     fun onMirrorSurfaceDestroyed() = sessionCoordinator.onMirrorSurfaceDestroyed()
-    fun releaseOffscreenSurface() = sessionCoordinator.releaseOffscreenSurface()
     fun sendTouchEvent(event: TouchEvent) = touchSender.sendTouchEvent(event)
     fun sendTouchBatch(pointers: List<TouchEvent>) = touchSender.sendTouchBatch(pointers)
     fun launchApp(packageName: String) = sessionCoordinator.launchApp(packageName)
@@ -201,12 +168,11 @@ class CarConnectionService : Service() {
     fun onLocationPermissionGranted() = altitudeProvider?.onPermissionResult()
     fun disconnectFromPhone() = sessionCoordinator.disconnectFromPhone()
     fun sendMediaAction(action: MediaAction) = sessionCoordinator.sendMediaAction(action)
-    fun log(msg: String) = carLogSend(msg)
     internal fun carLogSend(msg: String, level: String = "I") = logWriter.send(msg, level)
     internal fun setStatusMessage(resId: Int, vararg formatArgs: Any) = sessionCoordinator.setStatusMessage(resId, *formatArgs)
 
     internal fun sanitizePeerDimension(value: Int, fallback: Int): Int =
-        value.takeIf { it in MIN_PEER_DIMENSION..MAX_PEER_DIMENSION } ?: fallback
+        CarSessionCoordinator.sanitizePeerDimension(value, fallback)
 
     // ─── Lifecycle ───
 
@@ -220,7 +186,7 @@ class CarConnectionService : Service() {
             title = getString(R.string.notification_title),
             text = { ctx, res -> ctx.getString(res) }
         )
-        targetFps = carPrefs.startupFps
+        sessionCoordinator.targetFps = carPrefs.startupFps
         logWriter.setEnabled(com.dilinkauto.server.BuildConfig.DEBUG)
         logWriter.start()
         videoDecoder.logSink = { msg -> carLogSend(msg) }
@@ -395,8 +361,7 @@ class CarConnectionService : Service() {
         const val MAX_APP_LIST_ICON_BYTES = CarAppListReceiver.MAX_APP_LIST_ICON_BYTES
 
         internal fun reconnectBackoffMs(consecutiveFailures: Int): Long =
-            if (consecutiveFailures <= 1) 500L
-            else (500L * (1L shl (consecutiveFailures - 1).coerceAtMost(4))).coerceAtMost(8000L)
+            BackoffPolicy.DEFAULT.compute(consecutiveFailures)
 
         internal fun iconBudgetAccepts(totalBytes: Long, nextIconBytes: Int): Boolean =
             CarAppListReceiver.iconBudgetAccepts(totalBytes, nextIconBytes)
