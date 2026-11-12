@@ -100,6 +100,7 @@ class AudioPlayer(
 
     private val decodedFrames = AtomicLong(0)
     private val starvedFrames = AtomicLong(0)
+    private val silenceFrames = AtomicLong(0)
     private val maxRecoverMsValue = AtomicLong(0)
 
     /** 最近一次读到的 `AudioTrack.getUnderrunCount()`。 */
@@ -123,6 +124,9 @@ class AudioPlayer(
 
     /** 累计欠载补静音帧数。 */
     val starved: Long get() = starvedFrames.get()
+
+    /** 累计解码出的全零静音帧数（issue #84 / Refs #79）。 */
+    val silence: Long get() = silenceFrames.get()
 
     /** `AudioTrack.getUnderrunCount()` 的最新值。 */
     val underrun: Int get() = underrunValue
@@ -189,6 +193,7 @@ class AudioPlayer(
             jitter = buf
             decodedFrames.set(0)
             starvedFrames.set(0)
+            silenceFrames.set(0)
             maxRecoverMsValue.set(0)
             underrunValue = 0
             queueDepthValue = 0
@@ -214,7 +219,7 @@ class AudioPlayer(
     fun stop() {
         synchronized(lifecycleLock) {
             if (!running.getAndSet(false)) return
-            log("Stopping: decoded=${decodedFrames.get()} starved=${starvedFrames.get()} underrun=$underrunValue maxRecoverMs=${maxRecoverMsValue.get()} queue=$queueDepthValue")
+            log("Stopping: decoded=${decodedFrames.get()} starved=${starvedFrames.get()} silence=${silenceFrames.get()} underrun=$underrunValue maxRecoverMs=${maxRecoverMsValue.get()} queue=$queueDepthValue")
             emitStatLine()
             jitter?.clear()
             jitter = null
@@ -462,6 +467,9 @@ class AudioPlayer(
                     outBuf.limit(info.offset + info.size)
                     val pcm = ByteArray(info.size)
                     outBuf.get(pcm)
+                    if (isPcmSilent(pcm)) {
+                        silenceFrames.incrementAndGet()
+                    }
                     writePcm(track, pcm)
                 }
                 try { codec.releaseOutputBuffer(outId, false) } catch (_: Exception) {}
@@ -490,6 +498,7 @@ class AudioPlayer(
                 underrun = underrunValue,
                 maxRecoverMs = maxRecoverMsValue.get(),
                 queue = queueDepthValue,
+                silence = silenceFrames.get(),
             )
         )
     }

@@ -12,10 +12,10 @@ package com.dilinkauto.server.decoder
  */
 
 /**
- * 音频播放的周期/终局日志行（**契约格式，S6 直接 `grep -cF`，不得改**）：
+ * 音频播放的周期/终局日志行（契约格式，S6 直接 `grep -oE` / `grep -F`，Refs #73, #79, #84）：
  *
  * ```
- * [AudioPlayer] decoded=<累计解码帧> starved=<累计欠载补静音> underrun=<AudioTrack underrunCount> maxRecoverMs=<最长恢复耗时> queue=<队列深度>
+ * [AudioPlayer] decoded=<累计解码帧> starved=<累计欠载补静音> underrun=<AudioTrack underrunCount> maxRecoverMs=<最长恢复耗时> queue=<队列深度> silence=<累计静音帧>
  * ```
  *
  * 与 `VideoDecoder` 的 `Fed ... drops=...` 汇总行同风格：字段名 `=` 分隔、空格相连，
@@ -31,6 +31,21 @@ internal fun audioPlayerStatLine(
     underrun: Int,
     maxRecoverMs: Long,
     queue: Int,
+    silence: Long = 0L,
 ): String =
     "[AudioPlayer] decoded=$decoded starved=$starved underrun=$underrun " +
-        "maxRecoverMs=$maxRecoverMs queue=$queue"
+        "maxRecoverMs=$maxRecoverMs queue=$queue silence=$silence"
+
+/**
+ * 判定 PCM 16-bit 缓冲是否纯静音（issue #84 / Refs #79）。
+ *
+ * AAC-LC 解码出来的 PCM 每样本 2 字节（小端 16-bit signed）。
+ * 当且仅当字节流全部为 0 时判定为静音（与 vd-server 端 silenceFrame(spec) 全 0 数组对称）。
+ * 若缓冲为空，返回 true。
+ */
+internal fun isPcmSilent(pcm: ByteArray): Boolean {
+    for (b in pcm) {
+        if (b.toInt() != 0) return false
+    }
+    return true
+}
