@@ -4,12 +4,12 @@ import android.content.Context
 import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.setValue
 import com.dilinkauto.client.service.ConnectionService
+import com.dilinkauto.client.ui.BackStack
 import com.dilinkauto.client.ui.DiLinkAutoTheme
 import com.dilinkauto.client.ui.MainScreen
 import com.dilinkauto.client.ui.OnboardingScreen
@@ -51,7 +51,8 @@ class MainActivity : ComponentActivity() {
         data object Allowlist : Screen
     }
 
-    private var screen by mutableStateOf<Screen>(Screen.Main)
+    private val navigation = BackStack<Screen>(Screen.Main)
+    private val screen: Screen get() = navigation.current
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -59,7 +60,7 @@ class MainActivity : ComponentActivity() {
         // Prevent screen lock while streaming — HyperOS may override system timeout settings
         window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        screen = if (onboardingCompleted) Screen.Main else Screen.Onboarding
+        navigation.reset(if (onboardingCompleted) Screen.Main else Screen.Onboarding)
 
         // Auto-start the service when the app is opened (e.g. by the car via USB ADB).
         // Only if onboarding is done, the service isn't already running, and the user
@@ -77,29 +78,33 @@ class MainActivity : ComponentActivity() {
         setContent {
             DiLinkAutoTheme {
                 val installStatus by ConnectionService.installStatusFlow.collectAsState()
+                // 子页吃系统返回；Main 不吃，保留「主界面返回 = 退出 App」的既有语义。
+                BackHandler(enabled = screen == Screen.Settings || screen == Screen.Allowlist) {
+                    navigation.back()
+                }
                 when (screen) {
                     Screen.Onboarding -> OnboardingScreen(
                         onComplete = {
                             onboardingCompleted = true
-                            screen = Screen.Main
+                            navigation.reset(Screen.Main)
                         },
                         onInstallOnCar = { installOnCar(null) },
                         installStatus = installStatus
                     )
-                    Screen.Allowlist -> AllowlistScreen(onBack = { screen = Screen.Main })
+                    Screen.Allowlist -> AllowlistScreen(onBack = { navigation.back() })
                     Screen.Settings -> SettingsScreen(
-                        onBack = { screen = Screen.Main },
+                        onBack = { navigation.back() },
                         onOpenAllFilesAccess = { PermissionIntents.openAllFilesAccess(this) },
                         onOpenBatteryExemption = { PermissionIntents.openBatteryExemption(this) },
                         onOpenAccessibility = { PermissionIntents.openAccessibilitySettings(this) },
                         onOpenDeveloperOptions = { PermissionIntents.openDeveloperOptions(this) },
-                        onOpenAllowlist = { screen = Screen.Allowlist }
+                        onOpenAllowlist = { navigation.navigate(Screen.Allowlist) }
                     )
                     Screen.Main -> MainScreen(
                         onStartService = { startConnectionService() },
                         onStopService = { stopConnectionService() },
                         onInstallOnCar = { ip -> installOnCar(ip) },
-                        onOpenSettings = { screen = Screen.Settings },
+                        onOpenSettings = { navigation.navigate(Screen.Settings) },
                         onShareLogs = { LogSharer.share(this) }
                     )
                 }
