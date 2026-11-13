@@ -33,7 +33,8 @@
 
 本 fork 相对 [andersonlucasg3/dilink-auto-android](https://github.com/andersonlucasg3/dilink-auto-android) 的主要技术路线(详见各文档):
 
-- **直连 VD 架构**:VD Server 直接绑定 9638/9639 端口与接收端对话,手机端不做视频/触摸中继。
+- **直连 VD 架构**:VD Server 直接绑定 9638(视频)/9639(输入)/9640(音频)端口与接收端对话,手机端不做视频/触摸/音频中继。
+- **音频镜像完整闭环**:9640 独立 TCP 连接、AAC-LC 48kHz 立体声(128kbps)、46.875 fps 恒定静音补帧与统计、车机端 AudioPlayer 150ms 抖动缓冲、双向能力位(`FEATURE_AUDIO`)协商与防假绿契约闭环。
 - **接收端可替换**:同一份协议跑在车机(`app-server`)或 Windows(`app-desktop`);纯 JVM 的部分抽到 `protocol-core`,三端共用。
 - **DiLink 4.0 低配车机适配**:编码尺寸 cap 1920x1080、码率 4Mbps、20fps、TextureView → SurfaceView、线程优先级、图标缓存清理等九项优化。
 - **API 28 车机兼容**:移除 API 29+ 的硬件解码器 picker,minSdk 提到 26。
@@ -52,7 +53,7 @@
 
 ## 未实现
 
-- 音频流传输、媒体控制、导航小部件。
+- 媒体控制、导航小部件。（音频流镜像已在 1.0.3 实现闭环）
 
 ## 已知隐患(测试/审计发现,尚未修复)
 
@@ -68,4 +69,4 @@
 
 ## 下载
 
-不提供具体版本号(代码版本与 Release tag 不一致,以 [Releases](https://github.com/ID-VerNe/dilink-auto-android/releases/latest) 为准)。当前代码版本:`versionName = 1.0.2` / `versionCode = 61`(`gradle.properties`)。
+不提供具体版本号(代码版本与 Release tag 不一致,以 [Releases](https://github.com/ID-VerNe/dilink-auto-android/releases/latest) 为准)。当前代码版本:`versionName = 1.0.3` / `versionCode = 62`(`gradle.properties`)。
