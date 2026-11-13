@@ -61,15 +61,15 @@ Low-spec DiLink 4.0 head units like the tested 1280x800 BYD ship with a default 
 
 What this means in practice:
 
-- **Anyone who can reach ports `9637/9638/9639` can control the mirrored session**: launch apps, inject touch, uninstall packages, and turn the phone's physical screen off. Mitigations shipped after the 2026-10-09 audit (`docs/audit-project-2026-10-09.md`, S-01/S-02):
+- **Anyone who can reach ports `9637/9638/9639` can control the mirrored session**: launch apps, inject touch, uninstall packages, and turn the phone's physical screen off. Mitigations shipped in the security hardening pass (S-01/S-02):
   - the VD server binds `0.0.0.0:9638/9639` but **refuses accepts from any IP other than the receiver it was launched for** (`CAR_HOST` argv slot, populated by the deployer from the live control connection's remote address);
   - every package/component name that reaches `am start` / `pm uninstall` is shape-validated and shell-quoted (`requirePackageName` / `requireComponentName` + `VdDeploy.shellQuote`);
   - the phone's lifecycle listener on `19647` binds **loopback only** and rejects non-loopback peers;
   - the protocol decoders reject malformed frames instead of crashing, and the reader kills the connection (not the process) on any bad frame.
 - **Shizuku (optional)** grants shell-equivalent privileges to the phone app by design — anything that can bind Shizuku can direct shell commands. Only pair Shizuku with apps you trust. The Shizuku provider in the manifest is guarded by `android.permission.INTERACT_ACROSS_USERS_FULL` (signature|privileged).
 - **Do not expose these ports** to a hotspot shared with untrusted devices, a public WiFi, or a hostile AP. Use a dedicated SSID for the car link when possible.
-- **No encryption or integrity**: a MITM on the same LAN can watch the mirrored screen and inject input. There is no pairing protocol yet (tracked follow-up in the audit report).
-- The **release signing keystore is never committed** (audit B-01). Release builds require `RELEASE_KEYSTORE_PASSWORD` / `RELEASE_KEY_PASSWORD` and fail fast when they are missing; the keystore itself lives only in CI secrets.
+- **No encryption or integrity**: a MITM on the same LAN can watch the mirrored screen and inject input. There is no pairing protocol yet.
+- The **release signing keystore is never committed** (see `docs/release.md`). Release builds require `RELEASE_KEYSTORE_PASSWORD` / `RELEASE_KEY_PASSWORD` and fail fast when they are missing; the keystore itself lives only in CI secrets.
 - The car app's **ADB key pair** is stored in app-private `filesDir` (not world-readable `/sdcard`), so a co-installed app cannot steal the phone-ADB credential.
 
 ## Building

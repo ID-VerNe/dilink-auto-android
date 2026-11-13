@@ -67,7 +67,7 @@ client 和 server 都加了 `values-zh-rCN` / `values-zh`。这是面向中国�
 ### 9. 代码健康
 
 最近多轮 SRP/DRY 审计与重构 pass：跨模块共享常量(`AppPrefs`、`AppTargets`、`VdDeploy`、`VdDeployArgs`、`WifiGatewayIp`、`AppIconLimits`)、协作者提取与公共基元沉淀。
-- **第三轮 SRP/DRY 落地**(`docs/audit-srp-dry-round3.md`): `PipelineServer` 抽出 `PersistentShell`/`CarCommandRouter`/`LifecycleWriter`，`AppListBuilder` 降至 80 行。
+- **第三轮 SRP/DRY 落地**: `PipelineServer` 抽出 `PersistentShell`/`CarCommandRouter`/`LifecycleWriter`，`AppListBuilder` 降至 80 行。
 - **第四轮架构与职责解耦（Refs #87, #92）**:
   - `protocol-core` / `protocol`：抽离 `NioWriter`（SocketChannel 自旋写与超时）、`BackoffPolicy`（参数化指数退避）、`DecodeLivenessTracker`（解码存活判定与基线管理）、`ConnectionFactory`、`ConnectionKeepAlive`、`UsbAdbKeyStore`、`Ipv4Validator` 与 `AppIconLimits`；清理 `UsbAdbConnection` 死代码。
   - `vd-server`：抽离 `AsyncSocketSender`（异步发送模板）、`AudioEncoderSelector`、`ProcessWatchdog`（停止哨兵与看门狗解耦）、`VideoEncoderSelector`、`PortAcceptor`（多端口非阻塞绑定）、`ActivityDumpParser`、`VdDisplayHealer`；`LifecycleWriter` 接入 `AsyncSocketSender`。
@@ -276,7 +276,7 @@ DiLink-Auto/
 
 ## 文档
 
-完整文档(setup、architecture、protocol、client、server、progress)入口在 [docs/README.md](./docs/README.md),该索引与全部文档均与本 fork 同步更新。语言分工:核心六篇(Setup / Architecture / Protocol / Client / Server / Progress)是英文,`audit-*` 与 `IMPLEMENTATION_REPORT_TESTING` 等审计 / 测试报告是中文;docs/README.md 本身是中文的开发者索引,与本节互补。
+完整文档(setup、architecture、protocol、client、server、progress)入口在 [docs/README.md](./docs/README.md),该索引与全部文档均与本 fork 同步更新。语言分工:核心六篇(Setup / Architecture / Protocol / Client / Server / Progress)是英文,`IMPLEMENTATION_REPORT_TESTING` 测试实施报告与功能提案是中文;docs/README.md 本身是中文的开发者索引,与本节互补。
 
 ---
 
