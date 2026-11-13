@@ -412,11 +412,15 @@ class ConnectionService : Service() {
             ctrl.start() // heartbeat enabled (default)
             // issue #76：握手是纯被动的（handshakeJob 只在收到 HANDSHAKE_REQUEST 时才创建），
             // 对端在首帧前关闭或一直不发时，旧实现会无限期挂在 disconnected.await() 上。
-            // 给「建连 → 首个控制帧」一个明确窗口，超时由本端主动断开并留下原因。
-            val disconnectedBeforeTimeout = withTimeoutOrNull(HANDSHAKE_TIMEOUT_MS) {
-                disconnected.await()
+            // 注意：超时只能覆盖「等 HANDSHAKE_REQUEST」这一段；收到握手后会话可能持续
+            // 几十分钟，若继续套 5s 超时会把正常会话在 5s 后主动掐断（2026-11-13 S01 实测）。
+            val handshakeWindowExpired = withTimeoutOrNull(HANDSHAKE_TIMEOUT_MS) {
+                while (!handshakeReceived && !disconnected.isCompleted) {
+                    delay(25)
+                }
+                handshakeReceived
             }
-            if (disconnectedBeforeTimeout == null) {
+            if (handshakeWindowExpired == null) {
                 val reason = if (handshakeReceived) {
                     "Handshake timeout: request received but not completed within ${HANDSHAKE_TIMEOUT_MS}ms"
                 } else {
@@ -425,6 +429,8 @@ class ConnectionService : Service() {
                 FileLog.w(TAG, "$reason (session #$sessionId)")
                 ctrl.disconnect()
             }
+            // 未超时：正常会话在这里一直等到对端断开；握手窗口已结束，不再受 5s 限制。
+            disconnected.await()
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
