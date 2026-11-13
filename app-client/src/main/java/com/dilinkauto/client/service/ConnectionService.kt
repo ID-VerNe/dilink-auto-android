@@ -38,6 +38,15 @@ class ConnectionService : Service() {
     @Volatile private var vdClient: VirtualDisplayClient? = null
     private var pendingAppLaunch: String? = null
     private var handshakeJob: Job? = null
+
+    /**
+     * issue #76：本会话是否收到过 `HANDSHAKE_REQUEST`。
+     *
+     * 只用于两件事：握手超时时区分「对端一直不发」与「收到了但本端处理慢」，
+     * 以及空会话 cleanup 时跳过整条物理屏恢复链路。每次 accept 新会话时重置。
+     */
+    @Volatile
+    private var handshakeReceived = false
     private var targetFps = VideoConfig.TARGET_FPS
     private var targetBitrate = VideoConfig.DEFAULT_BITRATE
     private var serviceRegistration: Discovery.ServiceRegistration? = null
@@ -382,6 +391,7 @@ class ConnectionService : Service() {
             // generation is ignored by cleanupSession's id check.
             sessionId = sessionSeq.incrementAndGet()
             activeSessionId = sessionId
+            handshakeReceived = false
             resetCleanupGuard(sessionId)
             controlConnection = ctrl
             activeConnection = ctrl
@@ -400,7 +410,21 @@ class ConnectionService : Service() {
             }
 
             ctrl.start() // heartbeat enabled (default)
-            disconnected.await()
+            // issue #76：握手是纯被动的（handshakeJob 只在收到 HANDSHAKE_REQUEST 时才创建），
+            // 对端在首帧前关闭或一直不发时，旧实现会无限期挂在 disconnected.await() 上。
+            // 给「建连 → 首个控制帧」一个明确窗口，超时由本端主动断开并留下原因。
+            val disconnectedBeforeTimeout = withTimeoutOrNull(HANDSHAKE_TIMEOUT_MS) {
+                disconnected.await()
+            }
+            if (disconnectedBeforeTimeout == null) {
+                val reason = if (handshakeReceived) {
+                    "Handshake timeout: request received but not completed within ${HANDSHAKE_TIMEOUT_MS}ms"
+                } else {
+                    "Handshake timeout: no HANDSHAKE_REQUEST within ${HANDSHAKE_TIMEOUT_MS}ms"
+                }
+                FileLog.w(TAG, "$reason (session #$sessionId)")
+                ctrl.disconnect()
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -421,6 +445,9 @@ class ConnectionService : Service() {
         FileLog.d(TAG, "Control frame: type=0x${frame.messageType.toString(16)}")
         when (frame.messageType) {
             ControlMsg.HANDSHAKE_REQUEST -> {
+                // issue #76：先置位再解码；即使 payload 损坏，也能在超时日志里
+                // 区分「对端发了但本端没处理完」与「对端一直没发」。
+                handshakeReceived = true
                 val req = HandshakeRequest.decode(frame.payload)
                 FileLog.i(TAG, "Handshake from car: ${req.deviceName} ${req.screenWidth}x${req.screenHeight}")
                 // A-02: handleHandshake does disk I/O (jar CRC), a bind (19647)
@@ -778,6 +805,10 @@ class ConnectionService : Service() {
             client = vdClient
             vdClient = null
         }
+        // issue #76：没有 VD 的空会话（对端在握手前就 EOF / 握手超时）不需要
+        // power-reset、IME 恢复、KEYCODE_WAKEUP 和 MainActivity 拉起；这些动作
+        // 反而会在用户没有发起投屏时点亮/打扰物理屏。只有真正创建过 VD 才恢复。
+        val hadVd = client != null
         val conn = controlConnection
         controlConnection = null
         activeConnection = null
@@ -805,7 +836,11 @@ class ConnectionService : Service() {
             try { conn?.disconnect() } catch (e: Exception) { FileLog.w(TAG, "control disconnect: ${e.message}") }
             // Runs on PhoneDisplayRestorer's own process-lifetime scope: the two-stage
             // stop + `cmd display power-reset` cannot be cancelled by onDestroy().
-            displayRestorer.restore(ime)
+            if (hadVd) {
+                displayRestorer.restore(ime)
+            } else {
+                FileLog.i(TAG, "cleanupSession: empty session — skip physical display restore")
+            }
         }
     }
 
@@ -849,6 +884,12 @@ class ConnectionService : Service() {
 
         /** Max bytes of a single car→phone CAR_LOG line (audit A-05). */
         private const val CAR_LOG_LINE_MAX_BYTES = 8 * 1024
+
+        /**
+         * issue #76：从 accept 到首个控制帧的握手窗口。正常握手是毫秒级；
+         * 5s 足够覆盖车机启动/首帧排队，又不会让空连接无限期挂着。
+         */
+        private const val HANDSHAKE_TIMEOUT_MS = 5_000L
 
         const val ACTION_START = "com.dilinkauto.client.START"
         const val ACTION_STOP = "com.dilinkauto.client.STOP"
