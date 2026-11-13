@@ -105,7 +105,8 @@ git worktree add .tmp/wt-<issue> -b <type>/<issue>-<slug> main
 
 - **自述 vs 实际逐项核对（修复者）**：PR 说做了的每一条，合并后独立复核（`git status`、文件存在性、构建/单测原始输出）。
 - **欠账转新 issue**：对账发现的遗漏、误伤、未实机闭环项，逐条转新 issue 跟进；合并不算完，对账才算。
-- **行为类 issue 回签（发现者 / 全新上下文验证 agent）**：修复者合并后给 issue 贴 `needs-live-verify`；回签者按下面模板贴一条评论，结论为「症状消失」才摘标签并关闭。仍复现则摘标签、留 issue 并补证据。**回签者不能是本次 PR 的作者**。
+- **行为类 issue 回签（发现者 / 全新上下文验证 agent）**：修复者合并后给 issue 贴 `needs-live-verify`；回签者按下面模板贴一条评论，结论为「症状消失」才摘标签并关闭。仍复现则摘标签、留 issue 并补证据。**回签者不能是本次 PR 的作者 Agent**。
+  - **独立性按 Agent 判定，不按 GitHub 账号判定**：本仓库的开发流程由 Agent 推进，每个 Agent 相当于一个开发者。PR 作者 Agent 与 issue 作者/回签 Agent 必须是不同 Agent；同一 GitHub 账号（如 `ID-VerNe`）可以对应不同 Agent 的不同轮次，**不构成自签**，也不要求另建 reviewer 账号。回签评论应记录 Agent/会话标识，而不是用账号相同来认定角色冲突。
 - 同根因复发时开第二代修复并互相引用，每代都留测试墓碑。
 
 ### 回签模板

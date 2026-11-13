@@ -52,6 +52,7 @@
 3. **开 worktree 改代码**：`git worktree add .tmp/wt-<issue> -b <type>/<issue>-<slug> main`，不在主工作区切分支；分支、PR 标题、commit message 三处都带 issue 号。
 4. **开 PR**：按 [docs/PR_GUIDE.md](docs/PR_GUIDE.md)，正文分段齐全。**CI 全绿 + 无冲突才合并**。行为类 PR 用 `Refs #NN`，纯文档/纯重构才用 `Closes #NN`。
 5. **合并后对账与回签**：修复者先逐项核对「自述 vs 实际」，并给行为类 issue 贴 `needs-live-verify`；再由发现者或全新上下文的验证 agent 按 `docs/PR_GUIDE.md` 的回签模板复跑复现命令，**回签通过才关 issue**（修复者不能给自己回签）。欠账转新 issue。
+   - **角色单位是 Agent，不是 GitHub 账号**：PR 作者 Agent 与 issue 作者/回签 Agent 必须是不同 Agent；同一 GitHub 账号（如 `ID-VerNe`）可以代表不同 Agent 的不同轮次，不构成自签，也不要求另建 reviewer 账号。评审记录应写清「哪个 Agent / 哪个会话」，而不是以账号是否相同判定独立性。
 
 ## 4. 构建与验证（PowerShell）
 
