@@ -676,23 +676,44 @@ class PipelineServer(
      * after it to fail, so a mid-way exception or a SIGKILL from the phone side
      * left the panel off and the VD alive — one leaked display per reconnect.
      */
+    /**
+     * issue #48：`reset-letterbox-style` 原先 fire-and-forget，失败/未生效都会被静默吞掉。
+     * 这里执行后读 `get-letterbox-style` 的 `Aspect ratio:`，不是 0.0 再重试一次；
+     * 仍失败只落日志，不阻塞 cleanup。
+     */
+    private fun resetLetterboxStyle() {
+        for (attempt in 1..2) {
+            val out = shell.execOutput("cmd window reset-letterbox-style")
+            val state = shell.execOutput("cmd window get-letterbox-style")
+            if (state != null && Regex("Aspect ratio:\\s*0\\.0").containsMatchIn(state)) {
+                log("[teardown-display] reset-letterbox-style ok (attempt=$attempt, out=${out?.trim() ?: "<none>"})")
+                return
+            }
+            err(
+                "[teardown-display] reset-letterbox-style not effective " +
+                    "(attempt=$attempt, out=${out?.trim() ?: "<none>"}, " +
+                    "aspect=${state?.lineSequence()?.firstOrNull { it.contains("Aspect ratio") }?.trim() ?: "<unknown>"})"
+            )
+        }
+    }
+
     private fun cleanup() {
         if (!cleanedUp.compareAndSet(false, true)) return
         running = false
         // issue #64：先停窗口采样线程，后面的 shell 恢复命令与 close 才不会被 dumpsys 插队。
         windowMonitor.stop()
         // 1. Global state first — these outlive this process if we die.
-        // issue #48：失败不再静默 —— letterbox 残留会被用户描述成「显示尺寸/比例不对」，
-        // 至少要在日志里留下失败原因。命令、顺序不变（[PersistentShell.exec] 本身不抛，
-        // 这里的 catch 只在极端情况下兜底，不改变清理流程）。
-        try { shell.exec("cmd window reset-letterbox-style") } catch (e: Exception) {
+        // issue #48：letterbox 残留会被用户描述成「显示尺寸/比例不对」；带读回校验 + 一次重试。
+        try { resetLetterboxStyle() } catch (e: Exception) {
             err("[teardown-display] reset-letterbox-style failed: ${e.message}")
         }
         if (displayId >= 0) {
             try { shell.exec("wm user-rotation -d $displayId free") } catch (_: Exception) {}
         }
-        // 2. Resume foreground app from VD to phone display before tearing down VD
+        // 2. 先把前台 app 搬回，再把 VD 上**所有**残留 task 搬回并 resize（issue #48）；
+        //    只搬顶层会让 quickSwitch 历史任务带着 VD 的 density/bounds 留在物理屏。
         carCommands.moveTopApp(displayId, 0)
+        carCommands.moveAllTasksToDisplay(displayId, 0)
         // 3. Restore screen BEFORE killing shell (order matters: shell.exec needs the shell alive)
         displayController.setPhysicalDisplayPower(true)
         try { shell.exec("input keyevent 224") } catch (_: Exception) {}
