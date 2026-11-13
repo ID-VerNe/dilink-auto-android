@@ -397,6 +397,48 @@ internal class CarCommandRouter(
     }
 
     /**
+     * issue #48：cleanup 时把 VD 上**所有** task 搬回物理屏，并在目标屏重算 bounds。
+     *
+     * 只搬顶层会留下 quickSwitch 历史任务（xhs/bilibili/...）：VD 释放后框架把它们
+     * 挪到 display 0，但 task 的 `mGlobalConfig` 仍是 VD 的 density/bounds
+     * （2026-11-13 实机：xhs `271dpi / Rect(718,0-1356,1020)`）。这里按段内 task id
+     * 逐个 `am display move-stack`，再 `am task resize` 到物理屏尺寸；`fillTask`
+     * 复用 `wm size -d <to>`，因此不需要另写一套尺寸解析。
+     */
+    fun moveAllTasksToDisplay(fromDisplay: Int, toDisplay: Int) {
+        if (fromDisplay < 0 || toDisplay < 0 || fromDisplay == toDisplay) return
+        val api = sdkInt()
+        if (api < 29) {
+            PipeLog.log("moveAllTasks: skipping, am display move-stack requires API 29 (current $api)")
+            return
+        }
+        try {
+            val dump = execOut("dumpsys activity activities 2>/dev/null") ?: return
+            val tasks = ActivityDumpParser.tasksInDisplay(dump, fromDisplay)
+            if (tasks.isEmpty()) {
+                PipeLog.log("[teardown-move-all] display=$fromDisplay has no tasks, nothing to move")
+                return
+            }
+            PipeLog.log(
+                "[teardown-move-all] from=$fromDisplay to=$toDisplay tasks=" +
+                    tasks.joinToString(prefix = "[", postfix = "]")
+            )
+            for (taskId in tasks) {
+                exec("am display move-stack $taskId $toDisplay")
+                PipeLog.log("[teardown-move-all] move task=$taskId")
+            }
+            // move-stack 是异步入队；等一个与 logMovedTaskConfig 同量级的窗口再 resize/回读。
+            Thread.sleep(TEARDOWN_PROBE_DELAY_MS)
+            for (taskId in tasks) {
+                fillTask(taskId, toDisplay)
+                logMovedTaskConfig(taskId, toDisplay)
+            }
+        } catch (e: Exception) {
+            PipeLog.err("[teardown-move-all] failed: ${e.message}")
+        }
+    }
+
+    /**
      * issue #48 取证：`move-stack` 之后回读目标 task 的 `displayId / bounds /
      * compat / densityDpi`，只落一条 `[teardown-move]` 日志。
      *

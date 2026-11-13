@@ -534,6 +534,49 @@ Display #0 (activities from top to bottom):
     }
 
     @Test
+    fun `teardown moves every residual vd task and resizes each to the physical display`() {
+        // issue #48：S25 后 xhs/bilibili 等历史任务仍在 VD 段；cleanup 不能只搬顶层。
+        val r = Rig()
+        r.activitiesDump = """
+Display #0 (activities from top to bottom):
+  * Task{a11 #0 type=standard A=10216:com.dilinkauto.client}
+Display #7 (activities from top to bottom):
+  * Task{a11 #2048 type=standard A=10216:com.twitter.android U=0 visible=true visibleRequested=true mode=fullscreen translucent=false sz=1}
+    * ActivityRecord{751a1f5 u0 com.twitter.android/com.x.android.main.MainActivity t2048}
+  * Task{b22 #2047 type=standard A=10235:com.xingin.xhs U=0 visible=false visibleRequested=false mode=fullscreen translucent=true sz=1}
+    * ActivityRecord{751a1f6 u0 com.xingin.xhs/.index.v2.IndexActivityV2 t2047}
+"""
+        val log = captureStdout { r.router.moveAllTasksToDisplay(7, 0) }
+
+        assertEquals(
+            "每个 VD task 都必须搬回物理屏",
+            listOf("am display move-stack 2048 0", "am display move-stack 2047 0"),
+            r.execs.filter { it.startsWith("am display move-stack") },
+        )
+        assertEquals(
+            "每个搬回的 task 都必须按物理屏尺寸 resize",
+            listOf("am task resize 2048 0 0 2340 1316", "am task resize 2047 0 0 2340 1316"),
+            r.execOuts.filter { it.startsWith("am task resize") },
+        )
+        assertTrue(log.contains("[teardown-move-all] from=7 to=0 tasks=[2048, 2047]"))
+    }
+
+    @Test
+    fun `move all tasks is a no-op on pre api 29`() {
+        // 与 moveTopApp 同一门槛：API 26-28 没有 am display move-stack，不能静默发命令。
+        val r = Rig(sdkInt = { 28 })
+        r.activitiesDump = """
+Display #7 (activities from top to bottom):
+  * Task{a11 #2048 type=standard A=10216:com.twitter.android}
+    * ActivityRecord{751a1f5 u0 com.twitter.android/com.x.android.main.MainActivity t2048}
+"""
+        r.router.moveAllTasksToDisplay(7, 0)
+
+        assertTrue(r.execs.none { it.startsWith("am display move-stack") })
+        assertTrue(r.execs.none { it.startsWith("am task resize") })
+    }
+
+    @Test
     fun `teardown display snapshot logs physical init cur and residual vd tasks`() {
         // issue #48：cleanup 的取证行要能直接对比物理屏 init/cur，并列出没被搬回
         // 物理屏、仍挂在 VD 上的任务。
