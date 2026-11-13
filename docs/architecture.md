@@ -110,7 +110,7 @@ Audio mirroring completes an end-to-end loop operating on dedicated port `9640`:
 
 ## Trust Boundaries (Security Posture)
 
-The full model — including the Shizuku threat surface, keystore handling and the car's ADB key storage — lives in `docs/setup.md` ("Security Model (Trust Boundaries)"); the audit it derives from is `docs/audit-project-2026-10-09.md`. What matters for this architecture:
+The full model — including the Shizuku threat surface, keystore handling and the car's ADB key storage — lives in `docs/setup.md` ("Security Model (Trust Boundaries)"). What matters for this architecture:
 
 - **The trust boundary is the wire, and it is currently cleartext.** All four ports are plain TCP with no pairing secret and no integrity check, so the product assumption is "trusted local network / private hotspot". A MITM on the same LAN can watch the mirrored screen and inject input. Pairing/nonce is a tracked follow-up, not a shipped mitigation.
 - **The shell-UID engine is the crown jewel.** Anything that can drive `9638`/`9639` can `am start`, `pm uninstall`, inject touch and power the phone's physical panel off — as shell UID. The 2026-10-09 hardening pass (`a7d2b72` wire protocol, `8601fb1` VD server, `1f6836a` desktop, `5eae3e7` deploy quoting) narrowed the surface without changing the trust assumption:

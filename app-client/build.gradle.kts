@@ -64,7 +64,7 @@ android {
         throw GradleException(
             "Release build requested but RELEASE_KEYSTORE_PASSWORD / " +
                 "RELEASE_KEY_PASSWORD are not set. Set both (the keystore " +
-                "itself is never committed — see docs/audit-project-2026-10-09.md B-01)."
+                "itself is never committed — see docs/release.md)."
         )
     } else {
         logger.lifecycle(
