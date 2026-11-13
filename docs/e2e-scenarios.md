@@ -117,6 +117,7 @@ L3 任何不变量破坏 → 冻结现场 → 把操作序列回放固化为新�
 | S21 | 9637 被抢占 | 会话外用其他进程占 9637 → 建流应按设计失败并给出明确状态（**@expect: fail**——判向翻转，主操作应该失败）。**第六轮修正 ×2**：① `op_occupy_9637` 改 `nc -Lp`（`-l` 单连接即退 → A 首次连接耗掉占用者 → 首跑 UNEXPECTED-PASS 根因；`-L` 持续监听，真机冒烟两次连接后仍 LISTENING）；② 主操作改 `reconnect` 原语（批次 C 实证：9637 被占时 A 的失败尝试不产生 client.log 状态行 → `car_state=UNKNOWN` → 原 `op_connect` 走手动 UI 兜底而 ManualConnectBox 真机不可达 → 误判「ops 失败」FAIL；`reconnect` rc 恒 0 语义纯净，失败判向交由断言层的「未收敛」判定） |
 | S22 | 撤销调试授权 | adb_revoke 后重连 → 按设计引导重新授权，不静默失败 |
 | S23 | 音频镜像（含熄屏后持续出帧） | S01 + screen_off + sleep10 + screen_on。五条音频判据：① vd 帧计数 >0 且窗口内增长 + 速率下限（非严格线性）② 播放端 decoded>0 / starved==0 / underrun 不增长 ③ 静音补帧计数 >0（降观测项）④ 熄屏 10s 内帧仍增长（R7）⑤ 音频降级时视频轨存活。**覆盖面**：兜传输/解码链路断裂与「帧完全不出」；**不兜源侧静音**（漏 startRecording，需人工听觉回签）。Refs #13/#79 |
+| S25 | VD 连续切换 4 次（4~5 个应用） | S01 + `switch_app` ×4（磁贴 1~4：bilibili/小红书/番茄/百度地图；初始应用可能已在其中之一）。判据：① `[Window]` ≥4 行，末条 `n≥4`、顶层 `visReq=true`、旧应用 `visReq=false` ≥3；② 4 个被切换包名都在 `[Window]` 出现；③ 所有 `[Pipeline]` 统计行 `swapFails=0 sendDrops=0 glErr=0`（`q` 允许瞬时 1）且无 `tex=0`，末条 `tex` > 首条；④ 无 `[BLACK] decode still alive`。**不覆盖** #55/#58 的真实长视频/1 小时导航。Refs #15/#106 |
 
 ## 5. 不变量监控规格（每轮必查）
 
