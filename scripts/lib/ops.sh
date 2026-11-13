@@ -157,14 +157,15 @@ op_neutral() {
 }
 
 _ensure_wifi() { # <serial> <expect_ip>：IP 不符则 svc wifi enable 并等待（30s 真实预算）
-  local serial=$1 ip=$2 cur
-  cur=$(adb -s "$serial" shell "ip -4 addr show wlan0 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p'" 2>/dev/null | tr -d '\r\n ')
+  local serial=$1 ip=$2 cur iface
+  cur=$(active_wifi_ip "$serial")
   [ "$cur" = "$ip" ] && return 0
-  log_step "$serial wlan0 IP=$cur（期望 $ip），执行 svc wifi enable"
+  iface=$(active_wifi_iface "$serial")
+  log_step "$serial 活动 WiFi 网卡=${iface:-未知} IP=$cur（期望 $ip），执行 svc wifi enable"
   adb -s "$serial" shell svc wifi enable > /dev/null 2>&1
   local deadline=$((SECONDS + 30))
   while [ "$SECONDS" -lt "$deadline" ]; do
-    cur=$(adb -s "$serial" shell "ip -4 addr show wlan0 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p'" 2>/dev/null | tr -d '\r\n ')
+    cur=$(active_wifi_ip "$serial")
     [ "$cur" = "$ip" ] && return 0
     sleep 1
   done

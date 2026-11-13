@@ -32,6 +32,32 @@ dcar()   { adb -s "$CAR_SERIAL"   shell "$@"; }
 pull_phone() { MSYS_NO_PATHCONV=1 adb -s "$PHONE_SERIAL" pull "$@"; }
 pull_car()   { MSYS_NO_PATHCONV=1 adb -s "$CAR_SERIAL"   pull "$@"; }
 
+# ── 活动 WiFi 网卡探测 ─────────────────────────────────────────────────
+# Meizu 20 Inf 的 WiFi 是 wlan1，MI9 是 wlan0；不能把网卡名写死。
+# 优先读 `ip -4 route show table all` 里第一条 `default ... dev wlan*`，
+# 这样能排除 dummy0 / rmnet_data*；没有默认路由时退回到第一个有 IPv4 的 wlan*。
+# 保留 PHONE_IP / CAR_IP 环境变量覆盖（preflight 只在其为空时探测）。
+active_wifi_iface() { # <serial> → wlan0/wlan1/...
+  local serial=${1:-${PHONE_SERIAL:-}} out iface
+  [ -n "$serial" ] || return 1
+  out=$(adb -s "$serial" shell "ip -4 route show table all 2>/dev/null" 2>/dev/null | tr -d '\r')
+  iface=$(printf '%s\n' "$out" | awk '$1=="default" {for(i=1;i<=NF;i++) if($i=="dev" && $(i+1) ~ /^wlan/) {print $(i+1); exit}}')
+  if [ -z "$iface" ]; then
+    out=$(adb -s "$serial" shell "ip -4 addr show 2>/dev/null" 2>/dev/null | tr -d '\r')
+    iface=$(printf '%s\n' "$out" | awk '/^[0-9]+: wlan/ {gsub(":","",$2); cand=$2} /inet / {if(cand!=""){print cand; exit}}')
+  fi
+  [ -n "$iface" ] && printf '%s\n' "$iface"
+}
+
+active_wifi_ip() { # <serial> → IPv4
+  local serial=${1:-${PHONE_SERIAL:-}} iface
+  [ -n "$serial" ] || return 1
+  iface=$(active_wifi_iface "$serial") || return 1
+  [ -n "$iface" ] || return 1
+  adb -s "$serial" shell "ip -4 addr show $iface 2>/dev/null" 2>/dev/null \
+    | tr -d '\r' | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | head -1
+}
+
 # 当前光标位置等小工具留给调用方自己用 win_auto，这里不引。
 
 # wait_until <预算秒> <描述> <判定命令...>
@@ -205,14 +231,14 @@ preflight() {
   cr=$(adb -s "$CAR_SERIAL"   shell "getprop ro.build.version.release" 2>/dev/null | tr -d '\r\n')
   log_step "Android 版本：phone=$pr  car=$cr"
 
-  # 取两台 wlan0 IP
-  PHONE_IP=$(adb -s "$PHONE_SERIAL" shell "ip -4 addr show wlan0 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p'" 2>/dev/null | tr -d '\r\n' | head -1)
-  CAR_IP=$(adb -s "$CAR_SERIAL"   shell "ip -4 addr show wlan0 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p'" 2>/dev/null | tr -d '\r\n' | head -1)
+  # 取两台活动 WiFi 网卡 IP（Meizu=wlan1，MI9=wlan0；不要写死网卡名）
+  PHONE_IP="${PHONE_IP:-$(active_wifi_ip "$PHONE_SERIAL")}"
+  CAR_IP="${CAR_IP:-$(active_wifi_ip "$CAR_SERIAL")}"
   if [ -z "$PHONE_IP" ] || [ -z "$CAR_IP" ]; then
-    log_err "取不到 wlan0 IP（phone=$PHONE_IP car=$CAR_IP）—— WiFi 没连？"
+    log_err "取不到活动 WiFi IP（phone=$PHONE_IP car=$CAR_IP；接口 phone=$(active_wifi_iface "$PHONE_SERIAL") car=$(active_wifi_iface "$CAR_SERIAL")）—— WiFi 没连？"
     return 2
   fi
-  log_ok "IP：phone=$PHONE_IP  car=$CAR_IP"
+  log_ok "IP：phone=$PHONE_IP（$(active_wifi_iface "$PHONE_SERIAL")）  car=$CAR_IP（$(active_wifi_iface "$CAR_SERIAL")）"
 
   # 双向 ping（同网前提，脚本化不了，只能检查 + 提示）
   log_step "双向可达性检查"

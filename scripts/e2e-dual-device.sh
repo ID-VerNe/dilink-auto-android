@@ -469,7 +469,7 @@ else
   exit 2
 fi
 # PHONE_IP/CAR_IP 由 preflight 填充（op_connect 消费 PHONE_IP）
-[ -n "$PHONE_IP" ] && [ -n "$CAR_IP" ] || { echo "✗ preflight 未取到双端 wlan0 IP" >&2; exit 2; }
+[ -n "$PHONE_IP" ] && [ -n "$CAR_IP" ] || { echo "✗ preflight 未取到双端活动 WiFi IP（Meizu 可能是 wlan1，MI9 是 wlan0）" >&2; exit 2; }
 
 # ═════════════════════════════════════════════════════════════════════════
 # 4/9 解锁（禁重试循环猜 PIN；每设备累计失败 ≥2 → 全局 abort，D6）
