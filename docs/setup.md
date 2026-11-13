@@ -85,7 +85,7 @@ What this means in practice:
 
 The `buildVdServer` task compiles `vd-server/` to `vd-server.dex`, packages it as `vd-server.jar`, and copies it into `app-client/src/main/assets/`. The `embedServerApk` task bundles `app-server.apk` into the client assets the same way. Only the phone APK needs to be installed manually — the car APK and VD server jar are pushed/embedded automatically.
 
-Release builds require the `RELEASE_KEYSTORE_PASSWORD` and `RELEASE_KEY_PASSWORD` environment variables to be set; if either is missing the build fails immediately instead of producing an unsigned APK. The keystore itself is never committed — it lives only in CI secrets. Current version: `1.0.2` (versionCode 61). See [./release.md](./release.md) for the full signing and release procedure.
+Release builds require the `RELEASE_KEYSTORE_PASSWORD` and `RELEASE_KEY_PASSWORD` environment variables to be set; if either is missing the build fails immediately instead of producing an unsigned APK. The keystore itself is never committed — it lives only in CI secrets. Current version: `1.0.3` (versionCode 62). See [./release.md](./release.md) for the full signing and release procedure.
 
 > Upgrading from a debug-signed build to the officially signed one requires uninstalling the old app first — the certificates differ, so the install fails with `INSTALL_FAILED_UPDATE_INCOMPATIBLE`.
 
@@ -97,12 +97,12 @@ When the phone connects to the car:
 2. **Track A (WiFi):** gateway IP + mDNS discovery → NIO connect to phone control port `9637`.
 3. **Track B (USB):** scan devices → USB ADB connect → launch phone app via `am start`.
 4. **Handshake:** car sends viewport dimensions + DPI override + appVersionCode + targetFps; phone responds with device info and `vdServerJarPath`.
-5. **Three-connection setup:** after handshake the car opens video (`9638`) and input (`9639`) connections; the VD server reverse-connects to the phone on localhost:`19647` for the lifecycle channel.
+5. **Direct connection setup:** after handshake the car opens video (`9638`), input (`9639`), and audio (`9640`, if negotiated) connections; the VD server reverse-connects to the phone on localhost:`19647` for the lifecycle channel.
 6. **Phone deploys VD server** — extracts `vd-server.jar` to `/sdcard/DiLinkAuto/`, starts `app_process` as shell UID with the VD dimensions, DPI, encode dims, and FPS as args.
 7. **VD server creates the VirtualDisplay** at the negotiated DPI (Auto or override) and runs the GL pipeline: frame clock → GL render → encoder drain → TCP write, all on a single thread with `System.nanoTime()` / `LockSupport.parkNanos()` timing.
 8. **Video streams** over WiFi TCP on port `9638` — H.264 Main profile, 4 Mbps CBR, 20 fps, encode dimensions capped at 1920x1080. Adaptive bitrate drops to 75% (never below a 1.5 Mbps floor) when the car stops draining, then climbs back in 0.5 Mbps steps after each 2s of clean writes.
 
-Port reference: `9637` control+data, `9638` video, `9639` touch input, `19647` lifecycle (VD server → phone localhost), `5555` ADB TCP.
+Port reference: `9637` control+data, `9638` video, `9639` touch input, `9640` audio, `19647` lifecycle (VD server → phone localhost), `5555` ADB TCP.
 
 ## Troubleshooting
 

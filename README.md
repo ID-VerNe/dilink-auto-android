@@ -18,7 +18,7 @@
 
 ### 1. 架构层:直连 VD 流式架构
 
-手机端不再做视频/触摸中继。VD Server 直接绑定 `9638`(视频)、`9639`(输入)端口与车机对话,省掉了每帧 4 次 socket + 2 次进程上下文切换,变成 2 次 socket + 0 次上下文切换。手机端退化为纯编排器:握手、VD 生命周期(`VD_PORTS_BOUND`)、车机日志路由。涉及协议新增 `FrameCodec.readFrameBlocking()`、`MessageType.VD_PORTS_BOUND`,以及 `VirtualDisplayClient` 简化为只管生命周期。后续一系列 commit 修了直连架构下的生命周期通道竞争、部署竞争、栈导航、EGL/GL 纹理上下文等问题。
+手机端不再做视频/触摸/音频中继。VD Server 直接绑定 `9638`(视频)、`9639`(输入)、`9640`(音频，双向协商后开启)端口与接收端对话，省掉了每帧 4 次 socket + 2 次进程上下文切换，变成 2 次 socket + 0 次上下文切换。手机端退化为纯编排器：握手与能力协商、VD 生命周期(`VD_PORTS_BOUND`)、车机日志路由。涉及协议新增 `FrameCodec.readFrameBlocking()`、`MessageType.VD_PORTS_BOUND`、`AudioPayload`，以及 `VirtualDisplayClient` 简化为只管生命周期。后续一系列 commit 修了直连架构下的生命周期通道竞争、部署竞争、栈导航、EGL/GL 纹理上下文等问题，并实现了音视频全链路直连闭环。
 
 ### 2. DiLink 4.0 低配车机适配(核心)
 
@@ -66,9 +66,14 @@ client 和 server 都加了 `values-zh-rCN` / `values-zh`。这是面向中国�
 
 ### 9. 代码健康
 
-最近一轮 4-agent 并行审计后的 DRY/SRP pass:跨模块共享常量(`AppPrefs`、`AppTargets`、`VdDeploy`、`VdDeployArgs`、`WifiGatewayIp`)、协作者提取(`ApkInstaller`、`AppListBuilder`、`AppVersion`、`CarLogWriter`、`CarTouchSender`、`HandshakeFactory`、`VdServerDeployer`、`PhoneDisplayRestorer`、`VdDimensions` 等)、大文件拆分(`CarConnectionService` 1237 → 1137 行)。DPI 范围 `120..480` 和 `app_process` argv tail 在 phone 和 car 之间共享同一份 `VdDeployArgs`。
-
-第三轮 SRP/DRY 审计(`docs/audit-srp-dry-round3.md`,49 项)的修复 pass 已基本全部落地(其中 R3-SRP-01 / R3-SRP-02 为部分落地,见报告 §6「未闭环项说明」),其中第二轮遗留的 `CarConnectionService` 实际行数为 **1237**(README 曾误记为 1137),本轮降至 **1206**;`ConnectionService` 752 → 728,`PipelineServer` 523 → 383(抽出 `PersistentShell`/`CarCommandRouter`/`LifecycleWriter`),`AppListBuilder` 108 → 80。
+最近多轮 SRP/DRY 审计与重构 pass：跨模块共享常量(`AppPrefs`、`AppTargets`、`VdDeploy`、`VdDeployArgs`、`WifiGatewayIp`、`AppIconLimits`)、协作者提取与公共基元沉淀。
+- **第三轮 SRP/DRY 落地**(`docs/audit-srp-dry-round3.md`): `PipelineServer` 抽出 `PersistentShell`/`CarCommandRouter`/`LifecycleWriter`，`AppListBuilder` 降至 80 行。
+- **第四轮架构与职责解耦（Refs #87, #92）**:
+  - `protocol-core` / `protocol`：抽离 `NioWriter`（SocketChannel 自旋写与超时）、`BackoffPolicy`（参数化指数退避）、`DecodeLivenessTracker`（解码存活判定与基线管理）、`ConnectionFactory`、`ConnectionKeepAlive`、`UsbAdbKeyStore`、`Ipv4Validator` 与 `AppIconLimits`；清理 `UsbAdbConnection` 死代码。
+  - `vd-server`：抽离 `AsyncSocketSender`（异步发送模板）、`AudioEncoderSelector`、`ProcessWatchdog`（停止哨兵与看门狗解耦）、`VideoEncoderSelector`、`PortAcceptor`（多端口非阻塞绑定）、`ActivityDumpParser`、`VdDisplayHealer`；`LifecycleWriter` 接入 `AsyncSocketSender`。
+  - `app-client`：`ConnectionService` 瘦身，剥离 `ShizukuVdDeployer`、`ShizukuNav`、`ClientNetworkMonitor`、`CarAppInstallHost`、`AllowlistRepository`、`SessionState`；废弃 `InputInjectionService`。
+  - `app-server`：`CarConnectionService` 大幅瘦身至 407 行，状态机拆分为 `CarSessionCoordinator`（9637/9638/9639/9640 多通道状态机与重握手）、`CarAdbTracker`（USB/TCP ADB 双轨跟踪）、`CarAppListReceiver`（应用列表与图标安全门限）；`VdServerDeployer` 解耦。
+  - `app-desktop`：接入 `AppIconLimits`、`DecodeLivenessTracker`、`BackoffPolicy`，对齐最新协议基元。
 
 ### 10. VD 泄漏修复 + 清理幂等 + 黑屏自愈(v0.18.0-dev-13)
 
@@ -137,6 +142,7 @@ app-desktop --probe
 
 **已可用:**
 - H.264 视频镜像,24fps、4Mbps CBR、Main profile(针对 DiLink 4.0 低配车机调校;高配车机也兼容)
+- 音频流传输：AAC-LC 48kHz 双声道立体声、128kbps、9640 独立 TCP 连接、150ms 抖动缓冲、46.875 fps 恒定静音补帧与统计、手机/车机双向 `FEATURE_AUDIO` 能力位协商、客户端音频开关持久化
 - 完整触摸输入(多点触控、双指缩放)
 - 应用启动器:搜索、字母排序、64dp 图标、长按菜单(卸载、应用信息、置顶)
 - 应用允许列表:只把选中的应用推到车机
@@ -147,7 +153,7 @@ app-desktop --probe
 - 流式传输时手机屏幕关闭(省电),断连后物理面板恢复
 - 引导式权限授权
 - 简体中文 + 8 种其他语言(英、葡、俄、白俄、法、哈、乌、乌兹)
-- 直连 VD 架构:手机不做中继,视频/触摸直通
+- 直连 VD 架构:手机不做中继,视频/触摸/音频直通
 - VD 泄漏修复:停止哨兵优雅停机(引擎跑完整 cleanup,超时兜底强杀)、清理幂等 guard、VD 退出等待 —— 每次重连不再泄漏 VirtualDisplay
 - 黑屏自愈:车机端检测到持续 3 秒以上黑屏后触发重建 VD(重握手);持续黑屏判定已上移到 `protocol-core`,Windows 接收端用同一套判据(10 秒窗口)。恢复路径原先会 `stop()` 解码器却没人重启它,反而把屏幕永久留在黑屏 —— 已修(`35d7821`)
 - Windows 接收端(`app-desktop`):镜像窗口 + 鼠标触摸 + 应用启动器 + DPI/硬解面板 + adb 部署,`jpackage` 出免安装 app-image
@@ -157,7 +163,6 @@ app-desktop --probe
 - 最近任务栏、时钟、网络信息
 
 **未实现:**
-- 音频流传输
 - 媒体控制
 - 导航小部件
 
@@ -180,7 +185,7 @@ app-desktop --probe
 1. **开热点** —— 手机开 WiFi 热点,车机连上。
 2. **插 USB** —— 手机插车机 USB 口(或同 WiFi 网络)。
 3. **自动安装** —— 手机通过 WiFi ADB 把车机应用装到车机(首次,一键)。
-4. **自动连接** —— 三条 WiFi TCP 流:视频(9638)、触摸(9639)、控制(9637)。
+4. **自动连接** —— 四条 WiFi TCP 流：控制(9637)、视频(9638)、触摸(9639)、音频(9640, 协商开启)。
 5. **用应用** —— 从车机启动器点应用,在手机上跑,投到车机,触摸回传。
 
 手机在虚拟显示器上跑应用,编码成 H.264 推到车机;车机屏的触摸事件回传到手机,作为真实触摸事件注入。手机物理屏保持关闭(省电),可独立使用。
@@ -240,12 +245,12 @@ DiLink-Auto/
 
 | 模块 | 角色 | minSdk |
 |------|------|--------|
-| `protocol-core` | 纯 JVM 共享协议库(Connection/NioReader/FrameCodec/Messages/VdDeploy/VdDeploySequence/BlackScreenDetector) | — |
-| `protocol` | 共享协议库(UsbAdbConnection、AdbProtocol、VideoConfig、NioReader、FrameCodec) | 26 |
-| `app-client` | 手机应用(ConnectionService、VD 部署、车机自更新、FileLog、AllowlistScreen) | 29 |
-| `app-server` | 车机应用(CarConnectionService、VideoDecoder、CarShell、HomeScreen、PersistentNavBar) | 26 |
+| `protocol-core` | 纯 JVM 共享协议库(Connection/NioWriter/NioReader/FrameCodec/Messages/AudioPayload/VdDeploy/BackoffPolicy/DecodeLivenessTracker/BlackScreenDetector) | — |
+| `protocol` | 共享协议库(UsbAdbConnection、AdbProtocol、VideoConfig、ConnectionFactory、ConnectionKeepAlive、UsbAdbKeyStore) | 26 |
+| `app-client` | 手机应用(ConnectionService、ShizukuVdDeployer、ClientNetworkMonitor、CarAppInstallHost、AllowlistRepository、FileLog) | 29 |
+| `app-server` | 车机应用(CarSessionCoordinator、CarAdbTracker、CarAppListReceiver、AudioPlayer、VideoDecoder、CarShell、HomeScreen、PersistentNavBar) | 26 |
 | `app-desktop` | Windows 接收端(DesktopApp、DesktopConnectionService、VideoDecodePipeline、SwingVideoView) | — |
-| `vd-server` | Shell 权限进程(PipelineServer、TouchInjector、GlPipeline、DisplayPowerController) | — |
+| `vd-server` | Shell 权限进程(PipelineServer、AudioPipeline、AudioEncoderSelector、PortAcceptor、TouchInjector、GlPipeline、DisplayPowerController) | — |
 
 ---
 

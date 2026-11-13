@@ -2,14 +2,14 @@
 
 ## Overview
 
-DiLink-Auto 在手机与车机之间使用 **3 条专用 TCP 连接**（另有一条音频连接，其 wire 契约已定义但尚未绑定），手机 App 与 VD server 之间还有一条内部生命周期连接：
+DiLink-Auto 在手机与车机之间使用 **4 条专用 TCP 连接**（控制/数据、视频、输入、音频），手机 App 与 VD server 之间还有一条内部生命周期连接：
 
 | Connection | Port | Direction | Content |
 |------------|------|-----------|---------|
 | **Control + Data** | 9637 | Bidirectional | Handshake, heartbeat, app commands, app list, car logs, media metadata |
 | **Video** | 9638 | VD server -> Car | H.264 CONFIG + FRAME only |
 | **Input** | 9639 | Car -> VD server | Touch events only |
-| **Audio**（见下文） | 9640 | VD server -> Car | AAC-LC CONFIG + FRAME；S1 已有端口常量与载荷编解码，S3 才会 bind socket |
+| **Audio** | 9640 | VD server -> Car | AAC-LC CONFIG + FRAME；双向协商后绑定，独立传输 |
 | **Lifecycle** | 19647 | VD server -> Phone (localhost) | Display ready / stack empty / stop signals |
 | **ADB TCP** | 5555 | Car -> Phone (or Phone -> Car for dadb) | Persistent single-socket ADB for shell commands and car APK install |
 
@@ -51,7 +51,7 @@ The lifecycle channel on `localhost:19647` is documented in [client.md](./client
 |----|------|------------|-----------|---------|
 | 0 | CONTROL | Control (9637) | Bidirectional | Handshake, heartbeat, app commands, VD lifecycle signals |
 | 1 | VIDEO | Video (9638) | VD server -> Car | H.264 encoded video frames |
-| 2 | AUDIO | Audio (9640) | VD server -> Car | AAC-LC CONFIG + FRAME；载荷已定义，传输尚未绑定 |
+| 2 | AUDIO | Audio (9640) | VD server -> Car | AAC-LC CONFIG + FRAME；双向协商开启（isAudioNegotiated） |
 | 3 | DATA | Control (9637) | Bidirectional | App list, app info data, car logs, media metadata, log toggle |
 | 4 | INPUT | Input (9639) | Car -> VD server | Touch events (batched MOVE for multi-touch) |
 
@@ -202,7 +202,15 @@ H.264 NAL units representing a video frame.
 
 ## 音频通道 Audio Channel (0x02)
 
-S1 已定义 wire 契约（issue #67，`Refs #13`）；生产者 / 消费者与 9640 socket 的绑定留到 S2/S3。载荷编解码放在 `AudioPayload`，纯 JVM，可以不依赖 Android 直接单测。
+音频镜像协议在 1.0.3 实现完整闭环（Refs #67, #70, #72, #73, #79, #84）。包含 S1 载荷契约、S2 采集编码管线与静音补帧、S3 端口绑定与接收端播放、S4 双向能力协商与开关持久化、以及 S23 端到端测试与防假绿静音帧统计。载荷编解码由 `AudioPayload` 承载，纯 JVM，不依赖 Android 直接单测。
+
+### 阶段演化与技术规范
+
+- **S1 载荷契约与帧格式**：定义 `AudioPayload` 编解码格式，独立端口 `9640`（`AUDIO_PORT`），包含 `CONFIG (0x01)` 与 `FRAME (0x02)`。
+- **S2 编码与静音补帧**：VD server 端通过 `REMOTE_SUBMIX` 录音源采集，由 `AudioPipeline` + `AudioEncoderSelector` 编码为 AAC-LC（48000Hz, 双声道立体声, 128kbps）。48kHz AAC-LC 每帧 1024 采样 = **21.333 ms / 46.875 fps**（`AudioSpec.kt`, `AudioPacing.kt`）。采集静音期持续按 46.875 fps 节拍注入合成静音帧，杜绝接收端抖动缓冲下溢与排队延迟膨胀。
+- **S3 独立 TCP 连接与播放**：VD Server 启动 `PortAcceptor` 绑定 9640 端口（通过 `CAR_HOST` 进行对端 IP 锁定），使用 `AsyncSocketSender` 异步写入。车机端 `CarSessionCoordinator` 连接 9640，交付 `AudioPlayer`（内部维护 150ms 抖动缓冲，支持 60~200ms 配置），由 `AudioTrack` 自由跑播放。
+- **S4 双向能力协商**：握手双方必须在 `supportedFeatures` 均置位 `FEATURE_AUDIO`（`isAudioNegotiated` 判定）。客户端提供音频开关并持久化在本地配置；车机端根据手机响应动态置灰或启用音频开关。
+- **S23 端到端场景与防假绿**：落地 S23 音频镜像 e2e 场景；车机端 `AudioPlayer` 周期日志埋点静音帧统计（`silenceFrames`/`totalFrames`），杜绝全静音帧被误判为功能正常的假绿情况（issue #84）。
 
 ### CONFIG (0x01) -- VD server -> Car
 
@@ -454,7 +462,7 @@ PROTOCOL_VERSION      = 1
 CONTROL_PORT          = 9637  (phone <-> car, handshake + heartbeat + commands + data)
 VIDEO_PORT            = 9638  (VD server binds 0.0.0.0 -> car connects)
 INPUT_PORT            = 9639  (VD server binds 0.0.0.0 -> car connects)
-AUDIO_PORT            = 9640  （S1 常量；S3 绑定，承载 AAC-LC CONFIG + FRAME）
+AUDIO_PORT            = 9640  (VD server binds 0.0.0.0 -> car connects, AAC-LC CONFIG + FRAME)
 LIFECYCLE_PORT        = 19647 (VD server reverse-connects to phone localhost)
 ADB_PORT              = 5555  (standard ADB TCP port)
 TARGET_FPS            = 20

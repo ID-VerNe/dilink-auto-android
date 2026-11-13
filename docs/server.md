@@ -2,14 +2,15 @@
 
 ## Overview
 
-The car server app runs on the BYD DiLink infotainment system. It uses a **parallel connection model** with WiFi (3 dedicated connections) and USB tracks running simultaneously:
+The car server app runs on the BYD DiLink infotainment system. It uses a **parallel connection model** with WiFi (4 dedicated connections: control/data, video, touch, audio) and USB tracks running simultaneously:
 
-1. Track A (WiFi): gateway IP + mDNS discovery, control connect (9637), handshake with phone
-2. After handshake: video (9638) + input (9639) connections opened in parallel
+1. Track A (WiFi): gateway IP + mDNS discovery, control connect (9637), handshake with phone (including `FEATURE_AUDIO` negotiation)
+2. After handshake: video (9638) + input (9639) + audio (9640, if negotiated) connections opened in parallel
 3. Track B (USB): scan devices, USB ADB connect (with logSink diagnostics), launch phone app
 4. `checkAndAdvance()` evaluates state when any prerequisite changes
 5. Receives H.264 video and renders on car display via SurfaceView
-6. Captures touch events and sends to phone via input connection for VD input injection
+6. Receives AAC-LC audio and plays via `AudioPlayer` (150ms jitter buffer) and `AudioTrack`
+7. Captures touch events and sends to phone via input connection for VD input injection
 
 States: IDLE → CONNECTING → CONNECTED → STREAMING
 
@@ -29,16 +30,20 @@ The transition trigger: when the phone sends `APP_LIST` via the control connecti
 
 ### CarConnectionService
 
-Foreground service managing the full connection lifecycle with a parallel prerequisite state machine and 3 dedicated connections.
+Foreground service managing the connection lifecycle with a parallel prerequisite state machine and 4 dedicated connections. Substantially slimmed down to 407 lines through architectural decoupling (Refs #87, #92), delegating state coordination, ADB tracking, app-list parsing, and audio decoding to dedicated collaborators.
 
-**3-Connection Architecture:**
-- `controlConnection`: handshake, heartbeat, app commands, DATA channel (app list, media metadata, car logs)
-- `videoConnection`: H.264 video frames only (phone → car)
-- `inputConnection`: touch events only (car → phone)
-- Heartbeat/watchdog on control connection only; video and input have no heartbeat overhead
-- Any connection dying cascades → full session teardown
+**4-Connection Architecture:**
+- `controlConnection`: handshake, feature negotiation, heartbeat, app commands, DATA channel (app list, media metadata, car logs)
+- `videoConnection`: H.264 video frames only (phone → car, port 9638)
+- `inputConnection`: touch events only (car → phone, port 9639)
+- `audioConnection`: AAC-LC audio frames only (phone → car, port 9640, when `isAudioNegotiated`)
+- Heartbeat/watchdog on control connection only; video, input, and audio have no heartbeat overhead
+- Any critical connection dying cascades → full session teardown; audio failure degrades gracefully without killing video
 
-**Parallel Track Architecture:**
+**Parallel Track Architecture & Collaborators (Refs #87, #92):**
+- Delegated to `CarSessionCoordinator`, `CarAdbTracker`, `CarAppListReceiver`, and `AudioPlayer`.
+- Reconnect backoff utilizes `BackoffPolicy` from `:protocol-core` rather than ad-hoc calculations.
+- Decoder health monitored via `DecodeLivenessTracker`.
 - `connectionScope`: parent Job for all discovery coroutines, cancelled on disconnect
 - Track A and Track B run simultaneously
 - `checkAndAdvance()` evaluates overall state when any prerequisite changes
@@ -87,6 +92,35 @@ Foreground service managing the full connection lifecycle with a parallel prereq
 **Car Log Routing:**
 - `CarLogWriter` routes all car-side logs through the DATA channel (`DataMsg.CAR_LOG`) to the phone. Callers do a non-blocking `send` (logcat + queue) that hands the entry to a bounded `AsyncLogQueue` (1024); a dedicated coroutine on `Dispatchers.IO` drains it, formats each line (`LogLine.bracketed`) and ships it, so no caller ever blocks on the network. When the control connection is down, lines are buffered in a bounded `ConcurrentLinkedQueue` (10k cap, `AtomicInteger` counter for O(1) cap check) and flushed ahead of the next live line. `beginSession()` drops the previous session's buffer at each `startConnection`, and `shutdown()` closes the queue and drops the buffer so a dead writer cannot pin them for the rest of the process (audit S-L4). `videoDecoder.logSink`, `CarCrashHandler.logSink`, and `adb.setLogSink()` all wire through `carLogSend` so every log path reaches the phone. All logs visible in phone's `/sdcard/DiLinkAuto/client.log`. Logging defaults to `BuildConfig.DEBUG` (off in release); the phone toggles it via `LOG_TOGGLE`.
 
+### CarSessionCoordinator
+
+Manages multi-channel network connections (`service/CarSessionCoordinator.kt`), separating connection orchestration from Android Service lifecycle:
+- Manages four dedicated TCP channels: control (9637), video (9638), input (9639), and audio (9640).
+- Performs initial handshake with `HandshakeFactory`, evaluating `FEATURE_AUDIO` via `isAudioNegotiated`.
+- Orchestrates mid-stream rotation re-handshake and black-screen re-handshake on the existing control connection.
+- Dispatches received video to `VideoDecoder`, audio to `AudioPlayer`, and app events to `CarAppListReceiver`.
+
+### CarAdbTracker
+
+Manages USB ADB and TCP ADB connection tracks (`service/CarAdbTracker.kt`):
+- Handles USB broadcast intents, device enumeration, authentication, and background app launching.
+- Maintains TCP ADB fallback logic and monitors consecutive ADB failures (`noAdbCount >= 3`).
+- Tracks ADB state transitions independently of the Wi-Fi streaming state.
+
+### CarAppListReceiver
+
+Processes app lists and launcher metadata (`service/CarAppListReceiver.kt`):
+- Decodes incoming app lists and validates icon sizes against `AppIconLimits` (`MAX_ICON_DIM`, `MAX_ICON_BYTES`) to prevent memory exhaustion on low-RAM head units.
+- Manages icon cache population and updates the reactive app list state.
+
+### AudioPlayer
+
+Manages AAC-LC audio stream decoding and playback on the car (`audio/AudioPlayer.kt`):
+- **Codec**: Configures `MediaCodec` for AAC-LC audio decoding from `AudioPayload.CONFIG` (`csd-0`).
+- **Jitter Buffer**: Maintains a 150ms jitter buffer (configurable in range 60~200ms) to smooth out Wi-Fi transmission jitter without excessive audio lag.
+- **Playback**: Outputs decoded PCM audio to `AudioTrack` configured for low-latency media playback.
+- **Silence Metrics**: Logs periodic silence frame statistics (`silenceFrames`/`totalFrames`), closing the S23 testing contract against false-green silent passes (issue #84).
+
 ### HandshakeFactory
 
 Builds the car's `HandshakeRequest` to the phone (`service/HandshakeFactory.kt`). Populates `deviceName` (`DiLink-${Build.MODEL}`), viewport dims, DPI, `appVersionCode`/`appVersionName`, `targetFps`, `dpiOverride`, and `bitrate`. The same builder is used at both call sites — initial WiFi connect and mid-stream rotation re-handshake — so only the viewport dims and DPI differ between the two sites; callers compute those from the current display state. Extracted from `CarConnectionService` to remove duplication between `connectToPhone` and `onCarViewportChanged`.
@@ -98,7 +132,7 @@ Owns deployment of the vd-server (`PipelineServer`) onto the phone from the car,
 - `deploy()` — runs the availability check, retry, and TCP-ADB fallback. Called from the state machine when both tracks are ready or after a USB-ADB connection completes post-handshake.
 - `deployDirect(controller)` — for the dev-mode TCP-ADB path, which already has a fresh `RemoteAdbController` in hand and bypasses the availability probe.
 
-Reads viewport dims + DPI from the host (which owns the display) via `CarViewport.size`, and reports status through the host's message sink. DPI comes from `handshakeVdDpi` (if the phone adjusted it) or `VideoConfig.calculateOptimalDpi` otherwise. Uses `VdDeploy.buildDeployPlan` for the launch command; the stop side is owned by `VdDeploy.gracefulStopCommand` inside the shared sequence (stop is not part of the plan). Extracted from `CarConnectionService` — which now stands at 1611 lines: it grew well past its pre-extraction ~1237 lines during the audit round, but everything it has gained since is connection state and audit guards, not deploy logic.
+Reads viewport dims + DPI from the host (which owns the display) via `CarViewport.size`, and reports status through the host's message sink. DPI comes from `handshakeVdDpi` (if the phone adjusted it) or `VideoConfig.calculateOptimalDpi` otherwise. Uses `VdDeploy.buildDeployPlan` for the launch command; the stop side is owned by `VdDeploy.gracefulStopCommand` inside the shared sequence (stop is not part of the plan). Extracted from `CarConnectionService` — which has since been comprehensively refactored down to 407 lines (Refs #87, #92) by extracting `CarSessionCoordinator`, `CarAdbTracker`, and `CarAppListReceiver`.
 
 **Stopping the old engine**: Stop is a **cooperative sentinel protocol**, not a signal. Measured on MI 9 (2026-10-10): on ART, a bare `SIGTERM` terminates `app_process` immediately and **never runs the JVM shutdown hook**, so `PipelineServer.cleanup()` is skipped — the old `SIGTERM → SIGKILL` two-stage stop was silently equivalent to a force kill. Instead `vdRunDeploySequence` first writes `/sdcard/DiLinkAuto/stop-request` (`VdDeploy.gracefulStopCommand`, must return instantly — the desktop transport has a 5s deadline). The engine's watchdog polls that file, consumes it, and flips `running=false` + unparks every wait point, so `run()` unwinds through its natural exit path and the full `cleanup()` runs. `vdRunDeploySequence` then waits for exit: it polls the phone over ADB with `VdDeploy.probeExitCodeCommand` (exit 0 = alive, exit 1 = gone) for up to 12s (`VdDeploySequence.GRACEFUL_EXIT_TIMEOUT_MS`, polling every 150ms; the measured sentinel→exit latency on MI 9 is **6.1~6.3s**, so the earlier 6s/10s budgets were both too tight) and needs **two consecutive GONE** probes before accepting the exit — a transient false on a transport hiccup must not green-light a launch that races a still-live engine. A probe that could not run at all (`VdProbeResult.UNKNOWN`, transport dead) is accepted immediately so the deploy never stalls. On graceful timeout a force kill (`VdDeploy.killCommandForce`) is issued and the wait retried once with the short 3s (`EXIT_WAIT_TIMEOUT_MS`) budget. Two live engines race for the same VirtualDisplay / DTA / 9638-9639 binds and the loser never runs `cleanup()` — one leaked VD per reconnect, which is what turns the car screen black after a few cycles. The engine additionally deletes a stale sentinel at startup so a request that was never consumed cannot kill the replacement instance. The orchestration itself lives in protocol-core (`VdDeploySequence.kt`) because the car, phone-Shizuku and desktop sites had already drifted into three different "wait for exit" rules.
 
@@ -112,7 +146,7 @@ Encodes and sends touch events from the car to the phone's VD server on the inpu
 
 ### VideoDecoder
 
-H.264 decoder using `MediaCodec` with Surface output (GPU-direct rendering).
+H.264 decoder using `MediaCodec` with Surface output (GPU-direct rendering). Integrates `DecodeLivenessTracker` for unified decode vitality tracking and baseline tracking, and uses `BackoffPolicy` for exponential backoff during decoder resets.
 
 - Codec creation: `MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)` only. `REGULAR_CODECS` lists hardware decoders first, so this resolves to `OMX.qcom.video.decoder.avc` on the BYD without asking. The speculative `findHardwareAvcDecoder` + `createByCodecName` picker was removed because it called `MediaCodecInfo.isHardwareAccelerated()`, an API 29+ method that threw `NoSuchMethodError` on the API-28 BYD head unit and killed the process.
 - `fps` is clamped once at `start()` by the pure `coerceFps(fps)` into `VideoConfig.MIN_FPS..MAX_FPS` (10..60). The value arrives from a persisted preference and is used twice as a divisor (`1000L / fps`) and as `KEY_OPERATING_RATE`, so a legacy or hand-edited `0` raised `ArithmeticException` inside the feed thread and killed decoding with no recovery (audit S-L2).

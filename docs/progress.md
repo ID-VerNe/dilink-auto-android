@@ -329,7 +329,25 @@ Project created. Screen mirroring on emulators.
 
 ## Fork Changes (post v0.18.0-dev)
 
-The upstream repo went quiet after `v0.18.0-dev` (2026-05-09). This fork (`ID-VerNe/dilink-auto-android`) then landed a directed set of changes targeting Chinese ROM phones (Xiaomi HyperOS, Meizu, etc.) paired with BYD DiLink car head units. The reference car is a BYD Qin PLUS DM-i 2023 Champion 55KM Leading trim — DiLink 4.0 low-spec (Snapdragon 439, 8x Cortex-A53, Adreno 505, 4GB RAM, 16GB eMMC, 1280x800, 2.4GHz-only WiFi, Android 9 / API 28, H.264 hardware decode capped at 1080p). All work is on `main` (git-flow develop model dropped). Sections below are newest-first; the four entries at the top are **unreleased** work that still ships as `versionName 0.18.0-dev-13` (versionCode 58) — `v0.18.0-dev-13` itself is the last released tag.
+The upstream repo went quiet after `v0.18.0-dev` (2026-05-09). This fork (`ID-VerNe/dilink-auto-android`) then landed a directed set of changes targeting Chinese ROM phones (Xiaomi HyperOS, Meizu, etc.) paired with BYD DiLink car head units. The reference car is a BYD Qin PLUS DM-i 2023 Champion 55KM Leading trim — DiLink 4.0 low-spec (Snapdragon 439, 8x Cortex-A53, Adreno 505, 4GB RAM, 16GB eMMC, 1280x800, 2.4GHz-only WiFi, Android 9 / API 28, H.264 hardware decode capped at 1080p). All work is on `main` (git-flow develop model dropped). Sections below are newest-first.
+
+### v1.0.3 (2026-11-13)
+
+- **Complete Audio Mirroring Closed-Loop (issues #67, #70, #72, #73, #79, #84)**:
+  - **Port 9640 & Framing (S1)**: `AUDIO_PORT = 9640` in `Ports.kt`. Dedicated TCP connection independent of video to avoid 1MB video IDRs head-of-line blocking 341B audio frames. Binary framing via `AudioPayload` with out-of-band `CONFIG` (`csd-0`, AAC-LC 48kHz stereo, 128kbps) and `FRAME` (pts timestamp + raw AAC-LC access units).
+  - **Capture, Encoding & Pacing (S2)**: `AudioRecord` with `REMOTE_SUBMIX` captures system audio rendered to the VirtualDisplay. `AudioPipeline` + `AudioEncoderSelector` encode to AAC-LC. Constant 46.875 fps pacing (1024 samples/frame at 48kHz = 21.333ms per frame) with synthetic silence frame injection during audio pauses (`AudioSpec.kt`, `AudioPacing.kt`), preventing jitter buffer underruns and delay accumulation.
+  - **Port Binding & Receiver Playback (S3)**: `PortAcceptor` on `vd-server` binds port 9640 (accepting only pinned `CAR_HOST`). `CarSessionCoordinator` connects to 9640 and hands the stream to `AudioPlayer`. Internal 150ms jitter buffer (configurable 60~200ms) with `AudioTrack` free-running playback.
+  - **Bidirectional Feature Negotiation (S4)**: Dual-sided `FEATURE_AUDIO` negotiation via `isAudioNegotiated(request, response)`. Client provides a persisted audio toggle; car UI dynamically enables or dims the audio switch based on phone capability.
+  - **E2E Scenario & Silence Metrics (S23)**: S23 end-to-end audio mirroring test scenario landed in `e2e-scenarios.md`. Periodic logging in `AudioPlayer` tracks silence frame ratios (`silenceFrames`/`totalFrames`), closing the contract against false-green silent passes (issue #84).
+- **Two Rounds of SRP/DRY Architectural Decoupling (Refs #87, #92)**:
+  - `:protocol-core` & `:protocol`: Extracted `NioWriter` (SocketChannel spin-blocking writes with timeout), `BackoffPolicy` (parameterized exponential backoff with jitter), `DecodeLivenessTracker` (unified decode vitality tracking and baseline management), `ConnectionFactory`, `ConnectionKeepAlive`, `UsbAdbKeyStore`, `Ipv4Validator` (strict/loose), and `AppIconLimits` (max icon dim 512, max bytes 1MB). Cleaned up dead sync/push methods in `UsbAdbConnection` and unified UTF-8 writing in `Messages.kt`.
+  - `:vd-server`: Extracted `AsyncSocketSender` (unified non-blocking socket writer), `AudioEncoderSelector`, `ProcessWatchdog` (watchdog loop separated from stop-sentinel watcher), `VideoEncoderSelector`, `PortAcceptor` (multi-port listener with `CAR_HOST` enforcement), `ActivityDumpParser` (bounds-checked dumpsys window/display parsing), and `VdDisplayHealer`. Migrated `LifecycleWriter` to `AsyncSocketSender`.
+  - `:app-client`: Decoupled `ConnectionService`, extracting `ShizukuVdDeployer`, `ShizukuNav`, `ClientNetworkMonitor`, `CarAppInstallHost`, `AllowlistRepository`, and `SessionState`. Formally marked `InputInjectionService` as `@Deprecated` and severed its call path.
+  - `:app-server`: Substantially slimmed `CarConnectionService` down to 407 lines, extracting `CarSessionCoordinator` (manages 4-channel lifecycle 9637/9638/9639/9640 and re-handshake), `CarAdbTracker` (USB/TCP ADB dual tracks), and `CarAppListReceiver` (`AppIconLimits` security gate).
+  - `:app-desktop`: Aligned with `AppIconLimits`, `DecodeLivenessTracker`, and `BackoffPolicy`.
+- **Stability and Diagnostics Fixes**:
+  - **IDR Request Throttling (#75)**: Unified IDR request throttling thresholds across car server and VD server, eliminating the 500-999ms dead zone during keyframe recovery.
+  - **Dumpsys Display Section Parsing (#77)**: Added upper bounds and task-header checking in display dumpsys parsing, eliminating task duplication and cross-display activity leakage.
 
 ### Full-module test coverage — 18 files, 139 cases (commit 8157c86, 2026-10-10)
 
@@ -600,7 +618,8 @@ The 2026-10-09 full-project audit ([audit-project-2026-10-09.md](audit-project-2
 | Black screen after reconnect | Car stuck on black screen, no recovery | **FIXED v0.18.0-dev-13** — `onSustainedBlackScreen` callback triggers VD rebuild after 3s (`BlackScreenDetector.BLACK_SCREEN_SUSTAIN_MS`, protocol-core; was 5s in app-server before the e1674f8 extraction). The self-heal itself then had a defect: **FIXED `35d7821`** — the recovery path called `videoDecoder.stop()` while `CarShell` keeps the streaming layout mounted, so nothing ever restarted the codec and a triggered recovery left the screen black for the rest of the session. It now resets the detector state and lets the live codec consume the fresh IDR. |
 | Portrait apps letterboxed on landscape VD | Petal Maps home screen narrow | Mitigated — `VideoConfig.calculateOptimalDpi` caps DPI so portrait apps get >=360dp; user can override via `startup_dpi`. |
 | Hotspot must be enabled manually | User enables before plugging in | Android 16 limitation |
-| Audio streaming / media controls / navigation widgets | Not implemented | `NowPlayingBar` exists in the source tree but is only composed when `MediaMetadata` is present, which the phone never sends. |
+| Audio streaming | **FIXED / IMPLEMENTED in v1.0.3** | Full loop operational on port 9640 (AAC-LC 48kHz stereo, synthetic silence pacing at 46.875 fps, 150ms jitter buffer, bidirectional capability negotiation, silence metric audit). |
+| Media controls / navigation widgets | Not implemented | `NowPlayingBar` exists in the source tree but is only composed when `MediaMetadata` is present, which the phone never sends. |
 | `Versioning` zero-version sentinel (testing-audit C-5) | With nothing installed, `readInstalledVersion` returns `"0"`, which compares equal to `versionName` `"0"` / `"0.0"` / `"0.0.0"` — so the car app is judged "already up to date" and the **first install is skipped**. `-SNAPSHOT` also compares equal to its release | **OPEN** — product decision, pinned by a hazard test in `VersioningTest` (commit 8157c86). Fix: an explicit "not installed" state that can never compare equal, instead of a `"0"` sentinel |
 | `InstallStatus` classifies by English substring (testing-audit C-6) | Status strings come from `context.getString`, so every non-English `values-*` locale falls into `IDLE` — no progress and no error UI at all. `"not reachable"` / `"Invalid IP"` are not classified as ERROR either | **OPEN** — product decision, pinned by a hazard test in `InstallStatusTest` (8157c86). Fix: classify on a structured state enum rather than localized copy |
 | `CarCommandRouter.dispatch` decode unprotected (testing-audit S-02 residual) | `LAUNCH_APP` / `APP_UNINSTALL` call their decoders outside any try/catch (only `APP_INFO` has one), so a rejected package name escapes into the vd-server's frame-read thread instead of being logged and dropped | **OPEN** — the package-name shape check itself landed (`a7d2b72`, `8601fb1`); only the call-site guard is missing. Fix: wrap the two `decode` calls the way `APP_INFO` does. Pinned by `CarCommandRouterDispatchTest` |
@@ -615,12 +634,12 @@ The 2026-10-09 full-project audit ([audit-project-2026-10-09.md](audit-project-2
 ```
 Phone (Chinese ROM — Xiaomi HyperOS / Meizu etc., Android 14+)
 ├── DiLink Auto Client App (app-client, minSdk 29)
-│   ├── ConnectionService — pure orchestrator
+│   ├── ConnectionService — pure orchestrator (FEATURE_AUDIO negotiation, Shizuku deploy delegation)
 │   │   ├── Control (9637): accept → handshake → VD_PORTS_BOUND → car logs
-│   │   ├── VD JAR deploy to /sdcard/DiLinkAuto/ (Shizuku when available)
+│   │   ├── Collaborators: ShizukuVdDeployer, ShizukuNav, ClientNetworkMonitor, CarAppInstallHost, AllowlistRepository
 │   │   ├── Car auto-update: UPDATING_CAR → CarAppInstaller (dadb) push+install
 │   │   ├── App allowlist filter (AppListBuilder.sendAppList)
-│   │   ├── Smart network callback (TRANSPORT_WIFI only)
+│   │   ├── Smart network callback (ClientNetworkMonitor, TRANSPORT_WIFI only)
 │   │   └── FileLog: /sdcard/DiLinkAuto/client.log (rotation, 10 max)
 │   ├── VirtualDisplayClient — lifecycle-only
 │   │   ├── startListening() — synchronous ServerSocket on 127.0.0.1:19647 (loopback; non-loopback peers refused)
@@ -633,11 +652,12 @@ Phone (Chinese ROM — Xiaomi HyperOS / Meizu etc., Android 14+)
 │
 ├── VD Server (app_process, shell UID 2000, vd-server.jar)
 │   ├── PipelineServer — process entry point + lifecycle owner
-│   │   ├── Binds 9638 (video) and 9639 (input) on 0.0.0.0
-│   │   ├── Accepts car's video + input connections directly
+│   │   ├── Binds 9638 (video), 9639 (input), and 9640 (audio) on 0.0.0.0 via PortAcceptor
+│   │   ├── Accepts car's video, input, and audio connections directly (CAR_HOST pinned)
 │   │   ├── Reverse-connects lifecycle to phone localhost:19647
-│   │   ├── Encoder: candidate-ordered pick (Codec2 before legacy OMX, each really tried), CBR 4Mbps Main, I-frame 1s
-│   │   ├── Watchdog forces cleanup() if pipeline thread hangs in native MediaCodec
+│   │   ├── VideoEncoderSelector: candidate-ordered pick (Codec2 before legacy OMX), CBR 4Mbps Main, I-frame 1s
+│   │   ├── AudioPipeline: REMOTE_SUBMIX capture, AudioEncoderSelector AAC-LC, 46.875 fps synthetic silence pacing
+│   │   ├── ProcessWatchdog: forces cleanup() if pipeline hangs in native MediaCodec, watches stop-sentinel
 │   │   └── Cleanup: am display move-stack → restore panel → restore IME → kill shell
 │   ├── GlPipeline — EGL14 + GLES20 on the pipeline thread
 │   │   ├── parkNanos pace → updateTexImage → fullscreen quad → eglSwapBuffers
@@ -650,17 +670,15 @@ Phone (Chinese ROM — Xiaomi HyperOS / Meizu etc., Android 14+)
 │
 Car (BYD DiLink 4.0, Snapdragon 439, Android 9 / API 28, 1280x800)
 ├── DiLink Auto Server App (app-server, minSdk 26)
-│   ├── CarConnectionService — parallel WiFi + USB/TCP ADB tracks
-│   │   ├── controlConnection (9637): handshake, heartbeat, data
-│   │   ├── videoConnection (9638): H.264 → VideoDecoder (direct to VD server)
-│   │   ├── inputConnection (9639): touch → VD server (direct)
-│   │   ├── Track B (USB or TCP ADB): RemoteAdbController → TcpAdbConnection
+│   ├── CarConnectionService — parallel WiFi + USB/TCP ADB tracks (slimmed to 407 lines)
+│   │   ├── CarSessionCoordinator: manages 9637 (control), 9638 (video), 9639 (input), 9640 (audio)
+│   │   ├── CarAdbTracker: USB host ADB and TCP ADB dual tracks, reconnect bounds (noAdbCount >= 3)
+│   │   ├── CarAppListReceiver: app list parsing with AppIconLimits enforcement
+│   │   ├── AudioPlayer: MediaCodec AAC-LC decode, 150ms jitter buffer, AudioTrack, silence frame metrics
 │   │   ├── VdServerDeployer: shellBackground launchCommand
 │   │   ├── HandshakeFactory.buildHandshakeRequest (initial + rotation re-handshake)
-│   │   ├── onCarViewportChanged: re-handshake on rotation (cancels connectionScope)
-│   │   ├── Reconnect stops after noAdbCount >= 3
 │   │   └── startup_dpi SharedPreferences (0 = auto, [120, 480] = override)
-│   ├── VideoDecoder — createDecoderByType, 4-frame queue, keyframe priority
+│   ├── VideoDecoder — createDecoderByType, 4-frame queue, keyframe priority, DecodeLivenessTracker
 │   │   ├── outputSurfaceValid gate (SurfaceView destroy/re-create across navigation)
 │   │   ├── switchSurface re-attaches decoder with zero keyframe loss
 │   │   ├── post-flush IDR resync (skips P-frames until keyframe)
@@ -704,20 +722,20 @@ Windows (x64, no JDK required — jpackage app-image bundles a JRE)
    a. Gateway IP discovery + mDNS lookup
    b. NIO connect to phone control port (9637)
    c. Handshake: car sends viewport + DPI + appVersionCode + appVersionName
-                 + targetFps + dpiOverride
-   d. Phone responds with device info + vdServerJarPath + vdDpi
+                 + targetFps + dpiOverride + supportedFeatures (FEATURE_AUDIO)
+   d. Phone responds with device info + vdServerJarPath + vdDpi + supportedFeatures
    e. Phone checks version — if mismatch, sends UPDATING_CAR, auto-updates
       car APK via dadb, disconnects to wait for car restart
-   f. Phone opens lifecycle ServerSocket on 0.0.0.0:19647
+   f. Phone opens lifecycle ServerSocket on 127.0.0.1:19647 (loopback only)
    g. If Shizuku available: phone deploys VD server directly.
       Else car deploys via ADB (USB or TCP).
    h. VD server starts: CLASSPATH=jar app_process / PipelineServer
-                          W H DPI PHONE_HOST EW EH FPS
+                          W H DPI PHONE_HOST EW EH FPS BITRATE [CAR_HOST]
    i. VD server reverse-connects to phone localhost:19647 (NIO)
    j. Phone reads MSG_DISPLAY_READY (displayId + direct-injection flag)
    k. Phone sends VD_PORTS_BOUND to car on the control connection
-   l. Car connects video (9638) + input (9639) directly to the VD server
-   m. VD server accepts both — session fully established
+   l. Car connects video (9638), input (9639), and audio (9640, when negotiated) directly to VD server
+   m. VD server accepts connections — session fully established
 
    Track B (USB ADB / TCP ADB):
    a. USB: scan USB devices for ADB interface → CNXN → AUTH → connected
@@ -728,12 +746,13 @@ Windows (x64, no JDK required — jpackage app-image bundles a JRE)
 3. VD server creates VirtualDisplay (car viewport + auto-calibrated DPI)
 4. VD server powers off the phone's physical panel via DisplayControl
 5. VD server saves the original IME and sets the VD's IME policy
-6. Pipeline thread: EGL/GL init → SurfaceTexture → encoder → bind 9638/9639
+6. Pipeline thread: EGL/GL init → SurfaceTexture → encoder → bind 9638/9639/9640
 7. Car starts VideoDecoder on the SurfaceView surface when MirrorScreen creates it
 8. Video: VD → SurfaceTexture → GL → encoder → TCP 9638 → car VideoDecoder → SurfaceView
-9. Touch: car SurfaceView onTouch → TouchEvent encode → TCP 9639 → VD TouchInjector
+9. Audio: VD → AudioRecord (REMOTE_SUBMIX) → AAC-LC encoder (synthetic silence pacing) → TCP 9640 → car AudioPlayer (150ms buffer) → AudioTrack
+10. Touch: car SurfaceView onTouch → TouchEvent encode → TCP 9639 → VD TouchInjector
           → InputManager.injectInputEvent
-10. Car logs: carLogSend() + logSink callbacks → DATA CAR_LOG → phone FileLog
+11. Car logs: carLogSend() + logSink callbacks → DATA CAR_LOG → phone FileLog
 ```
 
 States: `IDLE → CONNECTING → CONNECTED → STREAMING`
