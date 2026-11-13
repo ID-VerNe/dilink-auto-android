@@ -88,6 +88,17 @@ wait_count() { # <file> <fixed-pattern> <target> <timeout_s>
 
 # ── 设备小工具 ────────────────────────────────────────────────────────
 dev() { adb -s "$SERIAL" shell "$@"; }
+# 活动 WiFi IP：Meizu 是 wlan1、MI9 是 wlan0，不能写死网卡名。
+wifi_ip() {
+  local out iface
+  out=$(dev 'ip -4 route show table all 2>/dev/null' 2>/dev/null | tr -d '\r')
+  iface=$(printf '%s\n' "$out" | awk '$1=="default" {for(i=1;i<=NF;i++) if($i=="dev" && $(i+1) ~ /^wlan/) {print $(i+1); exit}}')
+  if [ -z "$iface" ]; then
+    out=$(dev 'ip -4 addr show 2>/dev/null' 2>/dev/null | tr -d '\r')
+    iface=$(printf '%s\n' "$out" | awk '/^[0-9]+: wlan/ {gsub(":","",$2); cand=$2} /inet / {if(cand!=""){print cand; exit}}')
+  fi
+  [ -n "$iface" ] && dev "ip -4 addr show $iface 2>/dev/null" 2>/dev/null | tr -d '\r' | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | head -1
+}
 cur_timeout() { dev 'settings get system screen_off_timeout' 2>/dev/null | tr -d '\r\n '; }
 engine_pid() { dev 'pgrep -f "[P]ipelineServer" | head -1' 2>/dev/null | tr -d '\r\n '; }
 wait_timeout_eq() { # <value> <timeout_s>（SECONDS 预算：每次 adb 往返在本机约 1s，别按迭代次数算）
@@ -244,7 +255,7 @@ fi
 export DILINK_DESKTOP_HOME="$ROOT/$RUN/desktop-home"
 mkdir -p "$DILINK_DESKTOP_HOME"
 cp "$APPDATA/DiLinkAuto/config.json" "$DILINK_DESKTOP_HOME/config.json" 2>/dev/null || true
-PHONE_IP=$(dev 'ip -4 addr show wlan0 2>/dev/null' | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | head -1)
+PHONE_IP=$(wifi_ip)
 CFG=$(python - "$DILINK_DESKTOP_HOME/config.json" "$PHONE_IP" <<'PY'
 import json, sys
 dst, ip = sys.argv[1], sys.argv[2].strip()
@@ -253,7 +264,7 @@ try:
 except Exception:
     cfg = {}
 if ip:
-    cfg["dev_phone_ip"] = ip          # 以 adb 实测 wlan0 IP 为准
+    cfg["dev_phone_ip"] = ip          # 以 adb 实测活动 WiFi IP 为准（Meizu=wlan1 / MI9=wlan0）
 cfg["dev_mode"] = True                # ADB 部署路径是本机（无 Shizuku）主路径
 cfg["log_enabled"] = True
 cfg.setdefault("startup_fps", 24)
@@ -265,7 +276,7 @@ PY
 if [ -n "$CFG" ]; then
   ok "桌面端配置就绪（dev_phone_ip=$CFG，隔离目录 $RUN/desktop-home）"
 else
-  bad "无法确定手机 IP（wlan0 未取到且 config 无值）——桌面端会直接退出"
+  bad "无法确定手机 IP（活动 WiFi 网卡未取到 IP 且 config 无值）——桌面端会直接退出"
 fi
 
 if python "$WIN_AUTO" rect "$WINTITLE" > /dev/null 2>&1; then

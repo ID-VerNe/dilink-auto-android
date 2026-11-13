@@ -568,7 +568,9 @@ freeze_scene() { # <tag> [run_dir=${E2E_RUN_DIR}]
     echo "engine_pid=$(engine_pid)"
     echo "car_state=$(car_state_now) phone_state=$(phone_state_now)"
     echo "screen_off_timeout=$(dphone 'settings get system screen_off_timeout' 2>/dev/null | tr -d '\r\n ')"
-    dphone 'ip -4 addr show wlan0' 2>/dev/null; dcar 'ip -4 addr show wlan0' 2>/dev/null
+    echo "phone_wifi_iface=$(active_wifi_iface "$PHONE_SERIAL" 2>/dev/null) phone_ip=$(active_wifi_ip "$PHONE_SERIAL" 2>/dev/null)"
+    echo "car_wifi_iface=$(active_wifi_iface "$CAR_SERIAL" 2>/dev/null) car_ip=$(active_wifi_ip "$CAR_SERIAL" 2>/dev/null)"
+    dphone 'ip -4 addr show' 2>/dev/null; dcar 'ip -4 addr show' 2>/dev/null
   } > "$dir/state-snapshot.txt" 2>&1 || true
   [ -f "${E2E_SEQ_LOG:-/dev/null}" ] && cp "$E2E_SEQ_LOG" "$dir/sequence-slice.jsonl" 2>/dev/null
   log_ok "现场已冻结：$dir"
