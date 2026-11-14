@@ -131,8 +131,15 @@ fun CarShell(service: CarConnectionService) {
                     },
                     // issue #152-PA：切回上一个显示过的 APP（GO_RECENT，双击 recents 语义）。
                     // connected 传 isConnected：重握手（CONNECTING）期间该键禁用，不发无效指令。
-                    // 同时切到 Screen.APP：否则手机已把上一个 APP 拉到 VD 前台，车机仍停在
-                    // 主页磁贴，用户看不到切换结果。
+                    //
+                    // 为什么必须同时切到 Screen.APP：手机侧已把上一个 APP 拉到 VD 前台，
+                    // 车机若还停在 Screen.HOME，会继续显示主页磁贴，用户看不到切换结果。
+                    // 这是无条件副作用，以下是已知边界（评审要求记录，本 PR 不改行为）：
+                    //  - 已经在 APP 屏时重复置位，多余但无害；
+                    //  - quickSwitch() 找不到候选（只剩自家包 / launcher / systemui 等被过滤）
+                    //    时，车机会离开主页、显示 VD 的当前画面，可按「主页」退回；
+                    //  - videoReady = false 时会落进下面 CarContentArea 的「等待视频」无限
+                    //    转圈 overlay（`CarShell.kt:220`），直到首帧就绪或重连。
                     onRecent = {
                         service.goRecent()
                         currentScreen = Screen.APP
@@ -182,6 +189,9 @@ fun CarShell(service: CarConnectionService) {
                         service.goHome()
                         currentScreen = Screen.HOME
                     },
+                    // issue #152-PA：同横屏左栏 —— 必须切到 Screen.APP 才能看到切换结果，
+                    // 无条件置位的已知边界（已在 APP 冗余无害 / 无候选时显示 VD 当前画面、
+                    // 可 Home 退回 / videoReady=false 时落进 :220 的等待视频转圈）见上方注释。
                     onRecent = {
                         service.goRecent()
                         currentScreen = Screen.APP
