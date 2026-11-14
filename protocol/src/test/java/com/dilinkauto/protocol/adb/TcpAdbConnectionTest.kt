@@ -94,4 +94,79 @@ class TcpAdbConnectionTest {
         assertTrue("坏 magic 必须抛 IOException", threw != null)
         assertTrue(threw!!.message!!.contains("Malformed"))
     }
+
+    @Test
+    fun `shellBackground output does not contaminate subsequent shell command`() {
+        java.net.ServerSocket(0).use { server ->
+            val tempDir = java.io.File(System.getProperty("java.io.tmpdir"), "adb_test_${System.currentTimeMillis()}")
+            tempDir.mkdirs()
+            val conn = TcpAdbConnection("127.0.0.1", server.localPort, tempDir)
+
+            val serverThread = Thread {
+                val client = server.accept()
+                val inp = client.getInputStream()
+                val out = client.getOutputStream()
+
+                // 1. Read CNXN
+                TcpAdbConnection.readMessageFrom(inp)
+                // Send CNXN response
+                out.write(AdbProtocol.encode(AdbProtocol.A_CNXN, 0x01000000, 4096, "device::\u0000".toByteArray()))
+                out.flush()
+
+                // 2. Read A_OPEN for shellBackground
+                val openBg = TcpAdbConnection.readMessageFrom(inp)
+                assertEquals(AdbProtocol.A_OPEN, openBg.command)
+                val bgLocalId = openBg.arg0 // localId of client
+                val bgRemoteId = 100
+                // Send A_OKAY
+                out.write(AdbProtocol.encode(AdbProtocol.A_OKAY, bgRemoteId, bgLocalId, null))
+                out.flush()
+
+                // Send background stream WRTE and CLSE
+                out.write(AdbProtocol.encode(AdbProtocol.A_WRTE, bgRemoteId, bgLocalId, "bg output\n".toByteArray()))
+                out.flush()
+
+                // Read A_OKAY ack from client for WRTE
+                val ackWrte = TcpAdbConnection.readMessageFrom(inp)
+                assertEquals(AdbProtocol.A_OKAY, ackWrte.command)
+
+                out.write(AdbProtocol.encodeClose(bgRemoteId, bgLocalId))
+                out.flush()
+
+                // 3. Read A_OPEN for sync shell
+                val openSync = TcpAdbConnection.readMessageFrom(inp)
+                assertEquals(AdbProtocol.A_OPEN, openSync.command)
+                val syncLocalId = openSync.arg0
+                val syncRemoteId = 101
+                out.write(AdbProtocol.encode(AdbProtocol.A_OKAY, syncRemoteId, syncLocalId, null))
+                out.flush()
+
+                out.write(AdbProtocol.encode(AdbProtocol.A_WRTE, syncRemoteId, syncLocalId, "sync output\n".toByteArray()))
+                out.flush()
+
+                val ackSyncWrte = TcpAdbConnection.readMessageFrom(inp)
+                assertEquals(AdbProtocol.A_OKAY, ackSyncWrte.command)
+
+                out.write(AdbProtocol.encodeClose(syncRemoteId, syncLocalId))
+                out.flush()
+            }
+            serverThread.start()
+
+            try {
+                assertTrue("connect must succeed", conn.connect())
+                val bgId = conn.shellBackground("logcat")
+                assertTrue("shellBackground must succeed with valid stream id", bgId > 0)
+
+                // Now execute synchronous shell command
+                val syncOutput = StringBuilder()
+                val rc = conn.shell("echo hello", syncOutput)
+                assertEquals("shell must succeed (rc=0) despite background stream output", 0, rc)
+                assertEquals("sync output\n", syncOutput.toString())
+            } finally {
+                conn.close()
+                serverThread.join(5000)
+                tempDir.deleteRecursively()
+            }
+        }
+    }
 }
