@@ -3,10 +3,12 @@ package com.dilinkauto.server.service
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.util.Log
 import com.dilinkauto.protocol.WeatherData
 import com.dilinkauto.protocol.WeatherFormat
 import com.dilinkauto.protocol.WeatherParser
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -14,6 +16,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
 import java.net.URL
 
@@ -38,8 +41,9 @@ data class WeatherUiState(
  * 单独成类（SRP，仿 [ClockProvider] / [AltitudeProvider]）。服务只持有 `weatherState` 出口
  * 与 [start]/[stop] 两个生命周期调用。
  *
- * - 网络：`HttpURLConnection`（HTTPS，超时 5s/8s）；`AndroidManifest.xml` 已是
- *   `usesCleartextTraffic=false`，接口必须 HTTPS，不做 HTTP 回退。
+ * - 网络：`HttpURLConnection`（HTTPS，超时 5s/8s，**在 [Dispatchers.IO] 执行**——服务的
+ *   scope 绑 `Dispatchers.Main`，留在主线程会被 `BlockGuard` 抛 `NetworkOnMainThreadException`）；
+ *   `AndroidManifest.xml` 已是 `usesCleartextTraffic=false`，接口必须 HTTPS，不做 HTTP 回退。
  * - 解析：委托 [WeatherParser]（protocol-core，Gson，单测覆盖正常/code!=200/字段缺失/异常）。
  * - 调度：冷启动立即拉一次，随后每 [WeatherFormat.REFRESH_INTERVAL_MS]（15 分钟）轮询；
  *   失败按 [WeatherFormat.nextBackoffMs]（30s→2m→5m→15m）退避，不形成请求风暴。
@@ -131,13 +135,20 @@ internal class WeatherProvider(
             updatedAtMs = data.updatedAtMs,
             isStale = false
         )
+        Log.i(TAG, "weather ok: city=${data.city} cond=${data.condition} temp=${data.temperature} updatedAt=${data.updatedAtMs}")
         onSuccess()
         return true
     }
 
-    /** 拉取并解析；网络/解析失败返回 null，不抛。 */
-    private fun fetch(): WeatherData? {
-        return try {
+    /**
+     * 拉取并解析；网络/解析失败返回 null，不抛。失败原因写 logcat，避免静默吞掉（issue #41）。
+     *
+     * **必须切到 [Dispatchers.IO]**：服务的 scope 绑在 `Dispatchers.Main`
+     * （`CarConnectionService.kt:38`），阻塞的 `HttpURLConnection` 若留在主线程会被
+     * `BlockGuard` 抛 `NetworkOnMainThreadException`（issue #41 回签「天气恒 `—`」的真因）。
+     */
+    private suspend fun fetch(): WeatherData? = withContext(Dispatchers.IO) {
+        try {
             val conn = (URL(carPrefs.weatherApiBaseUrl).openConnection() as HttpURLConnection).apply {
                 connectTimeout = 5_000
                 readTimeout = 8_000
@@ -146,12 +157,17 @@ internal class WeatherProvider(
                 setRequestProperty("User-Agent", "DiLinkAuto/1.0 (car)")
             }
             conn.use {
-                if (conn.responseCode != 200) return null
+                if (conn.responseCode != 200) {
+                    Log.w(TAG, "fetch failed: HTTP ${conn.responseCode} url=${carPrefs.weatherApiBaseUrl}")
+                    return@withContext null
+                }
                 conn.inputStream.bufferedReader().use { reader ->
                     WeatherParser.parse(reader.readText())
                 }
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            // 关键：这里曾静默吞掉 NetworkOnMainThreadException，导致回签时无线索（issue #41）。
+            Log.w(TAG, "fetch failed: ${e.javaClass.simpleName} url=${carPrefs.weatherApiBaseUrl}", e)
             null
         }
     }
@@ -187,5 +203,9 @@ internal class WeatherProvider(
         } finally {
             disconnect()
         }
+    }
+
+    private companion object {
+        const val TAG = "WeatherProvider"
     }
 }
