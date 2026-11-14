@@ -173,6 +173,7 @@ data class HandshakeRequest(
             buf.require(4)
             val version = buf.getInt()
             val deviceName = buf.readShortLengthPrefixed()
+            buf.require(12)
             val request = HandshakeRequest(
                 protocolVersion = version,
                 deviceName = deviceName,
@@ -320,10 +321,11 @@ data class HandshakeResponse(
             val version = buf.getInt()
             val accepted = buf.get() != 0.toByte()
             val deviceName = buf.readShortLengthPrefixed()
+            buf.require(8)
             val dw = buf.getInt()
             val dh = buf.getInt()
-            val vdId = if (buf.hasRemaining()) buf.getInt() else -1
-            val adbP = if (buf.hasRemaining()) buf.getInt() else Ports.ADB_PORT
+            val vdId = if (buf.remaining() >= 4) buf.getInt() else -1
+            val adbP = if (buf.remaining() >= 4) buf.getInt() else Ports.ADB_PORT
             val jarPath = buf.readShortLengthPrefixedOrEmpty() // optional trailing field
             val connMethod = if (buf.hasRemaining()) buf.get() else CONNECTION_METHOD_USB_ADB
             val vdDpi = if (buf.remaining() >= 4) buf.getInt() else VideoConfig.VIRTUAL_DISPLAY_DPI

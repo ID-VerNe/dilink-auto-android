@@ -245,4 +245,56 @@ class MessagesTest {
         assertEquals(original.installTime, decoded.installTime)
         assertEquals(original.targetSdk, decoded.targetSdk)
     }
+
+    @Test
+    fun testHandshakeRequestTruncatedAfterDeviceNameThrowsProtocolDecodeException() {
+        val buf = ByteBuffer.allocate(4 + 2 + 4 + 4).order(ByteOrder.BIG_ENDIAN)
+        buf.putInt(PROTOCOL_VERSION)
+        buf.putShort(4)
+        buf.put("Test".toByteArray(Charsets.UTF_8))
+        buf.putInt(1080)
+        val data = buf.array()
+
+        try {
+            HandshakeRequest.decode(data)
+            fail("Expected ProtocolDecodeException")
+        } catch (e: ProtocolDecodeException) {
+            // Expected
+        }
+    }
+
+    @Test
+    fun testHandshakeResponseTruncatedAfterDeviceNameThrowsProtocolDecodeException() {
+        val buf = ByteBuffer.allocate(4 + 1 + 2 + 4 + 4).order(ByteOrder.BIG_ENDIAN)
+        buf.putInt(PROTOCOL_VERSION)
+        buf.put(1.toByte())
+        buf.putShort(4)
+        buf.put("Test".toByteArray(Charsets.UTF_8))
+        buf.putInt(1920)
+        val data = buf.array()
+
+        try {
+            HandshakeResponse.decode(data)
+            fail("Expected ProtocolDecodeException")
+        } catch (e: ProtocolDecodeException) {
+            // Expected
+        }
+    }
+
+    @Test
+    fun testHandshakeResponseTruncatedOptionalIntsHandledGracefully() {
+        val buf = ByteBuffer.allocate(4 + 1 + 2 + 4 + 4 + 4 + 2).order(ByteOrder.BIG_ENDIAN)
+        buf.putInt(PROTOCOL_VERSION)
+        buf.put(1.toByte())
+        buf.putShort(4)
+        buf.put("Test".toByteArray(Charsets.UTF_8))
+        buf.putInt(1920)
+        buf.putInt(1080)
+        buf.putShort(0x1234.toShort())
+        val data = buf.array()
+
+        val decoded = HandshakeResponse.decode(data)
+        assertEquals(-1, decoded.virtualDisplayId)
+        assertEquals(Ports.ADB_PORT, decoded.adbPort)
+    }
 }
