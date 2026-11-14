@@ -21,7 +21,8 @@ import java.util.concurrent.atomic.AtomicBoolean
  */
 class Connection(
     private val channel: SocketChannel,
-    private val scope: CoroutineScope
+    private val scope: CoroutineScope,
+    private val writeTimeoutMs: Long = DEFAULT_WRITE_TIMEOUT_MS
 ) {
     private val actualSendBuf: Int
     private val actualRecvBuf: Int
@@ -79,6 +80,7 @@ class Connection(
     @Volatile private var disconnectListener: (() -> Unit)? = null
     @Volatile private var logListener: ((String) -> Unit)? = null
     @Volatile private var disconnectReason: String = "unknown"
+    @Volatile private var activeWriteTimeoutMs: Long = writeTimeoutMs
 
     private var readerJob: Job? = null
     private var writerJob: Job? = null
@@ -113,9 +115,11 @@ class Connection(
     fun start(
         enableHeartbeat: Boolean = true,
         heartbeatIntervalMs: Long = HEARTBEAT_INTERVAL_MS,
-        heartbeatTimeoutMs: Long = HEARTBEAT_TIMEOUT_MS
+        heartbeatTimeoutMs: Long = HEARTBEAT_TIMEOUT_MS,
+        writeTimeoutMs: Long = this.writeTimeoutMs
     ) {
-        log("Connection started: sendBuf=$actualSendBuf recvBuf=$actualRecvBuf tcpNoDelay=${channel.socket().tcpNoDelay} heartbeat=$enableHeartbeat")
+        this.activeWriteTimeoutMs = writeTimeoutMs
+        log("Connection started: sendBuf=$actualSendBuf recvBuf=$actualRecvBuf tcpNoDelay=${channel.socket().tcpNoDelay} heartbeat=$enableHeartbeat writeTimeout=${activeWriteTimeoutMs}ms")
         lastFrameReceivedAt = System.currentTimeMillis()
 
         readerJob = scope.launch(Dispatchers.IO) {
@@ -263,10 +267,21 @@ class Connection(
     @Volatile private var writeStallCount = 0L
 
     private suspend fun writeBuffersToChannel(bufs: Array<ByteBuffer>) {
+        var lastProgressAt = System.currentTimeMillis()
         while (bufs.any { it.hasRemaining() }) {
             val n = channel.write(bufs)
-            if (n > 0) continue
+            if (n > 0) {
+                lastProgressAt = System.currentTimeMillis()
+                continue
+            }
             if (!connected.get()) throw IOException("Connection closed during write")
+            val now = System.currentTimeMillis()
+            if (activeWriteTimeoutMs > 0 && now - lastProgressAt > activeWriteTimeoutMs) {
+                val remaining = bufs.sumOf { it.remaining().toLong() }
+                throw IOException(
+                    "Write timed out: $remaining bytes remaining, send buffer full for ${now - lastProgressAt}ms (timeout=${activeWriteTimeoutMs}ms)"
+                )
+            }
             writeStallCount++
             if (writeStallCount % 100 == 1L) {
                 val remaining = bufs.sumOf { it.remaining().toLong() }
@@ -381,6 +396,7 @@ class Connection(
     }
 
     companion object {
+        const val DEFAULT_WRITE_TIMEOUT_MS = 10_000L
         private const val HEARTBEAT_INTERVAL_MS = ConnectionKeepAlive.DEFAULT_HEARTBEAT_INTERVAL_MS
         private const val HEARTBEAT_TIMEOUT_MS = ConnectionKeepAlive.DEFAULT_HEARTBEAT_TIMEOUT_MS
         const val CONNECT_TIMEOUT_MS = ConnectionFactory.CONNECT_TIMEOUT_MS
