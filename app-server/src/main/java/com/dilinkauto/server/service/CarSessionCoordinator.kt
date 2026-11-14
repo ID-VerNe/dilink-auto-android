@@ -546,7 +546,7 @@ internal class CarSessionCoordinator(
         }
     }
 
-    private suspend fun rehandshakeOnExistingControlLocked(
+    internal suspend fun rehandshakeOnExistingControlLocked(
         ctrl: Connection,
         newVpW: Int,
         newVpH: Int,
@@ -560,8 +560,13 @@ internal class CarSessionCoordinator(
 
         videoConnection?.clearDisconnectListener()
         inputConnection?.clearDisconnectListener()
+        audioConnection?.clearDisconnectListener()
         videoConnection?.disconnect(); videoConnection = null
         inputConnection?.disconnect(); inputConnection = null
+
+        val audio = audioConnection
+        audioConnection = null
+        submitAudioTeardown(audioExecutor, stop = { audioPlayer.stop() }, disconnect = { audio?.disconnect() })
 
         videoDecoder.resetBlackScreenState()
 
