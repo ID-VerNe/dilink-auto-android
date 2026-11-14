@@ -259,8 +259,10 @@ class NioReader(
      */
     private fun shrinkIfOversized() {
         if (buf.capacity() > DEFAULT_CAPACITY * 4 && buf.remaining() == 0) {
-            val newBuf = ByteBuffer.allocate(DEFAULT_CAPACITY)
-            newBuf.order(ByteOrder.BIG_ENDIAN)
+            val newBuf = ByteBuffer.allocate(DEFAULT_CAPACITY).apply {
+                order(ByteOrder.BIG_ENDIAN)
+                flip()
+            }
             buf = newBuf
         }
     }
