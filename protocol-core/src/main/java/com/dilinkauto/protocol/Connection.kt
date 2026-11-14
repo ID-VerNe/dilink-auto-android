@@ -52,8 +52,10 @@ class Connection(
     // Bounded (not UNLIMITED) so a slow TCP consumer applies backpressure to the
     // reader instead of growing the queue unbounded and OOMing on a slow car link.
     private val writeQueue = kotlinx.coroutines.channels.Channel<FrameCodec.Frame>(
-        64, kotlinx.coroutines.channels.BufferOverflow.SUSPEND
+        QUEUE_CAPACITY, kotlinx.coroutines.channels.BufferOverflow.SUSPEND
     )
+    private val pendingSendCount = java.util.concurrent.atomic.AtomicInteger(0)
+    val pendingSends: Int get() = pendingSendCount.get()
 
     /**
      * 发送入队的单线程派发器。
@@ -220,6 +222,7 @@ class Connection(
             var writeCount = 0L
             try {
                 for (frame in writeQueue) {
+                    pendingSendCount.decrementAndGet()
                     if (!connected.get() || !isActive) break
 
                     // Encode header — the byte layout lives in FrameCodec only
@@ -320,16 +323,22 @@ class Connection(
         logListener?.invoke(msg)
     }
 
-    fun sendFrame(frame: FrameCodec.Frame) {
-        // Public senders run on arbitrary threads (UI, service scope, etc).
-        // Route through the scope so the suspending enqueueFrame can apply
-        // backpressure without forcing every caller to be a suspend function.
-        // 走单线程派发器（而不是裸 scope）以保证入队顺序 == 调用顺序，见 sendDispatcher；
-        // sendMutex 保证队列满(挂起)时顺序仍然成立。
+    private fun isDroppable(frame: FrameCodec.Frame): Boolean =
+        frame.channel == Channel.VIDEO || frame.channel == Channel.AUDIO
+
+    fun sendFrame(frame: FrameCodec.Frame): Boolean {
         if (!connected.get()) throw IOException("Not connected")
+        if (isDroppable(frame) && pendingSendCount.get() >= QUEUE_CAPACITY) {
+            return false
+        }
+        pendingSendCount.incrementAndGet()
         scope.launch(sendDispatcher) {
+            var enqueued = false
             try {
-                sendMutex.withLock { enqueueFrame(frame) }
+                sendMutex.withLock {
+                    enqueueFrame(frame)
+                    enqueued = true
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Throwable) {
@@ -337,29 +346,36 @@ class Connection(
                 // send(); that surfaces as ClosedSendChannelException (an
                 // IllegalStateException, NOT an IOException) — catching only
                 // IOException let it escape into an unhandled coroutine exception.
+            } finally {
+                if (!enqueued) {
+                    pendingSendCount.decrementAndGet()
+                }
             }
+        }
+        return true
+    }
+
+    suspend fun sendFrameSuspending(frame: FrameCodec.Frame) {
+        if (!connected.get()) throw IOException("Not connected")
+        sendMutex.withLock {
+            enqueueFrame(frame)
         }
     }
 
-    fun sendControl(messageType: Byte, payload: ByteArray = ByteArray(0)) {
+    fun sendControl(messageType: Byte, payload: ByteArray = ByteArray(0)): Boolean =
         sendFrame(FrameCodec.Frame(Channel.CONTROL, messageType, payload))
-    }
 
-    fun sendVideo(messageType: Byte, payload: ByteArray) {
+    fun sendVideo(messageType: Byte, payload: ByteArray): Boolean =
         sendFrame(FrameCodec.Frame(Channel.VIDEO, messageType, payload))
-    }
 
-    fun sendAudio(messageType: Byte, payload: ByteArray) {
+    fun sendAudio(messageType: Byte, payload: ByteArray): Boolean =
         sendFrame(FrameCodec.Frame(Channel.AUDIO, messageType, payload))
-    }
 
-    fun sendData(messageType: Byte, payload: ByteArray) {
+    fun sendData(messageType: Byte, payload: ByteArray): Boolean =
         sendFrame(FrameCodec.Frame(Channel.DATA, messageType, payload))
-    }
 
-    fun sendInput(messageType: Byte, payload: ByteArray) {
+    fun sendInput(messageType: Byte, payload: ByteArray): Boolean =
         sendFrame(FrameCodec.Frame(Channel.INPUT, messageType, payload))
-    }
 
     fun disconnect() {
         if (connected.compareAndSet(true, false)) {
@@ -390,12 +406,16 @@ class Connection(
     private fun performTeardown() {
         writerJob?.cancel()
         writeQueue.close()
+        while (writeQueue.tryReceive().isSuccess) {
+            pendingSendCount.decrementAndGet()
+        }
         reader.close()
         try { channel.close() } catch (_: Exception) {}
         try { disconnectListener?.invoke() } catch (_: Exception) {}
     }
 
     companion object {
+        const val QUEUE_CAPACITY = 64
         const val DEFAULT_WRITE_TIMEOUT_MS = 10_000L
         private const val HEARTBEAT_INTERVAL_MS = ConnectionKeepAlive.DEFAULT_HEARTBEAT_INTERVAL_MS
         private const val HEARTBEAT_TIMEOUT_MS = ConnectionKeepAlive.DEFAULT_HEARTBEAT_TIMEOUT_MS
