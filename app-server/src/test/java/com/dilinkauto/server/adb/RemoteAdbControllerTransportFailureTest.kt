@@ -30,7 +30,7 @@ class RemoteAdbControllerTransportFailureTest {
         var noWaitOk: Boolean = true,
     ) : TcpAdbConnection("127.0.0.1", 0, File(".")) {
         override fun connect(): Boolean = true
-        override fun shell(command: String): Int = shellRc
+        override fun shell(command: String, outputSink: StringBuilder?): Int = shellRc
         override fun shellBackground(command: String): Int = backgroundId
         override fun shellNoWait(command: String): Boolean = noWaitOk
         override fun close() {}

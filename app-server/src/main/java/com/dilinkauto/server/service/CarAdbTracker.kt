@@ -43,6 +43,15 @@ internal class CarAdbTracker(
     @Volatile var usbAdb: UsbAdbConnection? = null
         internal set
 
+    @Volatile internal var currentUsbDevice: UsbDevice? = null
+
+    /** Test seam for comparing USB devices under stubbed JVM test environments. */
+    internal var isSameUsbDevice: (a: UsbDevice, b: UsbDevice) -> Boolean = { a, b ->
+        a == b ||
+            (a.deviceId != 0 && a.deviceId == b.deviceId) ||
+            (a.deviceName.isNotBlank() && a.deviceName == b.deviceName)
+    }
+
     @Volatile private var usbConnecting = false
     @Volatile private var tcpAdbConnecting = false
     @Volatile private var lastAdbHost: String? = null
@@ -53,7 +62,7 @@ internal class CarAdbTracker(
 
     private var receiverRegistered = false
 
-    private val usbReceiver = object : BroadcastReceiver() {
+    internal val usbReceiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context, intent: Intent) {
             when (intent.action) {
                 UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
@@ -64,10 +73,17 @@ internal class CarAdbTracker(
                     }
                 }
                 UsbManager.ACTION_USB_DEVICE_DETACHED -> {
+                    val detachedDevice = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE)
+                    val currentDevice = currentUsbDevice
+                    if (detachedDevice != null && currentDevice != null && !isSameUsbDevice(detachedDevice, currentDevice)) {
+                        log("Non-ADB USB device detached (${detachedDevice.deviceName}) — ignoring", "I")
+                        return
+                    }
                     log("USB device detached", "I")
                     val wasAdbTrack = usbAdb != null
                     usbAdb?.close()
                     usbAdb = null
+                    currentUsbDevice = null
                     usbReady = false
                     if (wasAdbTrack) {
                         onUsbDetachedMidSession()
@@ -246,11 +262,13 @@ internal class CarAdbTracker(
             adb.setLogSink { msg -> log(msg, "I") }
             if (!adb.connect(device)) {
                 usbConnecting = false
+                currentUsbDevice = null
                 setStatusMessage(R.string.status_usb_failed, emptyArray())
                 log("USB ADB connection failed", "I")
                 return@launch
             }
             usbAdb = adb
+            currentUsbDevice = device
             setStatusMessage(R.string.status_usb_connected, emptyArray())
             log("USB ADB connected", "I")
             noAdbCount = 0
@@ -336,6 +354,7 @@ internal class CarAdbTracker(
         unregisterUsbReceiver()
         usbAdb?.close()
         usbAdb = null
+        currentUsbDevice = null
         adbController?.disconnect()
         adbController = null
     }
