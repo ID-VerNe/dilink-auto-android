@@ -385,9 +385,13 @@ class VideoDecoder {
                             log("Feeding KEYFRAME #$keyFramesFed size=${frame.data.size} (fed=$frameCount rendered=$renderCount)")
                         }
                         val decodeStart = if (debugFrameStats) System.nanoTime() else 0L
-                        feedBuffer(decoder, frame.data, 0)
+                        val fed = feedBuffer(decoder, frame.data, 0)
                         if (debugFrameStats) windowDecodeNanos += System.nanoTime() - decodeStart
-                        frameCount++
+                        if (fed) {
+                            frameCount++
+                        } else {
+                            dropCount++
+                        }
                         if (frameCount % 30 == 0L) {
                             if (debugFrameStats) {
                                 val decodeMs = windowDecodeNanos / 1_000_000.0
@@ -465,16 +469,25 @@ class VideoDecoder {
         }
     }
 
-    private var consecutiveDrops = 0
+    internal var consecutiveDrops = 0
     private val drainBufferInfo = MediaCodec.BufferInfo()
 
-    private fun feedBuffer(decoder: MediaCodec, data: ByteArray, flags: Int) {
-        if (!running.get()) return
+    internal fun feedBuffer(decoder: MediaCodec, data: ByteArray, flags: Int): Boolean {
+        if (!running.get()) return false
         try {
             // 2ms 太短：喂帧线程刚 drain 完输出，输入缓冲偶尔还在解码器手里，
             // 一次失败就丢整帧并打断参考链（issue #9）。10ms 只影响异常路径，
             // 正常路径 dequeueInputBuffer 立即返回。
-            val inputIndex = decoder.dequeueInputBuffer(10_000)
+            // 针对偶发调度抖动（issue #125）：允许最多 MAX_ATTEMPTS 次尝试（每次 10ms），并在重试前主动 drainOutput，
+            // 避免单次 10ms 抖动误判参考链断裂导致后续 1~2 秒持续冻屏。
+            var inputIndex = -1
+            for (attempt in 0 until VideoDecoderStallPolicy.MAX_ATTEMPTS) {
+                inputIndex = decoder.dequeueInputBuffer(10_000)
+                if (inputIndex >= 0) break
+                if (attempt < VideoDecoderStallPolicy.MAX_ATTEMPTS - 1) {
+                    drainOutput(decoder)
+                }
+            }
             if (inputIndex >= 0) {
                 val inputBuffer = decoder.getInputBuffer(inputIndex)!!
                 inputBuffer.clear()
@@ -482,15 +495,19 @@ class VideoDecoder {
                 val pts = System.nanoTime() / 1000 // wall-clock microseconds
                 decoder.queueInputBuffer(inputIndex, 0, data.size, pts, flags)
                 consecutiveDrops = 0
+                return true
             } else {
                 consecutiveDrops++
                 inputFailCount++
-                // 丢掉的这帧若参与参考链，后续 P 帧就都不可信了 → 进入重同步。
-                if (flags == 0) noteGap()
+                // 仅在重试耗尽且连续失败达到阈值时，才确认丢帧打断参考链并进入重同步，
+                // 避免偶发的抖动导致长时间冻屏。
+                if (VideoDecoderStallPolicy.shouldTriggerGap(flags, consecutiveDrops)) {
+                    noteGap()
+                }
                 if (consecutiveDrops <= 3 || consecutiveDrops % 10 == 0) {
                     logW("dequeueInputBuffer failed: consecutiveDrops=$consecutiveDrops, size=${data.size}, flags=$flags")
                 }
-                if (consecutiveDrops > 10) {
+                if (VideoDecoderStallPolicy.shouldFlush(consecutiveDrops)) {
                     logW("Decoder stuck ($consecutiveDrops drops), flushing")
                     decoder.flush()
                     consecutiveDrops = 0
@@ -510,9 +527,11 @@ class VideoDecoder {
                         }
                     }
                 }
+                return false
             }
         } catch (e: Exception) {
             logE("Error feeding buffer to decoder: ${e.message}")
+            return false
         }
     }
 
