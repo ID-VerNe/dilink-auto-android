@@ -24,6 +24,9 @@ object Discovery {
     const val SERVICE_TYPE = "_dilinkauto._tcp."
     const val SERVICE_NAME = "DiLink-Auto"
 
+    fun isCompatibleServiceName(name: String?): Boolean =
+        name != null && name.startsWith(SERVICE_NAME)
+
     // 协议端口常量的唯一来源是平台无关的 :protocol-core（见 [Ports]）。
     //
     // 下面的别名曾为避免改动"大量历史调用点"而保留；那些调用点现已全部迁移到
@@ -126,12 +129,12 @@ object Discovery {
             override fun onDiscoveryStarted(serviceType: String) {}
 
             override fun onServiceFound(serviceInfo: NsdServiceInfo) {
-                // Only trust our own service name: NSD's service-type discovery
-                // returns every responder advertising `_dilinkauto._tcp`, and an
-                // impostor on the same LAN was previously resolved and shown to
-                // the user as a connection target (the car has no other
-                // authentication, so this is the first gate).
-                if (serviceInfo.serviceName != SERVICE_NAME) {
+                // Only trust our own service name (or conflict-renamed instances):
+                // NSD's service-type discovery returns every responder advertising
+                // `_dilinkauto._tcp`, and an impostor on the same LAN was previously
+                // resolved and shown to the user as a connection target (the car has no
+                // other authentication, so this is the first gate).
+                if (!isCompatibleServiceName(serviceInfo.serviceName)) {
                     android.util.Log.w(
                         "Discovery",
                         "Ignoring foreign mDNS responder: '${serviceInfo.serviceName}'"
