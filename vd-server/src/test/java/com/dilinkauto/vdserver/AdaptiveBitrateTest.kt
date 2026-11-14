@@ -110,4 +110,28 @@ class AdaptiveBitrateTest {
         val ab = AdaptiveBitrate(100_000)
         assertEquals(AdaptiveBitrate.MIN_BITRATE, ab.currentBitrate)
     }
+
+    @Test
+    fun recoveryDoesNotSpikeOnConsecutiveFramesAfterIntervalElapsed() {
+        val ab = AdaptiveBitrate(
+            ceiling = 8_000_000,
+            slowWriteMillis = 15L,
+            cleanIntervalMillis = 30L
+        )
+        // 先触发一次降级：8M -> 6M
+        ab.onFrameWritten(slowWrite())
+        assertEquals(6_000_000, ab.currentBitrate)
+
+        // 第一帧快速写入，激活清洁计时器
+        ab.onFrameWritten(fastWrite())
+        Thread.sleep(40)
+
+        // 达到 30ms 清洁间隔后第一帧应爬升一个步长 (500k)
+        assertTrue("达到清洁间隔后第一帧应爬升", ab.onFrameWritten(fastWrite()))
+        assertEquals(6_500_000, ab.currentBitrate)
+
+        // 紧接着的一帧（未满下一个清洁间隔）绝对不得连续爬升
+        assertFalse("爬升后下一帧未满 cleanIntervalMillis 不得连续爬升", ab.onFrameWritten(fastWrite()))
+        assertEquals(6_500_000, ab.currentBitrate)
+    }
 }
