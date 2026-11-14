@@ -129,10 +129,19 @@ fun CarShell(service: CarConnectionService) {
                         service.goHome()
                         currentScreen = Screen.HOME
                     },
+                    // issue #152-PA：切回上一个显示过的 APP（GO_RECENT，双击 recents 语义）。
+                    // connected 传 isConnected：重握手（CONNECTING）期间该键禁用，不发无效指令。
+                    // 同时切到 Screen.APP：否则手机已把上一个 APP 拉到 VD 前台，车机仍停在
+                    // 主页磁贴，用户看不到切换结果。
+                    onRecent = {
+                        service.goRecent()
+                        currentScreen = Screen.APP
+                    },
                     onDisconnect = {
                         service.disconnectFromPhone()
                         currentScreen = Screen.HOME
                     },
+                    connected = isConnected,
                     modifier = Modifier.zIndex(1f),
                     // issue #54：chip 常驻左栏，不占内容区高度 —— 顺带消除了切页时
                     // 内容区高度变化引起的视口重部署。
@@ -173,10 +182,15 @@ fun CarShell(service: CarConnectionService) {
                         service.goHome()
                         currentScreen = Screen.HOME
                     },
+                    onRecent = {
+                        service.goRecent()
+                        currentScreen = Screen.APP
+                    },
                     onDisconnect = {
                         service.disconnectFromPhone()
                         currentScreen = Screen.HOME
-                    }
+                    },
+                    connected = isConnected
                 )
             }
         }
