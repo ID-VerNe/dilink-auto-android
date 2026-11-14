@@ -51,6 +51,8 @@ internal class GlPipeline(
     private var glProgram = 0
     private var glPosLoc = 0
     private var glTexLoc = 0
+    private var uTexMatrixLoc = 0
+    private val texMatrix = FloatArray(16)
     private var quadBuf: FloatBuffer? = null
 
     private var vdInputSurface: Surface? = null
@@ -105,10 +107,12 @@ internal class GlPipeline(
         EGL14.eglMakeCurrent(display, surf, surf, ctx)
         eglDisplay = display; eglContext = ctx; eglSurface = surf
 
+        Matrix.setIdentityM(texMatrix, 0)
         // GL program
         glProgram = createProgram(); GLES20.glUseProgram(glProgram)
         glPosLoc = GLES20.glGetAttribLocation(glProgram, "aPosition")
         glTexLoc = GLES20.glGetAttribLocation(glProgram, "aTexCoord")
+        uTexMatrixLoc = GLES20.glGetUniformLocation(glProgram, "uTexMatrix")
         GLES20.glViewport(0, 0, encodeWidth, encodeHeight)
 
         // Create GL texture for SurfaceTexture (VD input)
@@ -130,7 +134,7 @@ internal class GlPipeline(
         }, android.os.Handler(cbThread!!.looper))
 
         // Fullscreen quad
-        val quad = floatArrayOf(-1f, -1f, 0f, 1f, 1f, -1f, 1f, 1f, -1f, 1f, 0f, 0f, 1f, 1f, 1f, 0f)
+        val quad = floatArrayOf(-1f, -1f, 0f, 0f, 1f, -1f, 1f, 0f, -1f, 1f, 0f, 1f, 1f, 1f, 1f, 1f)
         quadBuf = ByteBuffer.allocateDirect(quad.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
         quadBuf!!.put(quad).position(0)
 
@@ -177,14 +181,22 @@ internal class GlPipeline(
                 nextFrameNanos += frameIntervalNanos
                 if (nextFrameNanos <= System.nanoTime()) nextFrameNanos = System.nanoTime() + frameIntervalNanos
 
-                if (frameAvail.getAndSet(false)) { st.updateTexImage(); texUpdates++ }
+                val hasNewFrame = frameAvail.getAndSet(false)
+                if (hasNewFrame) {
+                    st.updateTexImage()
+                    st.getTransformMatrix(texMatrix)
+                    texUpdates++
+                }
 
                 GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
                 GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, stTexId)
+                GLES20.glUniformMatrix4fv(uTexMatrixLoc, 1, false, texMatrix, 0)
                 val qb = quadBuf!!; qb.position(0)
                 GLES20.glVertexAttribPointer(glPosLoc, 2, GLES20.GL_FLOAT, false, 16, qb); GLES20.glEnableVertexAttribArray(glPosLoc)
                 qb.position(2); GLES20.glVertexAttribPointer(glTexLoc, 2, GLES20.GL_FLOAT, false, 16, qb); GLES20.glEnableVertexAttribArray(glTexLoc)
                 GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+                val ptsNanos = computeFramePtsNanos(hasNewFrame, st.timestamp, System.nanoTime())
+                EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurface, ptsNanos)
                 if (!EGL14.eglSwapBuffers(eglDisplay, eglSurface)) swapFails++
 
                 var drained = 0
@@ -283,7 +295,15 @@ internal class GlPipeline(
     private fun applyBitrate(enc: MediaCodec, br: Int) { try { val p = Bundle(); p.putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, br); enc.setParameters(p) } catch (_: Exception) {} }
     private fun requestSyncFrame(enc: MediaCodec) { try { val p = Bundle(); p.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0); enc.setParameters(p) } catch (_: Exception) {} }
 
-    private fun createProgram(): Int { val vs = loadShader(GLES20.GL_VERTEX_SHADER, "attribute vec4 aPosition;attribute vec2 aTexCoord;varying vec2 vTexCoord;void main(){gl_Position=aPosition;vTexCoord=aTexCoord;}"); val fs = loadShader(GLES20.GL_FRAGMENT_SHADER, "#extension GL_OES_EGL_image_external:require\nprecision mediump float;varying vec2 vTexCoord;uniform samplerExternalOES sTexture;void main(){gl_FragColor=texture2D(sTexture,vTexCoord);}"); return GLES20.glCreateProgram().also { GLES20.glAttachShader(it, vs); GLES20.glAttachShader(it, fs); GLES20.glLinkProgram(it) } }
+    private fun createProgram(): Int {
+        val vs = loadShader(GLES20.GL_VERTEX_SHADER, VERTEX_SHADER_SRC)
+        val fs = loadShader(GLES20.GL_FRAGMENT_SHADER, FRAGMENT_SHADER_SRC)
+        return GLES20.glCreateProgram().also {
+            GLES20.glAttachShader(it, vs)
+            GLES20.glAttachShader(it, fs)
+            GLES20.glLinkProgram(it)
+        }
+    }
     private fun loadShader(type: Int, src: String): Int = GLES20.glCreateShader(type).also { GLES20.glShaderSource(it, src); GLES20.glCompileShader(it) }
 
     /**
@@ -316,4 +336,28 @@ internal class GlPipeline(
     // VideoConfig.SYNC_FRAME_REQUEST_MIN_INTERVAL_MS / VideoConfig.syncFrameRequestAllowed，
     // 与车机端共用一份——见 GlPipeline.requestSyncFrameThrottled 与 issue #75。
     // 这里刻意不再保留手机端私有的间隔常量：两端各写一个私有值正是死区的成因。
+
+    companion object {
+        internal const val VERTEX_SHADER_SRC =
+            "uniform mat4 uTexMatrix;\n" +
+            "attribute vec4 aPosition;\n" +
+            "attribute vec4 aTexCoord;\n" +
+            "varying vec2 vTexCoord;\n" +
+            "void main() {\n" +
+            "    gl_Position = aPosition;\n" +
+            "    vTexCoord = (uTexMatrix * aTexCoord).xy;\n" +
+            "}"
+
+        internal const val FRAGMENT_SHADER_SRC =
+            "#extension GL_OES_EGL_image_external:require\n" +
+            "precision mediump float;\n" +
+            "varying vec2 vTexCoord;\n" +
+            "uniform samplerExternalOES sTexture;\n" +
+            "void main() {\n" +
+            "    gl_FragColor = texture2D(sTexture, vTexCoord);\n" +
+            "}"
+
+        internal fun computeFramePtsNanos(hasNewFrame: Boolean, surfaceTextureTimestamp: Long, nowNanos: Long): Long =
+            if (hasNewFrame && surfaceTextureTimestamp > 0L) surfaceTextureTimestamp else nowNanos
+    }
 }

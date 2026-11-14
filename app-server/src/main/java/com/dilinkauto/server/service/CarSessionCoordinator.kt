@@ -1,7 +1,6 @@
 package com.dilinkauto.server.service
 
 import android.content.Context
-import android.graphics.SurfaceTexture
 import android.view.Surface
 import com.dilinkauto.protocol.*
 import com.dilinkauto.server.R
@@ -83,9 +82,6 @@ internal class CarSessionCoordinator(
     private var videoFrameCount = 0L
 
     val lastSyncFrameRequestMs = AtomicLong(0L)
-
-    private var offscreenTexture: SurfaceTexture? = null
-    private var offscreenSurface: Surface? = null
 
     val decoderExecutor: ExecutorService =
         Executors.newSingleThreadExecutor { r ->
@@ -568,7 +564,6 @@ internal class CarSessionCoordinator(
         inputConnection?.disconnect(); inputConnection = null
 
         videoDecoder.resetBlackScreenState()
-        releaseOffscreenSurface()
 
         _videoReady.value = false
         wifiReady = false
@@ -622,7 +617,6 @@ internal class CarSessionCoordinator(
         viewportGate.reset()
 
         stopDecoderAsync()
-        releaseOffscreenSurface()
         appListReceiver.reset()
 
         if (adbTracker.adbController?.isConnected != true) {
@@ -735,11 +729,9 @@ internal class CarSessionCoordinator(
             carLogSend("[MirrorScreen] SurfaceView surface created, decoder.isRunning=${videoDecoder.isRunning}")
             if (videoDecoder.isRunning) {
                 videoDecoder.switchSurface(surface)
-                releaseOffscreenSurface()
                 carLogSend("[MirrorScreen] Decoder surface switched to SurfaceView (no restart)")
             } else {
                 videoDecoder.start(surface, vdWidth, vdHeight, targetFps)
-                releaseOffscreenSurface()
                 carLogSend("[MirrorScreen] Decoder started on SurfaceView surface")
             }
         }
@@ -748,13 +740,6 @@ internal class CarSessionCoordinator(
     fun onMirrorSurfaceDestroyed() {
         videoDecoder.invalidateSurface()
         carLogSend("[MirrorScreen] SurfaceView surface destroyed — decoder stays running, render gated off")
-    }
-
-    fun releaseOffscreenSurface() {
-        offscreenSurface?.release()
-        offscreenSurface = null
-        offscreenTexture?.release()
-        offscreenTexture = null
     }
 
     fun stopDecoderAsync() {

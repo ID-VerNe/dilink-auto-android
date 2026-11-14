@@ -496,7 +496,9 @@ data class AppListMessage(val apps: List<AppInfo>) {
                 val category = AppCategory.fromId(buf.get())
                 buf.require(4)
                 val iconSize = buf.getInt()
-                if (iconSize < 0) throw ProtocolDecodeException("Negative icon size: $iconSize")
+                if (iconSize < 0 || iconSize > AppIconLimits.MAX_ICON_BYTES) {
+                    throw ProtocolDecodeException("Invalid icon size: $iconSize (max ${AppIconLimits.MAX_ICON_BYTES})")
+                }
                 // Truncated icon must fail the decode: silently dropping it made
                 // the next readShortLengthPrefixedOrEmpty() consume icon bytes as
                 // the hash length, caching a garbage iconHash under a real key.

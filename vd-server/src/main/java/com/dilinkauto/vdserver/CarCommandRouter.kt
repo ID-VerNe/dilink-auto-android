@@ -59,6 +59,7 @@ internal class CarCommandRouter(
      * （车机侧 6s 判黑 → 15s 自愈）。
      */
     private val layerRecheckInFlight = AtomicBoolean(false)
+    private val stackCheckInFlight = AtomicBoolean(false)
 
     fun dispatch(f: FrameCodec.Frame) {
         PipeLog.log("Car command received: 0x${Integer.toHexString(f.messageType.toInt() and 0xFF)}")
@@ -137,6 +138,10 @@ internal class CarCommandRouter(
 
     /** Ping the phone when the last VD activity finishes, so it can stop mirroring. */
     private fun checkStackEmpty() {
+        if (!stackCheckInFlight.compareAndSet(false, true)) {
+            PipeLog.log("checkStackEmpty: debounced (already in flight)")
+            return
+        }
         daemonThread("StackCheck") {
             try {
                 Thread.sleep(300) // 等 keyevent 生效后再查询
@@ -145,7 +150,11 @@ internal class CarCommandRouter(
                 val empty = sec == null || sec.lines().none { it.contains("Task{") }
                 PipeLog.log("checkStackEmpty: display=$id empty=$empty")
                 if (empty) onStackEmpty()
-            } catch (e: Exception) { PipeLog.err("checkStackEmpty: ${e.message}") }
+            } catch (e: Exception) {
+                PipeLog.err("checkStackEmpty: ${e.message}")
+            } finally {
+                stackCheckInFlight.set(false)
+            }
         }
     }
 

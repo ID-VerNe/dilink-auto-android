@@ -5,6 +5,7 @@ import com.dilinkauto.protocol.InputMsg
 import com.dilinkauto.protocol.TouchEvent
 import com.dilinkauto.protocol.TouchMoveBatch
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Encodes and sends touch events from the car to the phone's VD server on the
@@ -26,11 +27,15 @@ internal class CarTouchSender(
     private val executor = Executors.newSingleThreadExecutor { r ->
         Thread(r, "touch-sender").apply { isDaemon = true }
     }
-    private var dropCount = 0L
-    private var sendCount = 0L
+    private val dropCount = AtomicLong(0L)
+    private val sendCount = AtomicLong(0L)
 
     /** issue #64：多指 MOVE 批次单独计数，用于和手机端 `[TouchStats]` 对账。 */
-    private var multiBatchCount = 0L
+    private val multiBatchCount = AtomicLong(0L)
+
+    internal fun getDropCount(): Long = dropCount.get()
+    internal fun getSendCount(): Long = sendCount.get()
+    internal fun getMultiBatchCount(): Long = multiBatchCount.get()
 
     /**
      * Log-spam gate (audit R3-DRY-22): log the first [firstN] events, then
@@ -46,9 +51,9 @@ internal class CarTouchSender(
         executor.execute {
             try {
                 conn.sendInput(event.action, payload)
-                sendCount++
-                if (shouldLog(sendCount, SEND_LOG_FIRST)) {
-                    log("Touch #$sendCount action=${event.action} ptr=${event.pointerId} x=${"%.2f".format(event.x)} y=${"%.2f".format(event.y)}", "I")
+                val count = sendCount.incrementAndGet()
+                if (shouldLog(count, SEND_LOG_FIRST)) {
+                    log("Touch #$count action=${event.action} ptr=${event.pointerId} x=${"%.2f".format(event.x)} y=${"%.2f".format(event.y)}", "I")
                 }
             } catch (e: Exception) { log("Touch send failed: ${e.message}", "W") }
         }
@@ -60,20 +65,20 @@ internal class CarTouchSender(
         executor.execute {
             try {
                 conn.sendInput(InputMsg.TOUCH_MOVE_BATCH, payload)
-                sendCount++
+                val count = sendCount.incrementAndGet()
                 // issue #64：多指批次按「前 N 条 + 每 M 条」单独落日志。
                 // 手机端在 `TouchInjector` 里也有对应的 `[Touch] MOVE n=...`，
                 // 两边对不上就能判断是链路丢帧还是注入侧丢事件。
                 if (pointers.size >= 2) {
-                    multiBatchCount++
-                    if (multiBatchCount <= MULTI_LOG_FIRST || multiBatchCount % MULTI_LOG_EVERY == 0L) {
+                    val multiCount = multiBatchCount.incrementAndGet()
+                    if (multiCount <= MULTI_LOG_FIRST || multiCount % MULTI_LOG_EVERY == 0L) {
                         log(
-                            "Touch multi #$multiBatchCount (${pointers.size} pointers ids=${pointers.map { it.pointerId }})",
+                            "Touch multi #$multiCount (${pointers.size} pointers ids=${pointers.map { it.pointerId }})",
                             "I"
                         )
                     }
-                } else if (shouldLog(sendCount, SEND_LOG_FIRST)) {
-                    log("Touch batch #$sendCount (${pointers.size} pointers)", "I")
+                } else if (shouldLog(count, SEND_LOG_FIRST)) {
+                    log("Touch batch #$count (${pointers.size} pointers)", "I")
                 }
             } catch (e: Exception) { log("Touch batch send failed: ${e.message}", "W") }
         }
@@ -87,16 +92,16 @@ internal class CarTouchSender(
     private fun checkConn(label: String): Connection? {
         val conn = inputConnectionProvider()
         if (conn == null) {
-            dropCount++
-            if (shouldLog(dropCount, DROP_LOG_FIRST)) {
-                log("$label DROP #$dropCount: inputConnection=null state=${stateProvider()}", "I")
+            val drops = dropCount.incrementAndGet()
+            if (shouldLog(drops, DROP_LOG_FIRST)) {
+                log("$label DROP #$drops: inputConnection=null state=${stateProvider()}", "I")
             }
             return null
         }
         if (!conn.isConnected) {
-            dropCount++
-            if (shouldLog(dropCount, DROP_LOG_FIRST)) {
-                log("$label DROP #$dropCount: inputConnection not connected", "I")
+            val drops = dropCount.incrementAndGet()
+            if (shouldLog(drops, DROP_LOG_FIRST)) {
+                log("$label DROP #$drops: inputConnection not connected", "I")
             }
             return null
         }
@@ -105,9 +110,9 @@ internal class CarTouchSender(
 
     /** Reset counters on disconnect so the next session's log starts fresh. */
     fun resetCounters() {
-        sendCount = 0
-        dropCount = 0
-        multiBatchCount = 0
+        sendCount.set(0L)
+        dropCount.set(0L)
+        multiBatchCount.set(0L)
     }
 
     fun shutdown() { executor.shutdownNow() }

@@ -86,6 +86,11 @@ internal class VirtualDisplayCreator(
         var vd: VirtualDisplay? = createViaDisplayManagerGlobal(surface)
         if (vd == null) vd = createViaDisplayManager(surface)
         if (vd == null) return null
+        if (displayId < 0) {
+            err("VirtualDisplay created with invalid displayId: $displayId")
+            try { vd.release() } catch (_: Exception) {}
+            return null
+        }
         return vd
     }
 
