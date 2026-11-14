@@ -489,7 +489,9 @@ class PipelineServer(
      */
     private fun startAudio(carAudio: SocketChannel) {
         val sink = SocketAudioSink(carAudio).also { it.start() }
-        val pipeline = AudioPipeline(sink = sink)
+        // issue #165：采集闸门接会话状态。cleanup() 第一行 `running=false` 后，采集线程
+        // 立即停止投喂，不再横跨整个 shell 恢复阶段继续向编码器 queueInputBuffer。
+        val pipeline = AudioPipeline(sink = sink, sessionRunning = { running })
         if (!pipeline.start()) {
             err("Audio: pipeline start failed (${pipeline.startFailure ?: "unknown"}), channel closed")
             runCatching { sink.close() }
