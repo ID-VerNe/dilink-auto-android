@@ -48,9 +48,9 @@ class VideoDecoder {
         logSink?.invoke("[VideoDecoder][E] $msg") ?: Log.e(TAG, msg)
     }
 
-    private var codec: MediaCodec? = null
+    internal var codec: MediaCodec? = null
     private var feedThread: Thread? = null
-    private val running = AtomicBoolean(false)
+    internal val running = AtomicBoolean(false)
     val isRunning: Boolean get() = running.get()
     private val frameQueue = ArrayBlockingQueue<FrameData>(4) // small buffer, drop on overflow
 
@@ -67,6 +67,13 @@ class VideoDecoder {
      */
     private val lifecycleLock = Any()
 
+    /**
+     * Guards concurrent access to [codec] between [switchSurface] and the feed/drain operations
+     * on [feedThread] (issue #117). MediaCodec is not thread-safe; calling setOutputSurface
+     * concurrently with dequeue/release buffers triggers Native SIGSEGV in libstagefright.
+     */
+    internal val codecLock = Any()
+
     // Surface validity flag. SurfaceView (used since the Adreno 505 TextureView
     // composite cost was too high) destroys its surface when the view goes INVISIBLE;
     // TextureView kept it alive. Navigation HOME<->APP toggles visibility, so
@@ -75,7 +82,7 @@ class VideoDecoder {
     // releaseOutputBuffer's render flag on this so we don't render to a destroyed
     // surface during the brief window before surfaceCreated re-attaches.
     @Volatile
-    private var outputSurfaceValid = false
+    internal var outputSurfaceValid = false
 
     // CONFIG data is cached separately so it's never lost, even if it arrives
     // before start() is called or while the queue is full.
@@ -394,7 +401,11 @@ class VideoDecoder {
 
                     while (running.get()) {
                         // Drain output first to free decoder buffers before trying to feed
-                        drainOutput(decoder)
+                        synchronized(codecLock) {
+                            if (running.get()) {
+                                drainOutput(decoder)
+                            }
+                        }
                         // issue #58：记录「两次渲染推进之间的间隔」，停顿超阈值时留一条 STALL
                         // 汇总行。卡顿是「停顿后恢复」，恢复必经这里，所以不会漏报。
                         renderStall.onTick(
@@ -426,10 +437,15 @@ class VideoDecoder {
 
                         var fedThisRound = 0
                         while (frame != null) {
-                            feedOne(frame)
+                            val curFrame = frame
+                            synchronized(codecLock) {
+                                if (running.get()) {
+                                    feedOne(curFrame)
+                                    // 每喂一帧就排空一次输出，及时归还解码器输入缓冲。
+                                    drainOutput(decoder)
+                                }
+                            }
                             fedThisRound++
-                            // 每喂一帧就排空一次输出，及时归还解码器输入缓冲。
-                            drainOutput(decoder)
                             if (!FeedBurst.shouldContinue(fedThisRound, frameQueue.isNotEmpty())) break
                             frame = frameQueue.poll()
                         }
@@ -440,8 +456,10 @@ class VideoDecoder {
                     // it here whether we exited normally or threw. This is the
                     // only release path that is guaranteed to run *after* this
                     // thread has left every native MediaCodec call.
-                    try { decoder.stop() } catch (_: Exception) {}
-                    try { decoder.release() } catch (_: Exception) {}
+                    synchronized(codecLock) {
+                        try { decoder.stop() } catch (_: Exception) {}
+                        try { decoder.release() } catch (_: Exception) {}
+                    }
                 }
             }, "VideoDecoderFeed").apply { start() }
         }
@@ -605,17 +623,31 @@ class VideoDecoder {
      * Eliminates the keyframe-drop storm that happens with stop()+start().
      */
     fun switchSurface(newSurface: Surface) {
-        val c = codec
-        if (c == null) {
-            logW("switchSurface: codec is null, ignoring")
+        if (!newSurface.isValid) {
+            logW("switchSurface: newSurface is not valid, ignoring")
             return
         }
-        try {
-            c.setOutputSurface(newSurface)
-            outputSurfaceValid = true
-            log("Switched decoder output to new Surface")
-        } catch (e: Exception) {
-            logE("switchSurface failed: ${e.message}")
+        synchronized(codecLock) {
+            val c = codec
+            if (c == null) {
+                logW("switchSurface: codec is null, ignoring")
+                return
+            }
+            if (!running.get()) {
+                logW("switchSurface: decoder is not running, ignoring")
+                return
+            }
+            if (!newSurface.isValid) {
+                logW("switchSurface: newSurface became invalid before switch, ignoring")
+                return
+            }
+            try {
+                c.setOutputSurface(newSurface)
+                outputSurfaceValid = true
+                log("Switched decoder output to new Surface")
+            } catch (e: Exception) {
+                logE("switchSurface failed: ${e.message}")
+            }
         }
     }
 
