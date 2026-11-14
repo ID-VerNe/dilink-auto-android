@@ -363,7 +363,14 @@ class PipelineServer(
         displayController.saveCurrentIme()
         virtualDisplay = vdCreator.create(vdSurf)
         if (virtualDisplay == null) return false
-        displayId = vdCreator.displayId
+        val did = vdCreator.displayId
+        if (did < 0) {
+            PipeLog.err("VirtualDisplay displayId invalid: $did")
+            try { virtualDisplay?.release() } catch (_: Exception) {}
+            virtualDisplay = null
+            return false
+        }
+        displayId = did
         // Now that the originals are safely stored, apply the session overrides.
         vdCreator.configureEnvironment()
         try { displayController.setDisplayImePolicy(displayId) } catch (_: Exception) {}

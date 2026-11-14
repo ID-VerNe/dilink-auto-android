@@ -16,7 +16,7 @@ object H264NalParser {
      * （车机是弱 CPU）。兼容 3 字节（`00 00 01`）与 4 字节（`00 00 00 01`）起始码。
      */
     fun isKeyFrame(data: ByteArray): Boolean {
-        val limit = minOf(data.size - 4, 1024)
+        val limit = minOf(data.size - 3, 1024)
         var i = 0
         while (i < limit) {
             if (data[i] == 0.toByte() && data[i + 1] == 0.toByte()) {

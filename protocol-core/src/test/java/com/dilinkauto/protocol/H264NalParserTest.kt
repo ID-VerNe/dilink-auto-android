@@ -28,6 +28,12 @@ class H264NalParserTest {
     }
 
     @Test
+    fun `4 字节裸 IDR（3 字节起始码且无后续负载）正确判定为关键帧`() {
+        val bareIdr = byteArrayOf(0, 0, 1, 0x65)
+        assertTrue(H264NalParser.isKeyFrame(bareIdr))
+    }
+
+    @Test
     fun `非 IDR 的 slice（P 帧）不判定为关键帧`() {
         assertFalse(H264NalParser.isKeyFrame(nal(type = 1)))
     }

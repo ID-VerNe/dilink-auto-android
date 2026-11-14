@@ -281,7 +281,7 @@ class AudioPlayer(
             var starveStartMs = 0L
 
             while (running.get()) {
-                nextTick += frameNanos
+                nextTick = calculateNextTick(nextTick, System.nanoTime(), frameNanos)
                 val sleep = nextTick - System.nanoTime()
                 if (sleep > 0) LockSupport.parkNanos(sleep)
 
@@ -524,5 +524,15 @@ class AudioPlayer(
 
         /** stop() 等播放线程退出的上限（同 `VideoDecoder.stop()` 的 2s 预算口径）。 */
         private const val STOP_JOIN_TIMEOUT_MS = 2000L
+
+        /**
+         * Pacing clock calculation with underrun/jitter catch-up prevention.
+         * If [now] has drifted past [currentNextTick] by more than [frameNanos],
+         * resets the baseline to [now] so the loop does not spin without sleeping.
+         */
+        internal fun calculateNextTick(currentNextTick: Long, now: Long, frameNanos: Long): Long {
+            val base = if (now - currentNextTick > frameNanos) now else currentNextTick
+            return base + frameNanos
+        }
     }
 }
