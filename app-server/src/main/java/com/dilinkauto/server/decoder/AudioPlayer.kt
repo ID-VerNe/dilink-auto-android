@@ -353,6 +353,8 @@ class AudioPlayer(
                 // issue #164 候选 B：有输入、但解码器本拍没吐出任何 PCM（INFO_TRY_AGAIN_LATER），
                 // 这一拍 track 一个字节都拿不到，只能吃老本。原来只有「队列空」才补，
                 // 于是 85 ms 缓冲被一拍一拍啃到 0 —— 实车 22.6 次/秒 underrun 的直接来源。
+                // 与上面的 `starved` 路互斥且口径不同：那条是「没数据可解」，这条是
+                // 「有数据、但本拍解不出来」，所以单独计 `padIdle`，别混成一个数。
                 if (wroteFramesThisTick == 0) {
                     val pad = audioPadSilenceFrames(
                         bufferFrames = trackBufferFrames,
@@ -579,7 +581,11 @@ class AudioPlayer(
         private const val BYTES_PER_SAMPLE = 2
 
         /**
-         * `AudioTrack` 缓冲下限（帧）。12 帧 = 12 × 21.333 ms ≈ **256 ms**（issue #164）。
+         * `AudioTrack` 缓冲的**请求下限**（帧）。12 帧 = 12 × 21.333 ms ≈ **256 ms**（issue #164）。
+         *
+         * 注意「下限」是相对 `buildTrack` 的 `maxOf(minBufferSize, 12 帧)` 说的：ROM 会把请求值
+         * 向上取整，**实际分配容量可能更大**，`buildTrack` 的 `AudioTrack buffer: N frames ≈ Mms`
+         * 那行日志打的是实际值，归因时看那行。
          *
          * 原来是 4 帧（85 ms），实车 `underrun` 涨到 22.6 次/秒：主循环每 21.333 ms 只写一次
          * PCM，解码器一次 `INFO_TRY_AGAIN_LATER` 就有一拍不写，85 ms 只够扛 4 拍。
@@ -587,10 +593,12 @@ class AudioPlayer(
          * **为什么要 12 而不是 8**：实测 `maxRecoverMs=218`（最长一次「欠载 → 回到目标水位」
          * 的耗时），12 帧给这段最坏停顿留 38 ms 余量；16 帧只多付 85 ms 延迟、没有对应收益。
          *
-         * **延迟从哪扣**：这是缓冲**上限**，不是稳态水位 —— 稳态由
-         * [audioPadSilenceFrames] 的低水位（[AUDIO_TRACK_LOW_WATER_FRAMES] = 3 帧 / 64 ms）
-         * 钉住，所以新增的端到端延迟约 64 ms，不是 256 ms。放大上限换到的是两件事：
-         * ①一次突发写 2~4 帧不会把缓冲写满而让阻塞式 `write` 卡住节拍；
+         * **延迟从哪扣**：256 ms 是**容量上限**（写满会阻塞），不是稳态水位。
+         * [AUDIO_TRACK_LOW_WATER_FRAMES] = 3 帧（64 ms）是**补静音的触发阈值，不是容量上限**：
+         * 补帧最多把水位顶到 3 帧就停，真实 PCM 的突发（2~4 帧）会临时把水位抬到
+         * 「3 + 突发帧数」，之后随播放自然回落 —— 无论哪种情况都不会无界增长。
+         * 所以稳态新增的端到端延迟约 64 ms，不是 256 ms。放大容量上限换到的是两件事：
+         * ①一次突发写 2~4 帧不会写满而让阻塞式 `write` 卡住节拍；
          * ②播放线程被调度走 200 ms 时不至于立刻见底。
          *
          * 不动 `AUDIO_JITTER_BUFFER_DEFAULT_MS`（150 ms）：`queue` 已长期满仓，放大抖动缓冲
