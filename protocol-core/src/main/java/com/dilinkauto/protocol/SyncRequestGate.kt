@@ -18,7 +18,8 @@ package com.dilinkauto.protocol
  *
  * @property windowMs 滑动窗口长度（毫秒）。
  * @property maxPerWindow 窗口内允许放行的最大次数。
- * @property grantsMs 窗口内已放行的请求时刻（`elapsedRealtime` 毫秒，升序，长度 ≤ [maxPerWindow]）。
+ * @property grantsMs 窗口内已放行的请求时刻（`elapsedRealtime` 毫秒）。按 `tryAcquire` 的调用
+ *   时序依次追加，故天然按时间戳升序；长度 ≤ [maxPerWindow]。
  */
 data class SyncRequestGate(
     val windowMs: Long = VideoConfig.SYNC_FRAME_REQUEST_WINDOW_MS,
