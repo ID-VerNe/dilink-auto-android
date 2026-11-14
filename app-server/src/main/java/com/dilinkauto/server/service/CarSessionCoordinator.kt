@@ -304,8 +304,13 @@ internal class CarSessionCoordinator(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                carLogSend("WiFi connect failed: ${e.message}")
-                handleDisconnect()
+                carLogSend("WiFi connect failed ($host:$port): ${e.message}")
+                if (handshakeDone) {
+                    handleDisconnect()
+                } else {
+                    disconnectAllConnections(clearListeners = true)
+                    connectJob = null
+                }
             }
         }
     }
