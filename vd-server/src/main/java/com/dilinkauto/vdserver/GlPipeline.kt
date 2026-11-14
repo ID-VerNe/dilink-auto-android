@@ -302,6 +302,8 @@ internal class GlPipeline(
             GLES20.glAttachShader(it, vs)
             GLES20.glAttachShader(it, fs)
             GLES20.glLinkProgram(it)
+            GLES20.glDeleteShader(vs)
+            GLES20.glDeleteShader(fs)
         }
     }
     private fun loadShader(type: Int, src: String): Int = GLES20.glCreateShader(type).also { GLES20.glShaderSource(it, src); GLES20.glCompileShader(it) }
@@ -316,12 +318,25 @@ internal class GlPipeline(
      * (see `PipelineServer.releaseGlResources`). The guard below keeps a double call —
      * pipeline-thread finally plus a late stray caller — from destroying handles twice.
      */
-    fun cleanup() {
+    fun cleanup(
+        deleteProgram: (Int) -> Unit = { if (it != 0) GLES20.glDeleteProgram(it) },
+        deleteTextures: (Int) -> Unit = { if (it != 0) GLES20.glDeleteTextures(1, intArrayOf(it), 0) },
+        terminateDisplay: (EGLDisplay) -> Unit = { EGL14.eglTerminate(it) }
+    ) {
         if (!glTornDown.compareAndSet(false, true)) return
         val d = eglDisplay; val s = eglSurface; val c = eglContext
+        if (glProgram != 0) {
+            deleteProgram(glProgram)
+            glProgram = 0
+        }
+        if (stTexId != 0) {
+            deleteTextures(stTexId)
+            stTexId = 0
+        }
         if (d != null) EGL14.eglMakeCurrent(d, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
         if (d != null && s != null) EGL14.eglDestroySurface(d, s)
         if (d != null && c != null) EGL14.eglDestroyContext(d, c)
+        if (d != null) terminateDisplay(d)
         eglDisplay = null; eglSurface = null; eglContext = null
         // Stop the frame-callback looper BEFORE releasing the SurfaceTexture it
         // may still be posting from. Fallback for the path where pipelineLoop
@@ -330,6 +345,12 @@ internal class GlPipeline(
         cbThread?.quitSafely(); cbThread = null
         vdInputSurface?.release(); vdInputSurface = null
         stTexture?.release(); stTexture = null
+    }
+
+    internal fun setTestResources(program: Int, textureId: Int, display: EGLDisplay?) {
+        glProgram = program
+        stTexId = textureId
+        eglDisplay = display
     }
 
     // IDR 请求闸门（取值 + 判定 + 上次授予时刻）都来自 :protocol-core 的
