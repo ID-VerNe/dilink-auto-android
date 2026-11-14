@@ -41,7 +41,7 @@ internal class CarAdbTracker(
         internal set
 
     @Volatile var usbAdb: UsbAdbConnection? = null
-        private set
+        internal set
 
     @Volatile private var usbConnecting = false
     @Volatile private var tcpAdbConnecting = false
@@ -305,8 +305,28 @@ internal class CarAdbTracker(
                 else adbController!!.shell(command)
             }
             usbAdb?.isConnected == true -> {
-                if (noWait) usbAdb!!.shellNoWait(command) >= 0
-                else { usbAdb!!.shell(command); true }
+                if (noWait) {
+                    usbAdb!!.shellNoWait(command) >= 0
+                } else {
+                    // ADB v1 shell 协议流并不通过数据报文回传命令退出码。
+                    // 若调用方传入 probeExitCodeCommand，映射为带回显标记的 probeCommand，
+                    // 通过输出是 "Y" 还是 "N" 判定引擎存活性（避免恒为 true 导致卡死 15 秒强杀）。
+                    val isProbe = command == VdDeploy.probeExitCodeCommand || command == VdDeploy.probeCommand
+                    val actualCommand = if (command == VdDeploy.probeExitCodeCommand) {
+                        VdDeploy.probeCommand
+                    } else {
+                        command
+                    }
+                    val output = usbAdb!!.shell(actualCommand)
+                    when {
+                        output == null -> false
+                        isProbe -> {
+                            val trimmed = output.trim()
+                            trimmed == "Y" || trimmed.equals("ALIVE", ignoreCase = true) || trimmed == "0"
+                        }
+                        else -> true
+                    }
+                }
             }
             else -> false
         }
