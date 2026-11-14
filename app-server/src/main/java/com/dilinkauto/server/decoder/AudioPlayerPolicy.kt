@@ -89,7 +89,7 @@ internal fun audioTrackPendingFrames(
  * 只有「队列空」才补静音（计 `starved`）。于是 4 帧（85 ms）的 track 被一拍一拍啃到 0，
  * 底层按 22.6 次/秒记 underrun，而应用层 `starved` 只有 25。
  *
- * 规则（表驱动钉在 `AudioPlayerPolicyTest`）：
+ * 规则（表驱动钉在 `AudioPlayerPadPolicyTest`）：
  * - [wroteFramesThisTick] > 0：本拍已有真实 PCM → 不补（水位低是解码器供不上的问题，
  *   不该用静音掩盖）；
  * - 水位已到 [lowWaterFrames] → 不补；
