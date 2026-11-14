@@ -66,12 +66,12 @@ internal class AdaptiveBitrate(
         if (cleanSinceNanos > 0L &&
             (now - cleanSinceNanos) / 1_000_000L >= cleanIntervalMillis
         ) {
+            cleanSinceNanos = now
             val target = minOf(ceiling, currentBitrate + RECOVERY_STEP)
             if (target > currentBitrate) {
                 currentBitrate = target
                 return true
             }
-            cleanSinceNanos = now
         }
         return false
     }
