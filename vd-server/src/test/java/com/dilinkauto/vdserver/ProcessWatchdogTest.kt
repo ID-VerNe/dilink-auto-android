@@ -125,4 +125,30 @@ class ProcessWatchdogTest {
         assertTrue(errLogged.get())
         assertEquals(1, exitCode.get())
     }
+
+    @Test
+    fun cleanupStartedButHangsTriggersForceCleanupAndExit() {
+        val running = AtomicBoolean(false)
+        val cleanupFinished = AtomicBoolean(false)
+        val forceCleanupCalled = AtomicBoolean(false)
+        val exitCode = AtomicInteger(-1)
+
+        val watchdog = ProcessWatchdog(
+            isRunning = { running.get() },
+            isCleanedUp = { cleanupFinished.get() },
+            onStopRequested = {},
+            onForceCleanup = { forceCleanupCalled.set(true) },
+            stopRequestPath = stopPath,
+            gracePeriodMs = 30,
+            pollIntervalMs = 10,
+            cleanupCheckIntervalMs = 10,
+            exitProcess = { exitCode.set(it) },
+            sleep = { /* no-op in test for speed */ }
+        )
+
+        watchdog.runLoop()
+
+        assertTrue("清理挂起未完成超时后必须强制救护屏幕", forceCleanupCalled.get())
+        assertEquals("超时后退出码应为 1", 1, exitCode.get())
+    }
 }

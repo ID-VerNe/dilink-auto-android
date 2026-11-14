@@ -78,7 +78,8 @@ class PipelineServer(
     // the divide-by-zero this guard exists to prevent.
     private val frameIntervalNanos = 1_000_000_000L / this.fps
     @Volatile private var running = true
-    private val cleanedUp = AtomicBoolean(false)
+    private val cleanupStarted = AtomicBoolean(false)
+    private val cleanupFinished = AtomicBoolean(false)
     private var displayId = -1
     private var virtualDisplay: VirtualDisplay? = null
     private var encoder: MediaCodec? = null
@@ -130,12 +131,18 @@ class PipelineServer(
     private val lifecycle = LifecycleWriter { running }
     private val watchdog = ProcessWatchdog(
         isRunning = { running },
-        isCleanedUp = { cleanedUp.get() },
+        isCleanedUp = { cleanupFinished.get() },
         onStopRequested = {
             running = false
             pipelineThread?.let { LockSupport.unpark(it) }
         },
-        onForceCleanup = { cleanup() },
+        onForceCleanup = {
+            // issue #112：若主线程 cleanup() 在 resetLetterboxStyle/moveTasks 等步骤挂起，
+            // 看门狗强制唤醒物理屏幕并恢复 IME，防止手机永久黑屏
+            try { displayController.setPhysicalDisplayPower(true) } catch (e: Exception) { err("Watchdog force display power failed: ${e.message}") }
+            try { shell.exec("input keyevent 224") } catch (_: Exception) {}
+            try { displayController.restoreIme() } catch (_: Exception) {}
+        },
         log = { log(it) },
         err = { err(it) }
     )
@@ -489,7 +496,7 @@ class PipelineServer(
         // 里发现管线已死并跑完 cleanup()（它先置 running=false，再关 audioPipeline —— 那时还是
         // null）。若此处才赋值，采集线程会活过一个已经结束的会话，9640 也不会被关。
         // 双重关闭是安全的：AudioPipeline.close() 与 SocketAudioSink.close() 都幂等。
-        if (cleanedUp.get()) {
+        if (cleanupStarted.get()) {
             err("Audio: session cleaned up during start, closing capture and channel")
             runCatching { pipeline.close() }
             runCatching { sink.close() }
@@ -698,7 +705,7 @@ class PipelineServer(
     }
 
     private fun cleanup() {
-        if (!cleanedUp.compareAndSet(false, true)) return
+        if (!cleanupStarted.compareAndSet(false, true)) return
         running = false
         // issue #64：先停窗口采样线程，后面的 shell 恢复命令与 close 才不会被 dumpsys 插队。
         windowMonitor.stop()
@@ -766,6 +773,7 @@ class PipelineServer(
         releaseGlResources()
         virtualDisplay?.let { try { it.release() } catch (_: Exception) {} }
         log("Cleanup complete")
+        cleanupFinished.set(true)
     }
 }
 
