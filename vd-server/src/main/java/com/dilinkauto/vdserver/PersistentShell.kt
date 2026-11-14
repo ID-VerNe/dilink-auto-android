@@ -47,8 +47,9 @@ internal class PersistentShell(
     /** Write `cmd\n` to the shell's stdin. Never throws. */
     fun exec(cmd: String) = ShellExec.execShell(input, cmd)
 
-    /** One-shot `sh -c`, captures output. Never throws. */
-    fun execOutput(cmd: String): String? = ShellExec.execShellOutput(cmd)
+    /** One-shot `sh -c`, captures output with timeout. Never throws. */
+    fun execOutput(cmd: String, timeoutMs: Long = ShellExec.DEFAULT_EXEC_TIMEOUT_MS): String? =
+        ShellExec.execShellOutput(cmd, timeoutMs)
 
     /**
      * 阻塞直到**此前写入的所有命令都已执行完**（见类头与 [ShellSyncPoint]）。

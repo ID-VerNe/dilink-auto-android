@@ -3,6 +3,7 @@ package com.dilinkauto.vdserver
 import java.io.OutputStream
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
+import java.util.concurrent.TimeUnit
 
 /**
  * Logging and shell helpers shared by the VD server's pipeline collaborators
@@ -48,6 +49,9 @@ internal object PipeLog {
  * because a settings put failed.
  */
 internal object ShellExec {
+    /** 默认命令执行超时：3 秒（避免 dumpsys / am 等命令死锁拖死调用线程） */
+    const val DEFAULT_EXEC_TIMEOUT_MS = 3000L
+
     /** 输出摘要的截断长度：避免 dumpsys 等大输出把 vd-server.log 刷爆 */
     private const val OUTPUT_SUMMARY_CHARS = 400
 
@@ -71,19 +75,45 @@ internal object ShellExec {
     }
 
     /**
-     * Run `sh -c cmd`, capture stdout + stderr, block until exit. Returns null on any failure.
+     * Run `sh -c cmd`, capture stdout + stderr, block until exit with timeout. Returns null on any failure.
      *
      * 用 ProcessBuilder + redirectErrorStream 合并 stderr：am start 等命令的报错
      * （"Error: Activity ... does not exist"）不再丢失，同时避免 stderr 管道无人
      * 读取被写满后卡死调用线程。每次执行都记录命令、退出码与输出摘要。
+     * 支持有界超时（默认 3 秒），超时强制 destroyForcibly 并返回 null。
      */
-    fun execShellOutput(cmd: String): String? = try {
-        val p = ProcessBuilder("sh", "-c", cmd).redirectErrorStream(true).start()
-        val o = p.inputStream.bufferedReader().readText()
-        p.waitFor()
-        val summary = o.trim().replace(Regex("\\s+"), " ")
-        PipeLog.log("sh# $cmd -> exit=${p.exitValue()} out='${summary.take(OUTPUT_SUMMARY_CHARS)}'")
-        o
+    fun execShellOutput(
+        cmd: String,
+        timeoutMs: Long = DEFAULT_EXEC_TIMEOUT_MS,
+        processStarter: (String) -> Process = { c -> ProcessBuilder("sh", "-c", c).redirectErrorStream(true).start() }
+    ): String? = try {
+        val p = processStarter(cmd)
+        val outBuilder = StringBuilder()
+        val readerThread = daemonThread("ShellExecReader", start = true) {
+            try {
+                val buf = CharArray(1024)
+                p.inputStream.bufferedReader().use { reader ->
+                    var n = reader.read(buf)
+                    while (n != -1) {
+                        outBuilder.append(buf, 0, n)
+                        n = reader.read(buf)
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val exited = p.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
+        if (!exited) {
+            p.destroyForcibly()
+            readerThread.interrupt()
+            PipeLog.err("sh# $cmd -> timed out after ${timeoutMs}ms")
+            null
+        } else {
+            readerThread.join(500)
+            val o = outBuilder.toString()
+            val summary = o.trim().replace(Regex("\\s+"), " ")
+            PipeLog.log("sh# $cmd -> exit=${p.exitValue()} out='${summary.take(OUTPUT_SUMMARY_CHARS)}'")
+            o
+        }
     } catch (e: Exception) {
         PipeLog.err("sh# $cmd -> failed: ${e.message}")
         null
