@@ -71,16 +71,7 @@ internal object VideoEncoderSelector {
         for (name in orderEncoderCandidates(candidates)) {
             try {
                 val codec = MediaCodec.createByCodecName(name)
-                val surface: Surface
-                try {
-                    codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-                    surface = codec.createInputSurface()
-                    codec.start()
-                } catch (e: Exception) {
-                    // 半成品实例必须释放：失败的 codec 已占用底层组件
-                    runCatching { codec.release() }
-                    throw e
-                }
+                val surface = probeCodec(codec, format)
                 return SelectedEncoder(codec, surface, name, tried)
             } catch (e: Exception) {
                 // 失败原因保留在聚合信息里；空 message 的 CodecException 用类名兜底。
@@ -89,6 +80,32 @@ internal object VideoEncoderSelector {
             }
         }
         throw IOException("没有可用的 H.264 编码器；候选与失败原因: ${tried.joinToString("; ")}")
+    }
+
+    /**
+     * 探测并启动单个编码器候选。若 start 或后续步骤失败，必须确保已分配的 Surface 与 Codec 都被释放。
+     */
+    internal fun probeCodec(
+        codec: MediaCodec,
+        format: MediaFormat,
+        configure: (MediaCodec, MediaFormat) -> Unit = { c, f -> c.configure(f, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE) },
+        createInputSurface: (MediaCodec) -> Surface = { it.createInputSurface() },
+        start: (MediaCodec) -> Unit = { it.start() },
+        releaseCodec: (MediaCodec) -> Unit = { it.release() },
+        releaseSurface: (Surface) -> Unit = { it.release() }
+    ): Surface {
+        var surface: Surface? = null
+        try {
+            configure(codec, format)
+            surface = createInputSurface(codec)
+            start(codec)
+            return surface
+        } catch (e: Exception) {
+            // 半成品实例必须释放：失败的 codec 已占用底层组件；releasing the codec does not release the Surface
+            runCatching { surface?.let { releaseSurface(it) } }
+            runCatching { releaseCodec(codec) }
+            throw e
+        }
     }
 }
 
