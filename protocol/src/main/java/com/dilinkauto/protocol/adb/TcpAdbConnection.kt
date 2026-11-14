@@ -38,6 +38,13 @@ open class TcpAdbConnection(
     private var socket: Socket? = null
     private var maxPayload = AdbProtocol.MAX_PAYLOAD
     private var authSignatureSent = false
+    private val streamData = java.util.concurrent.ConcurrentHashMap<Int, java.util.concurrent.BlockingQueue<ByteArray>>()
+    private val streamPeerIds = java.util.concurrent.ConcurrentHashMap<Int, Int>()
+    private val streamClosed = java.util.concurrent.ConcurrentHashMap<Int, Boolean>()
+    private val streamOpenLatch = java.util.concurrent.ConcurrentHashMap<Int, java.util.concurrent.CountDownLatch>()
+    private val writeLock = Any()
+    @Volatile private var readerRunning = false
+    private var readerThread: Thread? = null
 
     val isConnected: Boolean get() = socket?.isConnected == true && !socket!!.isClosed
 
@@ -50,13 +57,14 @@ open class TcpAdbConnection(
             socket = sock
             val keyPair = getOrCreateKeyPair()
             // Send CNXN
-            sock.getOutputStream().write(AdbProtocol.encodeConnect())
+            writeRaw(AdbProtocol.encodeConnect())
             // Handle AUTH + CNXN response
             while (true) {
                 val msg = readMessage()
                 when (msg.command) {
                     AdbProtocol.A_CNXN -> {
                         maxPayload = negotiateMaxPayload(msg.data)
+                        startReaderThread()
                         return true
                     }
                     AdbProtocol.A_AUTH -> {
@@ -74,72 +82,114 @@ open class TcpAdbConnection(
         }
     }
 
-    /** Execute a shell command synchronously. Returns exit code (0 = stream closed, -1 = error). */
-    open fun shell(command: String): Int {
-        val sock = socket ?: return -1
-        val localId = nextLocalId()
-        var peerRemoteId = 0
-        return try {
-            synchronized(sock) {
-                // OPEN shell stream
-                val openBytes = "shell:$command".toByteArray()
-                sock.getOutputStream().write(
-                    AdbProtocol.encode(AdbProtocol.A_OPEN, localId, 0, openBytes))
-                // Read response: OKAY opens stream, WRTE carries data (ack each), CLSE ends.
-                var exitCode = -1
-                val output = StringBuilder()
-                while (true) {
+    private fun startReaderThread() {
+        readerRunning = true
+        readerThread = Thread({
+            try {
+                while (readerRunning && isConnected) {
                     val msg = readMessage()
-                    when (msg.command) {
-                        AdbProtocol.A_OKAY -> {
-                            // Stream opened — record the peer's remote id so we can
-                            // ack subsequent WRTEs and close cleanly.
-                            peerRemoteId = msg.arg0
-                        }
-                        AdbProtocol.A_WRTE -> {
-                            msg.data?.let { output.append(String(it)) }
-                            // Acknowledge the write so the device can send more
-                            // (ADB flow control — without this the device stalls).
-                            writeRaw(AdbProtocol.encode(AdbProtocol.A_OKAY, localId, peerRemoteId, null))
-                        }
-                        AdbProtocol.A_CLSE -> {
-                            // Ack the peer's CLSE with our own CLSE to fully close
-                            // the stream on both sides (no half-open leftover).
-                            writeRaw(AdbProtocol.encodeClose(localId, peerRemoteId))
-                            // 0 means "stream closed cleanly" — NOT "command succeeded".
-                            // adb's shell: protocol doesn't surface the real exit code
-                            // over this path.
-                            exitCode = 0
-                            break
-                        }
-                        else -> break
-                    }
+                    handleIncomingMessage(msg)
                 }
-                exitCode
+            } catch (_: Exception) {
+            } finally {
+                cleanupStreams()
             }
+        }, "TcpAdb-Reader").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    private fun handleIncomingMessage(msg: AdbMessage) {
+        val localId = msg.arg1
+        val peerRemoteId = msg.arg0
+        when (msg.command) {
+            AdbProtocol.A_OKAY -> {
+                streamPeerIds[localId] = peerRemoteId
+                streamOpenLatch[localId]?.countDown()
+            }
+            AdbProtocol.A_WRTE -> {
+                streamPeerIds[localId] = peerRemoteId
+                val queue = streamData[localId]
+                msg.data?.let { queue?.offer(it) }
+                writeRaw(AdbProtocol.encode(AdbProtocol.A_OKAY, localId, peerRemoteId, null))
+            }
+            AdbProtocol.A_CLSE -> {
+                streamClosed[localId] = true
+                streamPeerIds[localId] = peerRemoteId
+                streamOpenLatch[localId]?.countDown()
+                streamData[localId]?.offer(ByteArray(0))
+            }
+        }
+    }
+
+    /** Execute a shell command synchronously. Returns exit code (0 = stream closed, -1 = error). */
+    @JvmOverloads
+    open fun shell(command: String, outputSink: StringBuilder? = null): Int {
+        if (!isConnected) return -1
+        val localId = nextLocalId()
+        val queue = java.util.concurrent.LinkedBlockingQueue<ByteArray>()
+        val openLatch = java.util.concurrent.CountDownLatch(1)
+        streamData[localId] = queue
+        streamClosed[localId] = false
+        streamOpenLatch[localId] = openLatch
+
+        return try {
+            val openBytes = "shell:$command".toByteArray(Charsets.UTF_8)
+            writeRaw(AdbProtocol.encode(AdbProtocol.A_OPEN, localId, 0, openBytes))
+
+            if (!openLatch.await(10, java.util.concurrent.TimeUnit.SECONDS) || streamClosed[localId] == true) {
+                return -1
+            }
+
+            val deadline = System.currentTimeMillis() + 30000L
+            val output = outputSink ?: StringBuilder()
+            while (streamClosed[localId] != true && System.currentTimeMillis() < deadline) {
+                val chunk = queue.poll(500, java.util.concurrent.TimeUnit.MILLISECONDS)
+                if (chunk != null && chunk.isNotEmpty()) {
+                    output.append(String(chunk, Charsets.UTF_8))
+                }
+            }
+            if (streamClosed[localId] == true) 0 else -1
         } catch (e: Exception) {
             -1
+        } finally {
+            streamData.remove(localId)
+            streamPeerIds.remove(localId)
+            streamClosed.remove(localId)
+            streamOpenLatch.remove(localId)
         }
     }
 
     /** Start a long-running shell command. Keeps the stream open so the process survives.
      *  Returns the local stream ID if successful, -1 on failure. */
     open fun shellBackground(command: String): Int {
-        val sock = socket ?: return -1
+        if (!isConnected) return -1
         val localId = nextLocalId()
+        val queue = java.util.concurrent.ArrayBlockingQueue<ByteArray>(64)
+        val openLatch = java.util.concurrent.CountDownLatch(1)
+        streamData[localId] = queue
+        streamClosed[localId] = false
+        streamOpenLatch[localId] = openLatch
+
         return try {
-            synchronized(sock) {
-                val openBytes = "shell:$command".toByteArray()
-                sock.getOutputStream().write(
-                    AdbProtocol.encode(AdbProtocol.A_OPEN, localId, 0, openBytes))
-                val msg = readMessage()
-                if (msg.command == AdbProtocol.A_OKAY) {
-                    localId
-                } else {
-                    -1
-                }
+            val openBytes = "shell:$command".toByteArray(Charsets.UTF_8)
+            writeRaw(AdbProtocol.encode(AdbProtocol.A_OPEN, localId, 0, openBytes))
+
+            if (!openLatch.await(10, java.util.concurrent.TimeUnit.SECONDS) || streamClosed[localId] == true) {
+                streamData.remove(localId)
+                streamPeerIds.remove(localId)
+                streamClosed.remove(localId)
+                streamOpenLatch.remove(localId)
+                -1
+            } else {
+                localId
             }
         } catch (e: Exception) {
+            streamData.remove(localId)
+            streamPeerIds.remove(localId)
+            streamClosed.remove(localId)
+            streamOpenLatch.remove(localId)
             -1
         }
     }
@@ -150,8 +200,28 @@ open class TcpAdbConnection(
     }
 
     override fun close() {
+        readerRunning = false
         try { socket?.close() } catch (_: Exception) {}
         socket = null
+        cleanupStreams()
+        try { readerThread?.interrupt() } catch (_: Exception) {}
+        readerThread = null
+    }
+
+    private fun cleanupStreams() {
+        for (latch in streamOpenLatch.values) {
+            latch.countDown()
+        }
+        for (key in streamClosed.keys) {
+            streamClosed[key] = true
+        }
+        for (queue in streamData.values) {
+            queue.offer(ByteArray(0))
+        }
+        streamData.clear()
+        streamPeerIds.clear()
+        streamClosed.clear()
+        streamOpenLatch.clear()
     }
 
     // -- Message I/O --
@@ -177,7 +247,12 @@ open class TcpAdbConnection(
     }
 
     private fun writeRaw(data: ByteArray) {
-        socket?.getOutputStream()?.write(data)
+        synchronized(writeLock) {
+            val sock = socket ?: return
+            val out = sock.getOutputStream()
+            out.write(data)
+            out.flush()
+        }
     }
 
     // -- Key management (Tcp-specific: PEM storage for Dadb compatibility) --
