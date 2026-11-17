@@ -102,13 +102,16 @@
 ```powershell
 # 1. 版本号（app.versionName）已在 main 上改成时间戳并合并，工作区干净
 git status --porcelain
-# 2. 打 tag（用 merge commit，不要用分支名；tag 必须与 app.versionName 逐字一致）
+# 2. 从单一来源读出 tag（不要手抄版本号；tag 必须与 app.versionName 逐字一致，
+#    打错会被 build-release.yml 的 Verify tag matches versionName 拦下）
+$v = (Select-String -Path gradle.properties -Pattern '^app\.versionName=(.+)').Matches.Groups[1].Value.Trim()
+# 3. 打 tag（用 merge commit，不要用分支名）
 git fetch origin main
-git tag v20261117-2247 origin/main
-git push origin v20261117-2247
-# 3. 盯流水线
+git tag "v$v" origin/main
+git push origin "v$v"
+# 4. 盯流水线
 gh run list -R ID-VerNe/dilink-auto-android --limit 3
-# 4. 下载资产后校验签名（命令见 docs/release.md §3）
+# 5. 下载资产后校验签名（命令见 docs/release.md §3）
 ```
 
 ### 7.3 不能忘的坑（完整版见 `docs/release.md` §5）

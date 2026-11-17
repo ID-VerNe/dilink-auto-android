@@ -37,7 +37,7 @@
 - **应用允许列表 + 应用置顶**:手机端选择推送到车机的应用,车机端长按置顶。
 - **车机端启动 DPI 覆盖**:解决 1280x800 默认 DPI 偏小。
 - **持续黑屏自愈**:判据在 `protocol-core`(`BlackScreenDetector`),车机端重握手、桌面端自动重连(有次数上限)。
-- **全模块单元测试**:6 个模块均有 `src/test`(此前 `vd-server` / `protocol` 为零覆盖),JUnit4 + kotlinx-coroutines-test,**611 个 `@Test` 用例 / 86 个测试文件**(Android 模块按 debug+release 双变体合计执行 862 个,2026-10-10 全绿);其中 2026-10 的补齐与 seam 批次新增 24 个文件、183 个用例,后续实机回归轮再增 4 个(`ShellSyncPointTest` / `StopRequestTest` / `EncoderCandidateOrderTest` / `RecentsParserTest`);清单与锁定的跨模块不变量见 [IMPLEMENTATION_REPORT_TESTING.md](./IMPLEMENTATION_REPORT_TESTING.md)。
+- **全模块单元测试**:6 个模块均有 `src/test`(此前 `vd-server` / `protocol` 为零覆盖),JUnit4 + kotlinx-coroutines-test。**历史实测快照(2026-10-10 全绿)**:611 个 `@Test` 用例 / 86 个测试文件(Android 模块按 debug+release 双变体合计执行 862 个);其中 2026-10 的补齐与 seam 批次新增 24 个文件、183 个用例,后续实机回归轮再增 4 个(`ShellSyncPointTest` / `StopRequestTest` / `EncoderCandidateOrderTest` / `RecentsParserTest`)。**当前静态计数(2026-11-18,`grep -rh '@Test' --include=*.kt */src/test | wc -l` 与 `find */src/test -name '*.kt' | wc -l`)**:1440 个 `@Test` / 215 个测试文件,分模块 `protocol-core` 417/56、`protocol` 42/5、`vd-server` 334/48、`app-client` 163/26、`app-server` 303/56、`app-desktop` 181/24;这是源码静态计数,**本次未全量执行,不代表全绿**,不可与上面那个实测快照混为一谈。清单与锁定的跨模块不变量见 [IMPLEMENTATION_REPORT_TESTING.md](./IMPLEMENTATION_REPORT_TESTING.md)。
 - **安全加固**:协议不再无条件信任对端(畸形帧不再杀进程、payload 上限 128MB → 16MB)、VD 通道鉴权、`VdDeploy` shell 引用、桌面端部署入参校验、release keystore 移出仓库。
 - **简体中文**:client 和 server 都加了 `values-zh-rCN` / `values-zh`。
 
@@ -56,7 +56,7 @@
 
 | 编号 | 位置 | 现象 |
 |------|------|------|
-| C-5 | `app-client` `Versioning` / `CarAppInstaller` | 车机未安装时 `readInstalledVersion` 返回 `"0"`;若内嵌 `versionName` 也是 `0` / `0.0` / `0.0.0` 形式,比较结果判为"已最新",**跳过本应进行的首装**。当前 `1.0.0` 不触发 |
+| C-5 | `app-client` `Versioning` / `CarAppInstaller` | 车机未安装时 `readInstalledVersion` 返回 `"0"`;若内嵌 `versionName` 也是 `0` / `0.0` / `0.0.0` 形式,比较结果判为"已最新",**跳过本应进行的首装**。隐患仍在,但日期版本号首段是 8 位十进制,不会撞上 `"0"` 哨兵,当前不可触发 |
 | C-6 | `app-client` `InstallStatus.parse` | 状态串由 `context.getString` 本地化产出,分类却只按英文子串;中文等非英文 locale 全部落入 `IDLE`(无进度、无错误),且 `"not reachable"` / `"Invalid IP"` 也不归类为 ERROR。建议改走结构化状态枚举 |
 | S-02 | `vd-server` `CarCommandRouter.dispatch` | `LAUNCH_APP` / `APP_UNINSTALL` 的 decode 未加保护(包名已有 `shellQuote` + 解码器形状校验),恶意包名仍能让读帧线程抛异常;`APP_INFO` 分支有 try/catch |
 | B-05 | `app-client` `embedServerApk`(`app-client/build.gradle.kts:223-249`) | 曾固定内嵌 `app-server-debug.apk`。引入正式签名后会出现车机自更新签名不匹配;**已修复(issue #37)**:按客户端变体内嵌 release / debug 车机包,`build-release.yml` 另有证书摘要比对门禁 |
@@ -64,4 +64,4 @@
 
 ## 下载
 
-不提供具体版本号(代码版本与 Release tag 不一致,以 [Releases](https://github.com/ID-VerNe/dilink-auto-android/releases/latest) 为准)。当前代码版本:`app.versionName = 20261117-2247`(`versionCode` 由它派生出 `26111722`,见 [Release Guide](./release.md) §1)。
+不提供具体版本号(代码版本与 Release tag 不一致,以 [Releases](https://github.com/ID-VerNe/dilink-auto-android/releases/latest) 为准)。当前代码版本以仓库里 `gradle.properties` 的 `app.versionName` 为准(格式 `YYYYMMDD-HHMM`,`versionCode` 由它派生,见 [Release Guide](./release.md) §1)。
