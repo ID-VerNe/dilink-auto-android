@@ -14,6 +14,13 @@ android {
         versionCode = project.property("app.versionCode").toString().toInt()
         versionName = project.property("app.versionName").toString()
 
+        // issue #188：探针强制开关。默认 false，行为与 `BuildConfig.DEBUG` 完全一致；
+        // `-Pprobe.force=true` 只用于「实车跑一轮探针」的本地正式签名包 —— 车机上装的是
+        // 正式签名包，而 debug 包覆盖不上去（INSTALL_FAILED_UPDATE_INCOMPATIBLE），
+        // 卸载重装又会丢车机端配置。有这条开关才能在不卸载的前提下让正式包跑探针。
+        val probeForce = (project.findProperty("probe.force") as String?)?.toBoolean() ?: false
+        buildConfigField("boolean", "PROBE_FORCE", probeForce.toString())
+
         // 高德 Web 服务 key（天气城市反查用，issue #157）。来源优先级：
         // `-Pamap.key=` > `local.properties` 的 `amap.key` > 环境变量 `AMAP_KEY`。
         // 缺省空串 → 城市解析只走 IP 兜底；真实 key 不入库（与 keystore 同规矩）。

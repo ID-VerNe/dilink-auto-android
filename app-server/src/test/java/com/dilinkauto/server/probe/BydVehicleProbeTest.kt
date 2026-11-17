@@ -159,7 +159,7 @@ class BydVehicleProbeTest {
     }
 
     /**
-     * 探针总开关必须跟着 `BuildConfig.DEBUG` 走。
+     * 探针总开关必须跟着 `BuildConfig.DEBUG` 走（或显式的 `-Pprobe.force=true`）。
      *
      * 这个探针挂在 `CarSessionCoordinator.beginConnect` 上，每次连接都会跑约 3 秒并
      * **订阅 + 注销**车机的发动机事件通道；写死 `true` 就意味着正式包里每次连接都在
@@ -168,8 +168,8 @@ class BydVehicleProbeTest {
     @Test
     fun `probe is only enabled in debug builds`() {
         assertEquals(
-            "ENABLED 必须等于 BuildConfig.DEBUG，不得写死 true",
-            com.dilinkauto.server.BuildConfig.DEBUG,
+            "ENABLED 必须是 DEBUG 或 PROBE_FORCE，不得写死 true",
+            com.dilinkauto.server.BuildConfig.DEBUG || com.dilinkauto.server.BuildConfig.PROBE_FORCE,
             BydVehicleProbe.ENABLED,
         )
     }

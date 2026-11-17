@@ -676,8 +676,13 @@ internal class BydVehicleProbe(
          * 每次连接都会跑约 3 秒，并且会**订阅并注销**车机的发动机事件通道。正式包里
          * 让用户车机跑临时诊断代码是不可接受的，所以用 [BuildConfig.DEBUG] 卡住 ——
          * release 包里 `ENABLED` 恒为 false，效果等同删除，但代码还能给 debug 包复用。
+         *
+         * [BuildConfig.PROBE_FORCE] 是实车取证的唯一例外：车机上装的是正式签名包，
+         * debug 包覆盖不上去（`INSTALL_FAILED_UPDATE_INCOMPATIBLE`），卸载重装又会丢
+         * 车机端配置，所以实车那一轮用 `-Pprobe.force=true` 单独构建。默认 false，
+         * 发布流水线不带该参数，因此正式包不会跑探针。
          */
-        val ENABLED: Boolean = BuildConfig.DEBUG
+        val ENABLED: Boolean = BuildConfig.DEBUG || BuildConfig.PROBE_FORCE
 
         private const val SAMPLE_INTERVAL_MS = 500L
         private const val ENGINE_GET_PERMISSION = "android.permission.BYDAUTO_ENGINE_GET"
