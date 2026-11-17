@@ -11,8 +11,9 @@ android {
         applicationId = "com.dilinkauto.server"
         minSdk = 26
         targetSdk = 34
-        versionCode = project.property("app.versionCode").toString().toInt()
-        versionName = project.property("app.versionName").toString()
+        // 版本号由根 build.gradle.kts 单点算出（issue #224），与 app-client 同源。
+        versionCode = rootProject.extra["appVersionCode"] as Int
+        versionName = rootProject.extra["appVersionName"] as String
 
         // issue #188：探针强制开关。默认 false，行为与 `BuildConfig.DEBUG` 完全一致；
         // `-Pprobe.force=true` 只用于「实车跑一轮探针」的本地正式签名包 —— 车机上装的是
