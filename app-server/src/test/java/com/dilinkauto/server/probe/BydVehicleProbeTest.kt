@@ -159,6 +159,22 @@ class BydVehicleProbeTest {
     }
 
     /**
+     * 探针总开关必须跟着 `BuildConfig.DEBUG` 走。
+     *
+     * 这个探针挂在 `CarSessionCoordinator.beginConnect` 上，每次连接都会跑约 3 秒并
+     * **订阅 + 注销**车机的发动机事件通道；写死 `true` 就意味着正式包里每次连接都在
+     * 跑临时诊断代码。这条断言是那个错误的唯一门禁。
+     */
+    @Test
+    fun `probe is only enabled in debug builds`() {
+        assertEquals(
+            "ENABLED 必须等于 BuildConfig.DEBUG，不得写死 true",
+            com.dilinkauto.server.BuildConfig.DEBUG,
+            BydVehicleProbe.ENABLED,
+        )
+    }
+
+    /**
      * #195 对照 1：`getInstance` 之后 SDK 里存的是不是我们传入的 wrapper。
      * 如果被换成 ApplicationContext，wrapper 的作用范围就不覆盖 getter 的权限检查。
      */
@@ -356,10 +372,28 @@ class BydVehicleProbeTest {
     }
 
     /**
+     * 对照 lane 的判定不能套转速区间。
+     *
+     * AC 主温量程是 17..33℃（`BYDAutoAcDevice.java:50-51`），室外温度可到 -40℃。
+     * 之前用 `1..8000` 检对照，等于「碰巧对了」：夏天 26 能过，冬天 -5 或 0 会被判成
+     * 「反射链坏了」，整轮订阅实验白跑。
+     */
+    @Test
+    fun `lane anchor only excludes sentinels not the rpm range`() {
+        assertTrue("26℃ 必须算自证通过", isLaneAnchored(26))
+        assertTrue("0℃ 也是合法温度，不能当失败", isLaneAnchored(0))
+        assertTrue("室外 -5℃ 同样合法", isLaneAnchored(-5))
+        assertTrue("高温 45℃ 合法", isLaneAnchored(45))
+        assertFalse("8191 是哨兵，不能算通过", isLaneAnchored(8191))
+        assertFalse("65535 是哨兵，不能算通过", isLaneAnchored(65535))
+        assertFalse("拿不到对照值不算通过", isLaneAnchored(null))
+    }
+
+    /**
      * #188 v2 判定纯函数的分支表。
      *
-     * 核心约束：`raw[ctl]`（AC 主温，实车 26℃）是 lane 自证的锚点——它不通就说明反射链写错了，
-     * 不能拿其它 lane 的哨兵去论证「车上没数据」；这正是上一轮把 8191 误判成「字段不存在」的原因。
+     * 核心约束：`raw[ctl]`（AC 主温，实车 26℃）是 lane 自证的锚点，但它**只是**削弱证据，
+     * 不能让整轮作废——AC 设备缺失时仍要能判 `no-data`，只是标注证据弱（`unanchored`）。
      */
     @Test
     fun `subscribe verdict rules cover every lane outcome`() {
@@ -394,14 +428,9 @@ class BydVehicleProbeTest {
             decideSubscribeVerdict(sentinelEngine.copy(callbackValues = listOf(0, 1650))),
         )
         assertEquals(
-            "对照 lane 读到哨兵 → 反射链有问题，其它 lane 作废",
-            "lane-broken",
-            decideSubscribeVerdict(sentinelEngine.copy(rawControl = 8191)),
-        )
-        assertEquals(
-            "对照 lane 抛异常 → 同样不能下结论",
-            "lane-broken",
-            decideSubscribeVerdict(sentinelEngine.copy(rawControl = null)),
+            "0 与负值都不算真实转速",
+            "no-data",
+            decideSubscribeVerdict(sentinelEngine.copy(afterSubscribe = 0, afterSubscribeAll = -1)),
         )
         assertEquals(
             "没订阅成功这一轮就没测到订阅 → 不能替订阅下结论",
@@ -409,8 +438,8 @@ class BydVehicleProbeTest {
             decideSubscribeVerdict(sentinelEngine.copy(listener = ListenerState.SKIP_ABSTRACT)),
         )
         assertEquals(
-            "所有读数都抛异常 → 证据链断了",
-            "unclear",
+            "所有读数都抛异常但对照正常 → 反射链有问题",
+            "lane-broken",
             decideSubscribeVerdict(
                 sentinelEngine.copy(
                     rawEngine = null,
@@ -421,9 +450,37 @@ class BydVehicleProbeTest {
             ),
         )
         assertEquals(
-            "0 与负值都不算真实转速",
-            "no-data",
-            decideSubscribeVerdict(sentinelEngine.copy(afterSubscribe = 0, afterSubscribeAll = -1)),
+            "所有读数都抛异常且对照也没通 → 证据链断了",
+            "unclear",
+            decideSubscribeVerdict(
+                sentinelEngine.copy(
+                    rawEngine = null,
+                    rawLegacy = null,
+                    afterSubscribe = null,
+                    afterSubscribeAll = null,
+                    rawControl = null,
+                ),
+            ),
+        )
+        assertEquals(
+            "对照 lane 读到哨兵 → 结论降级为证据弱，但仍算读不到数据",
+            "no-data-unanchored",
+            decideSubscribeVerdict(sentinelEngine.copy(rawControl = 8191)),
+        )
+        assertEquals(
+            "AC 设备缺失（对照为 null）→ 同样降级，不能让整轮白跑",
+            "no-data-unanchored",
+            decideSubscribeVerdict(sentinelEngine.copy(rawControl = null)),
+        )
+        assertEquals(
+            "对照挂了但确实读到转速 → 读到就是读到，不受对照影响",
+            "subscribed-has-value",
+            decideSubscribeVerdict(sentinelEngine.copy(rawControl = null, rawEngine = 1650)),
+        )
+        assertEquals(
+            "对照挂了但回调有真实转速 → 事件通道依然成立",
+            "event-only",
+            decideSubscribeVerdict(sentinelEngine.copy(rawControl = null, callbackValues = listOf(1650))),
         )
     }
 
@@ -436,6 +493,136 @@ class BydVehicleProbeTest {
         assertEquals(null, parseProbeInt("err:SecurityException:denied"))
         assertEquals(null, parseProbeInt("skip(no-instance)"))
         assertEquals(null, parseProbeInt(null))
+    }
+
+    // ------------------------------------------------------------------
+    // 订阅反射链的端到端覆盖（P0：之前这一段是零测试）
+    // ------------------------------------------------------------------
+
+    /**
+     * 订阅成功 + 回调给出真实转速 → `subscribed-has-value`。
+     *
+     * 这条用例把 `newListenerProxy` / `registerListener` / `recordCallback` /
+     * `hasRealCallback` / 判定函数整条链路串起来。之前只有抽象类 skip 的用例，
+     * 那一条恰好**绕开**了新路径（`IBYDAutoListener` 被映射成非接口的假类），
+     * 所以订阅代码从没被真正执行过。
+     */
+    @Test
+    fun `subscribing with engine feature id reports a real value`() {
+        val lines = runProbe(
+            classLookup = { name ->
+                when {
+                    name == LISTENER_INTERFACE_FQN -> FakeListenerInterface::class.java
+                    name.endsWith("AbsBYDAutoEngineListener") -> AbstractEngineListener::class.java
+                    else -> SubscribingDevice::class.java
+                }
+            },
+        )
+
+        assertTrue("必须报注册成功：$lines", lines.any { it.contains("sub=registered featureIds=1") })
+        assertTrue("必须打回调行：$lines", lines.any { it.contains("cb dev=1012") })
+        assertTrue("注销必须成功：$lines", lines.any { it.contains("unsub=ok") })
+        assertTrue(
+            "回调里有真实转速就必须判成 subscribed-has-value：$lines",
+            lines.any { it.contains("verdict=subscribed-has-value") },
+        )
+        assertFalse("不得误判成没数据：$lines", lines.any { it.contains("verdict=no-data") })
+    }
+
+    /**
+     * P0-1 回归：`onDataEventChanged(int, BYDAutoEventValue)` 的**值在第二个参数里**。
+     *
+     * 之前这条分支把值整个丢掉（`value = null, dbl = null`），SDK 若只走这条路，
+     * 日志会显示「收到了回调但没有值」，判定给出 `no-data` —— 与事实正好相反。
+     */
+    @Test
+    fun `event value carried by onDataEventChanged is recorded`() {
+        val lines = runProbe(
+            classLookup = { name ->
+                when {
+                    name == LISTENER_INTERFACE_FQN -> FakeListenerInterface::class.java
+                    name.endsWith("AbsBYDAutoEngineListener") -> AbstractEngineListener::class.java
+                    else -> EventValueDevice::class.java
+                }
+            },
+        )
+
+        assertTrue("必须从 intValue 字段读出 1650：$lines", lines.any { it.contains("-> 1650") })
+        assertTrue(
+            "只有 onDataEventChanged 有值时必须判 event-only：$lines",
+            lines.any { it.contains("verdict=event-only") },
+        )
+    }
+
+    /**
+     * `BYDAutoEventValue.INVAILD_INT`（-999999999）是 SDK 的「无值」哨兵，
+     * 不能当成一个巨大的负数转速，也不能因为「有值」就把回调计入。
+     */
+    @Test
+    fun `invalid event value sentinel is not counted`() {
+        val lines = runProbe(
+            classLookup = { name ->
+                when {
+                    name == LISTENER_INTERFACE_FQN -> FakeListenerInterface::class.java
+                    name.endsWith("AbsBYDAutoEngineListener") -> AbstractEngineListener::class.java
+                    else -> InvalidEventValueDevice::class.java
+                }
+            },
+        )
+
+        assertTrue("必须留下回调日志：$lines", lines.any { it.contains("cb dev=1012") })
+        assertFalse(
+            "INVAILD_INT 不得被当成真实转速：$lines",
+            lines.any { it.contains("verdict=event-only") || it.contains("verdict=subscribed-has-value") },
+        )
+    }
+
+    /**
+     * 全量订阅会把**其它设备**的事件也打到同一个 listener 上。
+     * 空调 26℃、SOC 55 都落在转速的 `1..8000` 区间，不过滤就会刷出假的 `event-only`。
+     */
+    @Test
+    fun `callback from other device is logged but not counted as rpm`() {
+        val lines = runProbe(
+            classLookup = { name ->
+                when {
+                    name == LISTENER_INTERFACE_FQN -> FakeListenerInterface::class.java
+                    name.endsWith("AbsBYDAutoEngineListener") -> AbstractEngineListener::class.java
+                    else -> ForeignEventDevice::class.java
+                }
+            },
+        )
+
+        assertTrue("非发动机回调也要留日志：$lines", lines.any { it.contains("cb dev=1000") })
+        assertFalse(
+            "空调 26℃ 不得被当成转速：$lines",
+            lines.any { it.contains("verdict=event-only") || it.contains("verdict=subscribed-has-value") },
+        )
+    }
+
+    /**
+     * SDK 用 `ConcurrentHashMap<IBYDAutoListener, ArraySet<Integer>>` 存听众，
+     * 注册时必然调 `hashCode()` / `equals()`。handler 一律返回 null 会在拆箱成 int 时
+     * NPE，`registerListener` 直接抛异常——日志只剩 `listener=err:register(...)`，
+     * 整轮订阅实验作废。
+     */
+    @Test
+    fun `proxy answers object methods so map based registration works`() {
+        val lines = runProbe(
+            classLookup = { name ->
+                when {
+                    name == LISTENER_INTERFACE_FQN -> FakeListenerInterface::class.java
+                    name.endsWith("AbsBYDAutoEngineListener") -> AbstractEngineListener::class.java
+                    else -> MapBasedSubscribingDevice::class.java
+                }
+            },
+        )
+
+        assertFalse(
+            "hashCode/equals 必须可用，注册不能抛异常：$lines",
+            lines.any { it.contains("listener=err:register(") },
+        )
+        assertTrue("必须注册成功：$lines", lines.any { it.contains("sub=registered featureIds=1") })
     }
 
     /** 统一构造探针，默认把 listener 类映射为抽象类，模拟实车上的 `AbsBYDAutoEngineListener`。 */
@@ -459,8 +646,17 @@ class BydVehicleProbeTest {
     }
 
     /** listener 抽象类走单独的类，设备类由各用例指定。 */
-    private fun deviceClassFor(name: String, device: Class<*>): Class<*>? =
-        if (name.endsWith("AbsBYDAutoEngineListener")) AbstractEngineListener::class.java else device
+    private fun deviceClassFor(name: String, device: Class<*>): Class<*>? = when {
+        name.endsWith("AbsBYDAutoEngineListener") -> AbstractEngineListener::class.java
+        name == ABS_DEVICE_FQN -> FakeAbsDevice::class.java
+        else -> device
+    }
+
+    private companion object {
+        /** 与 `BydVehicleProbe` 里的常量保持一致（那边是 private，测试只能复制字面量）。 */
+        const val LISTENER_INTERFACE_FQN = "android.hardware.IBYDAutoListener"
+        const val ABS_DEVICE_FQN = "android.hardware.bydauto.AbsBYDAutoDevice"
+    }
 }
 
 /**
@@ -574,3 +770,206 @@ internal class RealDeniedDevice(private val mContext: android.content.Context) {
 
 /** 模拟 `AbsBYDAutoEngineListener`：抽象类，`java.lang.reflect.Proxy` 无法代理。 */
 internal abstract class AbstractEngineListener
+
+/**
+ * 模拟真实接口 `android.hardware.IBYDAutoListener`（3 个方法）。
+ *
+ * 必须是 `interface`：`java.lang.reflect.Proxy` 只能代理接口，而
+ * `BYDAutoEngineDevice.registerListener(AbsBYDAutoEngineListener)` 内部就是
+ * `super.registerListener((IBYDAutoListener) l)`（`temp.java:287-293`）。
+ *
+ * 方法名必须与实车接口一致：探针按 `method.name` 分派，名字写错就静默走 `else`。
+ */
+internal interface FakeListenerInterface {
+    fun onDataChanged(event: FakeEvent)
+    fun onDataEventChanged(eventType: Int, eventValue: FakeEventValue)
+    fun onError(errCode: Int, errMessage: String)
+}
+
+/** 模拟 `android.hardware.IBYDAutoEvent`：值通过 getter 暴露。 */
+internal class FakeEvent(
+    private val dev: Int,
+    private val evt: Int,
+    private val value: Int,
+) {
+    fun getDeviceType(): Int = dev
+    fun getEventType(): Int = evt
+    fun getValue(): Int = value
+    fun getDoubleValue(): Double = value.toDouble()
+}
+
+/**
+ * 模拟 `android.hardware.bydauto.BYDAutoEventValue`：值在**公有字段**里，不是 getter。
+ *
+ * 必须用 `@JvmField`：Kotlin 的 `val` 默认生成私有字段 + getter，而实车 SDK 里是
+ * `public int intValue`（`BYDAutoEventValue.java:7-12`）。若用普通 `val`，探针的
+ * `getField("intValue")` 在单测里永远拿不到值，测试会把「假类写错」伪装成「功能正常」。
+ *
+ * `INVAILD_INT` / `INVALID_DOUBLE` 沿用 SDK 的原样拼写（含 SDK 自己的拼写错误）。
+ */
+internal class FakeEventValue(
+    @JvmField val intValue: Int = INVAILD_INT,
+    @JvmField val doubleValue: Double = INVALID_DOUBLE,
+) {
+    companion object {
+        const val INVAILD_INT = -999_999_999
+        const val INVALID_DOUBLE = -9.99999999E8
+    }
+}
+
+/**
+ * 模拟 `android.hardware.bydauto.AbsBYDAutoDevice` 的公开面。
+ *
+ * 必须与真实 SDK 同构（`AbsBYDAutoDevice.java:72-105`）：`registerListener` 有**两个**
+ * 重载（带/不带 `int[] featureIDs`）、`get(int,int)` 也在这个基类上。探针用
+ * `getMethod` 反射这两个重载，假类漏掉一个就会 `NoSuchMethodException`，
+ * 而那条日志会伪装成「实车上不支持订阅」。
+ */
+internal abstract class FakeAbsDevice {
+    /** `AbsBYDAutoDevice.get(device, event)`：AC 主温给 26（lane 自证），其余哨兵。 */
+    open fun get(device: Int, event: Int): Int = when {
+        device == 1000 && event == 0x40400028 -> 26
+        else -> 8191
+    }
+
+    open fun registerListener(listener: FakeListenerInterface) = onRegistered(listener, null)
+
+    open fun registerListener(listener: FakeListenerInterface, featureIds: IntArray?) =
+        onRegistered(listener, featureIds)
+
+    open fun unregisterListener(listener: FakeListenerInterface) = Unit
+
+    /** 注册被调用时做什么，由各假设备决定（模拟 binder 下发回调）。 */
+    protected open fun onRegistered(listener: FakeListenerInterface, featureIds: IntArray?) = Unit
+}
+
+/**
+ * 订阅后在 `registerListener` 里**同步**回调一次转速 1650。
+ *
+ * 实车上回调来自 binder 线程、时机不定；这里同步触发是为了让单测确定性地覆盖
+ * 「注册 → 回调 → 记录 → 判定」整条链路。
+ */
+internal class SubscribingDevice : FakeAbsDevice() {
+    fun getEngineSpeed(): Int = 8191
+    fun getEnginePower(): Int = 0
+    fun getEngineCoolantLevel(): Int = 8191
+    fun getOilLevel(): Int = 8191
+    fun getEngineSpeedWarningValue(): Int = 8191
+    fun getElecPercentageValue(): Double = 55.0
+    fun getCurrentSpeed(): Double = 0.0
+    fun getTemprature(area: Int): Int = 26
+
+    /** 正确 dev 才给真实转速，复现「订阅之后 raw lane 才有值」。 */
+    override fun get(device: Int, event: Int): Int = when {
+        device == 1012 && event == 0x14400012 -> 1650
+        else -> super.get(device, event)
+    }
+
+    override fun onRegistered(listener: FakeListenerInterface, featureIds: IntArray?) {
+        listener.onDataChanged(FakeEvent(dev = 1012, evt = 0x14400012, value = 1650))
+    }
+
+    companion object {
+        @JvmStatic
+        fun getInstance(context: android.content.Context): SubscribingDevice = SubscribingDevice()
+    }
+}
+
+/** 只走 `onDataEventChanged`（值在 `BYDAutoEventValue.intValue` 字段里）的假设备。 */
+internal class EventValueDevice : FakeAbsDevice() {
+    fun getEngineSpeed(): Int = 8191
+    fun getEnginePower(): Int = 0
+    fun getEngineCoolantLevel(): Int = 8191
+    fun getOilLevel(): Int = 8191
+    fun getEngineSpeedWarningValue(): Int = 8191
+    fun getElecPercentageValue(): Double = 55.0
+    fun getCurrentSpeed(): Double = 0.0
+    fun getTemprature(area: Int): Int = 26
+
+    override fun onRegistered(listener: FakeListenerInterface, featureIds: IntArray?) {
+        listener.onDataEventChanged(0x14400012, FakeEventValue(intValue = 1650, doubleValue = 1650.0))
+    }
+
+    companion object {
+        @JvmStatic
+        fun getInstance(context: android.content.Context): EventValueDevice = EventValueDevice()
+    }
+}
+
+/** 回调只带 SDK 的「无值」哨兵，用来验证哨兵不会被当成转速。 */
+internal class InvalidEventValueDevice : FakeAbsDevice() {
+    fun getEngineSpeed(): Int = 8191
+    fun getEnginePower(): Int = 0
+    fun getEngineCoolantLevel(): Int = 8191
+    fun getOilLevel(): Int = 8191
+    fun getEngineSpeedWarningValue(): Int = 8191
+    fun getElecPercentageValue(): Double = 55.0
+    fun getCurrentSpeed(): Double = 0.0
+    fun getTemprature(area: Int): Int = 26
+
+    override fun onRegistered(listener: FakeListenerInterface, featureIds: IntArray?) {
+        listener.onDataChanged(FakeEvent(dev = 1012, evt = 0x14400012, value = FakeEventValue.INVAILD_INT))
+    }
+
+    companion object {
+        @JvmStatic
+        fun getInstance(context: android.content.Context): InvalidEventValueDevice = InvalidEventValueDevice()
+    }
+}
+
+/**
+ * `sub-all` 之后会收到**其它设备**的事件：空调 26℃、SOC 55。
+ * 两者都落在转速的 `1..8000` 区间内，不加归属过滤就会刷出假的 `event-only`。
+ */
+internal class ForeignEventDevice : FakeAbsDevice() {
+    fun getEngineSpeed(): Int = 8191
+    fun getEnginePower(): Int = 0
+    fun getEngineCoolantLevel(): Int = 8191
+    fun getOilLevel(): Int = 8191
+    fun getEngineSpeedWarningValue(): Int = 8191
+    fun getElecPercentageValue(): Double = 55.0
+    fun getCurrentSpeed(): Double = 0.0
+    fun getTemprature(area: Int): Int = 26
+
+    override fun onRegistered(listener: FakeListenerInterface, featureIds: IntArray?) {
+        // 空调设备（dev=1000）的事件，值 26 正好落在转速区间内。
+        listener.onDataChanged(FakeEvent(dev = 1000, evt = 0x40400028, value = 26))
+    }
+
+    companion object {
+        @JvmStatic
+        fun getInstance(context: android.content.Context): ForeignEventDevice = ForeignEventDevice()
+    }
+}
+
+/**
+ * 像 SDK 一样把 listener 放进 `HashMap` 存：注册过程会调 `hashCode()` / `equals()`。
+ * 代理若对 `Object` 方法返回 null，这里会直接 NPE。
+ */
+internal class MapBasedSubscribingDevice : FakeAbsDevice() {
+    private val listeners = HashMap<FakeListenerInterface, IntArray>()
+
+    fun getEngineSpeed(): Int = 8191
+    fun getEnginePower(): Int = 0
+    fun getEngineCoolantLevel(): Int = 8191
+    fun getOilLevel(): Int = 8191
+    fun getEngineSpeedWarningValue(): Int = 8191
+    fun getElecPercentageValue(): Double = 55.0
+    fun getCurrentSpeed(): Double = 0.0
+    fun getTemprature(area: Int): Int = 26
+
+    override fun onRegistered(listener: FakeListenerInterface, featureIds: IntArray?) {
+        // 复现 SDK 的 IBYDAutoListenerIdsMap：键的 hashCode/equals 必须可用。
+        listeners[listener] = featureIds ?: intArrayOf()
+        require(listeners.containsKey(listener)) { "listener lost in map — hashCode/equals broken" }
+    }
+
+    override fun unregisterListener(listener: FakeListenerInterface) {
+        listeners.remove(listener)
+    }
+
+    companion object {
+        @JvmStatic
+        fun getInstance(context: android.content.Context): MapBasedSubscribingDevice = MapBasedSubscribingDevice()
+    }
+}
