@@ -241,6 +241,17 @@ class BydVehicleProbeTest {
         assertTrue("必须读超速警告：$lines", lines.any { it.contains("speedWarn=ok:8191") })
     }
 
+    /** 第三轮的三条 lane 必须真的出现在日志里，否则手机上 grep 不到就等于没跑。 */
+    @Test
+    fun `raw lanes are emitted with the documented labels`() {
+        val lines = runProbe()
+
+        assertTrue("必须打正确 dev 的原始读数：$lines", lines.any { it.contains("raw[1012]=") })
+        assertTrue("必须打旧 dev 对照：$lines", lines.any { it.contains("raw[1003]=") })
+        assertTrue("必须打 lane 自证：$lines", lines.any { it.contains("raw[ctl]=") })
+        assertTrue("必须给 v2 结论：$lines", lines.any { it.contains("verdict=") })
+    }
+
     /**
      * #195 对照 5：`AbsBYDAutoEngineListener` 是抽象类，Proxy 不可用；
      * 找不到具体 Listener 时必须显式 skip，不能硬造一个假实现让结论失真。
@@ -260,7 +271,9 @@ class BydVehicleProbeTest {
             realContext = android.content.ContextWrapper(null),
         )
 
-        assertTrue("必须自动给出结论：$lines", lines.any { it.contains("verdict=server-permission") })
+        // #188 v2 起旧判定改名为 `verdict-legacy=`（它依赖的 realCtxCall 不是有效对照），
+        // 新主判据是 `verdict=`（raw lane + 订阅），两者都要能 grep 到。
+        assertTrue("必须自动给出结论：$lines", lines.any { it.contains("verdict-legacy=server-permission") })
     }
 
     /**
@@ -340,6 +353,89 @@ class BydVehicleProbeTest {
             "unclear",
             decideSpeedVerdict(BydSpeedEvidence(CtxStored.UNKNOWN, RealContextCall.SKIPPED, allSentinel, ListenerState.SKIP_ABSTRACT)),
         )
+    }
+
+    /**
+     * #188 v2 判定纯函数的分支表。
+     *
+     * 核心约束：`raw[ctl]`（AC 主温，实车 26℃）是 lane 自证的锚点——它不通就说明反射链写错了，
+     * 不能拿其它 lane 的哨兵去论证「车上没数据」；这正是上一轮把 8191 误判成「字段不存在」的原因。
+     */
+    @Test
+    fun `subscribe verdict rules cover every lane outcome`() {
+        val registered = ListenerState.REGISTERED
+        val sentinelEngine = BydSubscribeEvidence(
+            rawEngine = 8191,
+            rawLegacy = 8191,
+            rawControl = 26,
+            afterSubscribe = 8191,
+            afterSubscribeAll = 8191,
+            callbackValues = emptyList(),
+            listener = registered,
+        )
+        assertEquals(
+            "读数全哨兵但对照正常 → 本车无该字段",
+            "no-data",
+            decideSubscribeVerdict(sentinelEngine),
+        )
+        assertEquals(
+            "原始 FID 直接读到真实转速 → 订阅不是必要条件",
+            "subscribed-has-value",
+            decideSubscribeVerdict(sentinelEngine.copy(rawEngine = 1650)),
+        )
+        assertEquals(
+            "订阅之后才有真实转速 → 订阅是必要条件",
+            "subscribed-has-value",
+            decideSubscribeVerdict(sentinelEngine.copy(afterSubscribe = 1650)),
+        )
+        assertEquals(
+            "只有事件回调有真实转速 → 必须走回调通道",
+            "event-only",
+            decideSubscribeVerdict(sentinelEngine.copy(callbackValues = listOf(0, 1650))),
+        )
+        assertEquals(
+            "对照 lane 读到哨兵 → 反射链有问题，其它 lane 作废",
+            "lane-broken",
+            decideSubscribeVerdict(sentinelEngine.copy(rawControl = 8191)),
+        )
+        assertEquals(
+            "对照 lane 抛异常 → 同样不能下结论",
+            "lane-broken",
+            decideSubscribeVerdict(sentinelEngine.copy(rawControl = null)),
+        )
+        assertEquals(
+            "没订阅成功这一轮就没测到订阅 → 不能替订阅下结论",
+            "unclear",
+            decideSubscribeVerdict(sentinelEngine.copy(listener = ListenerState.SKIP_ABSTRACT)),
+        )
+        assertEquals(
+            "所有读数都抛异常 → 证据链断了",
+            "unclear",
+            decideSubscribeVerdict(
+                sentinelEngine.copy(
+                    rawEngine = null,
+                    rawLegacy = null,
+                    afterSubscribe = null,
+                    afterSubscribeAll = null,
+                ),
+            ),
+        )
+        assertEquals(
+            "0 与负值都不算真实转速",
+            "no-data",
+            decideSubscribeVerdict(sentinelEngine.copy(afterSubscribe = 0, afterSubscribeAll = -1)),
+        )
+    }
+
+    /** `ok:<int>` 才解析成数字；`err:` / `skip(...)` 必须当成「没拿到数」而不是 0。 */
+    @Test
+    fun `probe int parser keeps failures distinct from zero`() {
+        assertEquals(8191, parseProbeInt("ok:8191"))
+        assertEquals(0, parseProbeInt("ok:0"))
+        assertEquals(1650, parseProbeInt("ok:1650"))
+        assertEquals(null, parseProbeInt("err:SecurityException:denied"))
+        assertEquals(null, parseProbeInt("skip(no-instance)"))
+        assertEquals(null, parseProbeInt(null))
     }
 
     /** 统一构造探针，默认把 listener 类映射为抽象类，模拟实车上的 `AbsBYDAutoEngineListener`。 */
