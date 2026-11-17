@@ -15,9 +15,9 @@ package com.dilinkauto.client.service
  *
  * **2. 日期-时间版本（issue #224 起，当前默认）**
  *  - "20261117-2202" → base 整串, isDev=false, devNum=0，按 [20261117, 2202] 两段比较
- *  - 日期格式不支持 dev 变体：`20261117-2202-dev-1` 会走语义化分支，按旧规则塌陷成 0
- *    （`VersioningTest` 里用 `date version compare is irreflexive and antisymmetric`
- *    钉住这一点的自洽性；真要发 dev 包请直接换一个时间戳）。
+ *  - 日期格式**也支持** `-dev` 后缀（如 `20261117-2202-dev-1`）：base 是日期串，仍按日期段
+ *    比较，且同日期下 dev 排在 release 之前。日常迭代不需要这么做（换一个时间戳即可），
+ *    这里只是把行为说清，避免有人误以为日期格式会在这个分支上塌陷成 0。
  *
  * 排序规则：语义化版本 release > 同 base 的 dev，dev 之间按 devNum；日期格式逐段数值比较，
  * 且日期格式一律大于任何语义化版本（`20261117` 作为首段远大于常见主版本号，无需特判，

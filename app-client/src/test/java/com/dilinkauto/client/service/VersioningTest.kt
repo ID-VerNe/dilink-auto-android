@@ -178,4 +178,17 @@ class VersioningTest {
             )
         }
     }
+
+    @Test
+    fun `date version still honours a dev suffix`() {
+        // 日期格式确实会走 -dev 分支：base 是日期串，dev 排在同日期的 release 之后。
+        // 这一例不鼓励发 `-dev` 日期包（日常迭代直接用新时间戳），只是把行为钉住，
+        // 免得有人以为「日期格式不支持 dev」而写出错误的兼容逻辑。
+        val p = parseVersion("20261117-2247-dev-1")
+        assertEquals("20261117-2247", p.base)
+        assertTrue(p.isDev)
+        assertEquals(1, p.devNum)
+        assertTrue(compareVersions("20261117-2247", "20261117-2247-dev-1") > 0)
+        assertTrue(compareVersions("20261118-0900", "20261117-2247-dev-1") > 0)
+    }
 }
