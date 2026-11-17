@@ -125,4 +125,57 @@ class VersioningTest {
         assertEquals(0, compareVersions("0.0.0", "0"))
         assertEquals(0, compareVersions("0", "0"))
     }
+
+    // ---- 日期-时间版本号（issue #224）----
+    // 版本号切换成 YYYYMMDD-HHMM 后，旧实现把整串当一个非数字段 coerce 成 0，
+    // 任意两个日期版本号都判相等 → CarInstallCoordinator 的 `<= 0` 分支永久跳过安装。
+
+    @Test
+    fun `date version newer day beats older day`() {
+        assertTrue(compareVersions("20261118-0900", "20261117-2202") > 0)
+    }
+
+    @Test
+    fun `date version newer time beats older time same day`() {
+        assertTrue(compareVersions("20261117-2300", "20261117-2202") > 0)
+        assertTrue(compareVersions("20261117-0900", "20261117-2202") < 0)
+    }
+
+    @Test
+    fun `date version equal to itself`() {
+        assertEquals(0, compareVersions("20261117-2202", "20261117-2202"))
+    }
+
+    @Test
+    fun `date version beats any semantic version`() {
+        // 从 1.0.3 升级到日期版本号的那一次，车机必须被判为「需要安装」
+        assertTrue(compareVersions("20261117-2202", "1.0.3") > 0)
+        assertTrue(compareVersions("1.0.3", "20261117-2202") < 0)
+    }
+
+    @Test
+    fun `date version ordering is transitive across the year boundary`() {
+        assertTrue(compareVersions("20270101-0000", "20261231-2359") > 0)
+        assertTrue(compareVersions("20261231-2359", "20260101-0000") > 0)
+    }
+
+    @Test
+    fun `date version parses into day and minute segments`() {
+        val p = parseVersion("20261117-2202")
+        assertEquals("20261117-2202", p.base)
+        assertFalse(p.isDev)
+        assertEquals(0, p.devNum)
+    }
+
+    @Test
+    fun `date version compare is irreflexive and antisymmetric`() {
+        val samples = listOf("20261117-2202", "20261118-0900", "1.0.3", "20261117-2202-dev-1")
+        for (v in samples) assertEquals(0, compareVersions(v, v))
+        for (a in samples) for (b in samples) {
+            assertEquals(
+                Integer.signum(compareVersions(a, b)),
+                -Integer.signum(compareVersions(b, a))
+            )
+        }
+    }
 }
