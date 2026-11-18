@@ -6,7 +6,7 @@
 ## 0. 一句话现状
 
 - 发布包由一把**独立的正式 keystore** 签名（证书 `CN=DiLink Auto`），keystore 本体**不入库**，只存在于发布者本机与 GitHub Actions secrets。
-- 发版 = 在 `main` 上把版本号 bump 并合并 → 打三段式 tag `vX.Y.Z` 推到 origin → `Build (Release)` 在 `ubuntu-latest` 上构建并创建 GitHub Release。
+- 发版 = 在 `main` 上把 `app.versionName` 改成当前时间并合并 → 打日期-时间 tag `vYYYYMMDD-HHMM` 推到 origin → `Build (Release)` 在 `ubuntu-latest` 上构建并创建 GitHub Release。
 - 签名证书变更后，**新旧包不能互相覆盖安装**，必须卸载重装（手机端和车机端都一样）。
 
 ## 1. 版本号与 tag 规则
@@ -113,14 +113,16 @@ $sdk = "C:\Users\VerNe\AppData\Local\Android\Sdk\build-tools\36.0.0"
 
 ## 4. 发布流程（照抄即可）
 
-1. **改版本号**：只改 `gradle.properties` 的 `app.versionName` 为当前时间（`YYYYMMDD-HHMM`）；`versionCode` 自动派生，不要再写。同步文档里的版本号（`README.md`、`docs/README.md`、`docs/setup.md`、`docs/client.md`）。
+1. **改版本号**：只改 `gradle.properties` 的 `app.versionName` 为当前时间（`YYYYMMDD-HHMM`）；`versionCode` 自动派生，不要再写。**不要再去同步文档里的版本号** —— 文档一律以 `gradle.properties` 的 `app.versionName` 为准，硬编码的快照值只会在下次构建后失真。临时出包可以直接命令行覆盖：`.\gradlew.bat :app-client:assembleRelease -Papp.versionName=20261118-0429`（不写回仓库文件，产物版本号随之改变）。
 2. **走 PR 合并到 `main`**（AGENTS.md §3 那五步），CI `Build (Main)` 全绿。
 3. **确认 `main` 干净**：`git status --porcelain` 为空，否则包版本串会带 `-dirty`。
 4. **打 tag 并推**（tag 必须与 `app.versionName` 逐字一致，流水线会校验）：
    ```powershell
+   # 从单一来源读出，不要手抄版本号
+   $v = (Select-String -Path gradle.properties -Pattern '^app\.versionName=(.+)').Matches.Groups[1].Value.Trim()
    git fetch origin main
-   git tag v20261117-2247 <merge-commit>
-   git push origin v20261117-2247
+   git tag "v$v" <merge-commit>
+   git push origin "v$v"
    ```
 5. **盯流水线**：`gh run list -R ID-VerNe/dilink-auto-android --limit 3`，`gh run watch <id>` 到 success。
 6. **验收资产**：下载 Release 里的 `DiLinkAuto-Phone.apk` / `DiLinkAuto-Car.apk` 跑第 3 节的 `apksigner`，指纹必须一致；不一致就摘 release 并回滚。
@@ -144,14 +146,14 @@ $sdk = "C:\Users\VerNe\AppData\Local\Android\Sdk\build-tools\36.0.0"
 | 12 | `gh` 走代理失败 | 本机代理让 `gh` 请求卡住 | 调用前 `$env:NO_PROXY=""` |
 | 13 | `Leave fork network` 不可逆 | 只能在网页操作，没有 REST API。本仓库 2026-11-01 实测：脱离后 issues / PR / Release / secrets **全部保留**，只是 `parent` 与 fork 标记消失（`gh repo view --json isFork` 变 `false`、`parent` 变 `null`） | 操作不可逆，脱离前仍建议先导出备份（`gh issue list --json …` + 逐条评论）；备份不要提交进仓库 |
 | 14 | 退出 fork 前删本地 remote 不等于脱离 | `git remote remove upstream` 只影响本地；GitHub 侧 `isFork` 仍为 `true` | 以 `gh repo view <repo> --json isFork,parent` 为唯一判据 |
-| 15 | 日期格式版本号被比较逻辑塌陷 | `compareVersions` 旧实现按 `.` 切段、非数字 coerce 成 0，任意两个 `YYYYMMDD-HHMM` 版本号都判相等 → 车机自更新**永久静默跳过**，UI 还显示「已是最新版本」 | **已修复（issue #224）**：`Versioning.kt` 增加日期格式分支，按 `[YYYYMMDD, HHMM]` 两段比较；`VersioningTest` 有 7 例墓碑 |
-| 16 | 日期 tag 匹配不上发布流水线 | `build-release.yml` 原 tag 过滤是 `v[0-9]+.[0-9]+.[0-9]+`，`v20261117-2247` 不触发，push 后毫无反应 | tag 过滤已加 8+4 位数字形态（Gradle 过滤器不能用 `{8}`，必须逐位写）；另有 `Verify tag matches versionName` 步骤拦住 tag 与 `app.versionName` 不一致 |
+| 15 | 日期格式版本号被比较逻辑塌陷 | `compareVersions` 旧实现按 `.` 切段、非数字 coerce 成 0，任意两个 `YYYYMMDD-HHMM` 版本号都判相等 → 车机自更新**永久静默跳过**，UI 还显示「已是最新版本」 | **已修复（issue #224）**：`Versioning.kt` 增加日期格式分支，按 `[YYYYMMDD, HHMM]` 两段比较；`VersioningTest` 有 8 例墓碑 |
+| 16 | 日期 tag 匹配不上发布流水线 | `build-release.yml` 原 tag 过滤是 `v[0-9]+.[0-9]+.[0-9]+`，`v20261117-2247` 不触发，push 后毫无反应 | tag 过滤已加 8+4 位数字形态（GitHub 的 tag 过滤器不能用 `{8}`，必须逐位写）；另有 `Verify tag matches versionName` 步骤拦住 tag 与 `app.versionName` 不一致 |
 
 ## 6. 应急处置
 
 | 情况 | 做法 |
 |---|---|
-| tag 推错（版本号不匹配） | 删掉远端 tag 与对应 Release，重新 bump 版本号后发新 tag；**已发布过的 tag 不重打** |
+| tag 推错（版本号不匹配） | 删掉远端 tag 与对应 Release，把 `app.versionName` 换成新的时间戳后发新 tag；**已发布过的 tag 不重打** |
 | Release 资产签名不对 | 立即把该 Release 设为 draft / 删除资产，查 `Decode release keystore` 是否用了正确的 base64，然后重跑一次发版 |
 | secrets 被清空 | `gh secret list -R ID-VerNe/dilink-auto-android` 复核四项，缺什么补什么（见 2.3） |
 | 流水线一直 queued | 先查 `runs-on` 是否又写回 `self-hosted`；再查仓库 Actions 是否被禁用 |
