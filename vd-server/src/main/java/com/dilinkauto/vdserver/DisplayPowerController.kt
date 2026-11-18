@@ -279,23 +279,27 @@ internal class DisplayPowerController(
         if (SessionScreenTimeout.isSentinel(timeout)) {
             PipeLog.log("screen_off_timeout snapshot was our own sentinel (previous session was killed) — falling back to ${SessionScreenTimeout.DEFAULT_TIMEOUT_MS}ms")
         }
-        restoreSetting("lift_wakeup_enabled", savedLiftWakeup)
-        restoreSetting("proximity_wakeup_enabled", savedProximityWakeup)
+        // issue #230：这两个开关的合法值域是 {0, 1}，原值是 0 也要原样写回——
+        // 旧守卫把 0 当「无效快照」拒写，恢复成了空操作，设备被会话改成的 0 永不自愈。
+        restoreSetting("lift_wakeup_enabled", savedLiftWakeup, allowZero = true)
+        restoreSetting("proximity_wakeup_enabled", savedProximityWakeup, allowZero = true)
     }
 
     /**
-     * Write [value] back to `system.[key]` when it is a plausible snapshot.
+     * 把快照 [value] 写回 `system.[key]`；只在「不像有效快照」时跳过。
      *
-     * "Plausible" = non-blank and not a `settings get` miss marker (`null` /
-     * `undefined`), and numeric keys must hold a positive number. A failed
-     * snapshot yields one of those markers; writing them back would leave the
-     * device in a worse state than leaving the current value alone.
+     * 「不像有效快照」= 空白或 `settings get` 未命中标记（`null` / `undefined`）——
+     * 读取失败得到的正是这些标记，写回去只会让设备比保持现状更糟。数值键还要求
+     * 正数（`screen_off_timeout` 的 0 / 负值不是有效超时）——但 [allowZero] 为
+     * true 的键（issue #230：`lift_wakeup_enabled` / `proximity_wakeup_enabled`，
+     * 合法值域 {0, 1}）里 **0 是最常见的用户选择**，不能当「无效快照」拒写，
+     * 只拒负值；否则原值被会话改成的 0 永远写不回去，恢复成了空操作。
      */
-    private fun restoreSetting(key: String, value: String?) {
+    private fun restoreSetting(key: String, value: String?, allowZero: Boolean = false) {
         val v = value?.trim()
         if (v.isNullOrEmpty() || v.equals("null", true) || v.equals("undefined", true)) return
         val numeric = v.toLongOrNull()
-        if (numeric != null && numeric <= 0L) return
+        if (numeric != null && (if (allowZero) numeric < 0L else numeric <= 0L)) return
         try { execShell("settings put system $key $v") } catch (_: Exception) {}
     }
 
