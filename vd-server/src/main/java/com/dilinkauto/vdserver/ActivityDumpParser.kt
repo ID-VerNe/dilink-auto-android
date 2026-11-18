@@ -201,9 +201,16 @@ internal object ActivityDumpParser {
         return taskIdsInSection(section)
     }
 
-    /** `am task` 的 bounds：兼容 `bounds=[0,0][2340,1316]` 与 `mBounds=Rect(...)` 两种写法。 */
+    /**
+     * task 块的 bounds：兼容 `bounds=[0,0][2340,1316]`、`mBounds=Rect(...)` 与 `mBounds=null` 写法。
+     *
+     * issue #232：真实 dump 的 task 块里该字段只以 WinConfiguration 内的 `mBounds=Rect(0, 0 - W, H)`
+     * 出现（等号后是 `R`），旧正则要求等号后紧跟 `[`/`(` → 0 命中 → `[teardown-move]` 的 bounds
+     * 全 `<unknown>`。`Rect(...)` / `null` 分支与 [WindowStateMonitor] 的 `BOUNDS_RE` 写法对齐
+     * （`WindowStateMonitor.kt:166`）。
+     */
     fun extractBounds(block: String): String? =
-        Regex("(?:mBounds|bounds)=(\\[[^\\]]*\\](?:\\[[^\\]]*\\])?|\\([^)]*\\))")
+        Regex("(?:mBounds|bounds)=(Rect\\([^)]*\\)|\\[[^\\]]*\\](?:\\[[^\\]]*\\])?|\\([^)]*\\)|null)")
             .find(block)?.groupValues?.get(1)
 
     /**
@@ -215,11 +222,19 @@ internal object ActivityDumpParser {
             ?: Regex("mOverrideConfig=([^\\n]+)").find(block)?.groupValues?.get(1)?.trim()?.take(80)
 
     /**
-     * 任务级密度。
+     * 任务级密度：定向读任务 Configuration 段的 `NNNdpi`。
+     *
+     * issue #232：旧兜底 `(\d+)dpi` 全块扫描，抓到的块内**首个** `NNNdpi` 是 ActivityRecord 的
+     * `compat={560dpi}`，而任务真实 dpi 在其后的 Configuration 里——400dpi 的 VD 残留任务会被
+     * 假绿报成 560（恰是 #48 要抓的形态）。改为按 CurrentConfiguration → mOverrideConfig →
+     * mGlobalConfig 的优先级定向读段内首个 `NNNdpi`；`densityDpi=` 分支保留（其他 ROM 可能打印，
+     * 本机 ROM 的 dump 里该键 0 次出现）。
      */
     fun extractDensity(block: String): String? =
         Regex("densityDpi=(\\d+)").find(block)?.groupValues?.get(1)
-            ?: Regex("(\\d+)dpi").find(block)?.groupValues?.get(1)
+            ?: Regex("CurrentConfiguration=\\{[^}]*?(\\d+)dpi").find(block)?.groupValues?.get(1)
+            ?: Regex("mOverrideConfig=\\{[^}]*?(\\d+)dpi").find(block)?.groupValues?.get(1)
+            ?: Regex("mGlobalConfig=\\{[^}]*?(\\d+)dpi").find(block)?.groupValues?.get(1)
 
     /**
      * 解析 `wm size` 输出的宽与高。
