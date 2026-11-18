@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
+import android.os.Bundle
 import androidx.core.content.ContextCompat
 import com.dilinkauto.protocol.AltitudeFormat
 import kotlinx.coroutines.CoroutineScope
@@ -93,8 +94,16 @@ internal class AltitudeProvider(
             override fun onLocationChanged(location: Location) {
                 handleLocation(location)
             }
-            // 旧 API（< 30）仍可能走 onStatusChanged；minTime/minProvider 回调在 30+ 已弃用，
-            // 这里只覆盖 onLocationChanged 即可，其余用默认空实现。
+
+            // 下面三个回调在 compileSdk 34 上是 default 方法（编译器不强制实现），
+            // 但实车 API 28（issue #228 环境）上仍是抽象方法：不显式实现时
+            // GPS provider 状态一变化就 AbstractMethodError 杀死进程，必须补齐空实现。
+            // 写法与 CityResolver.kt:117-121 的正确对照一致。
+            override fun onProviderEnabled(provider: String) = Unit
+            override fun onProviderDisabled(provider: String) = Unit
+
+            @Deprecated("API 29 起弃用，仍需实现")
+            override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) = Unit
         }
         // requestLocationUpdates(long, float, LocationListener) 在 API 30 弃用但仍可用；
         // minSdk=26，用兼容签名避免引入额外的 PendingIntent 回路。
