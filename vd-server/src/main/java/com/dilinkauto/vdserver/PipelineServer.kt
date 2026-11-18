@@ -146,7 +146,7 @@ class PipelineServer(
         logInfo = { PipeLog.logClock(it) }
     )
     /**
-     * issue #64：周期采样 VD display 的窗口形态（`mLastNonfullscreenBounds`）。
+     * issue #64：周期采样 VD display 的窗口形态（`mLastNonFullscreenBounds`）。
      *
      * 启动时机在 `bindAndAccept` 成功之后：此时 `displayId` 已确定，也避开建屏期
      * 那串 `am`/`wm` 命令，避免额外的 dumpsys 与建屏步骤抢 shell。停止顺序在
