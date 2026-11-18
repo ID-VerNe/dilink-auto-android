@@ -20,12 +20,12 @@ internal data class TaskWindow(
  * 实车复测自动取证：VD display 上的窗口形态采样（issue #64）。
  *
  * #59 锁定 VD 方向后，是否仍被应用压成 letterbox 小窗，只能持续观察
- * `mLastNonfullscreenBounds` 才能事后判定。之前只在建屏恢复/teardown 的一次性
+ * `mLastNonFullscreenBounds` 才能事后判定。之前只在建屏恢复/teardown 的一次性
  * dumpsys 里读过（见 `CarCommandRouter`），运行中的窗口形态没有记录。
  *
  * 采集策略：
  *  - 每 [pollMs] 读一次 `dumpsys activity activities`，只解析 VD display 段；
- *  - 指纹变化立刻落一行 `[Window]`（含 `mLastNonfullscreenBounds`）；
+ *  - 指纹变化立刻落一行 `[Window]`（含 `mLastNonFullscreenBounds`）；
  *  - 指纹未变时每 [heartbeatMs] 落一次心跳，证明采样线程还活着；
  *  - 每行带 `HH:mm:ss.SSS` 时钟，方便和车机端 `STALL` 行对齐时间点。
  *
@@ -98,7 +98,7 @@ internal class WindowStateMonitor(
             tasks.joinToString(" ; ") { t ->
                 "task=${t.taskId} comp=${t.component ?: "<unknown>"} " +
                     "mode=${t.windowingMode ?: "<unknown>"} visReq=${t.visibleRequested ?: "<unknown>"} " +
-                    "bounds=${t.bounds ?: "<unknown>"} mLastNonfullscreenBounds=${t.lastNonfullscreenBounds ?: "<none>"}"
+                    "bounds=${t.bounds ?: "<unknown>"} mLastNonFullscreenBounds=${t.lastNonfullscreenBounds ?: "<none>"}"
             }
         }
         return "[Window] display=$displayId changed=$changed n=${tasks.size} top=${top?.taskId ?: "-"} $body"
@@ -165,6 +165,12 @@ internal object WindowStateParser {
     /** Task 块里的 `mBounds=Rect(...)`（不同 ROM 可能不打印，缺失即 null）。 */
     private val BOUNDS_RE = Regex("""mBounds=(Rect\([^)]*\)|null)""")
 
-    /** 竖屏小窗的核心字段（issue #59/#64）。 */
-    private val NONFULLSCREEN_RE = Regex("""mLastNonfullscreenBounds=(Rect\([^)]*\)|null)""")
+    /**
+     * 竖屏小窗的核心字段（issue #59/#64）。
+     *
+     * 真实 dumpsys 里是大写 F（`mLastNonFullscreenBounds`，见 issue #231 的实车证据）；
+     * 字符类 `[Aa]?[Ff]` 同时兼容个别 ROM 可能的小写/少 a 形态。之前写死小写 f，
+     * 大小写敏感匹配导致该字段从上线起 0 命中，`[Window]` 行恒为 `<none>`。
+     */
+    private val NONFULLSCREEN_RE = Regex("""mLastNon[Aa]?[Ff]ullscreenBounds=(Rect\([^)]*\)|null)""")
 }

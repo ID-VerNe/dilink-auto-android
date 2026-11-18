@@ -10,7 +10,7 @@ import org.junit.Test
  *
  * 用脱敏后的真实 `dumpsys activity activities` 片段钉住：
  *  - 只解析指定 display 段（不把物理屏 display#0 的 task 混进来）；
- *  - `mLastNonfullscreenBounds=Rect(...)` / `null` 两种形态；
+ *  - `mLastNonFullscreenBounds=Rect(...)` / `null` 两种形态（真实拼写是大写 F，issue #231）；
  *  - task 头里的 `mode=` / `visibleRequested=` 与 ActivityRecord 组件；
  *  - 指纹随窗口形态变化而变化（`[Window]` 只在变化时落日志）。
  */
@@ -20,17 +20,17 @@ class WindowStateParserTest {
         ACTIVITY MANAGER ACTIVITIES (dumpsys activity activities)
         Display #0 (activities from top to bottom):
           * Task{30edfd5 #30 type=standard A=10338:com.dilinkauto.client U=0 visible=true visibleRequested=false mode=fullscreen translucent=false sz=2}
-            mLastNonfullscreenBounds=Rect(372, 924 - 997, 2292)
+            mLastNonFullscreenBounds=Rect(372, 924 - 997, 2292)
             isSleeping=true
           * ActivityRecord{1f6675c u0 com.dilinkauto.client/.MainActivity t30}
 
         Display #19 (activities from top to bottom):
           * Task{ad54f40 #17 type=standard A=10001:com.baidu.BaiduMap U=0 visible=true visibleRequested=true mode=fullscreen translucent=false sz=1}
-            mLastNonfullscreenBounds=Rect(269, 536 - 811, 1616)
+            mLastNonFullscreenBounds=Rect(269, 536 - 811, 1616)
             isSleeping=false
             topResumedActivity=ActivityRecord{102f887 u0 com.baidu.BaiduMap/com.baidu.baidumaps.MapsActivity t17}
           * Task{9d1c4ff #347 type=standard A=10231:com.bilibili.app.in U=0 visible=true visibleRequested=false mode=fullscreen translucent=false sz=1}
-            mLastNonfullscreenBounds=Rect(920, 51 - 1641, 1351)
+            mLastNonFullscreenBounds=Rect(920, 51 - 1641, 1351)
             mBounds=Rect(0, 0 - 2560, 1402)
             ActivityRecord{2c7e1a1 u0 com.bilibili.app.in/.MainActivity t347}
     """.trimIndent()
@@ -61,7 +61,7 @@ class WindowStateParserTest {
         val sparse = """
             Display #2 (activities from top to bottom):
               * Task{aaa #5 type=standard A=1000:com.example U=0 visible=true visibleRequested=true mode=fullscreen}
-                mLastNonfullscreenBounds=null
+                mLastNonFullscreenBounds=null
         """.trimIndent()
 
         val task = WindowStateParser.parseDisplay(sparse, 2).single()
@@ -73,6 +73,32 @@ class WindowStateParserTest {
     @Test
     fun `returns empty when the display is absent`() {
         assertTrue(WindowStateParser.parseDisplay(dump, 77).isEmpty())
+    }
+
+    /**
+     * issue #231 的墓碑：真实 dumpsys 里该字段是大写 F（`mLastNonFullscreenBounds`），
+     * 旧正则用小写 f 从上线起 0 命中，`[Window]` 行恒为 `<none>`，#59 类小窗取证持续失明。
+     *
+     * 夹具逐字摘自 `debug-logs/dpi-repro-20261103-213130/activities-with-baidumap-on-vd.txt`
+     * 的 Display #19 段。期望值是真实 dump 里的字面量，不由被测函数反推；
+     * 打回旧正则（小写拼写）时本用例必须红。
+     */
+    @Test
+    fun `issue 231 parses real dumpsys spelling with capital F`() {
+        val realDump = """
+            ACTIVITY MANAGER ACTIVITIES (dumpsys activity activities)
+            Display #19 (activities from top to bottom):
+              * Task{ad54f40 #17 type=standard A=10001:com.baidu.BaiduMap U=0 visible=true visibleRequested=true mode=fullscreen translucent=false sz=1}
+                mLastNonFullscreenBounds=Rect(269, 536 - 811, 1616)
+                isSleeping=false
+                topResumedActivity=ActivityRecord{102f887 u0 com.baidu.BaiduMap/com.baidu.baidumaps.MapsActivity t17}
+        """.trimIndent()
+
+        val task = WindowStateParser.parseDisplay(realDump, 19).single()
+
+        assertEquals(17, task.taskId)
+        assertEquals("com.baidu.BaiduMap/com.baidu.baidumaps.MapsActivity", task.component)
+        assertEquals("Rect(269, 536 - 811, 1616)", task.lastNonfullscreenBounds)
     }
 
     @Test
