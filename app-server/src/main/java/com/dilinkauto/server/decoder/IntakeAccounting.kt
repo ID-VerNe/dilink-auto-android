@@ -13,8 +13,14 @@ package com.dilinkauto.server.decoder
  *
  * ```
  * received == fed + dropped + pending          // 全量帧
- * keyReceived == keyFed + keyDropped + keyPending  // 关键帧
+ * keyReceived == keyFed + keyDropped + keyDroppedBeforeStart + keyPending  // 关键帧
  * ```
+ *
+ * 关键帧侧比全量侧多一个分项 `keyDroppedBeforeStart`（issue #229）：停播期（解码器
+ * 尚未 start，典型如首连等 Surface 期间）被作废/覆盖的缓存 IDR 与码流内的丢帧语义
+ * 完全不同 —— 前者是「等 Surface 时的正常新陈代谢」，后者才意味着码流丢帧。混在
+ * 同一个 `keyDropped` 里，现场无法回答「首连 28.7 秒里的 9 个 IDR 丢在哪一程」。
+ * 全量侧不拆：`dropped` 的不变式保持原样，拆分只发生在关键帧侧。
  *
  * `pending` 是「已接收、尚未喂入也未丢弃」的帧数（队列里 + 缓存待补喂的 IDR）。
  * 它由本类显式维护，不由队列长度推导 —— 两者刻意分开，才能真正发现「帧被清掉了
@@ -33,13 +39,16 @@ internal class IntakeAccounting {
         val keyReceived: Long,
         val keyFed: Long,
         val keyDropped: Long,
+        /** 停播期（start 之前）作废/覆盖的缓存 IDR 数，与 in-stream 的 [keyDropped] 分账（issue #229）。 */
+        val keyDroppedBeforeStart: Long,
         val keyPending: Long,
     ) {
         /** 全量帧是否平账。 */
         val streamBalanced: Boolean get() = received == fed + dropped + pending
 
-        /** 关键帧是否平账。 */
-        val keyBalanced: Boolean get() = keyReceived == keyFed + keyDropped + keyPending
+        /** 关键帧是否平账（停播期分项计入）。 */
+        val keyBalanced: Boolean
+            get() = keyReceived == keyFed + keyDropped + keyDroppedBeforeStart + keyPending
 
         /** 全量帧与关键帧同时平账。 */
         val balanced: Boolean get() = streamBalanced && keyBalanced
@@ -53,6 +62,7 @@ internal class IntakeAccounting {
     private var keyReceived = 0L
     private var keyFed = 0L
     private var keyDropped = 0L
+    private var keyDroppedBeforeStart = 0L
     private var keyPending = 0L
 
     /** 会话边界清零：`VideoDecoder.start()` 调用，保证一个会话一套账。 */
@@ -65,6 +75,7 @@ internal class IntakeAccounting {
         keyReceived = 0L
         keyFed = 0L
         keyDropped = 0L
+        keyDroppedBeforeStart = 0L
         keyPending = 0L
     }
 
@@ -101,6 +112,22 @@ internal class IntakeAccounting {
         }
     }
 
+    /**
+     * 停播期作废一个缓存 IDR（issue #229）。
+     *
+     * 只记关键帧侧的细分桶（`dropped` 总账同 [onDropped]），调用方是 VideoDecoder 里
+     * 四个「缓存 IDR 从未进入活着的解码器」的作废点：start 跨代作废、新 CONFIG 清缓存、
+     * 停播期覆盖替换、stop 清缓存。它们全部发生在 start 之前或跨代，与码流内的丢帧
+     * （[onDropped]）语义不同 —— 首连等 Surface 期间的 IDR 覆盖全走这里，现场一眼可分。
+     */
+    @Synchronized
+    fun onKeyDroppedBeforeStart() {
+        dropped++
+        pending--
+        keyDroppedBeforeStart++
+        keyPending--
+    }
+
     @Synchronized
     fun snapshot(): Snapshot = Snapshot(
         received = received,
@@ -110,6 +137,7 @@ internal class IntakeAccounting {
         keyReceived = keyReceived,
         keyFed = keyFed,
         keyDropped = keyDropped,
+        keyDroppedBeforeStart = keyDroppedBeforeStart,
         keyPending = keyPending,
     )
 
@@ -124,6 +152,7 @@ internal class IntakeAccounting {
         val s = snapshot()
         if (s.pending >= 0L && s.keyPending >= 0L && s.balanced) return null
         return "recv=${s.received} fed=${s.fed} drop=${s.dropped} pending=${s.pending} " +
-            "keys recv=${s.keyReceived} fed=${s.keyFed} drop=${s.keyDropped} pending=${s.keyPending}"
+            "keys recv=${s.keyReceived} fed=${s.keyFed} drop=${s.keyDropped} " +
+            "prestart_drop=${s.keyDroppedBeforeStart} pending=${s.keyPending}"
     }
 }

@@ -175,6 +175,8 @@ class CarConnectionService : Service() {
 
     fun onMirrorSurfaceCreated(surface: Surface) = sessionCoordinator.onMirrorSurfaceCreated(surface)
     fun onMirrorSurfaceDestroyed() = sessionCoordinator.onMirrorSurfaceDestroyed()
+    /** issue #229：壳层镜像页可见性上报（归因插桩），转发给会话编排层记状态与日志。 */
+    fun onMirrorScreenVisibilityChanged(visible: Boolean) = sessionCoordinator.onMirrorScreenVisibilityChanged(visible)
     fun sendTouchEvent(event: TouchEvent) = touchSender.sendTouchEvent(event)
     fun sendTouchBatch(pointers: List<TouchEvent>) = touchSender.sendTouchBatch(pointers)
     fun launchApp(packageName: String) = sessionCoordinator.launchApp(packageName)
