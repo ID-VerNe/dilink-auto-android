@@ -2,6 +2,7 @@ package com.dilinkauto.server.decoder
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -55,6 +56,36 @@ class VideoDecoderIntakeAccountingTest {
             "被覆盖的缓存 IDR 必须留下可 grep 的痕迹，实际日志：$logs",
             logs.any { it.contains("Cached KEYFRAME replaced") },
         )
+    }
+
+    @Test
+    fun `停播期覆盖丢弃的 IDR 必须与 in-stream 丢帧分账`() {
+        val logs = mutableListOf<String>()
+        val d = decoder(logs)
+        // 停播期（start 之前）收到两个 IDR：第一个被第二个覆盖。首连等 Surface 28.7 秒
+        // 期间 9 个 IDR 全部属于这一类丢弃（issue #229）—— 它们丢在「解码器还没起来」，
+        // 与码流内的丢帧（队列驱逐、喂入失败）语义完全不同，混在同一个 keys_drop 里
+        // 现场无法归因。
+        d.onFrameReceived(isConfig = false, data = idrFrame)
+        d.onFrameReceived(isConfig = false, data = idrFrame)
+
+        val s = d.intake.snapshot()
+        assertEquals(
+            "覆盖丢弃必须记入停播期分项，in-stream keyDropped 应为 0，实际：$s",
+            0L,
+            s.keyDropped,
+        )
+        assertEquals(
+            "停播期分项必须记 1（第二个 IDR 覆盖第一个缓存），实际：$s",
+            1L,
+            s.keyDroppedBeforeStart,
+        )
+        assertEquals(
+            "总账 dropped 不变式不动（全量侧不拆分），实际：$s",
+            1L,
+            s.dropped,
+        )
+        assertNull("分账后总账必须仍平，实际：${d.intake.violationText()}", d.intake.violationText())
     }
 
     @Test

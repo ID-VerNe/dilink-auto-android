@@ -61,6 +61,10 @@ fun MirrorContent(service: CarConnectionService, visible: Boolean = true) {
             touchState.onAppScreen = visible
             // 只切 SurfaceView 的可见性；容器与透明触摸代理始终在场，触摸链路不断。
             container.surfaceView.visibility = if (visible) View.VISIBLE else View.INVISIBLE
+            // issue #229：把壳层页面状态上报给 service —— 首连等 Surface 期间
+            // `waiting for surface` 日志才能带上「镜像页是否可见」这一真正归因
+            //（用户停在 HOME 磁贴页没点应用，SurfaceView INVISIBLE → surface 永不创建）。
+            service.onMirrorScreenVisibilityChanged(visible)
         },
         modifier = Modifier
             .fillMaxSize()

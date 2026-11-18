@@ -98,6 +98,21 @@ internal class CarSessionCoordinator(
     private val surfaceWait = SurfaceWaitLogger()
 
     /**
+     * 壳层镜像页当前是否可见（issue #229 归因插桩）：`MirrorContent` 的 AndroidView
+     * update 块在主线程写入，`waiting for surface` / surface 回调日志读取。
+     *
+     * 首连等 Surface 28.7s 的真相是壳层冷启动停在 HOME 磁贴页（用户没点应用），
+     * SurfaceView 保持 INVISIBLE、surface 永不创建；重连 0.2s 则是壳层常已在 APP 页。
+     * 不带这个字段，等待日志只有解码器三态，回签者无法从日志直接归因到用户点击。
+     *
+     * **刻意不随 `startConnection` / `handleDisconnect` 复位**：重连时壳层常仍在 APP 页
+     *（重连 0.2s 场景正是如此），复位会把真 true 改成假 false。Activity 被杀后新会话的
+     * CarLaunchScreen 阶段可能残留 true，属可接受的诊断边界 —— 它只影响日志标注，
+     * 不改变任何行为（`update` 块会在下一次组合时写回真实值）。
+     */
+    @Volatile private var mirrorScreenVisible = false
+
+    /**
      * IDR 补帧请求闸门状态（issue #75 / #163）：与手机端共用 protocol-core 的 [SyncRequestGate]，
      * 滑动窗口「1s 内最多 2 次」。用 [AtomicReference] 承载不可变状态，靠 CAS 保证并发下不超发。
      */
@@ -599,11 +614,14 @@ internal class CarSessionCoordinator(
         if (!_videoReady.value && !isConfig) {
             if (!tryMarkVideoReady()) {
                 surfaceWait.onNotReady(SystemClock.elapsedRealtime())?.let { waitedSec ->
+                    // mirrorVisible（issue #229）：首连等 Surface 时的真正归因 —— 壳层停在
+                    // HOME 页（false）意味着 surfaceCreated 只能等用户点应用磁贴触发。
                     carLogSend(
                         "[Video] waiting for surface ${waitedSec}s " +
                             "(decoderRunning=${videoDecoder.isRunning} " +
                             "surfaceValid=${videoDecoder.outputSurfaceValid} " +
-                            "renderedOnSurface=${videoDecoder.framesRenderedOnSurface})",
+                            "renderedOnSurface=${videoDecoder.framesRenderedOnSurface} " +
+                            "mirrorVisible=$mirrorScreenVisible)",
                         "W"
                     )
                 }
@@ -1038,9 +1056,14 @@ internal class CarSessionCoordinator(
         }
     }
 
+    /** 壳层镜像页可见性上报（issue #229）：只记状态，不驱动任何行为 —— 纯归因插桩。 */
+    fun onMirrorScreenVisibilityChanged(visible: Boolean) {
+        mirrorScreenVisible = visible
+    }
+
     fun onMirrorSurfaceCreated(surface: Surface) {
         decoderExecutor.execute {
-            carLogSend("[MirrorScreen] SurfaceView surface created, decoder.isRunning=${videoDecoder.isRunning}")
+            carLogSend("[MirrorScreen] SurfaceView surface created, decoder.isRunning=${videoDecoder.isRunning} mirrorVisible=$mirrorScreenVisible")
             // issue #198：分派判据抽到 RenderPipelinePolicy，Surface 已失效时不做无用重绑。
             when (RenderPipelinePolicy.onSurfaceCreated(
                 decoderRunning = videoDecoder.isRunning,
@@ -1077,7 +1100,7 @@ internal class CarSessionCoordinator(
 
     fun onMirrorSurfaceDestroyed() {
         videoDecoder.invalidateSurface()
-        carLogSend("[MirrorScreen] SurfaceView surface destroyed — decoder stays running, render gated off")
+        carLogSend("[MirrorScreen] SurfaceView surface destroyed — decoder stays running, render gated off mirrorVisible=$mirrorScreenVisible")
     }
 
     fun stopDecoderAsync() {
