@@ -214,12 +214,33 @@ internal object ActivityDumpParser {
             .find(block)?.groupValues?.get(1)
 
     /**
-     * 任务级兼容/窗口状态。
+     * ActivityRecord 的 screen-compat 标志（`compat={560dpi}`，与 `ActivityRecord{…}` 同一行）。
+     * 实机 dump 是**字段行**形态（行首缩进的 `compat={560dpi} theme=…`），两种都认。
+     */
+    private val ACTIVITY_COMPAT_INLINE_RE = Regex("""ActivityRecord\{[^}\n]*compat=(\{[^}\n]*\}|\S+)""")
+    private val ACTIVITY_COMPAT_LINE_RE = Regex("""(?m)^[ \t]*compat=(\{[^}\n]*\}|\S+)""")
+
+    /**
+     * 任务级 screen-compat 标志：**只**认 ActivityRecord 行上的 `compat={NNNdpi}`。
+     *
+     * issue #238：旧实现首选 `mWindowingMode=`，而 task 块的 `winConfig={ … }` 恒含该键，
+     * 于是 `[teardown-move]` 的 `compat=` 从上线起一直打的是窗口模式（恒 `fullscreen`）
+     * —— 真正的 screen-compat 维度从未被读到。这里禁止任何回落：取不到返回 null，
+     * 由调用方记 `<unknown>`。窗口模式改由 [extractWindowMode] 单独提供。
      */
     fun extractCompat(block: String): String? =
+        ACTIVITY_COMPAT_INLINE_RE.find(block)?.groupValues?.get(1)
+            ?: ACTIVITY_COMPAT_LINE_RE.find(block)?.groupValues?.get(1)
+
+    /**
+     * 任务级窗口模式：`winConfig` 的 `mWindowingMode=`（旧 `compat=` 实际打的就是它），
+     * 块内没有该键时回落 Task 头行的 `mode=`。
+     *
+     * issue #238：与 [extractCompat] 拆开成独立语义，日志里叫 `windowMode=`。
+     */
+    fun extractWindowMode(block: String): String? =
         Regex("mWindowingMode=([^\\s,}]+)").find(block)?.groupValues?.get(1)
-            ?: Regex("compat=([^\\s,}]+)").find(block)?.groupValues?.get(1)
-            ?: Regex("mOverrideConfig=([^\\n]+)").find(block)?.groupValues?.get(1)?.trim()?.take(80)
+            ?: Regex("(?m)^[ \\t]*\\*[ \\t]*Task\\{[^}]*?\\bmode=([^\\s,}]+)").find(block)?.groupValues?.get(1)
 
     /**
      * 任务级密度：定向读任务 Configuration 段的 `NNNdpi`。
@@ -229,12 +250,22 @@ internal object ActivityDumpParser {
      * 假绿报成 560（恰是 #48 要抓的形态）。改为按 CurrentConfiguration → mOverrideConfig →
      * mGlobalConfig 的优先级定向读段内首个 `NNNdpi`；`densityDpi=` 分支保留（其他 ROM 可能打印，
      * 本机 ROM 的 dump 里该键 0 次出现）。
+     *
+     * issue #238：段内取值再**截到 `winConfig=` 之前**，并只按 `$key={` 锚定所在行——既不读
+     * `compat={560dpi}`，也不读窗口配置段，杜绝再次被整块正则误命中。
      */
-    fun extractDensity(block: String): String? =
-        Regex("densityDpi=(\\d+)").find(block)?.groupValues?.get(1)
-            ?: Regex("CurrentConfiguration=\\{[^}]*?(\\d+)dpi").find(block)?.groupValues?.get(1)
-            ?: Regex("mOverrideConfig=\\{[^}]*?(\\d+)dpi").find(block)?.groupValues?.get(1)
-            ?: Regex("mGlobalConfig=\\{[^}]*?(\\d+)dpi").find(block)?.groupValues?.get(1)
+    fun extractDensity(block: String): String? {
+        Regex("densityDpi=(\\d+)").find(block)?.let { return it.groupValues[1] }
+        fun configDensity(key: String): String? {
+            val line = block.lineSequence().firstOrNull { it.contains("$key={") } ?: return null
+            val from = line.indexOf("$key={") + key.length + 2
+            val to = line.indexOf("winConfig=", from).takeIf { it > from } ?: line.length
+            return Regex("(\\d+)dpi").find(line.substring(from, to))?.groupValues?.get(1)
+        }
+        return configDensity("CurrentConfiguration")
+            ?: configDensity("mOverrideConfig")
+            ?: configDensity("mGlobalConfig")
+    }
 
     /**
      * 解析 `wm size` 输出的宽与高。

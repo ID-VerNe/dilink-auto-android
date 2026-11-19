@@ -556,7 +556,12 @@ Display #0 (activities from top to bottom):
         // issue #232：真实 dump 里 bounds 的形态是 `mBounds=Rect(0, 0 - 1368, 3192)`（WinConfiguration
         // 内），旧断言的 `bounds=[0,0][1368,3192]` 形态真实 dump 里不存在（0 命中 → <unknown>）。
         assertTrue(log.contains("bounds=Rect(0, 0 - 1368, 3192)"))
-        assertTrue(log.contains("compat=fullscreen"))
+        // issue #238：窗口模式与 compat 拆成两个独立字段。旧断言 `compat=fullscreen` 把
+        // winConfig 的 `mWindowingMode` 当成了 compat；真 compat 是 ActivityRecord 的
+        // `compat={560dpi}`，窗口模式应叫 windowMode=。
+        assertTrue("窗口模式必须单独落 windowMode= 字段", log.contains("windowMode=fullscreen"))
+        assertTrue("compat= 必须打到 ActivityRecord 的 screen-compat 标志", log.contains("compat={560dpi}"))
+        assertTrue("compat= 不得再打窗口模式值", !log.contains("compat=fullscreen"))
         assertTrue(log.contains("densityDpi=560"))
     }
 
