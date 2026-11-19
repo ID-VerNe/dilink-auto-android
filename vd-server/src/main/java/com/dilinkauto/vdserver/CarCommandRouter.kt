@@ -547,8 +547,17 @@ internal class CarCommandRouter(
     private fun logTaskConfig(dump: String?, taskId: Int, toDisplay: Int) {
         try {
             val located = dump?.let { ActivityDumpParser.findTaskSection(it, taskId) }
-            val block = located?.let { ActivityDumpParser.taskBlock(it.second, taskId) }
-            val display = located?.first?.toString() ?: "<unknown>"
+            // issue #239：`findTaskSection` 按 dump 中 display 段的出现顺序取第一个命中，
+            // VD 残留段排在目标屏段之前时会把残留任务块当成归属。命中不是 `toDisplay`
+            // 时一律回到目标段内重新定位；目标段里读不到该 task 就记 `<unknown>`，
+            // 绝不回落到别的 display 的 bounds（那正是现场假数据的来源）。
+            val block = when {
+                located == null -> null
+                located.first == toDisplay -> ActivityDumpParser.taskBlock(located.second, taskId)
+                else -> ActivityDumpParser.displaySection(dump, toDisplay)
+                    ?.let { ActivityDumpParser.taskBlock(it, taskId) }
+            }
+            val display = if (block != null) toDisplay.toString() else "<unknown>"
             val bounds = block?.let { ActivityDumpParser.extractBounds(it) } ?: "<unknown>"
             val compat = block?.let { ActivityDumpParser.extractCompat(it) } ?: "<unknown>"
             val windowMode = block?.let { ActivityDumpParser.extractWindowMode(it) } ?: "<unknown>"
