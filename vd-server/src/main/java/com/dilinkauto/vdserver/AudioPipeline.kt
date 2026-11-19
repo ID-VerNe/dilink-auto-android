@@ -281,6 +281,8 @@ internal class AudioPipeline(
         val silence = silenceFrame(spec)
         var accLen = 0
         var frameIndex = 0L
+        // issue #252：最近一次 `read()>0` 的时刻，用于判断「半帧是不是还在路上」。
+        var lastRealNanos = 0L
 
         try {
             while (shouldContinueCapture(sessionRunning(), running.get(), sink.isFailed())) {
@@ -292,6 +294,7 @@ internal class AudioPipeline(
                         // issue #194：readBytes 是「本窗口实际读到的字节数」——它是
                         // 「读不到」与「读到 0」的分水岭，按读取时刻归属窗口。
                         txDiag.onRead(read)
+                        lastRealNanos = clockNanos()
                         // 凑满一整帧再喂：非阻塞读可能只给半帧。
                         var offset = 0
                         while (offset < read) {
@@ -311,12 +314,28 @@ internal class AudioPipeline(
 
                     read == 0 -> {
                         // 无数据（所有 player 消失）：按 21.333 ms 节拍补静音帧（R10）。
-                        val due = pacing.silenceFramesDue(clockNanos())
-                        repeat(due) {
-                            queuePcm(enc, silence, silence.size, frameIndex, pacingSilence = true)
-                            frameIndex++
-                            silenceFrames.incrementAndGet()
-                            didWork = true
+                        // issue #252：半帧还在 acc 里时先不补 —— 先补一帧静音、随后真实
+                        // 采样凑满又发一帧，会让发送侧比 46.875 fps 多出 0.3~0.9 帧/秒。
+                        val now = clockNanos()
+                        if (
+                            shouldDeferSilencePadding(
+                                accLen,
+                                now - lastRealNanos,
+                                spec.frameDurationNanos,
+                                AUDIO_SILENCE_GRACE_FRAMES
+                            )
+                        ) {
+                            // 半帧还在路上，最多等 2 拍（约 42.7 ms）；真实采样会自己凑满，
+                            // 避免多发一帧。
+                        } else {
+                            if (accLen > 0) accLen = 0  // 真静音：丢弃凑不满的残帧
+                            val due = pacing.silenceFramesDue(now)
+                            repeat(due) {
+                                queuePcm(enc, silence, silence.size, frameIndex, pacingSilence = true)
+                                frameIndex++
+                                silenceFrames.incrementAndGet()
+                                didWork = true
+                            }
                         }
                     }
 
