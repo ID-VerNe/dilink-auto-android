@@ -390,9 +390,12 @@ else
   BRC=$?
   if [ "$BRC" = "0" ]; then
     ok "BUILD SUCCESSFUL"
-    T=$(find . -path "*/build/test-results/*" -name '*.xml' -exec grep -hoE 'tests="[0-9]+"' {} + 2>/dev/null | grep -oE '[0-9]+' | awk '{s+=$1} END {printf "%d", s+0}')
-    FF=$(find . -path "*/build/test-results/*" -name '*.xml' -exec grep -hoE 'failures="[0-9]+"' {} + 2>/dev/null | grep -oE '[0-9]+' | awk '{s+=$1} END {printf "%d", s+0}')
-    EE=$(find . -path "*/build/test-results/*" -name '*.xml' -exec grep -hoE 'errors="[0-9]+"' {} + 2>/dev/null | grep -oE '[0-9]+' | awk '{s+=$1} END {printf "%d", s+0}')
+    # issue #149：find 从仓库根递归，会把 .tmp/ 下历史 worktree / 基线目录的
+    # test-results 一并计入（.tmp/ 在 .gitignore 里，但 find 不读 gitignore），
+    # 构建门因此误报 failures=4。这里剪掉 .tmp/，只统计本仓各模块的构建产物。
+    T=$(find . -path ./.tmp -prune -o -path "*/build/test-results/*" -name '*.xml' -exec grep -hoE 'tests="[0-9]+"' {} + 2>/dev/null | grep -oE '[0-9]+' | awk '{s+=$1} END {printf "%d", s+0}')
+    FF=$(find . -path ./.tmp -prune -o -path "*/build/test-results/*" -name '*.xml' -exec grep -hoE 'failures="[0-9]+"' {} + 2>/dev/null | grep -oE '[0-9]+' | awk '{s+=$1} END {printf "%d", s+0}')
+    EE=$(find . -path ./.tmp -prune -o -path "*/build/test-results/*" -name '*.xml' -exec grep -hoE 'errors="[0-9]+"' {} + 2>/dev/null | grep -oE '[0-9]+' | awk '{s+=$1} END {printf "%d", s+0}')
     if [ "${T:-0}" -gt 0 ] && [ "${FF:-1}" = "0" ] && [ "${EE:-1}" = "0" ]; then
       ok "单测 $T 个，0 失败 0 错误"
     else
