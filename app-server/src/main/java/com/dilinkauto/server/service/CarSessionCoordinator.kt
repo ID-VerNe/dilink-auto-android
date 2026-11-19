@@ -56,6 +56,15 @@ internal class CarSessionCoordinator(
     // ─── Handshake & Viewport parameters ───
     var handshakeVdDpi: Int = VideoConfig.VIRTUAL_DISPLAY_DPI
         internal set
+    /**
+     * issue #21：握手响应带来的「允许上车」包名集合（车机 App 列表白名单）。
+     *
+     * 车机端 ADB 部署路径在收到握手响应的同一段代码里就拼引擎 argv，而 APP_LIST
+     * 要等引擎启动之后才到 —— 白名单只能从握手响应里拿。空集合 = 手机从未配置
+     * 白名单 / 老版本手机未下传 → 引擎不做白名单过滤（行为与引入该字段前一致）。
+     */
+    @Volatile var handshakeAllowedPackages: Set<String> = emptySet()
+        internal set
     var vdServerJarPath: String = VdDeploy.JAR_PATH
         internal set
     var vdWidth: Int = 1408
@@ -267,6 +276,8 @@ internal class CarSessionCoordinator(
         vdServerStarted = false
         shizukuMode = false
         handshakeDone = false
+        // issue #21：上一台手机的白名单不得跨会话残留。
+        handshakeAllowedPackages = emptySet()
         _videoReady.value = false
         surfaceWait.reset()
         adbTracker.resetAdbReadiness()
@@ -683,6 +694,15 @@ internal class CarSessionCoordinator(
                 vdWidth = sanitizePeerDimension(response.displayWidth, vdWidth)
                 vdHeight = sanitizePeerDimension(response.displayHeight, vdHeight)
                 handshakeVdDpi = response.vdDpi
+                // issue #21：建屏恢复的白名单随握手响应到达，供随后的 ADB 部署拼进 argv。
+                handshakeAllowedPackages = response.allowedPackages
+                carLogSend(
+                    "Handshake allowlist: " + if (response.allowedPackages.isEmpty()) {
+                        "not handed down (recents restore unfiltered)"
+                    } else {
+                        "${response.allowedPackages.size} apps (recents restore bounded)"
+                    }
+                )
                 // issue #202 评审第 2 条：设置页要显示"实际生效值 / 视口上限"，
                 // 两者都从这次握手响应里取（不新增协议）。
                 _effectiveVdDpi.value = response.vdDpi
@@ -836,6 +856,8 @@ internal class CarSessionCoordinator(
         wifiReady = false
         vdServerStarted = false
         handshakeDone = false
+        // issue #21：新一次建 VD 前先清空，等本次握手响应重新给集合（重握手同样适用）。
+        handshakeAllowedPackages = emptySet()
         vdWidth = newVpW
         vdHeight = newVpH
         _state.value = CarConnectionService.State.CONNECTING
@@ -900,6 +922,8 @@ internal class CarSessionCoordinator(
         wifiReady = false
         vdServerStarted = false
         handshakeDone = false
+        // issue #21：白名单属于会话态，断开后清掉，避免下一台手机沿用旧集合。
+        handshakeAllowedPackages = emptySet()
         // issue #151：电量属于会话态，断开后必须回到 `—`，否则会显示上一台手机的旧值。
         onPhoneStatus(null)
         adbTracker.resetAdbReadiness()

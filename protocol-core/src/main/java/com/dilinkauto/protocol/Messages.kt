@@ -306,13 +306,33 @@ data class HandshakeResponse(
      *
      * 尾字段：老手机不带这 4 字节时解码为 0（不支持音频），这是安全的回退方向。
      */
-    val supportedFeatures: Int = 0
+    val supportedFeatures: Int = 0,
+    /**
+     * issue #21：手机端「允许上车」的包名集合（车机 App 列表白名单）。
+     *
+     * 车机端在**收到本响应的同一段代码里**就部署 vd-server（USB / TCP-ADB 路径，
+     * 见 `app-server` 的 `VdServerDeployer`），远早于 `APP_LIST`
+     * （后者要等 VD 生命周期连上、引擎已启动才发），所以白名单只能随握手响应
+     * 下传：否则车机拼 argv 时手里没有任何集合，引擎日志是
+     * `Allowlist: not handed down`，建屏恢复会把隐私应用（Shizuku 管理器、
+     * 银行、相册…）拉到车机屏。
+     *
+     * 编码/解码复用 [VdDeployArgs.formatAllowedPackages] /
+     * [VdDeployArgs.parseAllowedPackages]，与引擎 argv 的 `ALLOWED` 槽位同一套
+     * 校验与哨兵（`-`）。尾字段：老手机不带这 2+N 字节时解码为空集合 =
+     * 引擎不做白名单过滤（与引入该字段前一致）。
+     */
+    val allowedPackages: Set<String> = emptySet()
 ) {
     fun encode(): ByteArray {
         val nameBytes = deviceName.toByteArray(Charsets.UTF_8)
         val jarPathBytes = vdServerJarPath.toByteArray(Charsets.UTF_8)
-        val buf = ByteBuffer.allocate(4 + 1 + 2 + nameBytes.size + 4 + 4 + 4 + 4 + 2 + jarPathBytes.size + 1 + 4 + 4 + 4 + 4)
-            .order(ByteOrder.BIG_ENDIAN)
+        val allowedCsv = VdDeployArgs.formatAllowedPackages(allowedPackages)
+        val allowedBytes = allowedCsv.toByteArray(Charsets.UTF_8)
+        val buf = ByteBuffer.allocate(
+            4 + 1 + 2 + nameBytes.size + 4 + 4 + 4 + 4 + 2 + jarPathBytes.size + 1 + 4 + 4 + 4 + 4 +
+                2 + allowedBytes.size
+        ).order(ByteOrder.BIG_ENDIAN)
         buf.putInt(protocolVersion)
         buf.put(if (accepted) 1.toByte() else 0.toByte())
         buf.putUtf8(deviceName)
@@ -326,6 +346,7 @@ data class HandshakeResponse(
         buf.putInt(vdWidth)
         buf.putInt(vdHeight)
         buf.putInt(supportedFeatures)
+        buf.putUtf8(allowedCsv)
         return buf.array()
     }
 
@@ -347,6 +368,8 @@ data class HandshakeResponse(
             val vdW = if (buf.remaining() >= 4) buf.getInt() else 0
             val vdH = if (buf.remaining() >= 4) buf.getInt() else 0
             val features = if (buf.remaining() >= 4) buf.getInt() else 0
+            // issue #21：`-` / 缺省 / 全部非法 → 空集合 = 不做白名单过滤。
+            val allowed = VdDeployArgs.parseAllowedPackages(buf.readShortLengthPrefixedOrEmpty())
             return HandshakeResponse(
                 protocolVersion = version,
                 accepted = accepted,
@@ -360,7 +383,8 @@ data class HandshakeResponse(
                 vdDpi = vdDpi,
                 vdWidth = vdW,
                 vdHeight = vdH,
-                supportedFeatures = features
+                supportedFeatures = features,
+                allowedPackages = allowed
             )
         }
     }
