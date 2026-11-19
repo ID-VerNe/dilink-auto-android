@@ -208,10 +208,17 @@ internal object ActivityDumpParser {
      * 出现（等号后是 `R`），旧正则要求等号后紧跟 `[`/`(` → 0 命中 → `[teardown-move]` 的 bounds
      * 全 `<unknown>`。`Rect(...)` / `null` 分支与 [WindowStateMonitor] 的 `BOUNDS_RE` 写法对齐
      * （`WindowStateMonitor.kt:166`）。
+     *
+     * issue #239：`am display move-stack` 之后，块的**首个** `mBounds=` 仍属于
+     * `mLastReportedConfigurations`（搬迁前 VD 的上次上报快照，如 `Rect(634, 0 - 1293, 1054)`），
+     * 直接取首个命中会把旧 VD 坐标系当成回读结果。任务当前生效的配置在
+     * `CurrentConfiguration` 的 `winConfig` 里，必须优先读它；读不到才落回既有形态。
      */
     fun extractBounds(block: String): String? =
-        Regex("(?:mBounds|bounds)=(Rect\\([^)]*\\)|\\[[^\\]]*\\](?:\\[[^\\]]*\\])?|\\([^)]*\\)|null)")
+        Regex("CurrentConfiguration=\\{[^}]*?winConfig=\\{\\s*mBounds=(Rect\\([^)]*\\))")
             .find(block)?.groupValues?.get(1)
+            ?: Regex("(?:mBounds|bounds)=(Rect\\([^)]*\\)|\\[[^\\]]*\\](?:\\[[^\\]]*\\])?|\\([^)]*\\)|null)")
+                .find(block)?.groupValues?.get(1)
 
     /**
      * ActivityRecord 的 screen-compat 标志（`compat={560dpi}`，与 `ActivityRecord{…}` 同一行）。
