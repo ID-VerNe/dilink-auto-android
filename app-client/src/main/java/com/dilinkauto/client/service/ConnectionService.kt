@@ -655,6 +655,12 @@ class ConnectionService : Service() {
         // between the two produce "we said SHIZUKU but deployed nothing".
         val useShizuku = ShizukuManager.checkPermission()
         val connMethod = if (useShizuku) CONNECTION_METHOD_SHIZUKU else CONNECTION_METHOD_USB_ADB
+        // issue #21：车机端 ADB 部署路径在收到本响应的同一段代码里就启动引擎，
+        // 远早于 APP_LIST（后者要等 VD 生命周期连上、引擎已启动才发），所以白名单
+        // 必须随握手响应下传，否则车机拼 argv 时只能传空集合 → 引擎日志
+        // `Allowlist: not handed down`，建屏恢复会把隐私应用拉到车机屏。
+        // 与 Shizuku 部署路径同一份来源（AppListBuilder.allowedPackages）。
+        val allowedPackages = appListBuilder.allowedPackages().orEmpty()
         val resp = HandshakeResponse(
             accepted = true,
             deviceName = android.os.Build.MODEL,
@@ -673,13 +679,18 @@ class ConnectionService : Service() {
             // 采集端能力位（issue #72, Refs #13）。代理判据 = SDK_INT >= 30，理由与
             // 已知误报见 [phoneAudioFeatures] 的 KDoc —— 此处无法拿到真实
             // REMOTE_SUBMIX 结果（响应构造早于 vd-server 部署），不假装精确。
-            supportedFeatures = phoneAudioFeatures(Build.VERSION.SDK_INT)
+            supportedFeatures = phoneAudioFeatures(Build.VERSION.SDK_INT),
+            allowedPackages = allowedPackages
         )
         handshakeJob?.cancel()
         handshakeJob = serviceScope.launch(Dispatchers.IO) {
             try {
                 conn.sendControl(ControlMsg.HANDSHAKE_RESPONSE, resp.encode())
-                FileLog.i(TAG, "Handshake response sent")
+                FileLog.i(
+                    TAG,
+                    "Handshake response sent (allowlist=" +
+                        (allowedPackages.size.takeIf { it > 0 }?.toString() ?: "<not handed down>") + ")"
+                )
                 // issue #204：握手成功是「链路真的通」的最硬证据。系统回调可能再也不来
                 // （现场 16:36:37 lost 之后再无 available，而 16:36:42 会话照常建立），
                 // 这里用真实流量把监控状态拉回 available，只改状态与日志，不触发重建。

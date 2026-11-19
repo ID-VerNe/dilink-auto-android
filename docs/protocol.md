@@ -110,6 +110,8 @@ All three trailing fields are appended after `appVersionName` and decode as `0` 
 | vdWidth              | int32  |  trailing field, recommended VD width, 0 = not provided
 | vdHeight             | int32  |  trailing field, recommended VD height, 0 = not provided
 | supportedFeatures    | int32  |  尾字段，**手机侧**采集能力位掩码，0 = 不支持音频
+| allowedPackages len  | int16  |  尾字段（issue #21），白名单 CSV 字节数
+| allowedPackages      | UTF-8  |  逗号拼接的包名（`[A-Za-z0-9._]{1,255}`），`-` = 不下传
 +----------------------+--------+
 ```
 
@@ -118,6 +120,8 @@ All three trailing fields are appended after `appVersionName` and decode as `0` 
 `0` means an older phone did not send the field. Deploy sites with no shell access to the phone — the desktop ADB path — MUST use these dims for the VirtualDisplay when they are `> 0`; the desktop's own viewport is the *encoder* size, not the VD size. The phone-side metrics must come from real physical display metrics (`WindowManager.maximumWindowMetrics` / `Display.getRealMetrics`), never `resources.displayMetrics`, which reports compat-scaled values in screen-compat mode.
 
 `supportedFeatures`（S1）是音频能力交换里**手机 / 采集侧**的那一半，追加在 `vdHeight` 之后，与 request 里的同名字段语义不同：request 说的是接收端想用什么，这里说的是手机能提供什么。老手机不带末尾这 4 字节时解码为 `0`，这是安全的回退方向 —— `isAudioNegotiated` 返回 false，没人会去连一个从未监听的端口。手机只有在自身 SDK 与采集探针允许 `REMOTE_SUBMIX` 时才在这里置 `FEATURE_AUDIO`。
+
+`allowedPackages`（issue #21）是车机 App 列表的「允许上车」白名单，追加在 `supportedFeatures` 之后，编码/解码复用 `VdDeployArgs.formatAllowedPackages` / `parseAllowedPackages`（与引擎 argv 的 `ALLOWED` 槽位同一套校验与 `-` 哨兵）。它必须随握手响应下传，而不是等 `APP_LIST`：车机（USB / TCP-ADB 路径）在收到本响应的同一段代码里就部署 vd-server，而 `APP_LIST` 要等 VD 生命周期连上（引擎已启动）才发出，部署时车机手里没有任何集合。老手机不带这 2+N 字节时解码为空集合 = 引擎不做白名单过滤（与引入前一致）。
 
 ### HEARTBEAT (0x03) / HEARTBEAT_ACK (0x04) -- Control connection only
 
@@ -463,7 +467,7 @@ All VD server lifecycle commands are defined in `VdDeploy.kt` (protocol module) 
 | `FPS` | Target frame rate; all pipeline timeouts derive from it |
 | `BITRATE` | bps, validated against `500_000..20_000_000`, out-of-range falls back to 4 Mbps |
 | `CAR_HOST` | Trailing, optional. Dotted-quad IPv4 or hostname; blank or malformed degrades to `-` (= accept any peer) rather than failing the deploy. Pins the engine's 9638/9639 accepts to the receiver it serves |
-| `ALLOWED` | issue #21: comma-joined package names (`[A-Za-z0-9._]{1,255}`) the user allows onto the car screen; `-` / empty / all-invalid = no allowlist filtering (car/desktop ADB deploys cannot read the phone prefs). Bounds `RecentsParser.pickQuickSwitchTarget` so a private app is never pulled into the VD |
+| `ALLOWED` | issue #21: comma-joined package names (`[A-Za-z0-9._]{1,255}`) the user allows onto the car screen; `-` / empty / all-invalid = no allowlist filtering. 手机端 Shizuku 路径直接读 allowlist prefs；车机 USB/TCP-ADB 路径用 `HandshakeResponse.allowedPackages` 带来的同一份集合（部署早于 `APP_LIST`，见握手响应一节）；桌面 `adb.exe` 路径拿不到手机 prefs，仍传空集合。Bounds `RecentsParser.pickQuickSwitchTarget` so a private app is never pulled into the VD |
 | `SESSION` | issue #180: the session token generated at deploy time (`[A-Za-z0-9_-]{1,64}`, 32 hex chars from a UUID), also used to name this session's stop sentinel. `-` / invalid = legacy engine, listening on the fixed `stop-request` with pid content addressing + mtime fallback |
 | `DPI_SOURCE` | issue #202: DPI 来源令牌（`auto` / `user-240` / `fallback-480-234`，`[A-Za-z0-9._-]{1,48}`），引擎只把它打进 `Starting:` 行；`-` / 缺省 = 旧部署端未上报（日志记 `unknown`） |
 

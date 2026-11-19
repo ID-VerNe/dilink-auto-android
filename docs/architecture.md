@@ -308,7 +308,9 @@ Four defects found on the same MI 9 pass and fixed alongside it:
    e. Phone opens lifecycle ServerSocket on 127.0.0.1:19647 (loopback only)
    f. If Shizuku available: phone deploys VD server directly.
       Else the receiver deploys via ADB (car: USB or TCP; desktop: local adb.exe,
-      gated on its dev_mode setting).
+      gated on its dev_mode setting). The car's deploy is triggered from inside the
+      handshake-response handler, i.e. before APP_LIST, so the car-visible allowlist
+      rides along in the HandshakeResponse tail field (`allowedPackages`, issue #21).
    g. VD server starts: CLASSPATH=jar app_process / PipelineServer W H DPI PHONE_HOST
       EW EH FPS BITRATE [CAR_HOST [ALLOWED]]   (PHONE_HOST is 127.0.0.1 on every path)
    h. VD server reverse-connects to phone localhost:19647 (NIO non-blocking)

@@ -337,9 +337,11 @@ object VdDeploy {
      *                  (audit S-01). [VdDeployArgs.CAR_HOST_ANY] keeps the
      *                  legacy accept-any behaviour for deploy sites that cannot
      *                  determine their own outbound address.
-     * @param allowedPackages 车机可见应用的包名集合（issue #21）。只有手机端
-     *                  Shizuku 部署路径能读到 allowlist prefs 并下传；车机/桌面
-     *                  ADB 路径传空集合（引擎不做过滤，行为不变）。
+     * @param allowedPackages 车机可见应用的包名集合（issue #21）。手机端 Shizuku
+     *                  路径直接读 allowlist prefs；车机端 ADB 路径用握手响应尾字段
+     *                  `HandshakeResponse.allowedPackages` 带来的同一份集合。桌面
+     *                  `adb.exe` 路径拿不到手机 prefs，传空集合（引擎不做过滤）。
+     *                  空集合 = 不过滤，行为与引入该参数前一致。
      * @param sessionToken 本次会话的 token（issue #180）。缺省生成一个新的；
      *                  非法值（含 `-`）按"未传"处理，引擎回退旧格式固定名。
      */
