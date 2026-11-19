@@ -202,6 +202,57 @@ internal object ActivityDumpParser {
     }
 
     /**
+     * 段内带项目符号的 Task 头，捕获花括号内文本（供 [homeTaskId] / [taskIdByPackage]
+     * 读 `#<id>` / `type=` / `A=` 字段）。
+     *
+     * 与 [TASK_HEADER_RE] 同口径：只认行首 `* Task{`，不认
+     * `rootOfTask=… task=Task{…}` 这类引用行。
+     */
+    private val TASK_BODY_RE = Regex("""(?m)^[ \t]*\*[ \t]*Task\{([^}]*)}""")
+
+    /** Task 头花括号内的 `#<id>`。 */
+    private val TASK_BODY_ID_RE = Regex("""#(\d+)""")
+
+    /** Task 头里的 `type=home`（issue #17：launcher 任务的首选判据）。 */
+    private val TASK_TYPE_HOME_RE = Regex("""\btype=home\b""")
+
+    /** Task 头里的 `A=` 字段（亲和性），用于按 launcher 包名兜底认任务。 */
+    private val TASK_AFFINITY_RE = Regex("""\bA=(\S+)""")
+
+    /** 段内每个 task 头的 (id, 花括号内文本)，按正文出现先后。 */
+    private fun taskBodies(section: String): List<Pair<Int, String>> =
+        TASK_BODY_RE.findAll(section).mapNotNull { m ->
+            val body = m.groupValues[1]
+            val id = TASK_BODY_ID_RE.find(body)?.groupValues?.get(1)?.toIntOrNull()
+                ?: return@mapNotNull null
+            id to body
+        }.toList()
+
+    /**
+     * Task 头 `A=` 字段里的包名：`A=com.pkg/.Act` 与 `A=<userId>:com.pkg` 两种写法都认。
+     */
+    private fun affinityPackage(body: String): String? {
+        val raw = TASK_AFFINITY_RE.find(body)?.groupValues?.get(1) ?: return null
+        return raw.substringBefore('/').substringAfterLast(':')
+    }
+
+    /**
+     * 从 `Display #0` 段里找 `type=home` 的任务 id；找不到返回 null。
+     *
+     * 只认传入段内的内容（调用方负责只传 Display #0 的段），不跨 display 搜。
+     */
+    fun homeTaskId(displayZeroSection: String): Int? =
+        taskBodies(displayZeroSection).firstOrNull { TASK_TYPE_HOME_RE.containsMatchIn(it.second) }?.first
+
+    /**
+     * launcher 包兜底：从 `Display #0` 段里找 `A=<launcherPackage>/` 的任务 id。
+     *
+     * 部分 ROM 的 home 任务头不带 `type=home`，只剩 `A=` 亲和性字段可认。
+     */
+    fun taskIdByPackage(displayZeroSection: String, packageName: String): Int? =
+        taskBodies(displayZeroSection).firstOrNull { affinityPackage(it.second) == packageName }?.first
+
+    /**
      * task 块的 bounds：兼容 `bounds=[0,0][2340,1316]`、`mBounds=Rect(...)` 与 `mBounds=null` 写法。
      *
      * issue #232：真实 dump 的 task 块里该字段只以 WinConfiguration 内的 `mBounds=Rect(0, 0 - W, H)`
