@@ -11,8 +11,10 @@ class AudioPlayerTimingTest {
         val currentTick = 1_000_000_000L
         val now = 1_010_000_000L // within frame window (10ms after)
 
-        val next = AudioPlayer.calculateNextTick(currentTick, now, frameNanos)
-        assertEquals(currentTick + frameNanos, next)
+        // issue #179：准时时本拍只处理 1 帧，基准前进 1 帧（不再丢拍）。
+        val plan = audioTickPlan(currentTick, now, frameNanos)
+        assertEquals(1, plan.framesDue)
+        assertEquals(currentTick + frameNanos, plan.nextTickNanos)
     }
 
     @Test
@@ -22,8 +24,9 @@ class AudioPlayerTimingTest {
         // 500ms lag due to GC or system stutter
         val now = 1_500_000_000L
 
-        val next = AudioPlayer.calculateNextTick(currentTick, now, frameNanos)
-        // Should align to now + frameNanos rather than currentTick + frameNanos
-        assertEquals(now + frameNanos, next)
+        // 落后远超 AUDIO_MAX_FRAMES_PER_TICK → 走重置分支：1 帧、基准取 now + frameNanos。
+        val plan = audioTickPlan(currentTick, now, frameNanos)
+        assertEquals(1, plan.framesDue)
+        assertEquals(now + frameNanos, plan.nextTickNanos)
     }
 }

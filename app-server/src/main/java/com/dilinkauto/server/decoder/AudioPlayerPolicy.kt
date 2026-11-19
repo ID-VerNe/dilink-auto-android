@@ -181,9 +181,55 @@ internal fun audioTrackPendingFrames(
 }
 
 /**
+ * 单个节拍最多补处理的帧数（issue #179）。
+ *
+ * 与视频侧 [FeedBurst.MAX_FRAMES_PER_ROUND] 同量级（8）：播放线程单拍最多连处理 8 帧，
+ * 按 AAC-LC 48 kHz 的 1024 samples = 21.333 ms/帧算，对应约 **170 ms** 的突发上限
+ * （8 × 21.333 ms）。超过它说明线程被长停（GC、调度饥饿、native 阻塞），逐拍补齐只会
+ * 把过期帧一次性灌进 `AudioTrack`、顶高延迟，所以那时改为重置节拍基准。
+ */
+internal const val AUDIO_MAX_FRAMES_PER_TICK = 8
+
+/** 一个节拍的处理计划（issue #179）：本拍该处理几帧，以及下一拍的基准时刻。 */
+internal data class AudioTickPlan(val framesDue: Int, val nextTickNanos: Long)
+
+/**
+ * 计算音频主循环本拍的帧数与下一拍基准（issue #179，纯函数）。
+ *
+ * 背景：原来的 `calculateNextTick` 只推进基准，主循环每拍固定处理 1 帧。播放线程每拍
+ * 有约 6 ms 的固定开销，`now - nextTick` 一旦超过一帧就把基准直接重置成 `now`
+ * （`AudioPlayer.kt` 的旧实现），落后的整拍被永久丢弃 —— 消费速率只有 36.5 帧/秒，
+ * 低于发送侧的 46.875 帧/秒，jitter 队列长期 15~16/16，每秒丢 7~10 帧。
+ *
+ * 规则：
+ * - `lag = nowNanos - currentNextTickNanos`，负 lag 按 0 算；
+ * - `framesDue = floor(lag / frameNanos) + 1`：落后几拍就补几帧，不再丢拍；
+ * - `framesDue` 超过 [maxFramesPerTick]（线程被长停，如 500 ms）→ 判定为无法有意义地
+ *   追赶，返回 `AudioTickPlan(1, nowNanos + frameNanos)` 重置基准；
+ * - 正常情况下下一拍基准为 `currentNextTickNanos + framesDue * frameNanos`，保持节拍
+ *   基准连续，不会因每拍固定开销被逐步拖慢；
+ * - `frameNanos <= 0` 只做除零兜底，返回 `AudioTickPlan(1, nowNanos)`。
+ *
+ * 只覆盖主循环需要的这几种情况，不再发散出别的补偿分支。
+ */
+internal fun audioTickPlan(
+    currentNextTickNanos: Long,
+    nowNanos: Long,
+    frameNanos: Long,
+    maxFramesPerTick: Int = AUDIO_MAX_FRAMES_PER_TICK,
+): AudioTickPlan {
+    if (frameNanos <= 0L) return AudioTickPlan(1, nowNanos)
+    val lag = (nowNanos - currentNextTickNanos).coerceAtLeast(0L)
+    val due = lag / frameNanos + 1L
+    if (due > maxFramesPerTick.toLong()) return AudioTickPlan(1, nowNanos + frameNanos)
+    return AudioTickPlan(due.toInt(), currentNextTickNanos + due * frameNanos)
+}
+
+/**
  * 本拍该补多少帧静音（issue #164 候选 B 的判定核心，纯函数）。
  *
- * 背景：`AudioPlayer` 的主循环每 21.333 ms 只 poll/feed/drain 一次。输入队列有帧、
+ * 背景：`AudioPlayer` 的主循环每拍最多处理 [AUDIO_MAX_FRAMES_PER_TICK] 帧（issue #179 前
+ * 固定 1 帧）。输入队列有帧、
  * 但解码器本拍返回 `INFO_TRY_AGAIN_LATER` 时，这一拍**一个 PCM 字节都不写**；
  * 只有「队列空」才补静音（计 `starved`）。于是 4 帧（85 ms）的 track 被一拍一拍啃到 0，
  * 底层按 22.6 次/秒记 underrun，而应用层 `starved` 只有 25。
