@@ -523,6 +523,9 @@ class PipelineServer(
             lifecycle.channel = phoneChannel
             shell.exec("input keyevent 224"); log("Waking up device to ensure VD activities resume")
             shell.exec("am start --display $displayId -a android.intent.action.MAIN -c android.intent.category.HOME"); log("Home launched")
+            // issue #17：上面这条 am start 对已存在的 launcher 任务只做 bring-to-front，
+            // VD 段里可能连一个 Task{ 都没有；把物理屏的 home 任务整条迁进来兜底。
+            carCommands.ensureHomeTaskInDisplay(displayId)
             carCommands.moveTopApp(0, displayId)
             // VD 建好却没有任何窗口时编码器只能输出纯黑帧，车机侧判定黑屏后会反复重握手（issue #17）
             carCommands.ensureDisplayHasContent(displayId)

@@ -247,6 +247,75 @@ internal class CarCommandRouter(
     }
 
     /**
+     * issue #17：新建 VD 之后，把物理屏的 home 任务整条迁进 VD，保证 display 段里有 task。
+     *
+     * 现场证据：`am start --display N -a MAIN -c HOME` 对**已存在**的 launcher 任务只做
+     * bring-to-front（`Warning: Activity not started, its current task has been brought to
+     * the front`），不会在 N 上建任务；[moveTopApp] 又显式跳过 launcher —— 于是 Display #N
+     * 段里连一个 `Task{` 都没有，编码器只能出纯黑帧（`Pipeline: … tex=0`），车机侧
+     * `[BLACK] rendered=0`。
+     *
+     * 与 [ensureDisplayHasContent] 分工：这里只搬 home 任务，不改 [moveTopApp] 的
+     * 「跳过 launcher/systemui/自家 App」语义，也不挑 recents。
+     *
+     * 认任务的两条路：先按 `type=home`（[ActivityDumpParser.homeTaskId]），认不出再用
+     * `resolve-activity` 解析出的 launcher 包名按 `A=` 兜底（[ActivityDumpParser.taskIdByPackage]）。
+     *
+     * 同步执行（创建期命令本来就串行）：1 次 dumpsys + 1 次 move-stack + 400ms 复查，
+     * 失败只记日志，绝不阻塞会话。
+     */
+    fun ensureHomeTaskInDisplay(id: Int) {
+        if (id < 0) return
+        val api = sdkInt()
+        if (api < 29) {
+            PipeLog.log("homeTask: skipped, am display move-stack requires API 29")
+            return
+        }
+        try {
+            val dump = execOut("dumpsys activity activities 2>/dev/null") ?: ""
+            val target = ActivityDumpParser.displaySection(dump, id)
+            if (target != null && target.contains("Task{")) {
+                PipeLog.log("homeTask: display=$id already has a task")
+                return
+            }
+            val zero = ActivityDumpParser.displaySection(dump, 0) ?: ""
+            var homeId = ActivityDumpParser.homeTaskId(zero)
+            if (homeId == null) {
+                val launcher = launcherPackage()
+                if (launcher != null) homeId = ActivityDumpParser.taskIdByPackage(zero, launcher)
+            }
+            if (homeId == null) {
+                PipeLog.log("homeTask: no home task on display 0")
+                return
+            }
+            exec("am display move-stack $homeId $id")
+            Thread.sleep(HOME_TASK_VERIFY_MS)
+            val after = ActivityDumpParser.displaySection(execOut("dumpsys activity activities 2>/dev/null") ?: "", id)
+            val ok = after != null && after.contains("Task{")
+            PipeLog.log("homeTask: moved task=$homeId display=$id ok=$ok")
+        } catch (e: Exception) {
+            PipeLog.err("homeTask: ${e.message}")
+        }
+    }
+
+    /**
+     * `cmd package resolve-activity --brief` 的 home 解析结果里的 launcher 包名。
+     *
+     * 输出末行形如 `com.android.launcher3/.uioverrides.QuickstepLauncher`；
+     * 部分 ROM 把 `priority=0 … ` 前缀混在同一行，因此取最后一个空白分隔的 token
+     * 再截 `/` 前段。
+     */
+    private fun launcherPackage(): String? {
+        val out = execOut(
+            "cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.HOME 2>/dev/null"
+        )
+        val line = out?.lineSequence()?.map { it.trim() }?.lastOrNull { it.contains('/') } ?: return null
+        return line.substringAfterLast(' ')
+            .substringBefore('/')
+            .takeIf { it.isNotEmpty() && !it.contains(' ') && !it.contains(':') }
+    }
+
+    /**
      * 「最近」= 快速切换到上一个任务（2026-10-10 用户拍板的语义）。
      *
      * 不用 `input -d N keyevent 187`：AOSP 的系统 recents 硬编码作用于默认显示器
@@ -621,5 +690,11 @@ internal class CarCommandRouter(
          * 观察到 DTA 被踢出层树（issue #19），1.5s 会早于故障发生，取 1.8s 留余量。
          */
         const val LAYER_RECHECK_DELAY_MS = 1_800L
+
+        /**
+         * issue #17：`am display move-stack` 是异步入队的，把 home 任务搬进 VD 后
+         * 等 400ms 再回读，避免读到迁移前的 display 段。
+         */
+        const val HOME_TASK_VERIFY_MS = 400L
     }
 }
