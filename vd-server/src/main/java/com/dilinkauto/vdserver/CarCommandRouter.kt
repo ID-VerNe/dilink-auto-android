@@ -517,7 +517,11 @@ internal class CarCommandRouter(
 
     /**
      * issue #48 取证：`move-stack` 之后回读目标 task 的 `displayId / bounds /
-     * compat / densityDpi`，只落一条 `[teardown-move]` 日志。
+     * compat / windowMode / densityDpi`，只落一条 `[teardown-move]` 日志。
+     *
+     * issue #238：`compat=` 只打 ActivityRecord 的 screen-compat 标志（`compat={560dpi}`，
+     * 读不到记 `<unknown>`）；窗口模式单独落 `windowMode=`。此前 `compat=` 下打的是
+     * `winConfig` 的 `mWindowingMode`（恒 `fullscreen`），与标签名不符。
      *
      * `am display move-stack` 是异步入队的（这里是 fire-and-forget 的 `exec`），
      * 立刻 `dumpsys` 会读到迁移前的状态，所以先等一个很短的时间再读。任何字段
@@ -547,10 +551,11 @@ internal class CarCommandRouter(
             val display = located?.first?.toString() ?: "<unknown>"
             val bounds = block?.let { ActivityDumpParser.extractBounds(it) } ?: "<unknown>"
             val compat = block?.let { ActivityDumpParser.extractCompat(it) } ?: "<unknown>"
+            val windowMode = block?.let { ActivityDumpParser.extractWindowMode(it) } ?: "<unknown>"
             val density = block?.let { ActivityDumpParser.extractDensity(it) } ?: "<unknown>"
             PipeLog.log(
                 "[teardown-move] task=$taskId moved-to=$toDisplay displayId=$display " +
-                    "bounds=$bounds compat=$compat densityDpi=$density"
+                    "bounds=$bounds compat=$compat windowMode=$windowMode densityDpi=$density"
             )
         } catch (e: Exception) {
             PipeLog.err("[teardown-move] task=$taskId probe failed: ${e.message}")
