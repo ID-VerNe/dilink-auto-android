@@ -863,6 +863,16 @@ internal class CarSessionCoordinator(
         _state.value = CarConnectionService.State.CONNECTING
         _statusMessage.value = context.getString(R.string.status_starting_vd)
 
+        // issue #22：旧引擎的 exec app_process 长期占用这条 TCP ADB 流，kill 后 socket
+        // 半死但 isConnected 仍可能为 true；直接复用会让部署快速失败并等 60s 生命周期
+        // 超时（实车黑屏 79s）。这里先丢弃半死控制器，再让既有跟踪逻辑重建并触发部署。
+        // 注意用服务级 scope：上面的 connectionScope 已在本函数开头 cancel，挂在它上面
+        // 的协程不会启动，重建也就不会发生。
+        if (shouldRebuildAdbOnRehandshake(adbTracker.adbController != null)) {
+            adbTracker.resetAdbController()
+            adbTracker.startUsbTrack(scope)
+        }
+
         try {
             sendHandshake(ctrl, newVpW, newVpH, dpi)
         } catch (e: Exception) {
