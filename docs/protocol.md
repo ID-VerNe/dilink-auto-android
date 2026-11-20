@@ -214,7 +214,7 @@ H.264 NAL units representing a video frame.
 ### 阶段演化与技术规范
 
 - **S1 载荷契约与帧格式**：定义 `AudioPayload` 编解码格式，独立端口 `9640`（`AUDIO_PORT`），包含 `CONFIG (0x01)` 与 `FRAME (0x02)`。
-- **S2 编码与静音补帧**：VD server 端通过 `REMOTE_SUBMIX` 录音源采集，由 `AudioPipeline` + `AudioEncoderSelector` 编码为 AAC-LC（48000Hz, 双声道立体声, 128kbps）。48kHz AAC-LC 每帧 1024 采样 = **21.333 ms / 46.875 fps**（`AudioSpec.kt`, `AudioPacing.kt`）。采集静音期持续按 46.875 fps 节拍注入合成静音帧，杜绝接收端抖动缓冲下溢与排队延迟膨胀。
+- **S2 编码与静音补帧**：VD server 端通过 `REMOTE_SUBMIX` 录音源采集，由 `AudioPipeline` + `AudioEncoderSelector` 编码为 AAC-LC（48000Hz, 双声道立体声, 128kbps）。48kHz AAC-LC 每帧 1024 采样 = **21.333 ms / 46.875 fps**（`AudioSpec.kt`, `AudioSendPacer.kt`）。真实 PCM 帧与合成静音帧共用同一个墙钟预算（`elapsed / 21.333ms + 1`），长期平均发送速率因此锁定在 46.875 fps，杜绝接收端抖动缓冲下溢与排队延迟膨胀（issue #252）。
 - **S3 独立 TCP 连接与播放**：VD Server 启动 `PortAcceptor` 绑定 9640 端口（通过 `CAR_HOST` 进行对端 IP 锁定），使用 `AsyncSocketSender` 异步写入。车机端 `CarSessionCoordinator` 连接 9640，交付 `AudioPlayer`（内部维护 150ms 抖动缓冲，支持 60~200ms 配置），由 `AudioTrack` 自由跑播放。
 - **S4 双向能力协商**：握手双方必须在 `supportedFeatures` 均置位 `FEATURE_AUDIO`（`isAudioNegotiated` 判定）。客户端提供音频开关并持久化在本地配置；车机端根据手机响应动态置灰或启用音频开关。
 - **S23 端到端场景与防假绿**：落地 S23 音频镜像 e2e 场景；车机端 `AudioPlayer` 周期日志埋点静音帧统计（`silenceFrames`/`totalFrames`），杜绝全静音帧被误判为功能正常的假绿情况（issue #84）。

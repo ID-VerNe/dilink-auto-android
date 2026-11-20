@@ -10,7 +10,7 @@ import org.junit.Test
 /**
  * 锁定 S2 采集编码管线的纯逻辑契约（issue #70 / Refs #13）。
  *
- * 被测的是 [AudioSpec] / [AudioPacing] / [ptsUsForFrame] / [silenceFrame] 这几个可以在
+ * 被测的是 [AudioSpec] / [AudioSendPacer] / [ptsUsForFrame] / [silenceFrame] 这几个可以在
  * 纯 JVM 上跑的函数。`AudioPipeline` 本身的 `AudioRecord` + `MediaCodec` 部分依赖
  * Android 框架与真机 REMOTE_SUBMIX，只能在 S3/S6 的真机链路里验证 —— 那部分不属于
  * 本测试类的覆盖范围，不在注释里假装覆盖了。
@@ -20,8 +20,6 @@ import org.junit.Test
  * - R13：补帧节拍必须 21.333 ms / 46.875 fps，且落后时不能一次性灌爆队列。
  */
 class AudioPipelineTest {
-
-    private val second = 1_000_000_000L
 
     // ── AudioSpec ──
 
@@ -69,81 +67,6 @@ class AudioPipelineTest {
         assertThrows<IllegalArgumentException> { AudioSpec(bitrate = 0) }
         assertThrows<IllegalArgumentException> { AudioSpec(bitrate = -1) }
         assertThrows<IllegalArgumentException> { AudioSpec(samplesPerFrame = 0) }
-    }
-
-    // ── AudioPacing ──
-
-    @Test
-    fun firstCallOnlyEstablishesTheBaseline() {
-        val pacing = AudioPacing(frameDurationNanos = second)
-        // 还没收到任何真实数据时不能抢先补帧。
-        assertEquals(0, pacing.silenceFramesDue(0L))
-        assertEquals(1, pacing.silenceFramesDue(second))
-    }
-
-    @Test
-    fun nothingIsDueBeforeTheIntervalElapses() {
-        val pacing = AudioPacing(frameDurationNanos = second)
-        pacing.silenceFramesDue(0L)
-        assertEquals(0, pacing.silenceFramesDue(second - 1))
-        assertEquals(1, pacing.silenceFramesDue(second))
-    }
-
-    @Test
-    fun realDataPushesTheDeadlineForward() {
-        val pacing = AudioPacing(frameDurationNanos = second)
-        pacing.onRealData(5L * second)
-        assertEquals(0, pacing.silenceFramesDue(5L * second))
-        assertEquals(1, pacing.silenceFramesDue(6L * second))
-    }
-
-    @Test
-    fun continuousRealDataNeverTriggersSilence() {
-        // 正常的 46.875 fps 采集：每一拍都有真实数据，补帧一次都不该发生。
-        val spec = AudioSpec.DEFAULT
-        val pacing = AudioPacing(spec.frameDurationNanos)
-        var now = 0L
-        var silence = 0
-        repeat(1000) {
-            now += spec.frameDurationNanos
-            pacing.onRealData(now)
-            silence += pacing.silenceFramesDue(now)
-        }
-        assertEquals(0, silence)
-    }
-
-    @Test
-    fun catchUpIsCappedSoABlockedReadCannotFloodTheEncoder() {
-        // 落后 10 拍（例如 read 阻塞了 213 ms）：只补封顶的 2 帧。
-        val pacing = AudioPacing(frameDurationNanos = second, maxCatchUpFrames = 2)
-        pacing.onRealData(0L)
-        assertEquals(2, pacing.silenceFramesDue(10L * second))
-        // 同一次落后不会被补第二遍：已经对齐到当前时刻之后的第一拍。
-        assertEquals(0, pacing.silenceFramesDue(10L * second))
-    }
-
-    @Test
-    fun catchingUpWithinTheCapEmitsExactlyTheMissedBeats() {
-        val pacing = AudioPacing(frameDurationNanos = second, maxCatchUpFrames = 5)
-        pacing.onRealData(0L)
-        // 到期时刻是 +1s，现在 +3s ⇒ 3 拍到期，未超封顶。
-        assertEquals(3, pacing.silenceFramesDue(3L * second))
-    }
-
-    @Test
-    fun maxCatchUpFramesIsConfigurable() {
-        val pacing = AudioPacing(frameDurationNanos = second, maxCatchUpFrames = 1)
-        pacing.onRealData(0L)
-        assertEquals(1, pacing.silenceFramesDue(7L * second))
-    }
-
-    @Test
-    fun pacingRejectsInvalidConfiguration() {
-        assertThrows<IllegalArgumentException> { AudioPacing(frameDurationNanos = 0L) }
-        assertThrows<IllegalArgumentException> { AudioPacing(frameDurationNanos = -1L) }
-        assertThrows<IllegalArgumentException> {
-            AudioPacing(frameDurationNanos = second, maxCatchUpFrames = 0)
-        }
     }
 
     // ── 静音帧 ──

@@ -31,6 +31,9 @@ import java.util.concurrent.locks.LockSupport
  *   整段 try/catch 兜底。音频是可选能力，采不到就不采。
  * - **不丢真实帧**：与 `VideoFrameSender` 的「直播优先丢 P 帧」不同，音频丢一帧就是
  *   21.333 ms 的空洞，所以这里没有丢帧策略，只有欠载补静音。
+ * - **发送总量由墙钟预算决定（#252 第二代）**：真实帧与补静音帧共用 [AudioSendPacer]
+ *   的累计预算，长期平均恒为 46.875 帧/秒；真实数据早到就排进待发槽等下一拍，
+ *   不会因为「一凑满就发」而超发。
  * - **必须凑满一整帧再喂编码器**：`READ_NON_BLOCKING` 可能部分读，把半帧直接喂给
  *   `MediaCodec` 会让出帧节奏崩掉（#13 探针实测：帧率异常、播放端队列膨胀）。
  * - **CONFIG 必须先于 FRAME**：`INFO_OUTPUT_FORMAT_CHANGED` 时取 `csd-0` 发
@@ -274,81 +277,99 @@ internal class AudioPipeline(
     // ── 主循环 ──
 
     private fun captureLoop(rec: AudioRecord, enc: MediaCodec) {
-        val pacing = AudioPacing(spec.frameDurationNanos)
+        // issue #252（第二代）：所有帧（真实 + 补静音）共用一个墙钟预算，见 AudioSendPacer。
+        val pacer = AudioSendPacer(spec.frameDurationNanos)
         val info = MediaCodec.BufferInfo()
         val chunk = ByteArray(spec.frameBytes)
-        val acc = ByteArray(spec.frameBytes)
         val silence = silenceFrame(spec)
+        // 两块缓冲轮转：acc 用来凑满一整帧，凑满后整块移交给待发槽 ready，
+        // 发出去之后再回收成 spare 给下一帧用 —— 稳态下不会每帧分配 4 KB 垃圾。
+        var acc = ByteArray(spec.frameBytes)
         var accLen = 0
+        var ready: ByteArray? = null
+        var spare: ByteArray? = null
         var frameIndex = 0L
         // issue #252：最近一次 `read()>0` 的时刻，用于判断「半帧是不是还在路上」。
         var lastRealNanos = 0L
 
         try {
             while (shouldContinueCapture(sessionRunning(), running.get(), sink.isFailed())) {
-                val read = rec.read(chunk, 0, chunk.size, AudioRecord.READ_NON_BLOCKING)
                 var didWork = false
 
-                when {
-                    read > 0 -> {
-                        // issue #194：readBytes 是「本窗口实际读到的字节数」——它是
-                        // 「读不到」与「读到 0」的分水岭，按读取时刻归属窗口。
-                        txDiag.onRead(read)
-                        lastRealNanos = clockNanos()
-                        // 凑满一整帧再喂：非阻塞读可能只给半帧。
-                        var offset = 0
-                        while (offset < read) {
-                            val take = minOf(spec.frameBytes - accLen, read - offset)
-                            System.arraycopy(chunk, offset, acc, accLen, take)
-                            accLen += take
-                            offset += take
-                            if (accLen == spec.frameBytes) {
-                                queuePcm(enc, acc, accLen, frameIndex, pacingSilence = false)
-                                frameIndex++
-                                accLen = 0
-                                didWork = true
-                                pacing.onRealData(clockNanos())
+                // issue #252（第二代）：只在待发槽为空时读。读到的帧绝不能跑在发送预算
+                // 前面，否则「读得快、发得多」会把超发从静音帧搬到真实帧上；待发槽里有
+                // 货就把数据留在 AudioRecord 缓冲里，形成天然反压。
+                if (ready == null) {
+                    val read = rec.read(chunk, 0, chunk.size, AudioRecord.READ_NON_BLOCKING)
+                    when {
+                        read > 0 -> {
+                            // issue #194：readBytes 是「本窗口实际读到的字节数」——它是
+                            // 「读不到」与「读到 0」的分水岭，按读取时刻归属窗口。
+                            txDiag.onRead(read)
+                            lastRealNanos = clockNanos()
+                            // 凑满一整帧再喂：非阻塞读可能只给半帧。
+                            // chunk 与一帧等长，所以一次 read 最多凑满一帧，ready 不会被覆盖。
+                            var offset = 0
+                            while (offset < read) {
+                                val take = minOf(spec.frameBytes - accLen, read - offset)
+                                System.arraycopy(chunk, offset, acc, accLen, take)
+                                accLen += take
+                                offset += take
+                                if (accLen == spec.frameBytes) {
+                                    ready = acc
+                                    acc = spare ?: ByteArray(spec.frameBytes)
+                                    spare = null
+                                    accLen = 0
+                                    didWork = true
+                                }
                             }
                         }
-                    }
 
-                    read == 0 -> {
-                        // 无数据（所有 player 消失）：按 21.333 ms 节拍补静音帧（R10）。
-                        // issue #252：半帧还在 acc 里时先不补 —— 先补一帧静音、随后真实
-                        // 采样凑满又发一帧，会让发送侧比 46.875 fps 多出 0.3~0.9 帧/秒。
-                        val now = clockNanos()
-                        if (
-                            shouldDeferSilencePadding(
-                                accLen,
-                                now - lastRealNanos,
-                                spec.frameDurationNanos,
-                                AUDIO_SILENCE_GRACE_FRAMES
-                            )
-                        ) {
-                            // 半帧还在路上，最多等 2 拍（约 42.7 ms）；真实采样会自己凑满，
-                            // 避免多发一帧。
-                        } else {
-                            if (accLen > 0) accLen = 0  // 真静音：丢弃凑不满的残帧
-                            val due = pacing.silenceFramesDue(now)
-                            repeat(due) {
-                                queuePcm(enc, silence, silence.size, frameIndex, pacingSilence = true)
-                                frameIndex++
-                                silenceFrames.incrementAndGet()
-                                didWork = true
-                            }
+                        // 无数据（所有 player 消失）：本轮是否补静音交给下面统一判断。
+                        read == 0 -> Unit
+
+                        else -> {
+                            // ERROR_INVALID_OPERATION / ERROR_BAD_VALUE / ERROR_DEAD_OBJECT
+                            logErr("Audio: record.read returned $read, stopping capture")
+                            return
                         }
                     }
+                }
 
-                    else -> {
-                        // ERROR_INVALID_OPERATION / ERROR_BAD_VALUE / ERROR_DEAD_OBJECT
-                        logErr("Audio: record.read returned $read, stopping capture")
-                        return
+                // issue #252（第二代）：真实帧与补静音帧都必须先拿到预算才放行。
+                // 只给补静音计拍（#253 之前的形态）挡不住「真实帧一到就发 + 静音另补」
+                // 的叠加，长期平均会到 47~48 帧/秒；这里改成累计口径后恒有
+                // 已发帧数 ≤ 墙钟 / 21.333ms + 1。
+                val now = clockNanos()
+                // #253 判据原样保留：半帧还在 acc 里且距上次真实数据不足 2 拍时先不补。
+                val silenceAllowed = ready == null &&
+                    !shouldDeferSilencePadding(
+                        accLen,
+                        now - lastRealNanos,
+                        spec.frameDurationNanos,
+                        AUDIO_SILENCE_GRACE_FRAMES
+                    )
+                if ((ready != null || silenceAllowed) && pacer.tryAcquire(now)) {
+                    val real = ready
+                    if (real != null) {
+                        queuePcm(enc, real, spec.frameBytes, frameIndex, pacingSilence = false)
+                        frameIndex++
+                        spare = real
+                        ready = null
+                    } else {
+                        // 真静音：丢弃凑不满的残帧，补一整帧静音（R10）。
+                        if (accLen > 0) accLen = 0
+                        queuePcm(enc, silence, silence.size, frameIndex, pacingSilence = true)
+                        frameIndex++
+                        silenceFrames.incrementAndGet()
                     }
+                    didWork = true
                 }
 
                 if (drainOutput(enc, info)) didWork = true
 
-                // 一轮什么都没做就别空转烧 CPU：静音期非阻塞读会立刻返回 0。
+                // 一轮什么都没做就别空转烧 CPU：静音期非阻塞读会立刻返回 0，
+                // 真实帧在等档期时也只是多睡几轮 1 ms（预算按绝对时刻算，不会越睡越慢）。
                 if (!didWork) LockSupport.parkNanos(IDLE_SLEEP_NANOS)
             }
             // issue #165：写端判死后主动停采集，现场能直接看到「是谁先停的」。
@@ -365,6 +386,9 @@ internal class AudioPipeline(
 
     /**
      * 把一整帧 PCM 喂给编码器；输入缓冲暂时不可用时计数并丢这一帧。
+     *
+     * 调用方（无论这一帧有没有真的进编码器）都会占用本拍预算并推进 `frameIndex`：
+     * 时间轴按墙钟走，丢帧就是那 21.333 ms 的空洞（issue #252）。
      *
      * [pacingSilence] 为 true 表示这一帧是 `read()==0` 时 pacing 补的静音帧，
      * 用于把诊断里的 `readZeroPad` 与 `realZero` 分开（issue #194）。
