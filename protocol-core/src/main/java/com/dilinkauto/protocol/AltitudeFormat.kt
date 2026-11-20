@@ -110,6 +110,34 @@ object AltitudeFormat {
     }
 
     /**
+     * 用单调时钟计算定位年龄（毫秒，下限 0），issue #221。
+     *
+     * 旧口径 `ageMs = 车机墙钟 − GPS 时间戳` 会随车机时钟漂移而失真：现场 24h 内
+     * 偏差从 ~-1s 漂到 ~-11.1s，负值被 [acceptLocation] 钳 0 后，stale 闸门的实际
+     * 阈值被越冲越宽（#40 追评一要防的「过期缓存冒充实时」重新打开）。
+     *
+     * `location.elapsedRealtimeNanos` 与 `SystemClock.elapsedRealtimeNanos()` 同源
+     * （自 boot 起的单调时钟），差值不受墙钟漂移和用户改系统时间影响（#39），
+     * 也与跳变闸门 [isJumpPlausible] 的时间口径统一。
+     *
+     * @param nowElapsedNanos 当前单调时钟（纳秒）。
+     * @param locationElapsedNanos 定位到达时的单调时钟（纳秒）。
+     * @return 非负毫秒年龄；入参异常（定位时间在未来）时夹到 0，交给
+     *   [acceptLocation] 的「刚好现在」语义处理。
+     */
+    fun monotonicAgeMs(nowElapsedNanos: Long, locationElapsedNanos: Long): Long =
+        ((nowElapsedNanos - locationElapsedNanos) / 1_000_000L).coerceAtLeast(0L)
+
+    /**
+     * 墙钟年龄为负时的偏移量（毫秒，负值），非负时返回 0，issue #221。
+     *
+     * 仅供限频诊断日志「显式记录 clockOffset」使用；年龄判定本身已改用
+     * [monotonicAgeMs]，不再依赖墙钟。
+     */
+    fun clockOffsetMs(nowWallMs: Long, locationTimeMs: Long): Long =
+        if (nowWallMs < locationTimeMs) nowWallMs - locationTimeMs else 0L
+
+    /**
      * 指数滑动平均（EMA）。
      *
      * - `prev == null`（首个样本或失锁后首个恢复样本）：直接返回 [sample]，不做加权，避免从 0 拉起。

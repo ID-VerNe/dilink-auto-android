@@ -49,6 +49,35 @@ internal data class RestoreReport(
     ).joinToString("+").ifEmpty { "无" }
 }
 
+/** `cmd display` 对 `power-reset` 的支持程度（issue #221）。 */
+internal enum class PowerResetCapability { SUPPORTED, UNSUPPORTED, UNKNOWN }
+
+/**
+ * `power-reset` 能力的进程内缓存（issue #221）。
+ *
+ * 现场：该 ROM 的 `cmd display` 没有 `power-reset`，每次断开恢复都盲跑一次、
+ * 白等 3.4–4.2s 才拿到 `Unknown command`。引擎侧 `DisplayPowerController` 早已用
+ * `cmd display help` 探测并缓存；手机端补上同样的能力探测，负结论按**进程**缓存
+ * （[PhoneDisplayRestorer] 会随 Service 重建，实例级缓存不够）。
+ *
+ * `UNKNOWN`（help 拿不到）不写入缓存，下次仍尝试，避免把可用 ROM 误跳过。
+ */
+internal class PowerResetCapabilityCache {
+    @Volatile
+    private var cached: PowerResetCapability? = null
+
+    fun get(): PowerResetCapability? = cached
+
+    fun put(capability: PowerResetCapability) {
+        if (capability != PowerResetCapability.UNKNOWN) cached = capability
+    }
+
+    companion object {
+        /** 生产用进程级实例；单测各自 new 一个，互不污染。 */
+        val processWide = PowerResetCapabilityCache()
+    }
+}
+
 /**
  * 物理屏恢复的逐层执行器（issue #23，从 [PhoneDisplayRestorer] 抽出）。
  *
@@ -69,6 +98,8 @@ internal class DisplayRestoreSequence(
     private val launchActivityFn: () -> Unit,
     private val wakeLockFn: () -> Unit,
     private val log: RestoreLog,
+    /** `power-reset` 能力缓存；生产用进程级实例，单测可注入独立实例（issue #221）。 */
+    private val capabilityCache: PowerResetCapabilityCache = PowerResetCapabilityCache.processWide,
 ) {
     /**
      * @param imeToRestore 已解析出的原输入法（null 表示无需恢复）。
@@ -78,14 +109,31 @@ internal class DisplayRestoreSequence(
         // 2026-10-27 现场（MEIZU 20 Inf）：该 ROM 的 `cmd display` 没有 power-reset
         // 子命令，返回 `Unknown command: power-reset`；旧实现不看返回值，照样打
         // "Physical display restored via Shizuku"。现在按退出码 + 文本判定。
-        val resetOutcome = shell(ShellVerdict.wrap(POWER_RESET_COMMAND))
-        val powerResetOk = ShellVerdict.succeeded(resetOutcome?.stdout, resetOutcome?.stderr)
-        if (resetOutcome == null) {
-            log.w("Shizuku unavailable — relying on framework wake layers only")
-        } else if (powerResetOk) {
-            log.i("Physical display restored via power-reset ($POWER_RESET_COMMAND)")
+        //
+        // issue #221：先按 `cmd display help` 探测能力（进程内缓存），ROM 不支持时
+        // 直接跳过，不再盲跑一次、白等 3.4–4.2s 才拿到 `Unknown command`。
+        val capability = probePowerResetCapability()
+        var powerResetOk = false
+        if (capability == PowerResetCapability.UNSUPPORTED) {
+            log.w("power-reset skipped: cmd display help has no power-reset on this ROM — not waiting (issue #221)")
         } else {
-            log.w("power-reset did not take effect: ${ShellVerdict.detail(resetOutcome.stdout, resetOutcome.stderr)}")
+            val startedAt = System.nanoTime()
+            val resetOutcome = shell(ShellVerdict.wrap(POWER_RESET_COMMAND))
+            val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000
+            powerResetOk = ShellVerdict.succeeded(resetOutcome?.stdout, resetOutcome?.stderr)
+            when {
+                resetOutcome == null -> log.w("Shizuku unavailable — relying on framework wake layers only")
+                powerResetOk -> log.i("Physical display restored via power-reset ($POWER_RESET_COMMAND, ${elapsedMs}ms)")
+                else -> {
+                    val detail = ShellVerdict.detail(resetOutcome.stdout, resetOutcome.stderr)
+                    log.w("power-reset did not take effect after ${elapsedMs}ms: $detail")
+                    // 探针拿不到 help 时（UNKNOWN），运行期这句 `Unknown command` 就是
+                    // 负结论；写进进程缓存，后续会话直接跳过（issue #221）。
+                    if (detail.contains(ShellVerdict.UNKNOWN_COMMAND)) {
+                        capabilityCache.put(PowerResetCapability.UNSUPPORTED)
+                    }
+                }
+            }
         }
 
         // 第 1b 层：IME 恢复（与显示无关，不参与 anyDisplayLayerOk）。
@@ -150,6 +198,35 @@ internal class DisplayRestoreSequence(
             activityLaunched = activityLaunched,
             wakeLockHeld = wakeLockHeld,
         )
+    }
+
+    /**
+     * 探测 `cmd display help` 是否列出 `power-reset`（issue #221），结论按进程缓存。
+     *
+     * 与引擎侧 `DisplayPowerController.powerResetCapability()` 同款语义：
+     * help 拿不到（Shizuku 不可用 / 空输出）返回 [PowerResetCapability.UNKNOWN] 且
+     * **不缓存**，点亮链仍然尝试，避免把可用 ROM 误跳过。
+     */
+    private fun probePowerResetCapability(): PowerResetCapability {
+        capabilityCache.get()?.let { return it }
+        val startedAt = System.nanoTime()
+        val helpOutcome = shell("cmd display help")
+        val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000
+        val help = listOfNotNull(helpOutcome?.stdout, helpOutcome?.stderr)
+            .joinToString("\n")
+            .trim()
+        val capability = when {
+            help.isEmpty() -> PowerResetCapability.UNKNOWN
+            help.contains("power-reset") -> PowerResetCapability.SUPPORTED
+            else -> PowerResetCapability.UNSUPPORTED
+        }
+        capabilityCache.put(capability)
+        if (helpOutcome == null) {
+            log.d("power-reset capability unknown: Shizuku unavailable — still attempting")
+        } else {
+            log.d("power-reset capability=${capability.name.lowercase()} (cmd display help, ${elapsedMs}ms)")
+        }
+        return capability
     }
 
     companion object {
