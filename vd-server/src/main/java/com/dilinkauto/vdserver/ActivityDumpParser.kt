@@ -248,6 +248,30 @@ internal object ActivityDumpParser {
     fun homeTaskId(displayZeroSection: String): Int? =
         taskBodies(displayZeroSection).firstOrNull { TASK_TYPE_HOME_RE.containsMatchIn(it.second) }?.first
 
+    /** Task 头里的 `rootTaskId=<id>`（子任务的根任务引用）。 */
+    private val TASK_ROOT_ID_RE = Regex("""\brootTaskId=(\d+)""")
+
+    /**
+     * 段内所有「home 系」任务 id：`type=home` 的任务本身，以及 `rootTaskId` 指向它们的子任务。
+     *
+     * issue #258 实测（`main @ 963b7835`）：VD 段里 home 根任务 #945 下面还挂着 launcher 子任务
+     * #946（`* Task{…#946 type=home I=com.meizu.flyme.launcher/… rootTaskId=945 …}`），
+     * 只跳过 [homeTaskId] 认出的第一条会让 #946 被 `am display move-stack` 搬，报
+     * `moveRootTaskToTaskDisplayArea: Unknown rootTaskId=946` —— 子任务不是 root task，
+     * 本来就搬不动。这里把整棵 home 树一起排除，搬迁列表只留真正的普通 task。
+     */
+    fun homeTaskIds(section: String): Set<Int> {
+        val bodies = taskBodies(section)
+        val roots = bodies.filter { TASK_TYPE_HOME_RE.containsMatchIn(it.second) }.map { it.first }.toSet()
+        if (roots.isEmpty()) return emptySet()
+        val out = roots.toMutableSet()
+        for ((id, body) in bodies) {
+            val root = TASK_ROOT_ID_RE.find(body)?.groupValues?.get(1)?.toIntOrNull() ?: continue
+            if (root in roots) out += id
+        }
+        return out
+    }
+
     /**
      * launcher 包兜底：从 `Display #0` 段里找 `A=<launcherPackage>/` 的任务 id。
      *
