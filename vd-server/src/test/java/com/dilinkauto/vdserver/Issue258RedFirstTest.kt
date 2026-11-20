@@ -153,6 +153,52 @@ Display #45 (activities from top to bottom):
     }
 
     /**
+     * 实机 09:29（`main @ 6870be52`）第三层：VD 段里混进客户端自己的 ActivityRecord 引用 `t948`
+     * （该 task 实际在 Display #0），`move-stack 948 0` 报
+     * `Trying to move rootTask=…#948 … to its current taskDisplayArea`。搬迁列表必须只认 task 头。
+     */
+    private val dumpWithForeignActivityRef = """
+Display #0 (activities from top to bottom):
+  * Task{phy3 #948 type=standard A=10343:com.dilinkauto.client U=0 visible=true visibleRequested=true mode=fullscreen}
+Display #47 (activities from top to bottom):
+  * Task{a44 #929 type=standard A=10265:com.autonavi.minimap U=0 visible=true visibleRequested=true mode=fullscreen}
+    Resumed: ActivityRecord{332e8fc u0 com.dilinkauto.client/.MainActivity t948}
+""".trimIndent()
+
+    @Test
+    fun `task referenced only by activity record is not moved`() {
+        val r = Rig(dumpWithForeignActivityRef)
+        r.router.moveAllTasksToDisplay(47, 0)
+
+        val moved = r.execs.filter { it.startsWith("am display move-stack") }
+        assertEquals(
+            "只出现在 Resumed ActivityRecord 里的 t948 不属于 VD，不得发 move-stack：$moved",
+            listOf("am display move-stack 929 0"),
+            moved
+        )
+    }
+
+    /**
+     * 同一 task 同时出现在两个 display 段（异步搬迁后的滞后快照）时，以首个出现的归属为准；
+     * 已经在目标屏上的不得再搬。
+     */
+    private val dumpWithStaleDuplicate = """
+Display #0 (activities from top to bottom):
+  * Task{x99 #929 type=standard A=10265:com.autonavi.minimap U=0 visible=true visibleRequested=true mode=fullscreen}
+Display #47 (activities from top to bottom):
+  * Task{x99 #929 type=standard A=10265:com.autonavi.minimap U=0 visible=true visibleRequested=true mode=fullscreen}
+""".trimIndent()
+
+    @Test
+    fun `task already on target display is not moved again`() {
+        val r = Rig(dumpWithStaleDuplicate)
+        r.router.moveAllTasksToDisplay(47, 0)
+
+        val moved = r.execs.filter { it.startsWith("am display move-stack") }
+        assertTrue("已经在 display 0 上的 #929 不得再搬（否则报 current taskDisplayArea）：$moved", moved.isEmpty())
+    }
+
+    /**
      * issue #258 现场的第二条错误：`Unknown rootTaskId=941` 是旧快照里的残留，
      * 但正常路径下普通任务仍应被搬一次并 resize —— 证明跳过逻辑不会把普通任务一起吃掉。
      */
