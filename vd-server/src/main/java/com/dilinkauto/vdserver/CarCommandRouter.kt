@@ -568,9 +568,14 @@ internal class CarCommandRouter(
             // issue #258 实测补充：home 根任务下面还挂着 `type=home` 的子任务（#946 rootTaskId=945），
             // 子任务不是 root task，`move-stack` 会报 `Unknown rootTaskId`。整棵 home 树一起跳过。
             val homeIds = section?.let { ActivityDumpParser.homeTaskIds(it) }.orEmpty()
-            val allTasks = section?.let { ActivityDumpParser.taskIdsInSection(it) }.orEmpty()
-            val tasks = allTasks.filterNot { it in homeIds || it in skipTasks }
-            val skipped = allTasks.filter { it !in tasks }
+            // 只认行首 `* Task{` 且不带 rootTaskId 的 root task：ActivityRecord 引用（t<id>）可能属于别的屏。
+            val candidates = section?.let { ActivityDumpParser.rootTaskIds(it) }.orEmpty()
+            // 已经在目标屏上的任务不再搬（`am display move-stack` 是异步的，快照可能滞后）。
+            val displayOf = ActivityDumpParser.taskDisplays(dump)
+            val tasks = candidates.filterNot {
+                it in homeIds || it in skipTasks || displayOf[it] == toDisplay
+            }
+            val skipped = candidates.filter { it !in tasks }
             if (skipped.isNotEmpty()) {
                 PipeLog.log(
                     "[teardown-move-all] skipping tasks=${skipped.joinToString(prefix = "[", postfix = "]")} " +

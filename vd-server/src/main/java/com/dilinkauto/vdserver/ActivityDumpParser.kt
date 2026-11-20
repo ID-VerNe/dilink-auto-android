@@ -273,6 +273,35 @@ internal object ActivityDumpParser {
     }
 
     /**
+     * 段内可当作 `am display move-stack` 目标的 **root task**：行首 `* Task{` 头，且自身不带 `rootTaskId=`。
+     *
+     * 与 [taskIdsInSection] 的区别：后者为取证把 `ActivityRecord{… t<id>}` 引用也算进来（issue #77 的口径），
+     * 但那些 id 可能属于别的 display 的任务。issue #258 实测（2026-11-20 09:29）：VD 段里混进了
+     * 客户端自己的 `t948`，`move-stack 948 0` 报
+     * `Trying to move rootTask=Task{…#948 …} to its current taskDisplayArea` —— 它本来就在 display 0。
+     */
+    fun rootTaskIds(section: String): List<Int> =
+        taskBodies(section)
+            .filterNot { TASK_ROOT_ID_RE.containsMatchIn(it.second) }
+            .map { it.first }
+
+    /**
+     * 整份 dump 里每个 root task 所在的 display：`taskId -> displayId`。
+     *
+     * 收尾搬迁前用它剔除「已经在目标 display 上」的任务，避免异步搬迁尚未生效时把同一 task
+     * 再搬一次（`current taskDisplayArea` 报错）。
+     */
+    fun taskDisplays(dump: String): Map<Int, Int> {
+        val out = HashMap<Int, Int>()
+        for (header in DISPLAY_HEADER_RE.findAll(dump)) {
+            val displayId = header.groupValues[1].toIntOrNull() ?: continue
+            val section = displaySection(dump, displayId) ?: continue
+            for (taskId in rootTaskIds(section)) out.putIfAbsent(taskId, displayId)
+        }
+        return out
+    }
+
+    /**
      * launcher 包兜底：从 `Display #0` 段里找 `A=<launcherPackage>/` 的任务 id。
      *
      * 部分 ROM 的 home 任务头不带 `type=home`，只剩 `A=` 亲和性字段可认。
