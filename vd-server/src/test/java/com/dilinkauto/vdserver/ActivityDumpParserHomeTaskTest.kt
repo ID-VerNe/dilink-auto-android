@@ -2,6 +2,7 @@ package com.dilinkauto.vdserver
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -88,6 +89,25 @@ class ActivityDumpParserHomeTaskTest {
         val section = zeroSection(dumpWithoutHome)
         assertNull(ActivityDumpParser.homeTaskId(section))
         assertNull(ActivityDumpParser.taskIdByPackage(section, "com.android.launcher3"))
+    }
+
+    /**
+     * issue #256：桌面 JVM 接受裸 `}`，但 ART 的 ICU 正则会在**类初始化**时抛
+     * `PatternSyntaxException: Syntax error in regexp pattern near index 35`，
+     * 导致整个 `ActivityDumpParser` 不可用（`homeTask:` 取证、display 段切分全挂）。
+     * 闭合花括号必须写成 `\}`；这条断言在 JVM 上也会红，防止再次漏转义。
+     */
+    @Test
+    fun `task body pattern must escape closing brace for ART ICU`() {
+        assertTrue(
+            "TASK_BODY_PATTERN 的闭合花括号必须转义：${ActivityDumpParser.TASK_BODY_PATTERN}",
+            ActivityDumpParser.TASK_BODY_PATTERN.endsWith("""\}""")
+        )
+        // 转义后仍要能匹配实机 Task 头（避免为了过 ICU 把模式改废）
+        assertTrue(
+            "转义后的模式必须仍能匹配 Display #0 段里的 Task 头",
+            Regex(ActivityDumpParser.TASK_BODY_PATTERN).containsMatchIn(zeroSection(dumpWithHomeTask))
+        )
     }
 
     @Test

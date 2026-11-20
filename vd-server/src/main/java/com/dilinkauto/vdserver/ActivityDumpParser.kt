@@ -208,7 +208,11 @@ internal object ActivityDumpParser {
      * 与 [TASK_HEADER_RE] 同口径：只认行首 `* Task{`，不认
      * `rootOfTask=… task=Task{…}` 这类引用行。
      */
-    private val TASK_BODY_RE = Regex("""(?m)^[ \t]*\*[ \t]*Task\{([^}]*)}""")
+    internal const val TASK_BODY_PATTERN = """(?m)^[ \t]*\*[ \t]*Task\{([^}]*)\}"""
+
+    // issue #256：闭合花括号必须写成 `\}`。桌面 JVM 接受裸 `}`，但 ART 的
+    // ICU 正则会抛 PatternSyntaxException，导致整个 object 初始化失败。
+    private val TASK_BODY_RE = Regex(TASK_BODY_PATTERN)
 
     /** Task 头花括号内的 `#<id>`。 */
     private val TASK_BODY_ID_RE = Regex("""#(\d+)""")
