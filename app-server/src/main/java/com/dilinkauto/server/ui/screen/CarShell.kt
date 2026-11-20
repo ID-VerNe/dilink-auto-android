@@ -51,6 +51,16 @@ private const val TAG = "CarShell"
 fun CarShell(service: CarConnectionService) {
     var currentScreen by remember { mutableStateOf(Screen.HOME) }
 
+    // issue #267：HOME/APP 切换是 SurfaceView 可见性与 surface 创建的直接输入。
+    // 记下切页时刻，用于回答「surfaceCreated 是否只发生在进入 APP 页之后」。
+    LaunchedEffect(currentScreen) {
+        if (com.dilinkauto.server.BuildConfig.DEBUG) {
+            service.carLogSend(
+                "[Trace] t=${android.os.SystemClock.uptimeMillis()} [Screen] now=${currentScreen.name}"
+            )
+        }
+    }
+
     val state by service.state.collectAsState()
     val appList by service.appList.collectAsState()
     val statusMessage by service.statusMessage.collectAsState()

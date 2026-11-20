@@ -8,8 +8,14 @@ import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.os.Bundle
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import android.os.SystemClock
+import android.util.Log
+import android.view.Choreographer
 import android.view.View
+import android.view.ViewTreeObserver
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -38,6 +44,92 @@ class MainActivity : ComponentActivity() {
     internal var pendingUsbDevice: android.hardware.usb.UsbDevice? = null
     private var serviceBound by mutableStateOf(false)
 
+    // ─── issue #267：首帧 / 主线程归因插桩（仅 DEBUG 生效，不改任何行为） ───
+    // 目的：把「Activity 重建 → 窗口首帧 → SurfaceView surfaceCreated」拆成可排序的时间线。
+    // 现有日志只能看到 `waiting for surface Ns`，无法区分「主窗口没画出来」与
+    // 「HOME 页本来就不需要 surface」。统一格式 `[Trace] t=<uptime> ...`，跨来源可对齐。
+
+    private val traceStartMs = SystemClock.uptimeMillis()
+    private val traceHandler by lazy { Handler(Looper.getMainLooper()) }
+    private val pendingTrace = ArrayDeque<String>()
+    private var firstDrawSeen = false
+    private var firstFrameSeen = false
+
+    @Volatile private var watchdogRunning = false
+    @Volatile private var lastMainTickMs = 0L
+    private var watchdogThread: Thread? = null
+
+    private fun trace(tag: String, msg: String) {
+        if (!BuildConfig.DEBUG) return
+        val now = SystemClock.uptimeMillis()
+        val line = "[Trace] t=$now (boot+${now - traceStartMs}ms) $tag $msg"
+        Log.i("DiLinkTrace", line)
+        val svc = carService
+        if (svc != null) {
+            svc.carLogSend(line)
+        } else {
+            // 服务尚未绑定：先缓存，onServiceConnected 后按原顺序 flush。
+            synchronized(pendingTrace) { pendingTrace.addLast(line) }
+        }
+    }
+
+    private fun flushPendingTrace() {
+        val svc = carService ?: return
+        synchronized(pendingTrace) {
+            while (pendingTrace.isNotEmpty()) svc.carLogSend(pendingTrace.removeFirst())
+        }
+    }
+
+    private val heartbeat = object : Runnable {
+        override fun run() {
+            if (!watchdogRunning) return
+            lastMainTickMs = SystemClock.uptimeMillis()
+            traceHandler.postDelayed(this, 200L)
+        }
+    }
+
+    /**
+     * 主线程 watchdog：主线程每 200ms 刷新 `lastMainTickMs`，后台线程检测间隔。
+     * 超过 1s 就打 `[MainThread] blocked Xms` + 当时真实的主线程栈（从后台线程抓，
+     * 不是恢复后的残栈）。这是 #267「90 秒等待是否被主线程阻塞」的判据。
+     */
+    private fun startWatchdog() {
+        if (!BuildConfig.DEBUG || watchdogRunning) return
+        watchdogRunning = true
+        lastMainTickMs = SystemClock.uptimeMillis()
+        traceHandler.postDelayed(heartbeat, 200L)
+        watchdogThread = Thread {
+            var lastReportMs = 0L
+            while (watchdogRunning) {
+                try {
+                    Thread.sleep(200L)
+                } catch (_: InterruptedException) {
+                    break
+                }
+                val now = SystemClock.uptimeMillis()
+                val gap = now - lastMainTickMs
+                if (gap > 1_000L && now - lastReportMs > 3_000L) {
+                    lastReportMs = now
+                    val stack = Looper.getMainLooper().thread.stackTrace
+                        .take(12)
+                        .joinToString(" <- ") { "${it.className}.${it.methodName}:${it.lineNumber}" }
+                    trace("[MainThread]", "blocked ${gap}ms stack=$stack")
+                }
+            }
+        }.apply {
+            name = "FirstFrameWatchdog"
+            isDaemon = true
+            start()
+        }
+    }
+
+    private fun stopWatchdog() {
+        watchdogRunning = false
+        traceHandler.removeCallbacks(heartbeat)
+        watchdogThread?.interrupt()
+        watchdogThread = null
+    }
+
     /**
      * issue #40：运行时定位授权。`ACCESS_FINE_LOCATION` 已在 manifest 声明，但 app-server
      * 此前 0 处运行时申请 → 海拔无法获取。首次进入主屏时一次性请求；拒绝则海拔显示 `—`，
@@ -59,6 +151,8 @@ class MainActivity : ComponentActivity() {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
             carService = (binder as CarConnectionService.LocalBinder).service
             serviceBound = true
+            trace("[FirstFrame]", "serviceBound=true")
+            flushPendingTrace()
             pendingUsbDevice?.let { device ->
                 carService?.onUsbDeviceFromActivity(device)
                 pendingUsbDevice = null
@@ -68,11 +162,13 @@ class MainActivity : ComponentActivity() {
         override fun onServiceDisconnected(name: ComponentName?) {
             carService = null
             serviceBound = false
+            trace("[FirstFrame]", "serviceBound=false")
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        trace("[FirstFrame]", "onCreate")
 
         val serviceIntent = Intent(this, CarConnectionService::class.java).apply {
             action = CarConnectionService.ACTION_START
@@ -100,6 +196,27 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+        trace("[FirstFrame]", "setContent returned")
+
+        // issue #267：decorView 首次 draw 与 Choreographer 首个帧回调是「窗口是否真的出帧」
+        // 的硬判据：starting window 只有在真实窗口 drawn 之后才会被 WMS 替换。
+        window.decorView.viewTreeObserver.addOnDrawListener(
+            object : ViewTreeObserver.OnDrawListener {
+                override fun onDraw() {
+                    if (!firstDrawSeen) {
+                        firstDrawSeen = true
+                        trace("[FirstFrame]", "decor first draw")
+                    }
+                }
+            }
+        )
+        Choreographer.getInstance().postFrameCallback {
+            if (!firstFrameSeen) {
+                firstFrameSeen = true
+                trace("[FirstFrame]", "choreographer first frame")
+            }
+        }
+        startWatchdog()
     }
 
     override fun onNewIntent(intent: Intent?) {
@@ -127,6 +244,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
+        trace("[FirstFrame]", "windowFocus=$hasFocus")
         if (hasFocus) enableImmersiveMode()
     }
 
@@ -153,6 +271,8 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        trace("[FirstFrame]", "onDestroy")
+        stopWatchdog()
         if (serviceBound) {
             unbindService(serviceConnection)
             serviceBound = false
