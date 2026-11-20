@@ -948,8 +948,13 @@ class PipelineServer(
         //    只搬顶层会让 quickSwitch 历史任务带着 VD 的 density/bounds 留在物理屏。
         //    issue #199 A：批量迁移 —— 两层合起来只读 2 次 dumpsys、只等 1 个沉降窗口。
         TeardownStepPlan(TeardownStep.APPS_MOVED, TEARDOWN_BUDGET_APPS_MOVED_MS) {
-            carCommands.moveTopApp(displayId, 0, probe = false)
-            carCommands.moveAllTasksToDisplay(displayId, 0) { remaining ->
+            val movedByTopApp = carCommands.moveTopApp(displayId, 0, probe = false)
+            // issue #220：move-stack 是异步入队的，紧接着的 dumpsys 仍是迁移前快照；
+            // 把 moveTopApp 实际搬走的 task 交给批量路径跳过，避免同一 task 搬两次。
+            // issue #258：批量路径自己跳过 home root task（物理屏已重建新的 home root task）。
+            carCommands.moveAllTasksToDisplay(
+                displayId, 0, skipTasks = setOfNotNull(movedByTopApp)
+            ) { remaining ->
                 teardownPendingTasks = remaining.joinToString(prefix = "[", postfix = "]")
             }
         },

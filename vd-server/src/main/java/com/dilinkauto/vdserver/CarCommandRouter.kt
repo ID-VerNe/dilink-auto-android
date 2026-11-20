@@ -455,9 +455,14 @@ internal class CarCommandRouter(
      * @param probe issue #199：是否紧跟着回读一次目标 task 的配置（`[teardown-move]` 日志）。
      *   teardown 里由 [moveAllTasksToDisplay] 用**一次** dumpsys 统一回读，这里传 `false`
      *   可省掉 300ms 沉降 + 一次整份 dumpsys（现场 `apps-moved` 单步 3079ms 的主因之一）。
+     * @return issue #220：实际发出 `move-stack` 的 task id；没搬（无顶层 / 跳过自家 /
+     *   launcher / systemui）或命令失败时为 null。teardown 把它交给
+     *   [moveAllTasksToDisplay] 的 `skipTasks` 去重 —— `am display move-stack` 是异步入队的，
+     *   紧接着读到的 dumpsys 仍是迁移前快照，不去重就会把同一个 task 再搬一次并必报
+     *   `Trying to move rootTask … to its current taskDisplayArea`。
      */
-    fun moveTopApp(fromDisplay: Int, toDisplay: Int, probe: Boolean = true) {
-        if (fromDisplay < 0 || toDisplay < 0) return
+    fun moveTopApp(fromDisplay: Int, toDisplay: Int, probe: Boolean = true): Int? {
+        if (fromDisplay < 0 || toDisplay < 0) return null
         // `am display move-stack` was added in API 29 (Android 10). On API 26-28 the
         // subcommand is absent — am prints a usage error and exits non-zero. Skip the
         // whole feature on older levels so the foreground app is left in place rather
@@ -465,14 +470,14 @@ internal class CarCommandRouter(
         val api = sdkInt()
         if (api < 29) {
             PipeLog.log("moveTopApp: skipping, am display move-stack requires API 29 (current $api)")
-            return
+            return null
         }
         try {
-            val dump = execOut("dumpsys activity activities 2>/dev/null") ?: return
+            val dump = execOut("dumpsys activity activities 2>/dev/null") ?: return null
             val sec = ActivityDumpParser.displaySection(dump, fromDisplay)
             if (sec == null) {
                 PipeLog.log("moveTopApp: no 'Display #$fromDisplay' section found, skip")
-                return
+                return null
             }
             val match = ActivityDumpParser.TOP_ACTIVITY_RE.find(sec)
             val topComponent = match?.groupValues?.get(1)
@@ -495,12 +500,14 @@ internal class CarCommandRouter(
                 // 命令、顺序与返回值都不变（move-stack 仍是 fire-and-forget）。
                 // issue #199：teardown 批量路径传 probe=false，由 moveAllTasksToDisplay 统一回读。
                 if (probe) logMovedTaskConfig(taskId?.toIntOrNull(), toDisplay)
+                return taskId?.toIntOrNull()
             } else {
                 PipeLog.log("moveTopApp: nothing to move (top=${topComponent ?: "<none>"}, task=${taskId ?: "-"}, self=$isSelf)")
             }
         } catch (e: Exception) {
             PipeLog.err("Failed to move app: ${e.message}")
         }
+        return null
     }
 
     /**
@@ -520,6 +527,9 @@ internal class CarCommandRouter(
      *
      * @param budgetMs 本步软预算：到点立刻放弃剩余动作，并通过 [onPending] 交回还没搬回
      *   的 task id（日志里能直接看到卡在哪一段、还剩哪些 task）。
+     * @param skipTasks issue #220：调用方已经搬走的 task id（teardown 传入 [moveTopApp] 的
+     *   返回值）。`am display move-stack` 异步入队，紧接着读到的 dumpsys 仍是迁移前快照，
+     *   不去重就会把同一个 task 再搬一次并必报 "current taskDisplayArea"。
      * @param onPending 剩余 task id 回调（跑完时回调空列表）。
      * @return true 表示全部 task 都走了 move + resize + 回读。
      */
@@ -527,6 +537,7 @@ internal class CarCommandRouter(
         fromDisplay: Int,
         toDisplay: Int,
         budgetMs: Long = TEARDOWN_PROBE_DELAY_MS * 4,
+        skipTasks: Set<Int> = emptySet(),
         onPending: (List<Int>) -> Unit = {}
     ): Boolean {
         if (fromDisplay < 0 || toDisplay < 0 || fromDisplay == toDisplay) return true
@@ -548,9 +559,24 @@ internal class CarCommandRouter(
         }
         try {
             val dump = execOut("dumpsys activity activities 2>/dev/null") ?: return false
-            val tasks = ActivityDumpParser.tasksInDisplay(dump, fromDisplay)
+            // issue #258：home root task 归系统所有 —— VD 里这条（#17 从物理屏迁入）不能
+            // 当普通 task 搬回去。物理屏的 home root task 已由系统重建（现场 #942），
+            // 再搬 #940 必然触发
+            // `addRootTaskReferenceIfNeeded: root home task=…#942 already exist … rootTask=…#940`，
+            // 白占 apps-moved 步预算，还会把收尾拖到被 watchdog halt。
+            val section = ActivityDumpParser.displaySection(dump, fromDisplay)
+            val homeTaskId = section?.let { ActivityDumpParser.homeTaskId(it) }
+            val allTasks = section?.let { ActivityDumpParser.taskIdsInSection(it) }.orEmpty()
+            val tasks = allTasks.filterNot { it == homeTaskId || it in skipTasks }
+            val skipped = allTasks.filter { it !in tasks }
+            if (skipped.isNotEmpty()) {
+                PipeLog.log(
+                    "[teardown-move-all] skipping tasks=${skipped.joinToString(prefix = "[", postfix = "]")} " +
+                        "home=${homeTaskId ?: "-"} alreadyMoved=${skipTasks.joinToString(prefix = "[", postfix = "]")}"
+                )
+            }
             if (tasks.isEmpty()) {
-                PipeLog.log("[teardown-move-all] display=$fromDisplay has no tasks, nothing to move")
+                PipeLog.log("[teardown-move-all] display=$fromDisplay has no movable tasks, nothing to move")
                 onPending(emptyList())
                 return true
             }
