@@ -220,8 +220,10 @@ class CarSessionAutoReconnectGuardTest {
             serviceSrc.contains("autoReconnectAllowed = { trigger -> sessionCoordinator.allowReconnect(trigger) }"),
         )
         assertEquals(
-            "CarAdbTracker 的每个 ADB 自动入口都必须过闸门（扫描 / TCP track / TCP 重拨 / attach / 权限回调）",
-            5,
+            // issue #269 新增第 6 个入口：reset 后的主动重拨（scheduleTcpAdbReconnect）。
+            "CarAdbTracker 的每个 ADB 自动入口都必须过闸门" +
+                "（USB 扫描 / TCP track 快路径 / TCP 重拨 / USB attach / 权限回调 / reset 重拨）",
+            6,
             Regex("""autoReconnectAllowed\(ConnectTrigger\.AUTO_ADB_READY\)""").findAll(trackerSrc).count(),
         )
     }
