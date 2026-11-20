@@ -61,6 +61,17 @@ fun MirrorContent(service: CarConnectionService, visible: Boolean = true) {
             touchState.onAppScreen = visible
             // 只切 SurfaceView 的可见性；容器与透明触摸代理始终在场，触摸链路不断。
             container.surfaceView.visibility = if (visible) View.VISIBLE else View.INVISIBLE
+            // issue #267：visibility 变化是 surface 创建/销毁的直接触发器，去重后打一条，
+            // 用于和 `[Screen]` 切页、`[FirstFrame] decor first draw` 对齐。
+            if (container.lastReportedVisible != visible) {
+                container.lastReportedVisible = visible
+                if (com.dilinkauto.server.BuildConfig.DEBUG) {
+                    service.carLogSend(
+                        "[Trace] t=${android.os.SystemClock.uptimeMillis()} " +
+                            "[SurfaceView] visibility=${if (visible) "VISIBLE" else "INVISIBLE"}"
+                    )
+                }
+            }
             // issue #229：把壳层页面状态上报给 service —— 首连等 Surface 期间
             // `waiting for surface` 日志才能带上「镜像页是否可见」这一真正归因
             //（用户停在 HOME 磁贴页没点应用，SurfaceView INVISIBLE → surface 永不创建）。
@@ -87,6 +98,9 @@ private class MirrorContainer(
     val surfaceView: SurfaceView,
     touchProxy: View
 ) : FrameLayout(context) {
+
+    /** issue #267：上一次上报给日志的可见性，避免每帧重复打。 */
+    var lastReportedVisible: Boolean? = null
 
     init {
         addView(
@@ -145,6 +159,23 @@ private fun createMirrorContainer(
     touchState: MirrorTouchState
 ): MirrorContainer {
     val surfaceView = SurfaceView(context).apply {
+        // issue #267：View attach 与 surface 回调的主线程即时时间。现有
+        // `[MirrorScreen] SurfaceView surface created` 在 decoderExecutor 上异步打，
+        // 不能代表回调真正发生的时刻；这里补一条同步打点，用于和
+        // `[Screen] HOME->APP`、`[FirstFrame] decor first draw` 排序。
+        addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+            override fun onViewAttachedToWindow(v: View) {
+                if (com.dilinkauto.server.BuildConfig.DEBUG) {
+                    service.carLogSend("[Trace] t=${android.os.SystemClock.uptimeMillis()} [SurfaceView] attached")
+                }
+            }
+
+            override fun onViewDetachedFromWindow(v: View) {
+                if (com.dilinkauto.server.BuildConfig.DEBUG) {
+                    service.carLogSend("[Trace] t=${android.os.SystemClock.uptimeMillis()} [SurfaceView] detached")
+                }
+            }
+        })
         holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(holder: SurfaceHolder) {
                 // Deliberately thin (audit S-M3): the callback fires on the
@@ -152,6 +183,9 @@ private fun createMirrorContainer(
                 // enough to be visible as jank on the 8x A53 head unit.
                 // The service hands the Surface to its single decoder
                 // thread, which owns start/switchSurface.
+                if (com.dilinkauto.server.BuildConfig.DEBUG) {
+                    service.carLogSend("[Trace] t=${android.os.SystemClock.uptimeMillis()} [SurfaceView] surfaceCreated")
+                }
                 service.onMirrorSurfaceCreated(holder.surface)
             }
 
@@ -172,6 +206,9 @@ private fun createMirrorContainer(
                 // drop the keyframe cache and require a fresh IDR. Just gate
                 // the render flag off; surfaceCreated will re-attach a new
                 // surface via setOutputSurface.
+                if (com.dilinkauto.server.BuildConfig.DEBUG) {
+                    service.carLogSend("[Trace] t=${android.os.SystemClock.uptimeMillis()} [SurfaceView] surfaceDestroyed")
+                }
                 service.onMirrorSurfaceDestroyed()
             }
         })
