@@ -90,7 +90,7 @@ Display #43 (activities from top to bottom):
         )
         assertTrue(
             "跳过的 home task 必须落日志，现场可直接对账：$log",
-            log.contains("skipping tasks=") && log.contains("home=940")
+            log.contains("skipping tasks=") && log.contains("home=[940]")
         )
         assertTrue(
             "home task 不得被 resize 到物理屏",
@@ -114,6 +114,41 @@ Display #43 (activities from top to bottom):
             "同一个 task 不得被搬第二次（否则必报 current taskDisplayArea）：$moved",
             listOf("am display move-stack 929 0", "am display move-stack 941 0"),
             moved
+        )
+    }
+
+    /**
+     * 实机 09:18（`main @ 963b7835`）新增形态：home 根任务 #945 下面挂着 launcher 子任务 #946
+     * （`rootTaskId=945`、同样带 `type=home`）。只跳过 `homeTaskId` 认出的第一条会让 #946 被搬，
+     * 报 `moveRootTaskToTaskDisplayArea: Unknown rootTaskId=946`。
+     */
+    private val dumpWithHomeChildTask = """
+Display #0 (activities from top to bottom):
+  * Task{phy2 #944 type=home U=0 visible=true visibleRequested=true mode=fullscreen}
+Display #45 (activities from top to bottom):
+  * Task{5ad70f2 #945 type=home U=0 visible=true visibleRequested=true mode=fullscreen translucent=false sz=1}
+    * ActivityRecord{ee1 u0 com.meizu.flyme.launcher/com.android.launcher3.uioverrides.QuickstepLauncher t945}
+  * Task{d4410b2 #946 type=home I=com.meizu.flyme.launcher/com.android.launcher3.uioverrides.QuickstepLauncher U=0 rootTaskId=945 visible=true visibleRequested=true mode=fullscreen}
+""".trimIndent()
+
+    @Test
+    fun `home child task under home root task is not moved`() {
+        val r = Rig(dumpWithHomeChildTask)
+        val log = captureStdout { r.router.moveAllTasksToDisplay(45, 0) }
+
+        val moved = r.execs.filter { it.startsWith("am display move-stack") }
+        assertTrue(
+            "#946 是 #945 的子任务（rootTaskId=945），不是 root task，move-stack 必报 " +
+                "Unknown rootTaskId：不得发命令；实际=$moved",
+            moved.isEmpty()
+        )
+        assertTrue(
+            "子任务也不得被 resize",
+            r.execOuts.none { it.contains("am task resize 946 ") }
+        )
+        assertTrue(
+            "整棵 home 树都要出现在跳过日志里：$log",
+            log.contains("home=[945, 946]") || log.contains("home=[946, 945]")
         )
     }
 
