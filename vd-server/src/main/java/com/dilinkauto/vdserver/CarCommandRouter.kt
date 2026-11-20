@@ -293,7 +293,9 @@ internal class CarCommandRouter(
             val after = ActivityDumpParser.displaySection(execOut("dumpsys activity activities 2>/dev/null") ?: "", id)
             val ok = after != null && after.contains("Task{")
             PipeLog.log("homeTask: moved task=$homeId display=$id ok=$ok")
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
+            // issue #256：类初始化/链接错误是 Error 而不是 Exception，必须一起兜住，
+            // 否则会把建屏线程带死（本方法契约是「失败只记日志」）。
             PipeLog.err("homeTask: ${e.message}")
         }
     }
