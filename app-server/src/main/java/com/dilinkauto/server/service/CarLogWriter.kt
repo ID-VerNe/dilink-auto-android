@@ -34,6 +34,15 @@ internal class CarLogWriter(
 ) {
     private data class LogEntry(val msg: String, val level: String, val enqueuedMs: Long)
 
+    /**
+     * issue #266：离线缓冲条目必须带产生时刻的单调时钟。
+     *
+     * 旧实现只存已格式化的 `String`，入队时刻丢失，flush 时无法回答「这行压了多久」，
+     * 现场 `grep 'CarLog backlog'` 对断线积压永远 0 行。`line` 里已含出队时刻的墙钟
+     * 时间戳，flush 时**不重新格式化**，否则时间戳会被改写成重连时刻。
+     */
+    private data class BufferedLine(val line: String, val enqueuedMs: Long)
+
     /** Off-thread log queue: callers do a non-blocking offer; bounded at 1024. */
     private val logQueue = AsyncLogQueue<LogEntry>(1024)
     private val writerJob = Job()
@@ -41,7 +50,7 @@ internal class CarLogWriter(
 
     // Buffer used when the control connection is down. ConcurrentLinkedQueue for
     // multi-thread puts (touch-sender, video decoder, USB receiver all log).
-    private val buffer = ConcurrentLinkedQueue<String>()
+    private val buffer = ConcurrentLinkedQueue<BufferedLine>()
     // O(1) counter for the cap check — ConcurrentLinkedQueue.size() is O(n) and
     // was called per log line on the disconnected path.
     private val bufferCount = AtomicInteger(0)
@@ -80,16 +89,16 @@ internal class CarLogWriter(
      * to the teardown that just finished and are worth shipping.
      */
     fun beginSession(vararg keepMarkers: String) {
-        val kept = ArrayList<String>()
+        val kept = ArrayList<BufferedLine>()
         while (true) {
-            val line = buffer.poll() ?: break
+            val buffered = buffer.poll() ?: break
             bufferCount.decrementAndGet()
-            if (keepMarkers.any { line.contains(it) }) kept.add(line)
+            if (keepMarkers.any { buffered.line.contains(it) }) kept.add(buffered)
         }
-        for (line in kept) {
+        for (buffered in kept) {
             // 重放路径同样受 [MAX_BUFFER_LINES] 约束，避免多次「连不上→重连」把保留行堆上去。
             if (bufferCount.get() >= MAX_BUFFER_LINES) break
-            buffer.add(line)
+            buffer.add(buffered)
             bufferCount.incrementAndGet()
         }
     }
@@ -103,24 +112,19 @@ internal class CarLogWriter(
                 logQueue.consume { entry ->
                     try {
                         // issue #206：先量「产生 → 写出」的延迟，再真正写出。
-                        reportBacklogIfAny(entry)
+                        reportBacklogIfAny(entry.enqueuedMs)
                         val ts = LocalTime.now().format(tsFormatter)
                         val line = com.dilinkauto.protocol.LogLine.bracketed(ts, entry.level, entry.msg)
                         val conn = controlConnectionProvider()
                         if (conn != null && conn.isConnected) {
                             // Flush any buffered messages first.
-                            while (true) {
-                                val buffered = buffer.poll() ?: break
-                                bufferCount.decrementAndGet()
-                                try { conn.sendData(DataMsg.CAR_LOG, buffered.toByteArray(Charsets.UTF_8)) }
-                                catch (_: Exception) { break }
-                            }
+                            flushBuffer(conn)
                             try { conn.sendData(DataMsg.CAR_LOG, line.toByteArray(Charsets.UTF_8)) }
                             catch (_: Exception) {}
                         } else {
                             // Buffer for later — cap at [MAX_BUFFER_LINES].
                             if (bufferCount.get() < MAX_BUFFER_LINES) {
-                                buffer.add(line)
+                                buffer.add(BufferedLine(line, entry.enqueuedMs))
                                 bufferCount.incrementAndGet()
                             }
                         }
@@ -169,14 +173,34 @@ internal class CarLogWriter(
      * 再走队列会把自己排到积压后面，等它送达时早已不是当时的现场。
      * 不因此丢弃任何行 —— teardown / cleanup 关键行照旧全量写出。
      */
-    private fun reportBacklogIfAny(entry: LogEntry) {
+    private fun reportBacklogIfAny(enqueuedMs: Long) {
+        val conn = controlConnectionProvider() ?: return
+        if (!conn.isConnected) return
+        emitBacklog(conn, nowMs() - enqueuedMs)
+    }
+
+    /**
+     * issue #266：重连后逐行 flush 离线缓冲，并把「离线滞留」也计入积压统计。
+     *
+     * 每行用**产生时刻**的单调时钟算延迟（含在线排队 + 离线滞留），命中阈值时
+     * 先发告警行、再发该行本体；告警行自己受 5s 限流，不会把 1 万行 flush 刷爆。
+     */
+    private fun flushBuffer(conn: Connection) {
+        while (true) {
+            val buffered = buffer.poll() ?: break
+            bufferCount.decrementAndGet()
+            emitBacklog(conn, nowMs() - buffered.enqueuedMs)
+            try { conn.sendData(DataMsg.CAR_LOG, buffered.line.toByteArray(Charsets.UTF_8)) }
+            catch (_: Exception) { break }
+        }
+    }
+
+    private fun emitBacklog(conn: Connection, delayMs: Long) {
         val line = backlogReporter.onDrained(
-            delayMs = nowMs() - entry.enqueuedMs,
+            delayMs = delayMs,
             backlog = logQueue.pendingCount + bufferCount.get(),
         ) ?: return
         Log.w(tag, line)
-        val conn = controlConnectionProvider() ?: return
-        if (!conn.isConnected) return
         try {
             val ts = LocalTime.now().format(tsFormatter)
             conn.sendData(
