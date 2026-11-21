@@ -1,6 +1,7 @@
 package com.dilinkauto.server.ui.screen
 
 import android.util.Log
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -21,6 +22,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
@@ -28,6 +30,8 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import com.dilinkauto.server.R
+import com.dilinkauto.server.service.AcControlState
+import com.dilinkauto.server.service.AcChipLabel
 import com.dilinkauto.server.service.CarConnectionService
 import com.dilinkauto.server.ui.InfoBar
 import com.dilinkauto.server.ui.InfoChip
@@ -68,8 +72,33 @@ fun CarShell(service: CarConnectionService) {
     val timeState by service.timeState.collectAsState()
     val weatherState by service.weatherState.collectAsState()
     val phoneStatusState by service.phoneStatusState.collectAsState()
+    val acState by service.acState.collectAsState()
     val isConnected = state == CarConnectionService.State.STREAMING ||
             state == CarConnectionService.State.CONNECTED
+
+    // issue #278-PA：空调弹出设置块的开合。开合由用户点击驱动（本地状态即可，
+    // 数据源是 service.acState），数据灌入在打开前先全量读一次（见 acChip 的 onClick）。
+    var showAcSheet by remember { mutableStateOf(false) }
+
+    // issue #278-PA：空调 chip 文本本地化（「关」/Off；温度文本与语言无关）。
+    val acOffText = stringResource(R.string.ac_chip_off)
+    val acChipOnClick: () -> Unit = {
+        Log.i(TAG, "ac chip clicked -> open AcControlSheet")
+        service.refreshAcState()
+        showAcSheet = true
+    }
+
+    // issue #278-PA：写失败绝不静默（UX 表 S4）——provider 已回滚显示，这里补用户可见反馈。
+    val localContext = LocalContext.current
+    LaunchedEffect(Unit) {
+        service.acWriteFailed.collect {
+            Toast.makeText(
+                localContext,
+                localContext.getString(R.string.ac_write_failed),
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+    }
 
     // issue #39 / #40 / #41 / #151：常驻信息 chip：时间 + 天气 + 手机电量。
     // 天气：state 为 null（从未成功）时也加 chip 渲染 `—`，让用户知道此栏存在；
@@ -79,7 +108,7 @@ fun CarShell(service: CarConnectionService) {
     // issue #54：其余三项常驻 —— 横屏进左侧导航栏，竖屏进顶部信息条，不再随 Screen 切换隐藏。
     // issue #151：电量同样常驻，未收到/已断开渲染 `—`；文本由 protocol-core 的
     // BatteryFormat 生成（`86%` / `86%+`），受左栏 76dp 定宽约束，不加图标。
-    val infoChips = remember(timeState, weatherState, phoneStatusState) {
+    val infoChips = remember(timeState, weatherState, phoneStatusState, acState, acOffText) {
         buildList {
             timeState?.let { add(InfoChip(it.text)) }
             // 天气：把 WeatherUiState 转成 chip 文本；null（从未成功）渲染 `—`。
@@ -103,6 +132,19 @@ fun CarShell(service: CarConnectionService) {
                     )
                 )
             )
+            // issue #278-PA：空调 chip（可点）：常显当前设定温度（`24°`），空调关显「关」；
+            // 无有效数据（读链路失败/未初始化）整个不渲染——不留死入口（UX 表 S2）。
+            // 点击：先全量读一次灌 state（车况助手 initAutoData 模式），再开弹出块。
+            when (val acLabel = AcControlState.chipLabel(acState)) {
+                is AcChipLabel.Temp -> add(
+                    InfoChip(
+                        AcControlState.formatChipTemp(acLabel.value),
+                        onClick = acChipOnClick
+                    )
+                )
+                AcChipLabel.Off -> add(InfoChip(acOffText, onClick = acChipOnClick))
+                AcChipLabel.Hidden -> {}
+            }
         }
     }
 
@@ -130,6 +172,15 @@ fun CarShell(service: CarConnectionService) {
     val appInfoData by service.appInfoData.collectAsState()
     appInfoData?.let { info ->
         AppInfoDialog(info = info, onDismiss = { service.clearAppInfoData() })
+    }
+
+    // issue #278-PA：空调就地设置块（盖在镜像画面上层，点块外关闭）。
+    if (showAcSheet) {
+        AcControlSheet(
+            state = acState,
+            onStep = { service.adjustAcTemperature(it) },
+            onDismiss = { showAcSheet = false },
+        )
     }
 
     if (showStreamingMode) {

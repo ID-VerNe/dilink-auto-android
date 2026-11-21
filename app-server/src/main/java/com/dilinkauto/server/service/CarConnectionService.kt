@@ -160,6 +160,19 @@ class CarConnectionService : Service() {
     val phoneStatusState: StateFlow<PhoneStatusUiState?> = _phoneStatusState.asStateFlow()
     private var phoneStatusProvider: PhoneStatusProvider? = null
 
+    /**
+     * 空调（issue #278-PA）：由 [AcSettingsProvider] 持有。反射读 BYDAutoAcDevice，
+     * 读不到有效温度保持 null → chip 不渲染（不留死入口）。写失败经 [acWriteFailed]
+     * 通知 UI toast（写失败绝不静默）。
+     */
+    private val _acState = MutableStateFlow<AcUiState?>(null)
+    val acState: StateFlow<AcUiState?> = _acState.asStateFlow()
+    private var acSettingsProvider: AcSettingsProvider? = null
+
+    private val _acWriteFailed = MutableSharedFlow<Unit>(extraBufferCapacity = 8)
+    /** issue #278-PA：写失败事件（已回滚显示）——CarShell collect 后 toast「设置未生效，请重试」。 */
+    val acWriteFailed: SharedFlow<Unit> = _acWriteFailed.asSharedFlow()
+
     enum class State { IDLE, CONNECTING, CONNECTED, STREAMING }
 
     inner class LocalBinder : Binder() {
@@ -189,6 +202,12 @@ class CarConnectionService : Service() {
     fun clearAppInfoData() = appListReceiver.clearAppInfoData()
     fun onLocationPermissionGranted() = altitudeProvider?.onPermissionResult()
     fun disconnectFromPhone() = sessionCoordinator.disconnectFromPhone()
+
+    // issue #278-PA：空调弹出块的数据出入口（IO 由 provider 内部调度）。
+    /** 弹出块打开前全量读一次初始状态（车况助手 initAutoData 模式）。 */
+    fun refreshAcState() = acSettingsProvider?.refresh()
+    /** 温度步进 ±1：乐观更新 → 反射写 → 回读确认，失败回滚 + [acWriteFailed] 事件。 */
+    fun adjustAcTemperature(delta: Int) = acSettingsProvider?.adjustTemperature(delta)
 
     /** 用户点「重新连接」（issue #183）：从断开态重新发起发现/连接。 */
     fun reconnect() = sessionCoordinator.reconnect()
@@ -293,6 +312,20 @@ class CarConnectionService : Service() {
             phoneStatusProvider = it
             it.start()
         }
+        // issue #278-PA：空调温度档。反射链路（wrapper + setAcTemperature + 写后回读
+        // 确认）见 AcSettingsProvider 头注释；关键行日志走 sendUnconditional 保证
+        // release 实车也能 grep 到（写链路首次上实车，#200/#194 先例）。
+        AcSettingsProvider(
+            scope = scope,
+            context = this,
+            sink = _acState,
+            onWriteFailed = { _acWriteFailed.tryEmit(Unit) },
+            log = { carLogSend("[AcSettings] $it") },
+            logUnconditional = { logWriter.sendUnconditional("[AcSettings] $it") },
+        ).let {
+            acSettingsProvider = it
+            it.start()
+        }
     }
 
     private fun registerNetworkCallback() {
@@ -372,6 +405,8 @@ class CarConnectionService : Service() {
         weatherProvider = null
         phoneStatusProvider?.stop()
         phoneStatusProvider = null
+        acSettingsProvider?.stop()
+        acSettingsProvider = null
         networkCallback?.let {
             try { (getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager).unregisterNetworkCallback(it) }
             catch (_: Exception) {}
