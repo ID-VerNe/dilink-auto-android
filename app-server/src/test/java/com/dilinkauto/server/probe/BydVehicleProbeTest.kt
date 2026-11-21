@@ -279,6 +279,59 @@ class BydVehicleProbeTest {
         assertTrue("抽象类必须报 skip：$lines", lines.any { it.contains("listener=skip(abstract-class)") })
     }
 
+    // ------------------------------------------------------------------
+    // #188 v3（#277/#280）：非 public get 姿势 + tick 同拍组合读 + energyMode
+    // ------------------------------------------------------------------
+
+    /**
+     * P0 回归：`AbsBYDAutoDevice.get(int,int)` 不是 public（#277 §3），
+     * `getMethod` 姿势会整片 `NoSuchMethodException`（上一轮实车三条 raw lane 同报的根因）。
+     *
+     * [FakeAbsDevice.get] 已改成 protected 复现真实可见性 —— 本用例就是那条教训的门禁：
+     * 姿势一旦倒退，`raw[1012]` / tick / energy raw 行全部变 `err:NoSuchMethodException`。
+     */
+    @Test
+    fun `non-public get is reachable through declared method lookup`() {
+        val lines = runProbe(classLookup = { name -> deviceClassFor(name, HybridDevice::class.java) })
+
+        assertTrue(
+            "protected get 必须照样读到（err:NoSuchMethodException 即姿势倒退）：$lines",
+            lines.any { it.contains("raw[1012]=ok:") },
+        )
+        assertTrue(
+            "lane 自证也不能因姿势挂掉：$lines",
+            lines.any { it.contains("raw[ctl]=ok:") },
+        )
+    }
+
+    /**
+     * #280 的生产模型预演：typed 发动机、GB FID、前/后电机在**同一拍**里取值，
+     * 车上按 `tick[i]` 一行读出四个值的组合，直接对着车况助手同刻显示判读。
+     */
+    @Test
+    fun `tick lines carry engine gb and motor readings together`() {
+        val lines = runProbe(classLookup = { name -> deviceClassFor(name, HybridDevice::class.java) })
+
+        assertEquals("tick 必须与转速同 6 拍：$lines", 6, lines.count { Regex("""tick\[\d+] eng=""").containsMatchIn(it) })
+        assertTrue(
+            "四路读数必须同拍成行：$lines",
+            lines.any { it.contains("tick[0] eng=ok:1111 gb=ok:1100 mF=ok:3881 mR=ok:0") },
+        )
+    }
+
+    /**
+     * #280 EV 门控的三条 lane：typed `getEnergyMode()` + raw 双 FID 对照
+     * （`ENERGY_MODE_INSTRUMENT` / `_50`），模式值 3 = HEV（门控主态）。
+     */
+    @Test
+    fun `energy mode lanes are emitted for ev gating`() {
+        val lines = runProbe(classLookup = { name -> deviceClassFor(name, HybridDevice::class.java) })
+
+        assertTrue("typed energyMode 必须输出：$lines", lines.any { it.contains("energy mode=ok:3") })
+        assertTrue("raw[1006,mode] 必须输出：$lines", lines.any { it.contains("raw[1006,mode]=ok:3") })
+        assertTrue("raw[1006,mode50] 必须输出：$lines", lines.any { it.contains("raw[1006,mode50]=ok:3") })
+    }
+
     /** 全哨兵 + wrapper 保留 + 真实 context 被 SecurityException 拒绝 → 服务端拒绝。 */
     @Test
     fun `sentinel readings with denied real context conclude server permission`() {
@@ -669,6 +722,7 @@ internal class FakeDevice {
     fun getElecPercentageValue(): Double = 86.0
     fun getCurrentSpeed(): Double = 55.0
     fun getTemprature(area: Int): Int = 22
+    fun getEnergyMode(): Int = 3
 
     companion object {
         @JvmStatic
@@ -772,6 +826,39 @@ internal class RealDeniedDevice(private val mContext: android.content.Context) {
 internal abstract class AbstractEngineListener
 
 /**
+ * #188 v3 的混动工况假设备（#277 §7 / #280）：模拟实车「HEV 原地踩油门」——
+ * typed 发动机 1111（#195 实车真值）、GB FID 1100（GB 优先 lane）、前电机 3881
+ * （#277：车况助手同工况显示前电机 3881）、后电机 0、energyMode=3（HEV）。
+ *
+ * `get` 保持 protected（与真实 SDK 一致，见 [FakeAbsDevice]）——探针必须走
+ * `getDeclaredMethod` + `setAccessible` 才读得到，`getMethod` 姿势一旦倒退，
+ * tick/raw/energy 的 raw 行全部变 `err:NoSuchMethodException`，本假设备让它在单测里先红。
+ */
+internal class HybridDevice : FakeAbsDevice() {
+    fun getEngineSpeed(): Int = 1111
+    fun getEnginePower(): Int = -5
+    fun getEngineCoolantLevel(): Int = 0
+    fun getOilLevel(): Int = 12
+    fun getEngineSpeedWarningValue(): Int = 1
+    fun getElecPercentageValue(): Double = 38.0
+    fun getCurrentSpeed(): Double = 0.0
+    fun getTemprature(area: Int): Int = 27
+    fun getEnergyMode(): Int = 3
+
+    override fun get(device: Int, event: Int): Int = when {
+        device == 1012 && event == 0x10D00008 -> 1100
+        device == 1012 && event == 0x44100008 -> 3881
+        device == 1012 && event == 0x25100008 -> 0
+        else -> super.get(device, event)
+    }
+
+    companion object {
+        @JvmStatic
+        fun getInstance(context: android.content.Context): HybridDevice = HybridDevice()
+    }
+}
+
+/**
  * 模拟真实接口 `android.hardware.IBYDAutoListener`（3 个方法）。
  *
  * 必须是 `interface`：`java.lang.reflect.Proxy` 只能代理接口，而
@@ -821,14 +908,21 @@ internal class FakeEventValue(
  * 模拟 `android.hardware.bydauto.AbsBYDAutoDevice` 的公开面。
  *
  * 必须与真实 SDK 同构（`AbsBYDAutoDevice.java:72-105`）：`registerListener` 有**两个**
- * 重载（带/不带 `int[] featureIDs`）、`get(int,int)` 也在这个基类上。探针用
- * `getMethod` 反射这两个重载，假类漏掉一个就会 `NoSuchMethodException`，
- * 而那条日志会伪装成「实车上不支持订阅」。
+ * 重载（带/不带 `int[] featureIDs`）、`get(int,int)` 也在这个基类上。
+ *
+ * `get` 必须是 **protected**：真实 SDK 的 `get(int,int)` 不是 public（#277 §3：车况助手
+ * 反射走 `getDeclaredMethod` + `setAccessible`），之前假类写成 `open`（public）掩盖了
+ * `getMethod` 的姿势缺陷 —— 上一轮实车 `raw[1012]=err:NoSuchMethodException` 的单测
+ * 假阳面就在这里。
  */
 internal abstract class FakeAbsDevice {
-    /** `AbsBYDAutoDevice.get(device, event)`：AC 主温给 26（lane 自证），其余哨兵。 */
-    open fun get(device: Int, event: Int): Int = when {
+    /**
+     * `AbsBYDAutoDevice.get(device, event)`：AC 主温给 26（lane 自证），其余哨兵。
+     * energyMode（1006）给 3（HEV，#280 的门控主态）。
+     */
+    protected open fun get(device: Int, event: Int): Int = when {
         device == 1000 && event == 0x40400028 -> 26
+        device == 1006 && (event == 0x34200024 || event == 0x34200028) -> 3
         else -> 8191
     }
 
@@ -859,7 +953,7 @@ internal class SubscribingDevice : FakeAbsDevice() {
     fun getCurrentSpeed(): Double = 0.0
     fun getTemprature(area: Int): Int = 26
 
-    /** 正确 dev 才给真实转速，复现「订阅之后 raw lane 才有值」。 */
+    /** 正确 dev 才给真实转速，复现「订阅之后 raw lane 才有值」。可见性随基类（protected）。 */
     override fun get(device: Int, event: Int): Int = when {
         device == 1012 && event == 0x14400012 -> 1650
         else -> super.get(device, event)

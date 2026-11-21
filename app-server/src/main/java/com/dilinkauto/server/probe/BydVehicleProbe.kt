@@ -42,6 +42,15 @@ import kotlin.math.roundToInt
  *    很可能只是同一个错误的复制。本轮用 `AbsBYDAutoDevice.get(dev, fid)` 直接读 1012 / 1003，
  *    并用 AC 主温（`dev=1000`, 已知 26）自证这条反射链能读到非哨兵值。
  *
+ * #188 v3（第四轮，#277/#280 的验证项）：
+ * 1. **修 raw lane 的反射姿势**：`get(int,int)` 在 AbsBYDAutoDevice 上不是 public，
+ *    `getMethod` 必然 `NoSuchMethodException`（上一轮三条 raw lane 同报的根因，#277 §3
+ *    车况助手走 `getDeclaredMethod` + `setAccessible`）；
+ * 2. **tick 同拍组合读**：typed 发动机 + GB FID + 前后电机 raw 逐拍同拍输出，预演 #280
+ *    「EV 门控与转速同 tick 原子读」的生产模型；
+ * 3. **energyMode 三条 lane**：typed `getEnergyMode()` + `raw[1006]` 双 FID，#280 EV 门控
+ *    （`1=EV / 2=FORCE_EV` 隐藏发动机 chip）的数据源验证。
+ *
  * 输出约定：一行一个 `[BydProbe] key=value`，经 `CarLogWriter` 以 `CAR_LOG` 帧回传手机，
  * 手机端落进 `client.log`。得到结论后本类连同调用点一起删除（见 issue #188 的清理条件）。
  *
@@ -95,6 +104,10 @@ internal class BydVehicleProbe(
         // 每个 probe 返回 false 表示会话已结束（断线或超时）；断线不写 `verdict`/`done`，
         // 超时则写 `verdict` + `done` 并注明 deadline，避免把「没跑完」误读成「读不到」。
         if (!probeEngine(evidence)) {
+            finishAfterStop(evidence)
+            return
+        }
+        if (!probeEnergy()) {
             finishAfterStop(evidence)
             return
         }
@@ -172,6 +185,14 @@ internal class BydVehicleProbe(
             if (abortedAt("engine speed[$i]")) return false
             val raw = callInt(device, "getEngineSpeed")
             emit("engine speed[$i]=$raw")
+            // #188 v3（#277/#280）：同拍组合读 —— typed 与 GB FID / 前后电机 raw 在同一拍
+            // 取值，对应 #280「EV 门控与转速同 tick 原子读」的生产模型。这些行只记数据，
+            // 不进任何 verdict 判定；GB 对照 339738642 typed、282066952 GB（#277 §4 GB 优先）。
+            emit(
+                "tick[$i] eng=$raw gb=${rawGetInt(device, DEV_ENGINE, FID_ENGINE_SPEED_GB)} " +
+                    "mF=${rawGetInt(device, DEV_ENGINE, FID_MOTOR_FRONT)} " +
+                    "mR=${rawGetInt(device, DEV_ENGINE, FID_MOTOR_REAR)}",
+            )
             // 只用第一拍参与判定，避免 6 个重复样本掩盖其它 getter 的差异。
             if (i == 0) evidence.readings += parseOkInt(raw)
             if (i != speedSamples - 1) sleepMs(SAMPLE_INTERVAL_MS)
@@ -457,12 +478,18 @@ internal class BydVehicleProbe(
     /**
      * 直接调 `AbsBYDAutoDevice.get(dev, fid)`，绕开 typed getter 首行的客户端权限检查。
      * 返回 `ok:<int>` / `err:<异常>`，与其它 lane 的格式保持一致。
+     *
+     * #277 §3：`get(int,int)` 在 AbsBYDAutoDevice 上**不是 public**（车况助手 `b2.c#W` 走
+     * `getDeclaredMethod` + `setAccessible`），`getMethod` 只找 public 方法 —— 上一轮
+     * `raw[1012]/raw[1003]/raw[ctl]` 三条 lane 同报 `NoSuchMethodException:get [int, int]`
+     * 的根因就是这里，不是权限、也不是车上没数据。
      */
     private fun rawGetInt(device: Any?, dev: Int, fid: Int): String {
         if (device == null) return "skip(no-instance)"
         val base = classLookup(ABS_DEVICE) ?: return "skip(no-class)"
         return runCatching {
-            val m = base.getMethod("get", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+            val m = base.getDeclaredMethod("get", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+            m.isAccessible = true
             "ok:${m.invoke(device, dev, fid)}"
         }.getOrElse { "err:${describe(it)}" }
     }
@@ -485,6 +512,25 @@ internal class BydVehicleProbe(
                 "sub-after=${sub.afterSubscribe} sub-all-after=${sub.afterSubscribeAll} " +
                 "cb=${sub.callbackValues.size}/${evidence.callbackTotal.get()}",
         )
+    }
+
+    /**
+     * #280：EV 门控数据源。`getEnergyMode()` typed + `raw[1006]` 双 FID 并列 ——
+     * typed 走 wrapper（客户端权限检查被放行），raw 是同一值的非封装通道对照。
+     *
+     * 模式语义（`BYDAutoEnergyDevice.java:20-25`）：`0=STOP / 1=EV / 2=FORCE_EV / 3=HEV /
+     * 4=FUEL / 5=KEEP`。#280 的门控口径：`1 或 2` 才隐藏发动机 chip，读不到时保守显示
+     * （与车况助手 `DataHolder` 初值 HEV 同方向）。
+     *
+     * `ENERGY_MODE_SET = 734003254 (0x2bc00036)` 是**写**通道，本探针绝不触碰。
+     */
+    private fun probeEnergy(): Boolean {
+        if (abortedAt("energy")) return false
+        val device = obtainDevice(ENERGY_DEVICE, "energy") ?: return true
+        emit("energy mode=${callInt(device, "getEnergyMode")}")
+        emit("raw[1006,mode]=${rawGetInt(device, DEV_ENERGY, FID_ENERGY_MODE_INSTRUMENT)}")
+        emit("raw[1006,mode50]=${rawGetInt(device, DEV_ENERGY, FID_ENERGY_MODE_INSTRUMENT_50)}")
+        return true
     }
 
     /** 对照组：TripLogger 在这条路径上读到过真实值（SOC 86.0），用来区分「全挂」还是「只有 engine 不行」。 */
@@ -691,6 +737,7 @@ internal class BydVehicleProbe(
         private const val STATISTIC_DEVICE = "android.hardware.bydauto.statistic.BYDAutoStatisticDevice"
         private const val SPEED_DEVICE = "android.hardware.bydauto.speed.BYDAutoSpeedDevice"
         private const val AC_DEVICE = "android.hardware.bydauto.ac.BYDAutoAcDevice"
+        private const val ENERGY_DEVICE = "android.hardware.bydauto.energy.BYDAutoEnergyDevice"
 
         // ---- #188 v2（第三轮）：原始 FID 读取 + 订阅对照 ----
         /** `AbsBYDAutoDevice.get(int, int)` 所在的基类；typed getter 的权限检查就在它上一层。 */
@@ -704,8 +751,28 @@ internal class BydVehicleProbe(
         private const val DEV_ENGINE_LEGACY = 1003
         private const val DEV_AC = 1000
 
+        /** `BYDAutoConstants.BYDAUTO_DEVICE_ENERGY`；energyMode 的设备号（#280）。 */
+        private const val DEV_ENERGY = 1006
+
         /** `BYDAutoFeatureIds.ENGINE_SPEED`。 */
         private const val FID_ENGINE_SPEED = 0x14400012
+
+        // ---- #188 v3（#277/#280）：GB FID + 前后电机 + energyMode ----
+
+        /** `BYDAutoFeatureIds.ENGINE_SPEED_GB = 282066952`；#277 §4：GB 优先于非 GB。 */
+        private const val FID_ENGINE_SPEED_GB = 0x10D00008
+
+        /** 前电机转速 `1141899272`；#277 §7：`==1` 归零哨兵、负数 abs 后展示。 */
+        private const val FID_MOTOR_FRONT = 0x44100008
+
+        /** 后电机转速 `621805576`；本单只采集，不做 chip（无需求）。 */
+        private const val FID_MOTOR_REAR = 0x25100008
+
+        /** `BYDAutoFeatureIds.ENERGY_MODE_INSTRUMENT = 874512420`（#280 EV 门控）。 */
+        private const val FID_ENERGY_MODE_INSTRUMENT = 0x34200024
+
+        /** `BYDAutoFeatureIds.ENERGY_MODE_INSTRUMENT_50 = 874512424`。 */
+        private const val FID_ENERGY_MODE_INSTRUMENT_50 = 0x34200028
 
         /** `BYDAutoFeatureIds.AC_TEMP_MAIN`，实车 dump 读到 26，作为 lane 自证。 */
         private const val FID_AC_TEMP_MAIN = 0x40400028
