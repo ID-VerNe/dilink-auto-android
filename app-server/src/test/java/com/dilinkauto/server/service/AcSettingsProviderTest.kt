@@ -140,13 +140,37 @@ class AcSettingsProviderTest {
         runBlocking { h.provider.adjustTemperatureNow(+1) }
 
         val fake = AcSettingsProviderTestHarness.device!!
-        assertEquals("写调用必须记参数齐全的 value=23：${fake.written}", listOf(23), fake.written)
+        assertEquals(
+            "写调用必须逐参对齐 #277 §2 矩阵：area=1主驾, value=23, source=0 UI_KEY, unit=1℃",
+            listOf(FakeAcDevice.AcWriteCall(type = 1, value = 23, source = 0, unit = 1)),
+            fake.writes,
+        )
         assertEquals(23, h.sink.value?.temperatureC)
         assertEquals("写成功必须确认 0 次 UI 失败提示", 0, h.writeFailedCount)
         assertTrue(
             "写成功确认行（实车验收 grep 目标）：${h.unconditionalLogs}",
             h.unconditionalLogs.any { it.contains("write t=23 ret=0 confirmed=23") },
         )
+    }
+
+    @Test
+    fun `rapid repeated steps serialize through the write mutex`() {
+        val h = newHarness()
+        h.provider.readAllNow(reason = "test") // t=22
+
+        // 连点三次 +（writeMutex 串行）：必须依次 22→23→24→25，而不是乱序/丢失/重复。
+        runBlocking {
+            repeat(3) { h.provider.adjustTemperatureNow(+1) }
+        }
+
+        val fake = AcSettingsProviderTestHarness.device!!
+        assertEquals(
+            "三次连点 = 依次三条写，每条基于前一条的结果：${fake.writes}",
+            listOf(23, 24, 25).map { FakeAcDevice.AcWriteCall(1, it, 0, 1) },
+            fake.writes,
+        )
+        assertEquals(25, h.sink.value?.temperatureC)
+        assertEquals(0, h.writeFailedCount)
     }
 
     @Test
@@ -230,8 +254,8 @@ class AcSettingsProviderTest {
 
         val fake = AcSettingsProviderTestHarness.device!!
         assertTrue(
-            "上界再 + 不得发写（UI 置灰兜底，越界写会得到 INVALID_VALUE）：${fake.written}",
-            fake.written.isEmpty(),
+            "上界再 + 不得发写（UI 置灰兜底，越界写会得到 INVALID_VALUE）：${fake.writes}",
+            fake.writes.isEmpty(),
         )
         assertEquals("state 也不得被乐观更新污染", 33, h.sink.value?.temperatureC)
     }
@@ -243,7 +267,7 @@ class AcSettingsProviderTest {
 
         assertNull(h.sink.value)
         assertEquals(0, h.writeFailedCount)
-        assertTrue("无数据时无写调用", AcSettingsProviderTestHarness.device?.written.isNullOrEmpty())
+        assertTrue("无数据时无写调用", AcSettingsProviderTestHarness.device?.writes.isNullOrEmpty())
     }
 
     @Test
@@ -280,7 +304,7 @@ internal class FakeAcDevice {
     var readBackPin = false
     private var temperatureBeforeWrite = 22
 
-    val written = mutableListOf<Int>()
+    val writes = mutableListOf<AcWriteCall>()
     var contextIsWrapper: Boolean = false
 
     fun getTemprature(area: Int): Int {
@@ -294,13 +318,16 @@ internal class FakeAcDevice {
     fun getAcStartState(): Int = startState
 
     fun setAcTemperature(type: Int, value: Int, tempSource: Int, unit: Int): Int {
-        // 参数语义让 provider 侧断言（本类只记录 value；area/source/unit 由签名照抄保证）。
-        written += value
+        // 逐参记录（area/source/unit 是 #277 §2 矩阵契约的一部分，测试直接断言四元组）。
+        writes += AcWriteCall(type = type, value = value, source = tempSource, unit = unit)
         temperatureBeforeWrite = temperature
         setTempThrows?.let { throw it }
         if (setTempResult == 0) temperature = value
         return setTempResult
     }
+
+    /** 一次 `setAcTemperature` 调用的完整参数（与 SDK 签名一一对应）。 */
+    data class AcWriteCall(val type: Int, val value: Int, val source: Int, val unit: Int)
 
     companion object {
         @JvmStatic
