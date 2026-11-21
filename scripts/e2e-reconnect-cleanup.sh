@@ -156,9 +156,11 @@ else
     tail -25 "$RUN/build.log"
   fi
   if [ "$BRC" -eq 0 ]; then
-    T=$(find . -path "*/build/test-results/*" -name '*.xml' -exec grep -hoE 'tests="[0-9]+"' {} + 2>/dev/null | grep -oE '[0-9]+' | awk '{s+=$1} END {printf "%d", s+0}')
-    FF=$(find . -path "*/build/test-results/*" -name '*.xml' -exec grep -hoE 'failures="[0-9]+"' {} + 2>/dev/null | grep -oE '[0-9]+' | awk '{s+=$1} END {printf "%d", s+0}')
-    EE=$(find . -path "*/build/test-results/*" -name '*.xml' -exec grep -hoE 'errors="[0-9]+"' {} + 2>/dev/null | grep -oE '[0-9]+' | awk '{s+=$1} END {printf "%d", s+0}')
+    # issue #149：同 e2e-dual-device.sh —— 剪掉 .tmp/，否则历史 worktree / 基线目录的
+    # test-results 会被 find 计入，构建门误报 failures=4（find 不读 .gitignore）。
+    T=$(find . -path ./.tmp -prune -o -path "*/build/test-results/*" -name '*.xml' -exec grep -hoE 'tests="[0-9]+"' {} + 2>/dev/null | grep -oE '[0-9]+' | awk '{s+=$1} END {printf "%d", s+0}')
+    FF=$(find . -path ./.tmp -prune -o -path "*/build/test-results/*" -name '*.xml' -exec grep -hoE 'failures="[0-9]+"' {} + 2>/dev/null | grep -oE '[0-9]+' | awk '{s+=$1} END {printf "%d", s+0}')
+    EE=$(find . -path ./.tmp -prune -o -path "*/build/test-results/*" -name '*.xml' -exec grep -hoE 'errors="[0-9]+"' {} + 2>/dev/null | grep -oE '[0-9]+' | awk '{s+=$1} END {printf "%d", s+0}')
     if [ "${T:-0}" -gt 0 ] && [ "${FF:-1}" -eq 0 ] && [ "${EE:-1}" -eq 0 ]; then
       ok "单测 $T 个，0 失败 0 错误"
     else

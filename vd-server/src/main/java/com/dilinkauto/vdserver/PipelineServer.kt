@@ -124,7 +124,15 @@ class PipelineServer(
     /** PR #208 评审：最近一次被放弃（超时/失败/跳过）的收尾步骤，供后续步骤做保护。 */
     @Volatile private var abandonedStep: TeardownStep? = null
     private var displayId = -1
-    private var virtualDisplay: VirtualDisplay? = null
+    /**
+     * issue #202-A / #254：VD 租约 —— 建屏（预建）、复用判定、归还与「就绪 → 首帧」
+     * 时间线都收在这一处；收尾第 18/18 步通过 [VirtualDisplayLease.release] 归还。
+     */
+    private val vdLease: VirtualDisplayLease<VirtualDisplay> = VirtualDisplayLease(
+        params = VdLeaseParams(displayWidth, displayHeight, dpi),
+        log = { log(it) },
+        releaseRaw = { vd -> try { vd.release() } catch (_: Exception) {} },
+    )
     private var encoder: MediaCodec? = null
 
     /** Pipeline 线程引用：cleanup() 靠它 unpark + 有界 join（S-06/S-M8）。 */
@@ -146,7 +154,7 @@ class PipelineServer(
         logInfo = { PipeLog.logClock(it) }
     )
     /**
-     * issue #64：周期采样 VD display 的窗口形态（`mLastNonfullscreenBounds`）。
+     * issue #64：周期采样 VD display 的窗口形态（`mLastNonFullscreenBounds`）。
      *
      * 启动时机在 `bindAndAccept` 成功之后：此时 `displayId` 已确定，也避开建屏期
      * 那串 `am`/`wm` 命令，避免额外的 dumpsys 与建屏步骤抢 shell。停止顺序在
@@ -460,22 +468,27 @@ class PipelineServer(
 
     private fun createVirtualDisplay(): Boolean {
         val vdSurf = vdInputSurface ?: return false
-        // issue #202 结论：跨进程复用 VD 不可行 —— 一个会话一个 app_process，
-        // `createVirtualDisplay()` 全仓只有启动序列一个调用点，且 `virtualDisplay`
-        // 是建屏之后才赋值，所以这里不存在"本进程已有 VD"的分支（评审阻塞项 1）。
+        // issue #202-A：跨进程/跨会话复用 VD 在当前进程模型下**不可行** —— 一个会话
+        // 一个 app_process，`createVirtualDisplay()` 全仓只有启动序列一个调用点，进程
+        // 退出即释放 display。所以这里不存在"本进程已有 VD"的输入，复用判定
+        // （[VdLeasePolicy]）作为契约留在租约里，等引擎常驻落地后直接命中。
+        // #254 的预建语义是：EGL 输入 Surface 一就绪就建屏，且在建屏成功之前不会
+        // 允许任何出帧（首帧由 [VirtualDisplayLease.noteFirstFrame] 记账）。
         // Snapshot the system state we are about to change — BEFORE changing it.
         // This used to run after VirtualDisplayCreator.create(), which itself
         // wrote screen_off_timeout=SessionScreenTimeout.SESSION_TIMEOUT_SENTINEL /
         // lift_wakeup=0 / proximity=0, so the "original" snapshot captured our own
         // writes and restoreIme() could never put the user's real values back.
         displayController.saveCurrentIme()
-        virtualDisplay = vdCreator.create(vdSurf)
-        if (virtualDisplay == null) return false
-        val did = vdCreator.displayId
+        val vd: VirtualDisplay? = vdLease.acquire(
+            create = { vdCreator.create(vdSurf) },
+            displayIdOf = { vdCreator.displayId },
+        )
+        if (vd == null) return false
+        val did = vdLease.displayId
         if (did < 0) {
             PipeLog.err("VirtualDisplay displayId invalid: $did")
-            try { virtualDisplay?.release() } catch (_: Exception) {}
-            virtualDisplay = null
+            vdLease.release()
             return false
         }
         displayId = did
@@ -523,6 +536,9 @@ class PipelineServer(
             lifecycle.channel = phoneChannel
             shell.exec("input keyevent 224"); log("Waking up device to ensure VD activities resume")
             shell.exec("am start --display $displayId -a android.intent.action.MAIN -c android.intent.category.HOME"); log("Home launched")
+            // issue #17：上面这条 am start 对已存在的 launcher 任务只做 bring-to-front，
+            // VD 段里可能连一个 Task{ 都没有；把物理屏的 home 任务整条迁进来兜底。
+            carCommands.ensureHomeTaskInDisplay(displayId)
             carCommands.moveTopApp(0, displayId)
             // VD 建好却没有任何窗口时编码器只能输出纯黑帧，车机侧判定黑屏后会反复重握手（issue #17）
             carCommands.ensureDisplayHasContent(displayId)
@@ -664,7 +680,14 @@ class PipelineServer(
                 val ch = carVideoChannel
                 val enc = encoder
                 if (running && ch != null && enc != null) {
-                    glPipeline.pipelineLoop(enc, ch, { running }, { syncFrameRequested.getAndSet(false) })
+                    glPipeline.pipelineLoop(
+                        encoder = enc,
+                        carVideo = ch,
+                        running = { running },
+                        consumeSyncRequest = { syncFrameRequested.getAndSet(false) },
+                        // issue #254：首帧出编码器的时刻，用来钉住「VD 就绪 → 首帧」。
+                        onFirstFrame = { vdLease.noteFirstFrame() },
+                    )
                 }
             }
         } catch (e: Exception) {
@@ -945,8 +968,13 @@ class PipelineServer(
         //    只搬顶层会让 quickSwitch 历史任务带着 VD 的 density/bounds 留在物理屏。
         //    issue #199 A：批量迁移 —— 两层合起来只读 2 次 dumpsys、只等 1 个沉降窗口。
         TeardownStepPlan(TeardownStep.APPS_MOVED, TEARDOWN_BUDGET_APPS_MOVED_MS) {
-            carCommands.moveTopApp(displayId, 0, probe = false)
-            carCommands.moveAllTasksToDisplay(displayId, 0) { remaining ->
+            val movedByTopApp = carCommands.moveTopApp(displayId, 0, probe = false)
+            // issue #220：move-stack 是异步入队的，紧接着的 dumpsys 仍是迁移前快照；
+            // 把 moveTopApp 实际搬走的 task 交给批量路径跳过，避免同一 task 搬两次。
+            // issue #258：批量路径自己跳过 home root task（物理屏已重建新的 home root task）。
+            carCommands.moveAllTasksToDisplay(
+                displayId, 0, skipTasks = setOfNotNull(movedByTopApp)
+            ) { remaining ->
                 teardownPendingTasks = remaining.joinToString(prefix = "[", postfix = "]")
             }
         },
@@ -1025,7 +1053,7 @@ class PipelineServer(
                         "thread may still be moving tasks (${teardownPendingTasks.ifBlank { "[]" }})"
                 )
             }
-            virtualDisplay?.let { try { it.release() } catch (_: Exception) {} }
+            vdLease.release()
         },
         // issue #180：撤掉本会话发布在共享存储上的 pid / token，避免"上一轮标识"被下一轮
         // 的停止方读到（同时只在内容仍属于本进程时才删，见 removeSessionFiles）。

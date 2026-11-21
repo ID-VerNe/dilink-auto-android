@@ -201,25 +201,186 @@ internal object ActivityDumpParser {
         return taskIdsInSection(section)
     }
 
-    /** `am task` 的 bounds：兼容 `bounds=[0,0][2340,1316]` 与 `mBounds=Rect(...)` 两种写法。 */
-    fun extractBounds(block: String): String? =
-        Regex("(?:mBounds|bounds)=(\\[[^\\]]*\\](?:\\[[^\\]]*\\])?|\\([^)]*\\))")
-            .find(block)?.groupValues?.get(1)
+    /**
+     * 段内带项目符号的 Task 头，捕获花括号内文本（供 [homeTaskId] / [taskIdByPackage]
+     * 读 `#<id>` / `type=` / `A=` 字段）。
+     *
+     * 与 [TASK_HEADER_RE] 同口径：只认行首 `* Task{`，不认
+     * `rootOfTask=… task=Task{…}` 这类引用行。
+     */
+    internal const val TASK_BODY_PATTERN = """(?m)^[ \t]*\*[ \t]*Task\{([^}]*)\}"""
+
+    // issue #256：闭合花括号必须写成 `\}`。桌面 JVM 接受裸 `}`，但 ART 的
+    // ICU 正则会抛 PatternSyntaxException，导致整个 object 初始化失败。
+    private val TASK_BODY_RE = Regex(TASK_BODY_PATTERN)
+
+    /** Task 头花括号内的 `#<id>`。 */
+    private val TASK_BODY_ID_RE = Regex("""#(\d+)""")
+
+    /** Task 头里的 `type=home`（issue #17：launcher 任务的首选判据）。 */
+    private val TASK_TYPE_HOME_RE = Regex("""\btype=home\b""")
+
+    /** Task 头里的 `A=` 字段（亲和性），用于按 launcher 包名兜底认任务。 */
+    private val TASK_AFFINITY_RE = Regex("""\bA=(\S+)""")
+
+    /** 段内每个 task 头的 (id, 花括号内文本)，按正文出现先后。 */
+    private fun taskBodies(section: String): List<Pair<Int, String>> =
+        TASK_BODY_RE.findAll(section).mapNotNull { m ->
+            val body = m.groupValues[1]
+            val id = TASK_BODY_ID_RE.find(body)?.groupValues?.get(1)?.toIntOrNull()
+                ?: return@mapNotNull null
+            id to body
+        }.toList()
 
     /**
-     * 任务级兼容/窗口状态。
+     * Task 头 `A=` 字段里的包名：`A=com.pkg/.Act` 与 `A=<userId>:com.pkg` 两种写法都认。
+     */
+    private fun affinityPackage(body: String): String? {
+        val raw = TASK_AFFINITY_RE.find(body)?.groupValues?.get(1) ?: return null
+        return raw.substringBefore('/').substringAfterLast(':')
+    }
+
+    /**
+     * 从 `Display #0` 段里找 `type=home` 的任务 id；找不到返回 null。
+     *
+     * 只认传入段内的内容（调用方负责只传 Display #0 的段），不跨 display 搜。
+     */
+    fun homeTaskId(displayZeroSection: String): Int? =
+        taskBodies(displayZeroSection).firstOrNull { TASK_TYPE_HOME_RE.containsMatchIn(it.second) }?.first
+
+    /** Task 头里的 `rootTaskId=<id>`（子任务的根任务引用）。 */
+    private val TASK_ROOT_ID_RE = Regex("""\brootTaskId=(\d+)""")
+
+    /**
+     * 段内所有「home 系」任务 id：`type=home` 的任务本身，以及 `rootTaskId` 指向它们的子任务。
+     *
+     * issue #258 实测（`main @ 963b7835`）：VD 段里 home 根任务 #945 下面还挂着 launcher 子任务
+     * #946（`* Task{…#946 type=home I=com.meizu.flyme.launcher/… rootTaskId=945 …}`），
+     * 只跳过 [homeTaskId] 认出的第一条会让 #946 被 `am display move-stack` 搬，报
+     * `moveRootTaskToTaskDisplayArea: Unknown rootTaskId=946` —— 子任务不是 root task，
+     * 本来就搬不动。这里把整棵 home 树一起排除，搬迁列表只留真正的普通 task。
+     */
+    fun homeTaskIds(section: String): Set<Int> {
+        val bodies = taskBodies(section)
+        val roots = bodies.filter { TASK_TYPE_HOME_RE.containsMatchIn(it.second) }.map { it.first }.toSet()
+        if (roots.isEmpty()) return emptySet()
+        val out = roots.toMutableSet()
+        for ((id, body) in bodies) {
+            val root = TASK_ROOT_ID_RE.find(body)?.groupValues?.get(1)?.toIntOrNull() ?: continue
+            if (root in roots) out += id
+        }
+        return out
+    }
+
+    /**
+     * 段内可当作 `am display move-stack` 目标的 **root task**：行首 `* Task{` 头，且自身不带 `rootTaskId=`。
+     *
+     * 与 [taskIdsInSection] 的区别：后者为取证把 `ActivityRecord{… t<id>}` 引用也算进来（issue #77 的口径），
+     * 但那些 id 可能属于别的 display 的任务。issue #258 实测（2026-11-20 09:29）：VD 段里混进了
+     * 客户端自己的 `t948`，`move-stack 948 0` 报
+     * `Trying to move rootTask=Task{…#948 …} to its current taskDisplayArea` —— 它本来就在 display 0。
+     */
+    fun rootTaskIds(section: String): List<Int> =
+        taskBodies(section)
+            .filterNot { TASK_ROOT_ID_RE.containsMatchIn(it.second) }
+            .map { it.first }
+
+    /**
+     * 整份 dump 里每个 root task 所在的 display：`taskId -> displayId`。
+     *
+     * 收尾搬迁前用它剔除「已经在目标 display 上」的任务，避免异步搬迁尚未生效时把同一 task
+     * 再搬一次（`current taskDisplayArea` 报错）。
+     */
+    fun taskDisplays(dump: String): Map<Int, Int> {
+        val out = HashMap<Int, Int>()
+        for (header in DISPLAY_HEADER_RE.findAll(dump)) {
+            val displayId = header.groupValues[1].toIntOrNull() ?: continue
+            val section = displaySection(dump, displayId) ?: continue
+            for (taskId in rootTaskIds(section)) out.putIfAbsent(taskId, displayId)
+        }
+        return out
+    }
+
+    /**
+     * launcher 包兜底：从 `Display #0` 段里找 `A=<launcherPackage>/` 的任务 id。
+     *
+     * 部分 ROM 的 home 任务头不带 `type=home`，只剩 `A=` 亲和性字段可认。
+     */
+    fun taskIdByPackage(displayZeroSection: String, packageName: String): Int? =
+        taskBodies(displayZeroSection).firstOrNull { affinityPackage(it.second) == packageName }?.first
+
+    /**
+     * task 块的 bounds：兼容 `bounds=[0,0][2340,1316]`、`mBounds=Rect(...)` 与 `mBounds=null` 写法。
+     *
+     * issue #232：真实 dump 的 task 块里该字段只以 WinConfiguration 内的 `mBounds=Rect(0, 0 - W, H)`
+     * 出现（等号后是 `R`），旧正则要求等号后紧跟 `[`/`(` → 0 命中 → `[teardown-move]` 的 bounds
+     * 全 `<unknown>`。`Rect(...)` / `null` 分支与 [WindowStateMonitor] 的 `BOUNDS_RE` 写法对齐
+     * （`WindowStateMonitor.kt:166`）。
+     *
+     * issue #239：`am display move-stack` 之后，块的**首个** `mBounds=` 仍属于
+     * `mLastReportedConfigurations`（搬迁前 VD 的上次上报快照，如 `Rect(634, 0 - 1293, 1054)`），
+     * 直接取首个命中会把旧 VD 坐标系当成回读结果。任务当前生效的配置在
+     * `CurrentConfiguration` 的 `winConfig` 里，必须优先读它；读不到才落回既有形态。
+     */
+    fun extractBounds(block: String): String? =
+        Regex("CurrentConfiguration=\\{[^}]*?winConfig=\\{\\s*mBounds=(Rect\\([^)]*\\))")
+            .find(block)?.groupValues?.get(1)
+            ?: Regex("(?:mBounds|bounds)=(Rect\\([^)]*\\)|\\[[^\\]]*\\](?:\\[[^\\]]*\\])?|\\([^)]*\\)|null)")
+                .find(block)?.groupValues?.get(1)
+
+    /**
+     * ActivityRecord 的 screen-compat 标志（`compat={560dpi}`，与 `ActivityRecord{…}` 同一行）。
+     * 实机 dump 是**字段行**形态（行首缩进的 `compat={560dpi} theme=…`），两种都认。
+     */
+    private val ACTIVITY_COMPAT_INLINE_RE = Regex("""ActivityRecord\{[^}\n]*compat=(\{[^}\n]*\}|\S+)""")
+    private val ACTIVITY_COMPAT_LINE_RE = Regex("""(?m)^[ \t]*compat=(\{[^}\n]*\}|\S+)""")
+
+    /**
+     * 任务级 screen-compat 标志：**只**认 ActivityRecord 行上的 `compat={NNNdpi}`。
+     *
+     * issue #238：旧实现首选 `mWindowingMode=`，而 task 块的 `winConfig={ … }` 恒含该键，
+     * 于是 `[teardown-move]` 的 `compat=` 从上线起一直打的是窗口模式（恒 `fullscreen`）
+     * —— 真正的 screen-compat 维度从未被读到。这里禁止任何回落：取不到返回 null，
+     * 由调用方记 `<unknown>`。窗口模式改由 [extractWindowMode] 单独提供。
      */
     fun extractCompat(block: String): String? =
-        Regex("mWindowingMode=([^\\s,}]+)").find(block)?.groupValues?.get(1)
-            ?: Regex("compat=([^\\s,}]+)").find(block)?.groupValues?.get(1)
-            ?: Regex("mOverrideConfig=([^\\n]+)").find(block)?.groupValues?.get(1)?.trim()?.take(80)
+        ACTIVITY_COMPAT_INLINE_RE.find(block)?.groupValues?.get(1)
+            ?: ACTIVITY_COMPAT_LINE_RE.find(block)?.groupValues?.get(1)
 
     /**
-     * 任务级密度。
+     * 任务级窗口模式：`winConfig` 的 `mWindowingMode=`（旧 `compat=` 实际打的就是它），
+     * 块内没有该键时回落 Task 头行的 `mode=`。
+     *
+     * issue #238：与 [extractCompat] 拆开成独立语义，日志里叫 `windowMode=`。
      */
-    fun extractDensity(block: String): String? =
-        Regex("densityDpi=(\\d+)").find(block)?.groupValues?.get(1)
-            ?: Regex("(\\d+)dpi").find(block)?.groupValues?.get(1)
+    fun extractWindowMode(block: String): String? =
+        Regex("mWindowingMode=([^\\s,}]+)").find(block)?.groupValues?.get(1)
+            ?: Regex("(?m)^[ \\t]*\\*[ \\t]*Task\\{[^}]*?\\bmode=([^\\s,}]+)").find(block)?.groupValues?.get(1)
+
+    /**
+     * 任务级密度：定向读任务 Configuration 段的 `NNNdpi`。
+     *
+     * issue #232：旧兜底 `(\d+)dpi` 全块扫描，抓到的块内**首个** `NNNdpi` 是 ActivityRecord 的
+     * `compat={560dpi}`，而任务真实 dpi 在其后的 Configuration 里——400dpi 的 VD 残留任务会被
+     * 假绿报成 560（恰是 #48 要抓的形态）。改为按 CurrentConfiguration → mOverrideConfig →
+     * mGlobalConfig 的优先级定向读段内首个 `NNNdpi`；`densityDpi=` 分支保留（其他 ROM 可能打印，
+     * 本机 ROM 的 dump 里该键 0 次出现）。
+     *
+     * issue #238：段内取值再**截到 `winConfig=` 之前**，并只按 `$key={` 锚定所在行——既不读
+     * `compat={560dpi}`，也不读窗口配置段，杜绝再次被整块正则误命中。
+     */
+    fun extractDensity(block: String): String? {
+        Regex("densityDpi=(\\d+)").find(block)?.let { return it.groupValues[1] }
+        fun configDensity(key: String): String? {
+            val line = block.lineSequence().firstOrNull { it.contains("$key={") } ?: return null
+            val from = line.indexOf("$key={") + key.length + 2
+            val to = line.indexOf("winConfig=", from).takeIf { it > from } ?: line.length
+            return Regex("(\\d+)dpi").find(line.substring(from, to))?.groupValues?.get(1)
+        }
+        return configDensity("CurrentConfiguration")
+            ?: configDensity("mOverrideConfig")
+            ?: configDensity("mGlobalConfig")
+    }
 
     /**
      * 解析 `wm size` 输出的宽与高。

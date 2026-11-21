@@ -1,5 +1,7 @@
 package com.dilinkauto.server.probe
 
+import com.dilinkauto.server.service.BydPermissionContext
+import com.dilinkauto.server.service.shouldGrantBydPermission
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue

@@ -180,4 +180,13 @@
     <string name="connecting">连接中</string>
     <string name="connected_waiting_for_data">已连接 — 等待数据</string>
     <string name="home_allowlist_empty">未选择任何应用。请在手机端打开 应用设置 &gt; 车机应用白名单 中选择。</string>
+
+    <!-- AC quick control (issue #278-PA) -->
+    <string name="ac_title">空调</string>
+    <string name="ac_chip_off">关</string>
+    <string name="ac_state_on">开启</string>
+    <string name="ac_state_off">关闭</string>
+    <string name="ac_write_failed">设置未生效，请重试</string>
+    <string name="ac_temp_down">降低温度</string>
+    <string name="ac_temp_up">升高温度</string>
 </resources>

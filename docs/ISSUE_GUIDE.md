@@ -55,6 +55,27 @@ type(scope): 一句话摘要
 - 非行为类 issue（纯文档、纯重构、纯规范）在现象段写 `复现命令：无（不涉及运行时行为）`。
 - 反例：「有时候会卡」「感觉不太对」——无法复现的一律先贴 `needs-repro`。
 
+#### 测试类复现命令：先分清变体任务与聚合任务（#148）
+
+`:vd-server` / `:app-client` / `:app-server` / `:protocol` 用 AGP（`com.android.library` / `com.android.application`），
+它们的 `test` 是**聚合任务**（"Run unit tests for all variants"），命令行**不接受** `--tests`：
+写 `:vd-server:test --tests "…"` 会在配置阶段直接报 `Unknown command-line option '--tests'`。
+按类/方法过滤要用变体任务；纯 JVM 模块（`:protocol-core` / `:app-desktop`）没有变体，直接 `test` 即可：
+
+```powershell
+# Android 模块：单个测试类（注意是 testDebugUnitTest，不是 test）
+.\gradlew.bat :vd-server:testDebugUnitTest --tests "com.dilinkauto.vdserver.ProcessWatchdogTest"
+
+# Android 模块：整个模块跑一遍（聚合任务，后面不能再带 --tests）
+.\gradlew.bat :vd-server:test
+
+# 纯 JVM 模块：没有变体，直接 test + --tests
+.\gradlew.bat :protocol-core:test --tests "com.dilinkauto.protocol.ClockFormatTest"
+```
+
+- 写 issue 时把**实际跑过且通过**的命令原样贴进现象段；不确定任务名先 `.\gradlew.bat help --task :vd-server:test` 看类型。
+- 回签时同样复用这条命令；原命令不可执行要在回签里注明替换后的等价命令。
+
 ### 2. 证据链
 
 - 每条判断都要有 `文件:行号` 或可复现命令；日志要给路径与关键行。
@@ -111,7 +132,7 @@ type(scope): 一句话摘要
 ```markdown
 ## 现象
 
-- 复现命令：`<一条可直接粘贴进 PowerShell 的命令>`
+- 复现命令：`<一条可直接粘贴进 PowerShell 的命令；测试类用变体任务写法，见「测试类复现命令」>`
 - 期望输出：<正常时应看到什么>
 - 实际输出：<现在看到什么，贴原文>
 - 触发条件 / 频率：<设备 / 环境 / 条件 / 偶发或必现；非行为类写「无（不涉及运行时行为）」>

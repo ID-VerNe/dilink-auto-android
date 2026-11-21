@@ -60,7 +60,14 @@ internal class VideoFrameSender(
         },
         closeChannel = closeChannel,
         onWriteFailed = { e ->
-            PipeLog.err("VideoSend: write failed, session should reconnect: ${e.message}")
+            // issue #221：区分「用户/本端关闭通道」与真实 IO 故障，并保留异常类名与
+            // cause 链（旧实现只打 e.message，现场就只剩 `...: null`）。
+            val failure = VideoSendFailure.describe(e)
+            if (failure.expectedClose) {
+                PipeLog.log("VideoSend: ${failure.text}")
+            } else {
+                PipeLog.err("VideoSend: ${failure.text}")
+            }
         },
         onItemSent = { s, _, took ->
             lastWriteNanos = took

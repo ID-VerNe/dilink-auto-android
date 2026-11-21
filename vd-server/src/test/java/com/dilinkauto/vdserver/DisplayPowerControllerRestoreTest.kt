@@ -216,4 +216,77 @@ class DisplayPowerControllerRestoreTest {
             dir.deleteRecursively()
         }
     }
+
+    // ── issue #230：lift/proximity 的合法 0 必须原样写回 ──
+    //
+    // 会话期 VirtualDisplayCreator.configureDisplayEnvironment 无条件把这两个开关写 0，
+    // 收尾恢复时旧守卫「数值 <= 0 就 return」把 0 当"无效快照"拒写——
+    // 这两个键的合法值域是 {0, 1}，0 是最常见的用户选择，拒写即恢复永远不生效。
+
+    @Test
+    fun `zero lift and proximity wakeup snapshots are written back as-is`() {
+        val shell = CapturingShell()
+        val dpc = dpc(shell) { cmd ->
+            when {
+                cmd.contains("default_input_method") -> "com.baidu.input/.ImeService"
+                cmd.contains("screen_off_timeout") -> "300000"
+                cmd.contains("lift_wakeup_enabled") -> "0" // 用户本来就关着（合法 0）
+                cmd.contains("proximity_wakeup_enabled") -> "0" // 同上
+                else -> null
+            }
+        }
+        dpc.saveCurrentIme()
+        dpc.restoreIme()
+        val lines = shell.lines()
+        assertTrue(
+            "lift_wakeup 的合法 0 必须原样写回（issue #230）",
+            lines.any { it == "settings put system lift_wakeup_enabled 0" }
+        )
+        assertTrue(
+            "proximity_wakeup 的合法 0 必须原样写回（issue #230）",
+            lines.any { it == "settings put system proximity_wakeup_enabled 0" }
+        )
+    }
+
+    @Test
+    fun `zero screen off timeout snapshot is still not written back`() {
+        val shell = CapturingShell()
+        val dpc = dpc(shell) { cmd ->
+            when {
+                cmd.contains("default_input_method") -> "com.baidu.input/.ImeService"
+                cmd.contains("screen_off_timeout") -> "0" // 0 不是有效超时，必须继续拒写
+                cmd.contains("lift_wakeup_enabled") -> "1"
+                cmd.contains("proximity_wakeup_enabled") -> "1"
+                else -> null
+            }
+        }
+        dpc.saveCurrentIme()
+        dpc.restoreIme()
+        assertFalse(
+            "screen_off_timeout 的 0 仍不是有效快照，不得写回",
+            shell.lines().any { it == "settings put system screen_off_timeout 0" }
+        )
+    }
+
+    @Test
+    fun `negative lift wakeup snapshot is still not written back`() {
+        val shell = CapturingShell()
+        val dpc = dpc(shell) { cmd ->
+            when {
+                cmd.contains("default_input_method") -> "com.baidu.input/.ImeService"
+                cmd.contains("screen_off_timeout") -> "300000"
+                cmd.contains("lift_wakeup_enabled") -> "-1" // 负值不是合法开关，仍拒写
+                cmd.contains("proximity_wakeup_enabled") -> "0"
+                else -> null
+            }
+        }
+        dpc.saveCurrentIme()
+        dpc.restoreIme()
+        val lines = shell.lines()
+        assertFalse("负值不得写回", lines.any { it == "settings put system lift_wakeup_enabled -1" })
+        assertTrue(
+            "proximity 的合法 0 写回不受负值拒写影响",
+            lines.any { it == "settings put system proximity_wakeup_enabled 0" }
+        )
+    }
 }

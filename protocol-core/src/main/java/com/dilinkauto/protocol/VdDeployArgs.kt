@@ -22,7 +22,9 @@ package com.dilinkauto.protocol
  *                 `-` or empty = accept any peer (legacy behaviour, kept for
  *                 deploy sites that cannot determine their own outbound IP).
  *   - ALLOWED   — issue #21: comma-joined package names the user允许上车（车机 App 列表
- *                 的白名单），`-` = 不下传（引擎不做白名单过滤）。引擎侧用它约束
+ *                 的白名单），`-` = 不下传（引擎不做白名单过滤）。手机端 Shizuku
+ *                 路径直接读 allowlist prefs；车机端 ADB 路径用握手响应尾字段
+ *                 `HandshakeResponse.allowedPackages` 带来的同一份集合。引擎侧用它约束
  *                 [com.dilinkauto.protocol.RecentsParser.pickQuickSwitchTarget] 的
  *                 建屏恢复目标，避免把私有应用拉到车机屏。
  *   - SESSION   — issue #180 第三版: 本次会话的 token（`[A-Za-z0-9_-]{1,64}`），

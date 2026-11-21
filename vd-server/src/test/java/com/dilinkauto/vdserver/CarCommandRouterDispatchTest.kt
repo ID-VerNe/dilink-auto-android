@@ -516,13 +516,34 @@ Display #7 (activities from top to bottom):
   * Task{a11 #2048 type=standard A=10216:com.twitter.android U=0 visible=true visibleRequested=true mode=fullscreen translucent=false sz=1}
     * ActivityRecord{751a1f5 u0 com.twitter.android/com.x.android.main.MainActivity t2048}
 """,
+                // issue #232：移动后回读的 dump 必须用**真实**形态（摘自实机
+                // debug-logs/dpi-repro-20261103-213130/activities-with-baidumap-on-vd.txt
+                // 的 task 块，参数换成物理屏 1368x3192 @560dpi）。旧的编造形态
+                // （`bounds=[0,0][1368,3192]` / `densityDpi=560`）在真实 dump 里不存在，
+                // 只能与错误实现互证（假绿）。
                 """
 Display #0 (activities from top to bottom):
   * Task{a11 #2048 type=standard A=10216:com.twitter.android U=0 visible=true visibleRequested=true mode=fullscreen translucent=false sz=1}
-    bounds=[0,0][1368,3192]
-    mWindowingMode=fullscreen
-    densityDpi=560
-    * ActivityRecord{751a1f5 u0 com.twitter.android/com.x.android.main.MainActivity t2048}
+    mLastNonFullscreenBounds=Rect(269, 536 - 811, 1616)
+    isSleeping=false
+    topResumedActivity=ActivityRecord{751a1f5 u0 com.twitter.android/com.x.android.main.MainActivity t2048}
+    * Hist  #0: ActivityRecord{751a1f5 u0 com.twitter.android/com.x.android.main.MainActivity t2048}
+      packageName=com.twitter.android processName=com.twitter.android
+      launchedFromUid=10216 launchedFromPackage=com.twitter.android launchedFromFeature=null userId=0
+      app=ProcessRecord{487f1ca 27234:com.twitter.android/u0a216}
+      Intent { flg=0x10020000 cmp=com.twitter.android/com.x.android.main.MainActivity (has extras) }
+      rootOfTask=true task=Task{a11 #2048 type=standard A=10216:com.twitter.android}
+      taskAffinity=10216:com.twitter.android
+      mActivityComponent=com.twitter.android/com.x.android.main.MainActivity
+      stateNotNeeded=false componentSpecified=true mActivityType=standard
+      compat={560dpi} theme=0x7f120168
+      mLastReportedConfigurations:
+        mGlobalConfig={1.0 460mcc2mnc [zh_CN] ldltr sw342dp w342dp h803dp 560dpi nrml long port -touch -keyb/v/h -nav/h winConfig={ mBounds=Rect(0, 0 - 1368, 3192) mAppBounds=Rect(0, 0 - 1368, 3192) mMaxBounds=Rect(0, 0 - 1368, 3192) mDisplayRotation=ROTATION_0 mWindowingMode=fullscreen mActivityType=undefined mAlwaysOnTop=undefined mRotation=ROTATION_0} as.5 s.3334 fontWeightAdjustment=163}
+        mOverrideConfig={1.0 ?mcc0mnc ?localeList ?layoutDir sw342dp w342dp h803dp 560dpi nrml long port ?uimode ?night -touch -keyb/v/h -nav/h winConfig={ mBounds=Rect(0, 0 - 1368, 3192) mAppBounds=Rect(0, 0 - 1368, 3192) mMaxBounds=Rect(0, 0 - 1368, 3192) mDisplayRotation=ROTATION_0 mWindowingMode=fullscreen mActivityType=standard mAlwaysOnTop=undefined mRotation=ROTATION_0} s.60 ?fontWeightAdjustment}
+      mLastReportedActivityWindowInfo=ActivityWindowInfo{isEmbedded=false, taskBounds=Rect(0, 0 - 1368, 3192), taskFragmentBounds=Rect(0, 0 - 1368, 3192)}
+      CurrentConfiguration={1.0 460mcc2mnc [zh_CN] ldltr sw342dp w342dp h803dp 560dpi nrml long port -touch -keyb/v/h -nav/h winConfig={ mBounds=Rect(0, 0 - 1368, 3192) mAppBounds=Rect(0, 0 - 1368, 3192) mMaxBounds=Rect(0, 0 - 1368, 3192) mDisplayRotation=ROTATION_0 mWindowingMode=fullscreen mActivityType=standard mAlwaysOnTop=undefined mRotation=ROTATION_0} as.5 s.60 fontWeightAdjustment=163}
+      RequestedOverrideConfiguration={1.0 ?mcc0mnc ?localeList ?layoutDir ?swdp ?wdp ?hdp ?density ?lsize ?long ?ldr ?wideColorGamut ?orien ?uimode ?night ?touch ?keyb/?/? ?nav/? winConfig={ mBounds=Rect(0, 0 - 0, 0) mAppBounds=null mMaxBounds=Rect(0, 0 - 0, 0) mDisplayRotation=undefined mWindowingMode=undefined mActivityType=undefined mAlwaysOnTop=undefined mRotation=undefined} ?fontWeightAdjustment}
+      ResolvedOverrideConfiguration={1.0 ?mcc0mnc ?localeList ?layoutDir sw342dp w342dp h803dp ?density ?lsize ?long ?ldr ?wideColorGamut port ?uimode ?night ?touch ?keyb/?/? ?nav/? winConfig={ mBounds=Rect(0, 0 - 0, 0) mAppBounds=Rect(0, 0 - 1368, 3192) mMaxBounds=Rect(0, 0 - 0, 0) mDisplayRotation=undefined mWindowingMode=undefined mActivityType=undefined mAlwaysOnTop=undefined mRotation=undefined} s.60 ?fontWeightAdjustment}
 """
             )
         )
@@ -532,8 +553,15 @@ Display #0 (activities from top to bottom):
         assertEquals("移动命令序列必须与修复前一致", listOf("am display move-stack 2048 0"), r.execs.toList())
         assertTrue("必须仍先读源 display 段", r.execOuts.first().startsWith("dumpsys activity activities"))
         assertTrue(log.contains("[teardown-move] task=2048 moved-to=0 displayId=0"))
-        assertTrue(log.contains("bounds=[0,0][1368,3192]"))
-        assertTrue(log.contains("compat=fullscreen"))
+        // issue #232：真实 dump 里 bounds 的形态是 `mBounds=Rect(0, 0 - 1368, 3192)`（WinConfiguration
+        // 内），旧断言的 `bounds=[0,0][1368,3192]` 形态真实 dump 里不存在（0 命中 → <unknown>）。
+        assertTrue(log.contains("bounds=Rect(0, 0 - 1368, 3192)"))
+        // issue #238：窗口模式与 compat 拆成两个独立字段。旧断言 `compat=fullscreen` 把
+        // winConfig 的 `mWindowingMode` 当成了 compat；真 compat 是 ActivityRecord 的
+        // `compat={560dpi}`，窗口模式应叫 windowMode=。
+        assertTrue("窗口模式必须单独落 windowMode= 字段", log.contains("windowMode=fullscreen"))
+        assertTrue("compat= 必须打到 ActivityRecord 的 screen-compat 标志", log.contains("compat={560dpi}"))
+        assertTrue("compat= 不得再打窗口模式值", !log.contains("compat=fullscreen"))
         assertTrue(log.contains("densityDpi=560"))
     }
 

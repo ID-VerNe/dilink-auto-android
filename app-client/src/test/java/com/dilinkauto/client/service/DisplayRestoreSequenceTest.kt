@@ -32,9 +32,17 @@ class DisplayRestoreSequenceTest {
         val log = RecordingLog()
         val commands = mutableListOf<String>()
         var activityLaunches = 0
+        val capabilityCache = PowerResetCapabilityCache()
 
         fun sequence(
-            shellAnswer: (String) -> ShellOutcome? = { ShellOutcome("__DILINK_RC=0", "") },
+            // 默认 ROM 支持 power-reset，避免 issue #221 的能力探测把既有用例短路。
+            shellAnswer: (String) -> ShellOutcome? = { cmd ->
+                if (cmd.startsWith("cmd display help")) {
+                    ShellOutcome("  power-reset DISPLAY_ID\n__DILINK_RC=0", "")
+                } else {
+                    ShellOutcome("__DILINK_RC=0", "")
+                }
+            },
             wakeUp: () -> Unit = {},
         ) = DisplayRestoreSequence(
             shell = { cmd ->
@@ -45,6 +53,7 @@ class DisplayRestoreSequenceTest {
             launchActivityFn = { activityLaunches++ },
             wakeLockFn = {},
             log = log,
+            capabilityCache = capabilityCache,
         )
     }
 
@@ -59,6 +68,7 @@ class DisplayRestoreSequenceTest {
         val seq = h.sequence(
             shellAnswer = { cmd ->
                 when {
+                    cmd.startsWith("cmd display help") -> ShellOutcome("  power-reset DISPLAY_ID\n__DILINK_RC=0", "")
                     cmd.contains("power-reset") -> ShellOutcome("Unknown command: power-reset", "")
                     else -> ShellOutcome("__DILINK_RC=0", "")
                 }
@@ -92,7 +102,15 @@ class DisplayRestoreSequenceTest {
     @Test
     fun `power reset success is logged and keyevent fallback is skipped`() {
         val h = Harness()
-        val seq = h.sequence(shellAnswer = { ShellOutcome("__DILINK_RC=0", "") })
+        val seq = h.sequence(
+            shellAnswer = { cmd ->
+                if (cmd.startsWith("cmd display help")) {
+                    ShellOutcome("  power-reset DISPLAY_ID\n__DILINK_RC=0", "")
+                } else {
+                    ShellOutcome("__DILINK_RC=0", "")
+                }
+            },
+        )
         val report = seq.run(null)
 
         assertTrue("rc=0 应判定成功", report.powerResetOk)
@@ -109,7 +127,12 @@ class DisplayRestoreSequenceTest {
     fun `unknown command is a failure even when rc is zero`() {
         val h = Harness()
         val report = h.sequence(
-            shellAnswer = { ShellOutcome("Unknown command: power-reset\n__DILINK_RC=0", "") },
+            shellAnswer = { cmd ->
+                when {
+                    cmd.startsWith("cmd display help") -> ShellOutcome("  power-reset DISPLAY_ID\n__DILINK_RC=0", "")
+                    else -> ShellOutcome("Unknown command: power-reset\n__DILINK_RC=0", "")
+                }
+            },
         ).run(null)
 
         assertFalse("文本含 Unknown command 时，rc=0 也不能算成功", report.powerResetOk)
@@ -145,5 +168,71 @@ class DisplayRestoreSequenceTest {
         assertFalse("Activity 启动抛异常时不得记为成功", report.activityLaunched)
         assertTrue("WakeLock 层必须继续执行", wakeLockCalled)
         assertTrue(report.wakeLockHeld)
+    }
+
+    @Test
+    fun `rom without power-reset skips the command instead of waiting`() {
+        // issue #221：现场 6/6 会话都白等 3.4–4.2s 才拿到 `Unknown command`。
+        // help 已明确没有 power-reset 时，不得再下发该命令，并要留下跳过原因。
+        val h = Harness()
+        val report = h.sequence(
+            shellAnswer = { cmd ->
+                when {
+                    cmd.startsWith("cmd display help") ->
+                        ShellOutcome("  enable-display DISPLAY_ID\n  disable-display DISPLAY_ID\n__DILINK_RC=0", "")
+                    cmd.contains("power-reset") -> ShellOutcome("Unknown command: power-reset\n__DILINK_RC=255", "")
+                    else -> ShellOutcome("__DILINK_RC=0", "")
+                }
+            },
+        ).run(null)
+
+        assertFalse(report.powerResetOk)
+        assertTrue(
+            "ROM 不支持时不得再下发 power-reset：${h.commands}",
+            h.commands.none { it.contains("power-reset 0") },
+        )
+        assertTrue(
+            "必须记录跳过原因：${h.log.lines}",
+            h.log.lines.any { it.first == 'W' && it.second.contains("skipped") && it.second.contains("power-reset") },
+        )
+    }
+
+    @Test
+    fun `capability probe runs once per process cache`() {
+        val h = Harness()
+        h.sequence().run(null)
+        // 模拟 Service 重建：同一个进程级缓存，新的 sequence 实例。
+        h.sequence().run(null)
+
+        val probes = h.commands.count { it == "cmd display help" }
+        assertEquals("能力探测必须命中进程缓存，只探测一次：${h.commands}", 1, probes)
+    }
+
+    @Test
+    fun `runtime unknown command is cached for the next restore`() {
+        // help 拿不到（UNKNOWN）时仍会尝试 power-reset；运行期返回 Unknown command
+        // 就是负结论，必须写进缓存，下一次恢复不再白等（issue #221）。
+        var helpQueries = 0
+        val log = RecordingLog()
+        // 两次恢复必须共享同一个缓存：这里把 cache 提出来，模拟进程级实例。
+        val cache = PowerResetCapabilityCache()
+        fun sharedSequence() = DisplayRestoreSequence(
+            shell = { cmd ->
+                when {
+                    cmd.startsWith("cmd display help") -> { helpQueries++; null }
+                    cmd.contains("power-reset") -> ShellOutcome("Unknown command: power-reset\n__DILINK_RC=255", "")
+                    else -> ShellOutcome("__DILINK_RC=0", "")
+                }
+            },
+            wakeUpFn = {},
+            launchActivityFn = {},
+            wakeLockFn = {},
+            log = log,
+            capabilityCache = cache,
+        )
+
+        assertFalse("首次没有 help，power-reset 运行期失败", sharedSequence().run(null).powerResetOk)
+        assertFalse("第二次仍不得记为成功", sharedSequence().run(null).powerResetOk)
+        assertEquals("第二次应命中运行期负缓存，不再探测 help", 1, helpQueries)
     }
 }

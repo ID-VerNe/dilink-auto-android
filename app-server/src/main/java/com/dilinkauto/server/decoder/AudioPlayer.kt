@@ -351,7 +351,9 @@ class AudioPlayer(
             var starveStartMs = 0L
 
             while (running.get()) {
-                nextTick = calculateNextTick(nextTick, System.nanoTime(), frameNanos)
+                // issue #179：按落后几拍决定本拍处理几帧，落后的拍只补不丢。
+                val plan = audioTickPlan(nextTick, System.nanoTime(), frameNanos)
+                nextTick = plan.nextTickNanos
                 val sleep = nextTick - System.nanoTime()
                 if (sleep > 0) LockSupport.parkNanos(sleep)
 
@@ -373,39 +375,48 @@ class AudioPlayer(
                 val dec = codec ?: break
                 val trk = track
 
-                val frame = buf.poll()
-                var wroteFramesThisTick = 0
-                if (frame == null) {
-                    starvedFrames.incrementAndGet()
-                    if (!recovering) {
-                        recovering = true
-                        starveStartMs = SystemClock.elapsedRealtime()
-                    }
-                    // 队列空：沿用 #73 的「一拍补一帧」语义（口径不动，只计 starved）。
-                    if (writePcm(trk, silence) > 0) wroteFramesThisTick = 1
-                    writtenTrackFrames += wroteFramesThisTick
-                } else {
-                    if (feedDecoder(dec, frame, ptsUs)) {
-                        ptsUs += frameNanos / 1000L
-                        decodedFrames.incrementAndGet()
+                // issue #179：本拍按 framesDue 逐帧槽位消费，落后的拍补齐而不是丢弃。
+                // 队列空仍沿用 #73 的「一拍补一帧」语义（只计 starved），只是本拍可能有多拍。
+                var wroteBytesThisTick = 0
+                repeat(plan.framesDue) {
+                    val frame = buf.poll()
+                    if (frame == null) {
+                        starvedFrames.incrementAndGet()
+                        if (!recovering) {
+                            recovering = true
+                            starveStartMs = SystemClock.elapsedRealtime()
+                        }
+                        val written = writePcm(trk, silence)
+                        if (written > 0) {
+                            wroteBytesThisTick += written
+                            writtenTrackFrames++
+                        }
                     } else {
-                        inputDropValue++
-                    }
-                    wroteFramesThisTick = drainDecoder(dec, trk, info) / pcmFrameBytes
-                    writtenTrackFrames += wroteFramesThisTick
-                    if (recovering && buf.size >= buf.targetFrames) {
-                        recovering = false
-                        val r = SystemClock.elapsedRealtime() - starveStartMs
-                        if (r > maxRecoverMsValue.get()) maxRecoverMsValue.set(r)
+                        if (feedDecoder(dec, frame, ptsUs)) {
+                            ptsUs += frameNanos / 1000L
+                            decodedFrames.incrementAndGet()
+                        } else {
+                            inputDropValue++
+                        }
+                        val bytes = drainDecoder(dec, trk, info)
+                        wroteBytesThisTick += bytes
+                        writtenTrackFrames += (bytes / pcmFrameBytes).toLong()
                     }
                 }
 
-                // issue #164 候选 B：有输入、但解码器本拍没吐出任何 PCM（INFO_TRY_AGAIN_LATER），
-                // 这一拍 track 一个字节都拿不到，只能吃老本。原来只有「队列空」才补，
-                // 于是 85 ms 缓冲被一拍一拍啃到 0 —— 实车 22.6 次/秒 underrun 的直接来源。
-                // 与上面的 `starved` 路互斥且口径不同：那条是「没数据可解」，这条是
-                // 「有数据、但本拍解不出来」，所以单独计 `padIdle`，别混成一个数。
-                if (wroteFramesThisTick == 0) {
+                // 欠载恢复计时放在本拍处理完之后：落后的多拍可能已经补齐。
+                if (recovering && buf.size >= buf.targetFrames) {
+                    recovering = false
+                    val r = SystemClock.elapsedRealtime() - starveStartMs
+                    if (r > maxRecoverMsValue.get()) maxRecoverMsValue.set(r)
+                }
+
+                // issue #164 候选 B：本拍（全部 framesDue 帧槽位）**一个 PCM 字节都没写**，
+                // track 只能吃老本。原来只有「队列空」才补，于是 85 ms 缓冲被一拍一拍啃到 0
+                // —— 实车 22.6 次/秒 underrun 的直接来源。与上面的 `starved` 路互斥且口径不同：
+                // 那条是「没数据可解」，这条是「有数据、但本拍解不出来」，单独计 `padIdle`。
+                // 队列空时上面已经写过静音（计入 wroteBytesThisTick），这里不会重复补。
+                if (wroteBytesThisTick == 0) {
                     val pad = audioPadSilenceFrames(
                         bufferFrames = trackBufferFrames,
                         pendingFrames = trackPendingFrames(trk, writtenTrackFrames, trackBufferFrames),
@@ -729,15 +740,5 @@ class AudioPlayer(
 
         /** stop() 等播放线程退出的上限（同 `VideoDecoder.stop()` 的 2s 预算口径）。 */
         private const val STOP_JOIN_TIMEOUT_MS = 2000L
-
-        /**
-         * Pacing clock calculation with underrun/jitter catch-up prevention.
-         * If [now] has drifted past [currentNextTick] by more than [frameNanos],
-         * resets the baseline to [now] so the loop does not spin without sleeping.
-         */
-        internal fun calculateNextTick(currentNextTick: Long, now: Long, frameNanos: Long): Long {
-            val base = if (now - currentNextTick > frameNanos) now else currentNextTick
-            return base + frameNanos
-        }
     }
 }

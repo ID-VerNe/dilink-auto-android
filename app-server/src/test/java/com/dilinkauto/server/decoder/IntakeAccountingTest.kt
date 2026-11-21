@@ -15,7 +15,7 @@ import kotlin.random.Random
  *
  * ```
  * received == fed + dropped + pending
- * keyReceived == keyFed + keyDropped + keyPending
+ * keyReceived == keyFed + keyDropped + keyDroppedBeforeStart + keyPending  // 停播期分项见 issue #229
  * ```
  *
  * 不复制实现细节，只驱动四个入口后判等式。
@@ -30,9 +30,9 @@ class IntakeAccountingTest {
             s.fed + s.dropped + s.pending,
         )
         assertEquals(
-            "关键帧账不平：$s",
+            "关键帧账不平（停播期分项计入，issue #229）：$s",
             s.keyReceived,
-            s.keyFed + s.keyDropped + s.keyPending,
+            s.keyFed + s.keyDropped + s.keyDroppedBeforeStart + s.keyPending,
         )
         assertTrue("pending 不得为负（同一帧被销账两次）：$s", s.pending >= 0L)
         assertTrue("keyPending 不得为负：$s", s.keyPending >= 0L)
@@ -97,8 +97,26 @@ class IntakeAccountingTest {
         assertEquals(0L, s.keyReceived)
         assertEquals(0L, s.keyFed)
         assertEquals(0L, s.keyDropped)
+        assertEquals("停播期分项必须随会话清零（issue #229）", 0L, s.keyDroppedBeforeStart)
         assertEquals(0L, s.keyPending)
         assertTrue(s.balanced)
+    }
+
+    @Test
+    fun `停播期作废只入分项桶且总账不变式不动`() {
+        val accounting = IntakeAccounting()
+        // issue #229：首连等 Surface 期间的缓存 IDR 覆盖丢弃走 onKeyDroppedBeforeStart，
+        // 总账 dropped 照常 +1（全量不变式不动），关键帧侧只入细分桶、不污染 in-stream keyDropped。
+        accounting.onReceived(isKey = true)
+        accounting.onKeyDroppedBeforeStart()
+
+        val s = accounting.snapshot()
+        assertEquals("停播期作废必须体现在总账 dropped", 1L, s.dropped)
+        assertEquals("in-stream keyDropped 不得被停播期作废污染", 0L, s.keyDropped)
+        assertEquals("停播期分项必须记 1", 1L, s.keyDroppedBeforeStart)
+        assertEquals(0L, s.keyPending)
+        balanced(accounting)
+        assertNull("分账后必须仍平账", accounting.violationText())
     }
 
     @Test

@@ -67,7 +67,9 @@ internal fun parseBatterySample(
  * `registerReceiver(null, filter)` 主动取一次，保证服务一启动（还没收到广播时）就有值。
  *
  * 上报节奏全部交给纯函数 [BatteryReportGate]：变化 ≥2% / 充电位翻转立即发，
- * 1% 变化 5s 防抖，电量不变 60s 兜底。**只有握手完成且控制连接可用时才发**
+ * 1% 变化 5s 防抖，电量不变**最迟** 60s 兜底（issue #160：兜底节拍按上次成功上报
+ * 对齐 —— [BatteryReportGate.msUntilHeartbeat]，不是相对 [start] 的固定网格）。
+ * **只有握手完成且控制连接可用时才发**
  * （[isReady]），未连接不上报、也不消耗 gate 的基准。
  *
  * 失败必须留痕（issue #41 的教训）：广播回调与定时协程都在主线程，这里只做
@@ -110,9 +112,12 @@ internal class PhoneBatteryReporter(
 
         // 电量不变时 ACTION_BATTERY_CHANGED 不会再来，靠这条定时兜底证明手机还活着，
         // 也顺便把「断开重连后 60s 内没有变化」的窗口补上。
+        // issue #160：延时每轮按「距上次成功上报」重算（[BatteryReportGate.msUntilHeartbeat]），
+        // 而不是相对 start() 的固定 60s 网格 —— 否则一次广播触发的 off-grid 上报会把
+        // 兜底间隔拉成 60~120s（真机复演 61~114s）。
         heartbeatJob = scope.launch {
             while (isActive) {
-                delay(BatteryReportGate.HEARTBEAT_MS)
+                delay(gate.msUntilHeartbeat(SystemClock.elapsedRealtime()))
                 lastSample?.let { maybeSend(it) }
             }
         }

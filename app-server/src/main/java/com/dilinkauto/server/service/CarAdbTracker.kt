@@ -183,22 +183,41 @@ internal class CarAdbTracker(
         tcpAdbConnecting = true
         trackScope.launch(Dispatchers.IO) {
             try {
-                var attempts = 0
-                while (isActive && !usbReady && attempts < 60) {
-                    val host = getPhoneHost()
-                    if (host != null) {
-                        log("Dev mode: TCP ADB connecting to $host:${Ports.ADB_PORT} (attempt ${attempts + 1})", "I")
-                        connectTcpAdb(host)
-                        if (adbController?.isConnected == true) {
-                            lastAdbHost = host
-                        }
+                // 阶段一：等手机 IP（最多 60s，与原逻辑一致）。
+                var waitAttempts = 0
+                while (isActive && !usbReady && getPhoneHost() == null && waitAttempts < 60) {
+                    delay(1000)
+                    waitAttempts++
+                }
+                var host: String = getPhoneHost() ?: run {
+                    if (!usbReady) {
+                        log("Dev mode: could not determine phone IP after ${waitAttempts}s", "I")
+                    }
+                    return@launch
+                }
+
+                // 阶段二：issue #269 —— 连接失败不再一次就放弃。原实现在
+                // `connectTcpAdb` 之后无条件 `return@launch`，第一次失败后只能等
+                // 下一次 startTcpAdbTrack 被调用，现场表现为 62s 空窗。
+                for (attempt in 0 until TcpAdbReconnectPolicy.maxAttempts()) {
+                    if (!isActive || usbReady) return@launch
+                    val delayMs = TcpAdbReconnectPolicy.delayMsBeforeAttempt(attempt) ?: break
+                    delay(delayMs)
+                    if (usbReady) return@launch
+                    host = getPhoneHost() ?: host
+                    log("Dev mode: TCP ADB connecting to $host:${Ports.ADB_PORT} (attempt ${attempt + 1})", "I")
+                    connectTcpAdb(host)
+                    if (adbController?.isConnected == true) {
+                        lastAdbHost = host
                         return@launch
                     }
-                    delay(1000)
-                    attempts++
                 }
                 if (!usbReady) {
-                    log("Dev mode: could not determine phone IP after ${attempts}s", "I")
+                    log(
+                        "Dev mode: TCP ADB connect gave up after " +
+                            "${TcpAdbReconnectPolicy.maxAttempts()} attempts",
+                        "W"
+                    )
                 }
             } finally {
                 tcpAdbConnecting = false
@@ -331,7 +350,47 @@ internal class CarAdbTracker(
         adbController = null
         lastAdbHost = null
         usbReady = false
-        log("ADB controller reset — will reconnect on next state pass", "I")
+        log("ADB controller reset — scheduling backoff reconnect", "I")
+        // issue #269：断网期间控制通道仍可能有心跳，checkAndAdvance 不会被触发；
+        // 等外部 state pass 就是现场那 62s 空窗。重连必须由 reset 自己发起。
+        scheduleTcpAdbReconnect()
+    }
+
+    /**
+     * issue #269：reset 后的主动重连（退避 1s/2s/4s）。
+     *
+     * 只负责 TCP 轨：USB 已连或 `usbReady` 被别的路径恢复时立即结束；
+     * `autoReconnectAllowed` 闸门保持 issue #201 的语义不变。
+     */
+    private fun scheduleTcpAdbReconnect() {
+        if (!autoReconnectAllowed(ConnectTrigger.AUTO_ADB_READY)) return
+        if (tcpAdbConnecting) return
+        tcpAdbConnecting = true
+        scope.launch(Dispatchers.IO) {
+            try {
+                for (attempt in 0 until TcpAdbReconnectPolicy.maxAttempts()) {
+                    val delayMs = TcpAdbReconnectPolicy.delayMsBeforeAttempt(attempt) ?: break
+                    delay(delayMs)
+                    if (usbReady || usbAdb?.isConnected == true) return@launch
+                    val host = getPhoneHost() ?: continue
+                    log("Dev mode: TCP ADB reconnecting to $host:${Ports.ADB_PORT} (attempt ${attempt + 1})", "I")
+                    connectTcpAdb(host)
+                    if (adbController?.isConnected == true) {
+                        lastAdbHost = host
+                        return@launch
+                    }
+                }
+                if (!usbReady) {
+                    log(
+                        "Dev mode: TCP ADB reconnect exhausted " +
+                            "${TcpAdbReconnectPolicy.maxAttempts()} attempts",
+                        "W"
+                    )
+                }
+            } finally {
+                tcpAdbConnecting = false
+            }
+        }
     }
 
     fun resetAdbReadiness() {

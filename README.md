@@ -6,7 +6,7 @@
 
 实测车型:**比亚迪 秦PLUS DM-i 2023款 冠军版 55KM 领先型**。该款车机是 DiLink 4.0 低配方案 —— 骁龙 439(8x Cortex-A53 全小核、Adreno 505)、4GB RAM、16GB eMMC、1280x800 屏、仅 2.4GHz WiFi、Android 9 / API 28、H.264 硬件解码上限 1080p。本 fork 的性能调优全部围绕这套硬件展开。
 
-当前版本:**20261117-2247**(`versionCode 26111722`,由版本号日期派生)。
+当前版本以 `gradle.properties` 的 `app.versionName` 为准,`versionCode` 由它派生。
 
 版本号采用 `YYYYMMDD-HHMM` 日期-时间格式(issue #224):日常迭代按天发布,日期时间能直接读出这一包是哪一轮。`versionCode` 由 `app.versionName` 自动派生,不需要手工维护。
 
@@ -151,7 +151,7 @@ app-desktop --probe
 - 车机端 DPI 覆盖:解决 1280x800 默认 DPI 偏小
 - 横竖屏跟随:车机旋转时 VD 跟着重建,竖屏应用不再被压成细条
 - Shizuku 支持:免 USB ADB 部署 VD server,`pm install` 静默自更新
-- 车机应用自更新:手机检测到车机应用版本旧(versionCode 比对)就走 WiFi ADB 更新
+- 车机应用自更新:手机比对车机应用版本号(日期-时间串,并兼容旧的语义化形态)决定是否推送,走 WiFi ADB 更新
 - 流式传输时手机屏幕关闭(省电),断连后物理面板恢复
 - 引导式权限授权
 - 简体中文 + 8 种其他语言(英、葡、俄、白俄、法、哈、乌、乌兹)
@@ -178,7 +178,7 @@ app-desktop --probe
 - 部分应用不铺满屏幕(信箱化/仅竖屏)。DiLink-Auto 把横屏虚拟显示器镜像到车机,不支持横屏方向的应用会出现黑边 —— 这由应用自身决定,镜像侧无法解决。
 - API 26-28 车机上,若 DisplayControl 反射失败,`cmd display power-reset`/`power-off` shell 回退也是 API 29+(无 `power-on` 子命令),物理面板可能无法恢复(会打日志,不再静默)。
 - 安装进度在中文等非英文界面语言下不显示 —— `InstallStatus.parse` 只按英文子串分类安装状态串,而状态串本身是本地化文案;中文界面下全部落入 `IDLE`,阶段勾选与错误颜色都不出现。已用测试固定现状,未修(`docs/IMPLEMENTATION_REPORT_TESTING.md` C-6)。
-- 车机应用首装在极端版本号下可能被跳过 —— 车机未安装时 `readInstalledVersion` 返回 `"0"`,若内嵌 `versionName` 也是 `0` / `0.0` / `0.0.0` 这种形式,比较结果会被判"已最新"而跳过首装。当前 `versionName` 为 `1.0.0`,不触发(同上 C-5)。
+- 车机应用首装在极端版本号下可能被跳过 —— 车机未安装时 `readInstalledVersion` 返回 `"0"`,若内嵌 `versionName` 也是 `0` / `0.0` / `0.0.0` 这种形式,比较结果会被判"已最新"而跳过首装。隐患仍在,但日期版本号首段是 8 位十进制,不会撞上 `"0"` 哨兵,当前不可触发(同上 C-5)。
 
 ---
 

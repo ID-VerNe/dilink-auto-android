@@ -5,7 +5,6 @@ import com.dilinkauto.protocol.Ports
 import com.dilinkauto.protocol.VdDeploy
 import com.dilinkauto.protocol.VdDeployExecutor
 import com.dilinkauto.protocol.VdProbeResult
-import com.dilinkauto.protocol.VideoConfig
 import com.dilinkauto.protocol.vdRunDeploySequence
 import com.dilinkauto.server.R
 import com.dilinkauto.server.adb.RemoteAdbController
@@ -139,9 +138,25 @@ internal class VdServerDeployer(
         )
         val vdW = vp.first
         val vdH = vp.second
-        val phoneDpi = if (sessionCoordinator.handshakeVdDpi > 0) sessionCoordinator.handshakeVdDpi
-            else VideoConfig.calculateOptimalDpi(vdW, vdH, displayMetrics.densityDpi)
-        log("VD server: ${vdW}x${vdH}@${phoneDpi}dpi (car-native, no downscale)")
+        // issue #20：握手 DPI 是手机按**手机**视口算出来的，这里实际用**车机视口**建 VD，
+        // 必须按最终 VD 尺寸夹紧（maxSafeDpi），否则竖屏应用逻辑宽不足 360dp。
+        val resolvedDpi = deployDpi(
+            handshakeVdDpi = sessionCoordinator.handshakeVdDpi,
+            vdWidth = vdW,
+            vdHeight = vdH,
+            carReportedDpi = displayMetrics.densityDpi
+        )
+        val phoneDpi = resolvedDpi.dpi
+        val dpiSource = resolvedDpi.source
+        // issue #21：车机持握手响应带来的「允许上车」包名集合；APP_LIST 要等引擎
+        // 启动之后才到，部署时拿不到，所以这里只能用它。空集合 = 手机从未配置
+        // 白名单 / 老版本手机未下传 → 引擎不做白名单过滤（行为与引入前一致）。
+        val allowedPackages = sessionCoordinator.handshakeAllowedPackages
+        log(
+            "VD server: ${vdW}x${vdH}@${phoneDpi}dpi (car-native, no downscale), allowlist=" +
+                (allowedPackages.size.takeIf { it > 0 }?.toString() ?: "<not handed down>") +
+                ", dpiSource=$dpiSource"
+        )
         return VdDeploy.buildDeployPlan(
             jarPath = jarPath,
             logPath = VdDeploy.LOG_PATH,
@@ -149,11 +164,13 @@ internal class VdServerDeployer(
             encodeWidth = vdW, encodeHeight = vdH,
             phoneHost = "127.0.0.1", fps = sessionCoordinator.targetFps,
             bitrate = carPrefs.startupBitrate,
+            allowedPackages = allowedPackages,
             // background=false → exec app_process，shell 流保持附着：
             // 带 & 后台化会让 shell 立即退出、ADB 流立刻关闭，而车机端
             // TcpAdbConnection 没有按流分发的读线程，残留消息会连带
             // 干掉刚启动的引擎（表现为日志 0 字节、进程秒死）。
-            background = false
+            background = false,
+            dpiSource = dpiSource
         )
     }
 

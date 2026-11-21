@@ -154,6 +154,11 @@ internal class GlPipeline(
         carVideo: SocketChannel,
         running: () -> Boolean,
         consumeSyncRequest: () -> Boolean,
+        /**
+         * issue #254：第一帧编码输出被排空时回调一次。用来记录「VD 就绪 → 首帧」，
+         * 证明建屏（预建）先于出帧完成；默认 no-op，测试与旧调用点不受影响。
+         */
+        onFirstFrame: () -> Unit = {},
     ) {
         val st = stTexture ?: return
         val bufInfo = MediaCodec.BufferInfo()
@@ -255,6 +260,8 @@ internal class GlPipeline(
                             // 入队即返回：写不进队列时按直播优先策略丢 P 帧，本线程不回退。
                             sender.offer(msgType, payload, isKey)
                             drained++; frameCount++
+                            // issue #254：只记第一帧（CONFIG 也计入，但要能证明建屏先于出帧）。
+                            if (frameCount == 1L) onFirstFrame()
                         }
                         encoder.releaseOutputBuffer(idx, false)
                     }

@@ -247,6 +247,77 @@ internal class CarCommandRouter(
     }
 
     /**
+     * issue #17：新建 VD 之后，把物理屏的 home 任务整条迁进 VD，保证 display 段里有 task。
+     *
+     * 现场证据：`am start --display N -a MAIN -c HOME` 对**已存在**的 launcher 任务只做
+     * bring-to-front（`Warning: Activity not started, its current task has been brought to
+     * the front`），不会在 N 上建任务；[moveTopApp] 又显式跳过 launcher —— 于是 Display #N
+     * 段里连一个 `Task{` 都没有，编码器只能出纯黑帧（`Pipeline: … tex=0`），车机侧
+     * `[BLACK] rendered=0`。
+     *
+     * 与 [ensureDisplayHasContent] 分工：这里只搬 home 任务，不改 [moveTopApp] 的
+     * 「跳过 launcher/systemui/自家 App」语义，也不挑 recents。
+     *
+     * 认任务的两条路：先按 `type=home`（[ActivityDumpParser.homeTaskId]），认不出再用
+     * `resolve-activity` 解析出的 launcher 包名按 `A=` 兜底（[ActivityDumpParser.taskIdByPackage]）。
+     *
+     * 同步执行（创建期命令本来就串行）：1 次 dumpsys + 1 次 move-stack + 400ms 复查，
+     * 失败只记日志，绝不阻塞会话。
+     */
+    fun ensureHomeTaskInDisplay(id: Int) {
+        if (id < 0) return
+        val api = sdkInt()
+        if (api < 29) {
+            PipeLog.log("homeTask: skipped, am display move-stack requires API 29")
+            return
+        }
+        try {
+            val dump = execOut("dumpsys activity activities 2>/dev/null") ?: ""
+            val target = ActivityDumpParser.displaySection(dump, id)
+            if (target != null && target.contains("Task{")) {
+                PipeLog.log("homeTask: display=$id already has a task")
+                return
+            }
+            val zero = ActivityDumpParser.displaySection(dump, 0) ?: ""
+            var homeId = ActivityDumpParser.homeTaskId(zero)
+            if (homeId == null) {
+                val launcher = launcherPackage()
+                if (launcher != null) homeId = ActivityDumpParser.taskIdByPackage(zero, launcher)
+            }
+            if (homeId == null) {
+                PipeLog.log("homeTask: no home task on display 0")
+                return
+            }
+            exec("am display move-stack $homeId $id")
+            Thread.sleep(HOME_TASK_VERIFY_MS)
+            val after = ActivityDumpParser.displaySection(execOut("dumpsys activity activities 2>/dev/null") ?: "", id)
+            val ok = after != null && after.contains("Task{")
+            PipeLog.log("homeTask: moved task=$homeId display=$id ok=$ok")
+        } catch (e: Throwable) {
+            // issue #256：类初始化/链接错误是 Error 而不是 Exception，必须一起兜住，
+            // 否则会把建屏线程带死（本方法契约是「失败只记日志」）。
+            PipeLog.err("homeTask: ${e.message}")
+        }
+    }
+
+    /**
+     * `cmd package resolve-activity --brief` 的 home 解析结果里的 launcher 包名。
+     *
+     * 输出末行形如 `com.android.launcher3/.uioverrides.QuickstepLauncher`；
+     * 部分 ROM 把 `priority=0 … ` 前缀混在同一行，因此取最后一个空白分隔的 token
+     * 再截 `/` 前段。
+     */
+    private fun launcherPackage(): String? {
+        val out = execOut(
+            "cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.HOME 2>/dev/null"
+        )
+        val line = out?.lineSequence()?.map { it.trim() }?.lastOrNull { it.contains('/') } ?: return null
+        return line.substringAfterLast(' ')
+            .substringBefore('/')
+            .takeIf { it.isNotEmpty() && !it.contains(' ') && !it.contains(':') }
+    }
+
+    /**
      * 「最近」= 快速切换到上一个任务（2026-10-10 用户拍板的语义）。
      *
      * 不用 `input -d N keyevent 187`：AOSP 的系统 recents 硬编码作用于默认显示器
@@ -384,9 +455,14 @@ internal class CarCommandRouter(
      * @param probe issue #199：是否紧跟着回读一次目标 task 的配置（`[teardown-move]` 日志）。
      *   teardown 里由 [moveAllTasksToDisplay] 用**一次** dumpsys 统一回读，这里传 `false`
      *   可省掉 300ms 沉降 + 一次整份 dumpsys（现场 `apps-moved` 单步 3079ms 的主因之一）。
+     * @return issue #220：实际发出 `move-stack` 的 task id；没搬（无顶层 / 跳过自家 /
+     *   launcher / systemui）或命令失败时为 null。teardown 把它交给
+     *   [moveAllTasksToDisplay] 的 `skipTasks` 去重 —— `am display move-stack` 是异步入队的，
+     *   紧接着读到的 dumpsys 仍是迁移前快照，不去重就会把同一个 task 再搬一次并必报
+     *   `Trying to move rootTask … to its current taskDisplayArea`。
      */
-    fun moveTopApp(fromDisplay: Int, toDisplay: Int, probe: Boolean = true) {
-        if (fromDisplay < 0 || toDisplay < 0) return
+    fun moveTopApp(fromDisplay: Int, toDisplay: Int, probe: Boolean = true): Int? {
+        if (fromDisplay < 0 || toDisplay < 0) return null
         // `am display move-stack` was added in API 29 (Android 10). On API 26-28 the
         // subcommand is absent — am prints a usage error and exits non-zero. Skip the
         // whole feature on older levels so the foreground app is left in place rather
@@ -394,14 +470,14 @@ internal class CarCommandRouter(
         val api = sdkInt()
         if (api < 29) {
             PipeLog.log("moveTopApp: skipping, am display move-stack requires API 29 (current $api)")
-            return
+            return null
         }
         try {
-            val dump = execOut("dumpsys activity activities 2>/dev/null") ?: return
+            val dump = execOut("dumpsys activity activities 2>/dev/null") ?: return null
             val sec = ActivityDumpParser.displaySection(dump, fromDisplay)
             if (sec == null) {
                 PipeLog.log("moveTopApp: no 'Display #$fromDisplay' section found, skip")
-                return
+                return null
             }
             val match = ActivityDumpParser.TOP_ACTIVITY_RE.find(sec)
             val topComponent = match?.groupValues?.get(1)
@@ -424,12 +500,14 @@ internal class CarCommandRouter(
                 // 命令、顺序与返回值都不变（move-stack 仍是 fire-and-forget）。
                 // issue #199：teardown 批量路径传 probe=false，由 moveAllTasksToDisplay 统一回读。
                 if (probe) logMovedTaskConfig(taskId?.toIntOrNull(), toDisplay)
+                return taskId?.toIntOrNull()
             } else {
                 PipeLog.log("moveTopApp: nothing to move (top=${topComponent ?: "<none>"}, task=${taskId ?: "-"}, self=$isSelf)")
             }
         } catch (e: Exception) {
             PipeLog.err("Failed to move app: ${e.message}")
         }
+        return null
     }
 
     /**
@@ -449,6 +527,9 @@ internal class CarCommandRouter(
      *
      * @param budgetMs 本步软预算：到点立刻放弃剩余动作，并通过 [onPending] 交回还没搬回
      *   的 task id（日志里能直接看到卡在哪一段、还剩哪些 task）。
+     * @param skipTasks issue #220：调用方已经搬走的 task id（teardown 传入 [moveTopApp] 的
+     *   返回值）。`am display move-stack` 异步入队，紧接着读到的 dumpsys 仍是迁移前快照，
+     *   不去重就会把同一个 task 再搬一次并必报 "current taskDisplayArea"。
      * @param onPending 剩余 task id 回调（跑完时回调空列表）。
      * @return true 表示全部 task 都走了 move + resize + 回读。
      */
@@ -456,6 +537,7 @@ internal class CarCommandRouter(
         fromDisplay: Int,
         toDisplay: Int,
         budgetMs: Long = TEARDOWN_PROBE_DELAY_MS * 4,
+        skipTasks: Set<Int> = emptySet(),
         onPending: (List<Int>) -> Unit = {}
     ): Boolean {
         if (fromDisplay < 0 || toDisplay < 0 || fromDisplay == toDisplay) return true
@@ -477,9 +559,32 @@ internal class CarCommandRouter(
         }
         try {
             val dump = execOut("dumpsys activity activities 2>/dev/null") ?: return false
-            val tasks = ActivityDumpParser.tasksInDisplay(dump, fromDisplay)
+            // issue #258：home root task 归系统所有 —— VD 里这条（#17 从物理屏迁入）不能
+            // 当普通 task 搬回去。物理屏的 home root task 已由系统重建（现场 #942），
+            // 再搬 #940 必然触发
+            // `addRootTaskReferenceIfNeeded: root home task=…#942 already exist … rootTask=…#940`，
+            // 白占 apps-moved 步预算，还会把收尾拖到被 watchdog halt。
+            val section = ActivityDumpParser.displaySection(dump, fromDisplay)
+            // issue #258 实测补充：home 根任务下面还挂着 `type=home` 的子任务（#946 rootTaskId=945），
+            // 子任务不是 root task，`move-stack` 会报 `Unknown rootTaskId`。整棵 home 树一起跳过。
+            val homeIds = section?.let { ActivityDumpParser.homeTaskIds(it) }.orEmpty()
+            // 只认行首 `* Task{` 且不带 rootTaskId 的 root task：ActivityRecord 引用（t<id>）可能属于别的屏。
+            val candidates = section?.let { ActivityDumpParser.rootTaskIds(it) }.orEmpty()
+            // 已经在目标屏上的任务不再搬（`am display move-stack` 是异步的，快照可能滞后）。
+            val displayOf = ActivityDumpParser.taskDisplays(dump)
+            val tasks = candidates.filterNot {
+                it in homeIds || it in skipTasks || displayOf[it] == toDisplay
+            }
+            val skipped = candidates.filter { it !in tasks }
+            if (skipped.isNotEmpty()) {
+                PipeLog.log(
+                    "[teardown-move-all] skipping tasks=${skipped.joinToString(prefix = "[", postfix = "]")} " +
+                        "home=${homeIds.joinToString(prefix = "[", postfix = "]")} " +
+                        "alreadyMoved=${skipTasks.joinToString(prefix = "[", postfix = "]")}"
+                )
+            }
             if (tasks.isEmpty()) {
-                PipeLog.log("[teardown-move-all] display=$fromDisplay has no tasks, nothing to move")
+                PipeLog.log("[teardown-move-all] display=$fromDisplay has no movable tasks, nothing to move")
                 onPending(emptyList())
                 return true
             }
@@ -517,7 +622,11 @@ internal class CarCommandRouter(
 
     /**
      * issue #48 取证：`move-stack` 之后回读目标 task 的 `displayId / bounds /
-     * compat / densityDpi`，只落一条 `[teardown-move]` 日志。
+     * compat / windowMode / densityDpi`，只落一条 `[teardown-move]` 日志。
+     *
+     * issue #238：`compat=` 只打 ActivityRecord 的 screen-compat 标志（`compat={560dpi}`，
+     * 读不到记 `<unknown>`）；窗口模式单独落 `windowMode=`。此前 `compat=` 下打的是
+     * `winConfig` 的 `mWindowingMode`（恒 `fullscreen`），与标签名不符。
      *
      * `am display move-stack` 是异步入队的（这里是 fire-and-forget 的 `exec`），
      * 立刻 `dumpsys` 会读到迁移前的状态，所以先等一个很短的时间再读。任何字段
@@ -543,14 +652,24 @@ internal class CarCommandRouter(
     private fun logTaskConfig(dump: String?, taskId: Int, toDisplay: Int) {
         try {
             val located = dump?.let { ActivityDumpParser.findTaskSection(it, taskId) }
-            val block = located?.let { ActivityDumpParser.taskBlock(it.second, taskId) }
-            val display = located?.first?.toString() ?: "<unknown>"
+            // issue #239：`findTaskSection` 按 dump 中 display 段的出现顺序取第一个命中，
+            // VD 残留段排在目标屏段之前时会把残留任务块当成归属。命中不是 `toDisplay`
+            // 时一律回到目标段内重新定位；目标段里读不到该 task 就记 `<unknown>`，
+            // 绝不回落到别的 display 的 bounds（那正是现场假数据的来源）。
+            val block = when {
+                located == null -> null
+                located.first == toDisplay -> ActivityDumpParser.taskBlock(located.second, taskId)
+                else -> ActivityDumpParser.displaySection(dump, toDisplay)
+                    ?.let { ActivityDumpParser.taskBlock(it, taskId) }
+            }
+            val display = if (block != null) toDisplay.toString() else "<unknown>"
             val bounds = block?.let { ActivityDumpParser.extractBounds(it) } ?: "<unknown>"
             val compat = block?.let { ActivityDumpParser.extractCompat(it) } ?: "<unknown>"
+            val windowMode = block?.let { ActivityDumpParser.extractWindowMode(it) } ?: "<unknown>"
             val density = block?.let { ActivityDumpParser.extractDensity(it) } ?: "<unknown>"
             PipeLog.log(
                 "[teardown-move] task=$taskId moved-to=$toDisplay displayId=$display " +
-                    "bounds=$bounds compat=$compat densityDpi=$density"
+                    "bounds=$bounds compat=$compat windowMode=$windowMode densityDpi=$density"
             )
         } catch (e: Exception) {
             PipeLog.err("[teardown-move] task=$taskId probe failed: ${e.message}")
@@ -607,5 +726,11 @@ internal class CarCommandRouter(
          * 观察到 DTA 被踢出层树（issue #19），1.5s 会早于故障发生，取 1.8s 留余量。
          */
         const val LAYER_RECHECK_DELAY_MS = 1_800L
+
+        /**
+         * issue #17：`am display move-stack` 是异步入队的，把 home 任务搬进 VD 后
+         * 等 400ms 再回读，避免读到迁移前的 display 段。
+         */
+        const val HOME_TASK_VERIFY_MS = 400L
     }
 }

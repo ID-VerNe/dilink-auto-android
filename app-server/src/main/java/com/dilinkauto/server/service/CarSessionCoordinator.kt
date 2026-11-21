@@ -56,6 +56,15 @@ internal class CarSessionCoordinator(
     // ─── Handshake & Viewport parameters ───
     var handshakeVdDpi: Int = VideoConfig.VIRTUAL_DISPLAY_DPI
         internal set
+    /**
+     * issue #21：握手响应带来的「允许上车」包名集合（车机 App 列表白名单）。
+     *
+     * 车机端 ADB 部署路径在收到握手响应的同一段代码里就拼引擎 argv，而 APP_LIST
+     * 要等引擎启动之后才到 —— 白名单只能从握手响应里拿。空集合 = 手机从未配置
+     * 白名单 / 老版本手机未下传 → 引擎不做白名单过滤（行为与引入该字段前一致）。
+     */
+    @Volatile var handshakeAllowedPackages: Set<String> = emptySet()
+        internal set
     var vdServerJarPath: String = VdDeploy.JAR_PATH
         internal set
     var vdWidth: Int = 1408
@@ -96,6 +105,21 @@ internal class CarSessionCoordinator(
      * 实车回签时能直接区分「SurfaceView 不可见、没有 Surface」与「有 Surface 但没出帧」。
      */
     private val surfaceWait = SurfaceWaitLogger()
+
+    /**
+     * 壳层镜像页当前是否可见（issue #229 归因插桩）：`MirrorContent` 的 AndroidView
+     * update 块在主线程写入，`waiting for surface` / surface 回调日志读取。
+     *
+     * 首连等 Surface 28.7s 的真相是壳层冷启动停在 HOME 磁贴页（用户没点应用），
+     * SurfaceView 保持 INVISIBLE、surface 永不创建；重连 0.2s 则是壳层常已在 APP 页。
+     * 不带这个字段，等待日志只有解码器三态，回签者无法从日志直接归因到用户点击。
+     *
+     * **刻意不随 `startConnection` / `handleDisconnect` 复位**：重连时壳层常仍在 APP 页
+     *（重连 0.2s 场景正是如此），复位会把真 true 改成假 false。Activity 被杀后新会话的
+     * CarLaunchScreen 阶段可能残留 true，属可接受的诊断边界 —— 它只影响日志标注，
+     * 不改变任何行为（`update` 块会在下一次组合时写回真实值）。
+     */
+    @Volatile private var mirrorScreenVisible = false
 
     /**
      * IDR 补帧请求闸门状态（issue #75 / #163）：与手机端共用 protocol-core 的 [SyncRequestGate]，
@@ -252,6 +276,8 @@ internal class CarSessionCoordinator(
         vdServerStarted = false
         shizukuMode = false
         handshakeDone = false
+        // issue #21：上一台手机的白名单不得跨会话残留。
+        handshakeAllowedPackages = emptySet()
         _videoReady.value = false
         surfaceWait.reset()
         adbTracker.resetAdbReadiness()
@@ -599,11 +625,14 @@ internal class CarSessionCoordinator(
         if (!_videoReady.value && !isConfig) {
             if (!tryMarkVideoReady()) {
                 surfaceWait.onNotReady(SystemClock.elapsedRealtime())?.let { waitedSec ->
+                    // mirrorVisible（issue #229）：首连等 Surface 时的真正归因 —— 壳层停在
+                    // HOME 页（false）意味着 surfaceCreated 只能等用户点应用磁贴触发。
                     carLogSend(
                         "[Video] waiting for surface ${waitedSec}s " +
                             "(decoderRunning=${videoDecoder.isRunning} " +
                             "surfaceValid=${videoDecoder.outputSurfaceValid} " +
-                            "renderedOnSurface=${videoDecoder.framesRenderedOnSurface})",
+                            "renderedOnSurface=${videoDecoder.framesRenderedOnSurface} " +
+                            "mirrorVisible=$mirrorScreenVisible)",
                         "W"
                     )
                 }
@@ -665,6 +694,15 @@ internal class CarSessionCoordinator(
                 vdWidth = sanitizePeerDimension(response.displayWidth, vdWidth)
                 vdHeight = sanitizePeerDimension(response.displayHeight, vdHeight)
                 handshakeVdDpi = response.vdDpi
+                // issue #21：建屏恢复的白名单随握手响应到达，供随后的 ADB 部署拼进 argv。
+                handshakeAllowedPackages = response.allowedPackages
+                carLogSend(
+                    "Handshake allowlist: " + if (response.allowedPackages.isEmpty()) {
+                        "not handed down (recents restore unfiltered)"
+                    } else {
+                        "${response.allowedPackages.size} apps (recents restore bounded)"
+                    }
+                )
                 // issue #202 评审第 2 条：设置页要显示"实际生效值 / 视口上限"，
                 // 两者都从这次握手响应里取（不新增协议）。
                 _effectiveVdDpi.value = response.vdDpi
@@ -818,10 +856,22 @@ internal class CarSessionCoordinator(
         wifiReady = false
         vdServerStarted = false
         handshakeDone = false
+        // issue #21：新一次建 VD 前先清空，等本次握手响应重新给集合（重握手同样适用）。
+        handshakeAllowedPackages = emptySet()
         vdWidth = newVpW
         vdHeight = newVpH
         _state.value = CarConnectionService.State.CONNECTING
         _statusMessage.value = context.getString(R.string.status_starting_vd)
+
+        // issue #22：旧引擎的 exec app_process 长期占用这条 TCP ADB 流，kill 后 socket
+        // 半死但 isConnected 仍可能为 true；直接复用会让部署快速失败并等 60s 生命周期
+        // 超时（实车黑屏 79s）。这里先丢弃半死控制器，再让既有跟踪逻辑重建并触发部署。
+        // 注意用服务级 scope：上面的 connectionScope 已在本函数开头 cancel，挂在它上面
+        // 的协程不会启动，重建也就不会发生。
+        if (shouldRebuildAdbOnRehandshake(adbTracker.adbController != null)) {
+            adbTracker.resetAdbController()
+            adbTracker.startUsbTrack(scope)
+        }
 
         try {
             sendHandshake(ctrl, newVpW, newVpH, dpi)
@@ -882,6 +932,8 @@ internal class CarSessionCoordinator(
         wifiReady = false
         vdServerStarted = false
         handshakeDone = false
+        // issue #21：白名单属于会话态，断开后清掉，避免下一台手机沿用旧集合。
+        handshakeAllowedPackages = emptySet()
         // issue #151：电量属于会话态，断开后必须回到 `—`，否则会显示上一台手机的旧值。
         onPhoneStatus(null)
         adbTracker.resetAdbReadiness()
@@ -1038,9 +1090,14 @@ internal class CarSessionCoordinator(
         }
     }
 
+    /** 壳层镜像页可见性上报（issue #229）：只记状态，不驱动任何行为 —— 纯归因插桩。 */
+    fun onMirrorScreenVisibilityChanged(visible: Boolean) {
+        mirrorScreenVisible = visible
+    }
+
     fun onMirrorSurfaceCreated(surface: Surface) {
         decoderExecutor.execute {
-            carLogSend("[MirrorScreen] SurfaceView surface created, decoder.isRunning=${videoDecoder.isRunning}")
+            carLogSend("[MirrorScreen] SurfaceView surface created, decoder.isRunning=${videoDecoder.isRunning} mirrorVisible=$mirrorScreenVisible")
             // issue #198：分派判据抽到 RenderPipelinePolicy，Surface 已失效时不做无用重绑。
             when (RenderPipelinePolicy.onSurfaceCreated(
                 decoderRunning = videoDecoder.isRunning,
@@ -1077,7 +1134,7 @@ internal class CarSessionCoordinator(
 
     fun onMirrorSurfaceDestroyed() {
         videoDecoder.invalidateSurface()
-        carLogSend("[MirrorScreen] SurfaceView surface destroyed — decoder stays running, render gated off")
+        carLogSend("[MirrorScreen] SurfaceView surface destroyed — decoder stays running, render gated off mirrorVisible=$mirrorScreenVisible")
     }
 
     fun stopDecoderAsync() {

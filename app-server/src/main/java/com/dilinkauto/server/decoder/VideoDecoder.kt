@@ -521,7 +521,8 @@ class VideoDecoder {
                                 "Discarding cached KEYFRAME from codec generation=${cached.entry.generation} " +
                                     "(current generation=$generation) — waiting for a new IDR"
                             )
-                            intake.onDropped(isKey = true)
+                            // 缓存 IDR 从未进入活着的解码器，走停播期分项（issue #229）。
+                            intake.onKeyDroppedBeforeStart()
                             false
                         }
 
@@ -616,7 +617,8 @@ class VideoDecoder {
                             fpsWindowStartMs = nowMs
                             val fpsText = " fps=%.1f".format(measuredFps)
                             val counters = "rendered=$renderCount drops=${snap.dropped} inputFails=$inputFailCount " +
-                                "keys_recv=${snap.keyReceived} keys_fed=${snap.keyFed} keys_drop=${snap.keyDropped}"
+                                "keys_recv=${snap.keyReceived} keys_fed=${snap.keyFed} keys_drop=${snap.keyDropped} " +
+                                "keys_prestart_drop=${snap.keyDroppedBeforeStart}"
                             if (debugFrameStats) {
                                 val decodeMs = windowDecodeNanos / 1_000_000.0
                                 log("Fed ${snap.fed} $counters queue=${frameQueue.size} skips=$skipCount resync=${resync.awaitingIdr} decodeMs=${"%.1f".format(decodeMs)}$fpsText")
@@ -853,7 +855,8 @@ class VideoDecoder {
         if (isConfig) {
             configData = data
             // 被新码流边界作废的缓存 IDR 从此再也不会喂入，必须记丢（issue #205）。
-            if (cachedKeyFrameStore.clear()) intake.onDropped(isKey = true)
+            // 它从未进入活着的解码器，走停播期分项（issue #229）。
+            if (cachedKeyFrameStore.clear()) intake.onKeyDroppedBeforeStart()
         }
         // 停播期间缓存最近的 IDR，供 start() 判断能否作为参考帧；P 帧没有解码器可解，直接丢弃。
         if (!running.get() && !isConfig) {
@@ -862,7 +865,9 @@ class VideoDecoder {
                 // 代次取当前 codecGeneration：停播期通常为 0（没有活着的 codec），
                 // stop 卡死时可能是尚未配对的旧代次 —— 两种情况都会被新 codec 判为跨代。
                 if (cachedKeyFrameStore.replace(codecGeneration, data) != null) {
-                    intake.onDropped(isKey = true)
+                    // 首连等 Surface 期间的 IDR 覆盖全走这里（issue #229 的 9 行现场日志）：
+                    // 丢在「解码器还没起来」，与 in-stream 丢帧分账，现场一眼可归因。
+                    intake.onKeyDroppedBeforeStart()
                     logW("Cached KEYFRAME replaced by a newer one before start() — counted as dropped")
                 }
             } else {
@@ -991,7 +996,8 @@ class VideoDecoder {
                 // CONFIG 不进账（它从未被 onReceived 记过），只结视频帧的账。
                 if (!queued.isConfig) intake.onDropped(queued.isKeyFrame)
             }
-            if (cachedKeyFrameStore.clear()) intake.onDropped(isKey = true)
+            // stop 作废的缓存 IDR 同样从未进入活着的解码器，走停播期分项（issue #229）。
+            if (cachedKeyFrameStore.clear()) intake.onKeyDroppedBeforeStart()
             val stopSnap = intake.snapshot()
             log("Stopping decoder: fed=${stopSnap.fed} rendered=$renderCount drops=${stopSnap.dropped} inputFails=$inputFailCount codec generation=$codecGeneration")
             resetBlackScreenState()

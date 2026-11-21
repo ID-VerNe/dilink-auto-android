@@ -7,6 +7,8 @@ import android.content.pm.PackageManager
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
+import android.os.Bundle
+import android.os.SystemClock
 import androidx.core.content.ContextCompat
 import com.dilinkauto.protocol.AltitudeFormat
 import kotlinx.coroutines.CoroutineScope
@@ -67,6 +69,9 @@ internal class AltitudeProvider(
     private var lastAcceptedMeters: Double = 0.0
     private var lastAcceptedElapsedNanos: Long = 0L
 
+    /** 上次输出时钟偏移诊断的单调时刻；issue #221 的限频基线。 */
+    private var lastClockOffsetLogMs = Long.MIN_VALUE / 2
+
     /**
      * 启动 GPS 采样。权限未授予时安全降级为「不注册、保持 null」。
      *
@@ -93,8 +98,16 @@ internal class AltitudeProvider(
             override fun onLocationChanged(location: Location) {
                 handleLocation(location)
             }
-            // 旧 API（< 30）仍可能走 onStatusChanged；minTime/minProvider 回调在 30+ 已弃用，
-            // 这里只覆盖 onLocationChanged 即可，其余用默认空实现。
+
+            // 下面三个回调在 compileSdk 34 上是 default 方法（编译器不强制实现），
+            // 但实车 API 28（issue #228 环境）上仍是抽象方法：不显式实现时
+            // GPS provider 状态一变化就 AbstractMethodError 杀死进程，必须补齐空实现。
+            // 写法与 CityResolver.kt:117-121 的正确对照一致。
+            override fun onProviderEnabled(provider: String) = Unit
+            override fun onProviderDisabled(provider: String) = Unit
+
+            @Deprecated("API 29 起弃用，仍需实现")
+            override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) = Unit
         }
         // requestLocationUpdates(long, float, LocationListener) 在 API 30 弃用但仍可用；
         // minSdk=26，用兼容签名避免引入额外的 PendingIntent 回路。
@@ -120,13 +133,21 @@ internal class AltitudeProvider(
     }
 
     private fun handleLocation(location: Location) {
-        // 年龄判定仍用系统时钟（与 acceptLocation 的语义一致）；跳变闸门用单调时钟
-        // elapsedRealtimeNanos，避免用户改系统时间（issue #39 场景）让 Δt 失真。
-        val ageMs = System.currentTimeMillis() - location.time
         val altitude = if (location.hasAltitude()) location.altitude else null
         val hasVAcc = location.hasVerticalAccuracy()
         val vAcc = if (hasVAcc) location.verticalAccuracyMeters else Float.NaN
+        // issue #221：年龄判定改用单调时钟（两端都是 elapsedRealtimeNanos），与跳变闸门
+        // 同口径。旧口径「车机墙钟 − GPS 时间戳」会随墙钟漂移失真（现场 24h 内 ~-1s →
+        // ~-11.1s），负值被钳 0 后 stale 闸门实际阈值被越冲越宽。墙钟年龄只用于在相位
+        // 不同步时限频记录 clockOffset，不再参与判定（#39 的「用户改系统时间」也随之免疫）。
         val elapsedNanos = location.elapsedRealtimeNanos
+        val ageMs = if (elapsedNanos > 0L) {
+            AltitudeFormat.monotonicAgeMs(SystemClock.elapsedRealtimeNanos(), elapsedNanos)
+        } else {
+            // 少数 provider/模拟定位不填单调时间戳：退回墙钟年龄并夹 0（旧口径兜底）。
+            (System.currentTimeMillis() - location.time).coerceAtLeast(0L)
+        }
+        logClockOffsetIfNeeded(location)
 
         fun diagnose(accepted: Boolean, reason: String) {
             // 每样本一行（1Hz），由 CarLogWriter 的开关控制；release 默认关闭，不产生噪声。
@@ -189,7 +210,29 @@ internal class AltitudeProvider(
         diagnose(accepted = true, reason = "ema")
     }
 
+    /**
+     * 墙钟年龄为负时留一条限频诊断（issue #221），显式记录车机时钟相对 GPS 时间戳的
+     * 偏移量。年龄判定本身已改用单调时钟，这条日志只用于持续观察漂移趋势。
+     */
+    private fun logClockOffsetIfNeeded(location: Location) {
+        val nowWallMs = System.currentTimeMillis()
+        val offsetMs = AltitudeFormat.clockOffsetMs(nowWallMs, location.time)
+        if (offsetMs >= 0L) return
+        val nowElapsed = SystemClock.elapsedRealtime()
+        if (nowElapsed - lastClockOffsetLogMs < CLOCK_OFFSET_LOG_INTERVAL_MS) return
+        lastClockOffsetLogMs = nowElapsed
+        log(
+            "[Altitude] clock offset: wall clock is ${-offsetMs}ms behind GPS timestamp; " +
+                "ageMs now uses monotonic clock (issue #221)"
+        )
+    }
+
     private fun hasPermission(): Boolean =
         ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) ==
             PackageManager.PERMISSION_GRANTED
+
+    private companion object {
+        /** 时钟偏移诊断日志的最小间隔（issue #221）。 */
+        const val CLOCK_OFFSET_LOG_INTERVAL_MS = 60_000L
+    }
 }
