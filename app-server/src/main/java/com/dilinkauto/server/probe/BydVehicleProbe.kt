@@ -4,10 +4,15 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.util.Log
+import com.dilinkauto.server.BuildConfig
 import com.dilinkauto.server.service.BydPermissionContext
 import com.dilinkauto.server.service.shouldGrantBydPermission
 import java.lang.reflect.Field
 import java.lang.reflect.Modifier
+import java.lang.reflect.Proxy as JavaProxy
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.roundToInt
 
 /**
  * 车机侧 BYDAuto 车辆数据探针：issue #188 立单，issue #195 增补对照实验。
@@ -23,8 +28,29 @@ import java.lang.reflect.Modifier
  * 2. `permSelf=` / `permReal=`：wrapper 与真实 ApplicationContext 的权限判定并列；
  * 3. `realCtxCall=`：用真实 context 重新实例化并调 `getEngineSpeed()`；
  * 4. `engine coolant=` / `oil=` / `speedWarn=`：同 `BYDAUTO_ENGINE_GET` 权限的其它 getter；
- * 5. `listener=`：事件通道（`AbsBYDAutoEngineListener` 是抽象类，Proxy 不可用，见实现注释）；
- * 最后 `verdict=` 由纯函数 [decideSpeedVerdict] 自动判定，避免人工读日志把根因看反。
+ * 5. `listener=`：事件通道（上一轮误判为「抽象类不可 Proxy」，见 #188 v2 的更正）；
+ * 最后 `verdict-legacy=` 由 [decideSpeedVerdict] 判定；#188 v2 起主判据是
+ * `verdict=`（[decideSubscribeVerdict]，raw FID + 订阅对照），避免人工读日志把根因看反。
+ *
+ * #188 v2（第三轮）推翻了上一轮的两个前提：
+ * 1. **事件通道不是死路**。#195 判 `listener=skip(abstract-class)` 是因为拿抽象类去 Proxy；
+ *    实际注册入口收的是**接口** `android.hardware.IBYDAutoListener`，
+ *    `BYDAutoEngineDevice.registerListener(AbsBYDAutoEngineListener)` 内部就是
+ *    `super.registerListener((IBYDAutoListener) l)`（`temp.java:287-293`），所以
+ *    `java.lang.reflect.Proxy` 可直接订阅，不需要 DexMaker；
+ * 2. **原始 FID 读取要自己走**。typed getter 首行有客户端权限检查，且历史上 `HelperDaemon`
+ *    与 `FidDaemon` 都把发动机归到 `dev=1003`（正确是 `1012`），所以「三条通道都返回 8191」
+ *    很可能只是同一个错误的复制。本轮用 `AbsBYDAutoDevice.get(dev, fid)` 直接读 1012 / 1003，
+ *    并用 AC 主温（`dev=1000`, 已知 26）自证这条反射链能读到非哨兵值。
+ *
+ * #188 v3（第四轮，#277/#280 的验证项）：
+ * 1. **修 raw lane 的反射姿势**：`get(int,int)` 在 AbsBYDAutoDevice 上不是 public，
+ *    `getMethod` 必然 `NoSuchMethodException`（上一轮三条 raw lane 同报的根因，#277 §3
+ *    车况助手走 `getDeclaredMethod` + `setAccessible`）；
+ * 2. **tick 同拍组合读**：typed 发动机 + GB FID + 前后电机 raw 逐拍同拍输出，预演 #280
+ *    「EV 门控与转速同 tick 原子读」的生产模型；
+ * 3. **energyMode 三条 lane**：typed `getEnergyMode()` + `raw[1006]` 双 FID，#280 EV 门控
+ *    （`1=EV / 2=FORCE_EV` 隐藏发动机 chip）的数据源验证。
  *
  * 输出约定：一行一个 `[BydProbe] key=value`，经 `CarLogWriter` 以 `CAR_LOG` 帧回传手机，
  * 手机端落进 `client.log`。得到结论后本类连同调用点一起删除（见 issue #188 的清理条件）。
@@ -82,6 +108,10 @@ internal class BydVehicleProbe(
             finishAfterStop(evidence)
             return
         }
+        if (!probeEnergy()) {
+            finishAfterStop(evidence)
+            return
+        }
         if (!probeStatistic()) {
             finishAfterStop(evidence)
             return
@@ -90,7 +120,7 @@ internal class BydVehicleProbe(
             finishAfterStop(evidence)
             return
         }
-        if (!probeAc()) {
+        if (!probeAc(evidence)) {
             finishAfterStop(evidence)
             return
         }
@@ -149,13 +179,21 @@ internal class BydVehicleProbe(
         // 对照 1：SDK 内部存的 context 是否还是我们的 wrapper（被换掉则 wrapper 失效）。
         evidence.storedContext = probeStoredContext(device)
         if (device == null) {
-            evidence.listener = probeListener(null)
+            evidence.listener = probeSubscribe(null, evidence)
             return true
         }
         for (i in 0 until speedSamples) {
             if (abortedAt("engine speed[$i]")) return false
             val raw = callInt(device, "getEngineSpeed")
             emit("engine speed[$i]=$raw")
+            // #188 v3（#277/#280）：同拍组合读 —— typed 与 GB FID / 前后电机 raw 在同一拍
+            // 取值，对应 #280「EV 门控与转速同 tick 原子读」的生产模型。这些行只记数据，
+            // 不进任何 verdict 判定；GB 对照 339738642 typed、282066952 GB（#277 §4 GB 优先）。
+            emit(
+                "tick[$i] eng=$raw gb=${rawGetInt(device, DEV_ENGINE, FID_ENGINE_SPEED_GB)} " +
+                    "mF=${rawGetInt(device, DEV_ENGINE, FID_MOTOR_FRONT)} " +
+                    "mR=${rawGetInt(device, DEV_ENGINE, FID_MOTOR_REAR)}",
+            )
             // 只用第一拍参与判定，避免 6 个重复样本掩盖其它 getter 的差异。
             if (i == 0) evidence.readings += parseOkInt(raw)
             if (i != speedSamples - 1) sleepMs(SAMPLE_INTERVAL_MS)
@@ -179,8 +217,15 @@ internal class BydVehicleProbe(
         emit("speedWarn=$warn")
         evidence.readings += parseOkInt(warn)
 
-        // 对照 5：事件通道。
-        evidence.listener = probeListener(device)
+        // 对照 5：事件通道（#188 v2 起改成真订阅，见 [probeSubscribe]）。
+        if (abortedAt("raw lanes")) return false
+        evidence.rawEngine = rawGetInt(device, DEV_ENGINE, FID_ENGINE_SPEED)
+        evidence.rawLegacy = rawGetInt(device, DEV_ENGINE_LEGACY, FID_ENGINE_SPEED)
+        emit("raw[1012]=${evidence.rawEngine}")
+        emit("raw[1003]=${evidence.rawLegacy}")
+
+        if (abortedAt("subscribe")) return false
+        evidence.listener = probeSubscribe(device, evidence)
 
         // 对照 3 必须放在最后：`getInstance(realContext)` 可能返回同一单例并覆盖它的
         // `mContext`，之后任何 getter 都会落到真实 context 的权限检查上；先跑会把
@@ -286,36 +331,168 @@ internal class BydVehicleProbe(
     }
 
     /**
-     * #195 对照 5：事件通道。
+     * #188 v2 对照 5：**真订阅**，并对比订阅前后的原始读数。
      *
-     * `AbsBYDAutoEngineListener` 是**抽象类**而不是接口（`temp.java:287-293`），
-     * `java.lang.reflect.Proxy` 只能代理接口，硬造子类需要 DexMaker 或编译期依赖
-     * car-lib —— 两者都超出本轮临时探针的范围，所以这里只显式 skip 并留证据，
-     * 不用假实现污染结论。
+     * 上一轮判 `listener=skip(abstract-class)` 的推理是错的：需要 Proxy 的不是
+     * `AbsBYDAutoEngineListener`（抽象类），而是它实现的接口 `android.hardware.IBYDAutoListener`
+     * （3 个方法）。`BYDAutoEngineDevice.registerListener(AbsBYDAutoEngineListener)` 内部执行
+     * `super.registerListener((IBYDAutoListener) l)`（`temp.java:287-293`），说明设备侧只认接口，
+     * 所以 `java.lang.reflect.Proxy` 可以直接订阅 —— 不需要 DexMaker，也不需要编译期依赖。
+     *
+     * 三步：只订阅转速 FID → 读一次；全量订阅 → 再读一次；注销（必须同一 proxy 实例）。
      */
-    private fun probeListener(device: Any?): ListenerState {
-        val cls = classLookup(LISTENER_CLASS)
-        if (cls == null) {
-            emit("listener=skip(no-class($LISTENER_CLASS))")
-            return ListenerState.NOT_ATTEMPTED
-        }
-        if (Modifier.isAbstract(cls.modifiers)) {
-            emit("listener=skip(abstract-class)")
-            return ListenerState.SKIP_ABSTRACT
-        }
+    private fun probeSubscribe(device: Any?, evidence: EngineEvidence): ListenerState {
         if (device == null) {
             emit("listener=skip(no-instance)")
             return ListenerState.NOT_ATTEMPTED
         }
-        return runCatching {
-            val listener = cls.getDeclaredConstructor().newInstance()
-            device.javaClass.getMethod("registerListener", cls).invoke(device, listener)
-            emit("listener=registered")
-            ListenerState.REGISTERED
-        }.getOrElse {
-            emit("listener=err:${describe(it)}")
-            ListenerState.ERROR
+        val iface = classLookup(LISTENER_INTERFACE)
+        if (iface == null || !iface.isInterface) {
+            emit("listener=skip(no-interface($LISTENER_INTERFACE))")
+            // 接口缺失时把「抽象类不可 Proxy」的旧结论原样留证，别让两轮日志对不上。
+            val abs = classLookup(LISTENER_CLASS)
+            if (abs != null && Modifier.isAbstract(abs.modifiers)) emit("listener=skip(abstract-class)")
+            return ListenerState.SKIP_ABSTRACT
         }
+        val proxy = runCatching { newListenerProxy(iface, evidence) }.getOrElse {
+            emit("listener=err:proxy(${describe(it)})")
+            return ListenerState.ERROR
+        }
+
+        if (!registerListener(device, iface, proxy, intArrayOf(FID_ENGINE_SPEED))) {
+            return ListenerState.ERROR
+        }
+        emit("sub=registered featureIds=1")
+        sleepMs(SUBSCRIBE_WAIT_MS)
+        evidence.afterSubscribe = rawGetInt(device, DEV_ENGINE, FID_ENGINE_SPEED)
+        emit("sub-after=${evidence.afterSubscribe}")
+
+        // 全量订阅：排除「单 FID 订阅没下发」造成的假阴性。
+        if (registerListener(device, iface, proxy, null)) {
+            emit("sub-all=registered")
+            sleepMs(SUBSCRIBE_WAIT_MS)
+            evidence.afterSubscribeAll = rawGetInt(device, DEV_ENGINE, FID_ENGINE_SPEED)
+            emit("sub-all-after=${evidence.afterSubscribeAll}")
+        }
+
+        runCatching {
+            val base = classLookup(ABS_DEVICE) ?: error("no $ABS_DEVICE")
+            base.getMethod("unregisterListener", iface).invoke(device, proxy)
+            emit("unsub=ok")
+        }.onFailure { emit("unsub=err:${describe(it)}") }
+
+        return if (evidence.hasRealCallback()) ListenerState.REGISTERED_REAL_VALUE else ListenerState.REGISTERED
+    }
+
+    /** 反射 `AbsBYDAutoDevice.registerListener(IBYDAutoListener[, int[]])`；子类只声明了 typed 重载。 */
+    private fun registerListener(device: Any, iface: Class<*>, proxy: Any, featureIds: IntArray?): Boolean =
+        runCatching {
+            val base = classLookup(ABS_DEVICE) ?: error("no $ABS_DEVICE")
+            if (featureIds == null) {
+                base.getMethod("registerListener", iface).invoke(device, proxy)
+            } else {
+                base.getMethod("registerListener", iface, IntArray::class.java).invoke(device, proxy, featureIds)
+            }
+            true
+        }.getOrElse {
+            emit("listener=err:register(${describe(it)})")
+            false
+        }
+
+    /**
+     * 造一个 `IBYDAutoListener` 代理。回调**可能在 binder 线程**，所以 `EngineEvidence`
+     * 里的事件容器必须是并发安全且只在锁内累积（见 [EngineEvidence.recordCallback]）。
+     *
+     * 两个必须踩住的坑，踩错任何一个这一轮的订阅实验都会直接作废：
+     * 1. **`Object` 方法也会进 handler**。SDK 用
+     *    `ConcurrentHashMap<IBYDAutoListener, ArraySet<Integer>>` 存听众
+     *    （`IBYDAutoListenerIdsMap.mListenerIdMap`），注册时必然调 `hashCode()`/`equals()`；
+     *    handler 一律 `return null` 会在拆箱成 `int` 时 NPE，`registerListener` 直接抛异常，
+     *    日志只剩 `listener=err:register(...)`。所以这三个方法必须给出真值。
+     * 2. **事件值藏在两个不同形状里**：`onDataChanged(IBYDAutoEvent)` 走 getter，
+     *    而 `onDataEventChanged(int, BYDAutoEventValue)` 的值在**公有字段**里
+     *    （`intValue` / `doubleValue`），第二个参数不是 null 就一定要读 —— 只记 `evt`
+     *    等于把「读到了转速」记成「没有数据」，判定会给出与事实相反的 `no-data`。
+     */
+    private fun newListenerProxy(iface: Class<*>, evidence: EngineEvidence): Any {
+        // 接口在 boot classpath 时 `classLoader` 是 null；用我们自己的 loader 定义代理类更稳。
+        val loader = iface.classLoader ?: BydVehicleProbe::class.java.classLoader
+        return JavaProxy.newProxyInstance(loader, arrayOf(iface)) { proxySelf, method, args ->
+            when {
+                method.declaringClass == Any::class.java -> when (method.name) {
+                    "toString" -> "BydProbeListenerProxy"
+                    "hashCode" -> System.identityHashCode(proxySelf)
+                    // 剩下只有 equals：代理之间按引用相等，否则 ConcurrentHashMap 会找不到自己。
+                    else -> proxySelf === args?.getOrNull(0)
+                }
+                method.name == "onDataChanged" -> {
+                    val event = args?.getOrNull(0)
+                    evidence.recordCallback(
+                        dev = readInt(event, "getDeviceType"),
+                        evt = readInt(event, "getEventType"),
+                        value = readInt(event, "getValue"),
+                        dbl = readDouble(event, "getDoubleValue"),
+                        emit = ::emit,
+                    )
+                    null
+                }
+                // `onDataEventChanged(int, BYDAutoEventValue)`：第一个参数是 eventType，值在第二个参数里。
+                method.name == "onDataEventChanged" -> {
+                    val event = args?.getOrNull(1)
+                    evidence.recordCallback(
+                        dev = null,
+                        evt = args?.getOrNull(0) as? Int,
+                        value = readIntField(event, "intValue"),
+                        dbl = readDoubleField(event, "doubleValue"),
+                        emit = ::emit,
+                    )
+                    null
+                }
+                method.name == "onError" -> {
+                    emit("cb=err ${args?.getOrNull(1)}")
+                    null
+                }
+                else -> null
+            }
+        }
+    }
+
+    private fun readCall(target: Any?, method: String): Any? =
+        runCatching { target?.javaClass?.getMethod(method)?.invoke(target) }.getOrNull()
+
+    private fun readInt(target: Any?, method: String): Int? = readCall(target, method) as? Int
+
+    private fun readDouble(target: Any?, method: String): Double? = readCall(target, method) as? Double
+
+    /** 直读 `BYDAutoEventValue.intValue`；`INVAILD_INT`（-999999999）是 SDK 的「无值」哨兵。 */
+    private fun readIntField(target: Any?, field: String): Int? {
+        val raw = runCatching { target?.javaClass?.getField(field)?.get(target) }.getOrNull() as? Int
+        return if (raw == null || raw == BYD_EVENT_INVALID_INT) null else raw
+    }
+
+    /** 直读 `BYDAutoEventValue.doubleValue`；`INVALID_DOUBLE`（-9.99999999E8）是「无值」。 */
+    private fun readDoubleField(target: Any?, field: String): Double? {
+        val raw = runCatching { target?.javaClass?.getField(field)?.get(target) }.getOrNull() as? Double
+        return if (raw == null || raw <= BYD_EVENT_INVALID_DOUBLE_THRESHOLD) null else raw
+    }
+
+    /**
+     * 直接调 `AbsBYDAutoDevice.get(dev, fid)`，绕开 typed getter 首行的客户端权限检查。
+     * 返回 `ok:<int>` / `err:<异常>`，与其它 lane 的格式保持一致。
+     *
+     * #277 §3：`get(int,int)` 在 AbsBYDAutoDevice 上**不是 public**（车况助手 `b2.c#W` 走
+     * `getDeclaredMethod` + `setAccessible`），`getMethod` 只找 public 方法 —— 上一轮
+     * `raw[1012]/raw[1003]/raw[ctl]` 三条 lane 同报 `NoSuchMethodException:get [int, int]`
+     * 的根因就是这里，不是权限、也不是车上没数据。
+     */
+    private fun rawGetInt(device: Any?, dev: Int, fid: Int): String {
+        if (device == null) return "skip(no-instance)"
+        val base = classLookup(ABS_DEVICE) ?: return "skip(no-class)"
+        return runCatching {
+            val m = base.getDeclaredMethod("get", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+            m.isAccessible = true
+            "ok:${m.invoke(device, dev, fid)}"
+        }.getOrElse { "err:${describe(it)}" }
     }
 
     /** 把判定所需的全部对照结果汇总成一行，方便明天上车直接 grep `verdict=`。 */
@@ -323,10 +500,38 @@ internal class BydVehicleProbe(
         val snapshot = evidence.snapshot()
         val sentinel = snapshot.engineReadings.count { it != null && it in BYD_SENTINEL_VALUES }
         emit(
-            "verdict=${decideSpeedVerdict(snapshot)} ctxStored=${snapshot.storedContext.tag} " +
+            "verdict-legacy=${decideSpeedVerdict(snapshot)} ctxStored=${snapshot.storedContext.tag} " +
                 "realCtx=${snapshot.realContextCall.tag} sentinel=$sentinel/${snapshot.engineReadings.size} " +
                 "listener=${snapshot.listener.tag}",
         )
+        // #188 v2 的主判据：raw lane + 订阅前后对比。上一轮 `verdict-legacy` 依赖的
+        // `realCtxCall` 已被证明不是有效对照（`getInstance` 是进程级单例），判读看这一行。
+        val sub = evidence.subscribeSnapshot()
+        emit(
+            "verdict=${decideSubscribeVerdict(sub)} raw[1012]=${sub.rawEngine} raw[1003]=${sub.rawLegacy} " +
+                "raw[ctl]=${sub.rawControl} anchored=${isLaneAnchored(sub.rawControl)} " +
+                "sub-after=${sub.afterSubscribe} sub-all-after=${sub.afterSubscribeAll} " +
+                "cb=${sub.callbackValues.size}/${evidence.callbackTotal.get()}",
+        )
+    }
+
+    /**
+     * #280：EV 门控数据源。`getEnergyMode()` typed + `raw[1006]` 双 FID 并列 ——
+     * typed 走 wrapper（客户端权限检查被放行），raw 是同一值的非封装通道对照。
+     *
+     * 模式语义（`BYDAutoEnergyDevice.java:20-25`）：`0=STOP / 1=EV / 2=FORCE_EV / 3=HEV /
+     * 4=FUEL / 5=KEEP`。#280 的门控口径：`1 或 2` 才隐藏发动机 chip，读不到时保守显示
+     * （与车况助手 `DataHolder` 初值 HEV 同方向）。
+     *
+     * `ENERGY_MODE_SET = 734003254 (0x2bc00036)` 是**写**通道，本探针绝不触碰。
+     */
+    private fun probeEnergy(): Boolean {
+        if (abortedAt("energy")) return false
+        val device = obtainDevice(ENERGY_DEVICE, "energy") ?: return true
+        emit("energy mode=${callInt(device, "getEnergyMode")}")
+        emit("raw[1006,mode]=${rawGetInt(device, DEV_ENERGY, FID_ENERGY_MODE_INSTRUMENT)}")
+        emit("raw[1006,mode50]=${rawGetInt(device, DEV_ENERGY, FID_ENERGY_MODE_INSTRUMENT_50)}")
+        return true
     }
 
     /** 对照组：TripLogger 在这条路径上读到过真实值（SOC 86.0），用来区分「全挂」还是「只有 engine 不行」。 */
@@ -345,11 +550,21 @@ internal class BydVehicleProbe(
         return true
     }
 
-    /** 更高门槛的对照：AC 设备初始化要求 `BYDAUTO_AC_COMMON`，比 engine 的 `_GET` 更严。 */
-    private fun probeAc(): Boolean {
+    /**
+     * 更高门槛的对照：AC 设备初始化要求 `BYDAUTO_AC_COMMON`，比 engine 的 `_GET` 更严。
+     *
+     * #188 v2 起同时充当 `raw` lane 的自证：`get(1000, AC_TEMP_MAIN)` 在实车 dump 里读到 26，
+     * 如果这条也返回哨兵，说明 `raw` lane 本身写错了，不能拿它否定发动机字段。
+     *
+     * 设备拿不到时**不要**让整轮作废：`laneState` 会退化成 `unanchored`（判据见
+     * [LaneSelfCheck]），结论仍可用，只是标注为证据较弱。
+     */
+    private fun probeAc(evidence: EngineEvidence): Boolean {
         if (abortedAt("ac")) return false
         val device = obtainDevice(AC_DEVICE, "ac") ?: return true
         emit("ac temp(area=1)=${callInt(device, "getTemprature", 1)}")
+        evidence.rawControl = rawGetInt(device, DEV_AC, FID_AC_TEMP_MAIN)
+        emit("raw[ctl]=${evidence.rawControl}")
         return true
     }
 
@@ -424,17 +639,97 @@ internal class BydVehicleProbe(
         var listener: ListenerState = ListenerState.NOT_ATTEMPTED
         val readings = mutableListOf<Int?>()
 
+        // ---- #188 v2：raw lane + 订阅 ----
+        var rawEngine: String? = null
+        var rawLegacy: String? = null
+        var rawControl: String? = null
+        var afterSubscribe: String? = null
+        var afterSubscribeAll: String? = null
+
+        /** 事件回调值。可能在 binder 线程写入，所以用并发容器，不在锁里做 IO。 */
+        private val callbacks = CopyOnWriteArrayList<Int>()
+        private val callbackLines = AtomicInteger()
+        val callbackTotal = AtomicInteger()
+
+        /**
+         * 记录一条事件回调。日志行数封顶（[MAX_CALLBACK_LINES]），否则转速事件会把
+         * `client.log` 刷爆；总共收到多少条走 [callbackTotal] 单独统计。
+         *
+         * `value` 来自 `IBYDAutoEvent.getValue()` 或 `BYDAutoEventValue.intValue`；
+         * `dbl` 是两者的 double 版本。两条通道只要任一条给出有效整数就计入。
+         *
+         * **必须做归属过滤**：`sub-all` 是全量订阅，空调/车速/统计的事件都会打到同一个
+         * listener 上。若不过滤，`26`（AC 温度）、`55`（SOC）都落在转速的 `1..8000` 区间，
+         * 会被 [isRealRpm] 当成转速，把结论刷成假的 `event-only`。
+         *
+         * 归属判定：
+         * - `dev` 非空（`onDataChanged` 带 `getDeviceType()`）→ 必须等于 [DEV_ENGINE]；
+         * - `dev` 为空（`onDataEventChanged` 只给一个 int）→ 该 int 按 SDK 的
+         *   `IBYDAutoListenerIdsMap` 语义是 **featureId**，只有等于 [FID_ENGINE_SPEED] 才算转速；
+         * - 两者都拿不到 → 不计入，只留日志。
+         */
+        fun recordCallback(dev: Int?, evt: Int?, value: Int?, dbl: Double?, emit: (String) -> Unit) {
+            callbackTotal.incrementAndGet()
+            val asInt = value ?: dbl?.roundToInt()
+            val attribution = when {
+                dev != null -> if (dev == DEV_ENGINE) "engine" else "dev=$dev"
+                evt != null -> if (evt == FID_ENGINE_SPEED) "engine-fid" else "fid=0x${evt.toUInt().toString(16)}"
+                else -> "unknown"
+            }
+            val attributed = attribution == "engine" || attribution == "engine-fid"
+            if (callbackLines.getAndIncrement() < MAX_CALLBACK_LINES) {
+                emit("cb dev=$dev evt=$evt val=$value dbl=$dbl -> $asInt [$attribution]")
+            }
+            if (asInt != null && attributed) callbacks += asInt
+        }
+
+        /**
+         * 事件通道里是否出现过**真实**转速。口径必须与判定函数一致（[isRealRpm]）：
+         * 只看 `>0 && !in 哨兵` 会把 9000+ 的越界回调也算成真值，让 `event-only` 误报。
+         */
+        fun hasRealCallback(): Boolean = callbacks.any(::isRealRpm)
+
         fun snapshot(): BydSpeedEvidence =
             BydSpeedEvidence(storedContext, realContextCall, readings.toList(), listener)
+
+        /**
+         * #188 v2 快照。`listener` 在这里**重新**按回调结果升级成 [ListenerState.REGISTERED_REAL_VALUE]：
+         * `probeSubscribe` 收尾后就返回，之后（比如 `probeRealContextCall` 那一段）仍可能来回调，
+         * 若在 `probeSubscribe` 里就把状态钉死，这些晚到的值会被判成「没收到」。
+         */
+        fun subscribeSnapshot(): BydSubscribeEvidence = BydSubscribeEvidence(
+            rawEngine = parseProbeInt(rawEngine),
+            rawLegacy = parseProbeInt(rawLegacy),
+            rawControl = parseProbeInt(rawControl),
+            afterSubscribe = parseProbeInt(afterSubscribe),
+            afterSubscribeAll = parseProbeInt(afterSubscribeAll),
+            callbackValues = callbacks.toList(),
+            listener = effectiveListener(),
+        )
+
+        /** 注册成功且有真实回调时升级为 [ListenerState.REGISTERED_REAL_VALUE]。 */
+        fun effectiveListener(): ListenerState =
+            if (listener == ListenerState.REGISTERED && hasRealCallback()) ListenerState.REGISTERED_REAL_VALUE else listener
     }
 
     companion object {
         const val TAG = "[BydProbe]"
 
         /**
-         * 探针总开关。**本轮临时打开**：得出 #188/#195 结论后连同本文件与调用点一起删除。
+         * 探针总开关。**只在 debug 包里自动打开**：本轮实验结束、结论回填后连同本文件
+         * 与调用点一起删除（清理条件见 issue #188）。
+         *
+         * 为什么不能写死 `true`：这个探针挂在 `CarSessionCoordinator.beginConnect` 上，
+         * 每次连接都会跑约 3 秒，并且会**订阅并注销**车机的发动机事件通道。正式包里
+         * 让用户车机跑临时诊断代码是不可接受的，所以用 [BuildConfig.DEBUG] 卡住 ——
+         * release 包里 `ENABLED` 恒为 false，效果等同删除，但代码还能给 debug 包复用。
+         *
+         * [BuildConfig.PROBE_FORCE] 是实车取证的唯一例外：车机上装的是正式签名包，
+         * debug 包覆盖不上去（`INSTALL_FAILED_UPDATE_INCOMPATIBLE`），卸载重装又会丢
+         * 车机端配置，所以实车那一轮用 `-Pprobe.force=true` 单独构建。默认 false，
+         * 发布流水线不带该参数，因此正式包不会跑探针。
          */
-        const val ENABLED = true
+        val ENABLED: Boolean = BuildConfig.DEBUG || BuildConfig.PROBE_FORCE
 
         private const val SAMPLE_INTERVAL_MS = 500L
         private const val ENGINE_GET_PERMISSION = "android.permission.BYDAUTO_ENGINE_GET"
@@ -443,6 +738,57 @@ internal class BydVehicleProbe(
         private const val STATISTIC_DEVICE = "android.hardware.bydauto.statistic.BYDAutoStatisticDevice"
         private const val SPEED_DEVICE = "android.hardware.bydauto.speed.BYDAutoSpeedDevice"
         private const val AC_DEVICE = "android.hardware.bydauto.ac.BYDAutoAcDevice"
+        private const val ENERGY_DEVICE = "android.hardware.bydauto.energy.BYDAutoEnergyDevice"
+
+        // ---- #188 v2（第三轮）：原始 FID 读取 + 订阅对照 ----
+        /** `AbsBYDAutoDevice.get(int, int)` 所在的基类；typed getter 的权限检查就在它上一层。 */
+        private const val ABS_DEVICE = "android.hardware.bydauto.AbsBYDAutoDevice"
+
+        /** 注册入口真正接收的**接口**（不是 `AbsBYDAutoEngineListener` 抽象类）。 */
+        private const val LISTENER_INTERFACE = "android.hardware.IBYDAutoListener"
+
+        /** `BYDAutoConstants.BYDAUTO_DEVICE_ENGINE`；历史上两个 daemon 误用 1003。 */
+        private const val DEV_ENGINE = 1012
+        private const val DEV_ENGINE_LEGACY = 1003
+        private const val DEV_AC = 1000
+
+        /** `BYDAutoConstants.BYDAUTO_DEVICE_ENERGY`；energyMode 的设备号（#280）。 */
+        private const val DEV_ENERGY = 1006
+
+        /** `BYDAutoFeatureIds.ENGINE_SPEED`。 */
+        private const val FID_ENGINE_SPEED = 0x14400012
+
+        // ---- #188 v3（#277/#280）：GB FID + 前后电机 + energyMode ----
+
+        /** `BYDAutoFeatureIds.ENGINE_SPEED_GB = 282066952`；#277 §4：GB 优先于非 GB。 */
+        private const val FID_ENGINE_SPEED_GB = 0x10D00008
+
+        /** 前电机转速 `1141899272`；#277 §7：`==1` 归零哨兵、负数 abs 后展示。 */
+        private const val FID_MOTOR_FRONT = 0x44100008
+
+        /** 后电机转速 `621805576`；本单只采集，不做 chip（无需求）。 */
+        private const val FID_MOTOR_REAR = 0x25100008
+
+        /** `BYDAutoFeatureIds.ENERGY_MODE_INSTRUMENT = 874512420`（#280 EV 门控）。 */
+        private const val FID_ENERGY_MODE_INSTRUMENT = 0x34200024
+
+        /** `BYDAutoFeatureIds.ENERGY_MODE_INSTRUMENT_50 = 874512424`。 */
+        private const val FID_ENERGY_MODE_INSTRUMENT_50 = 0x34200028
+
+        /** `BYDAutoFeatureIds.AC_TEMP_MAIN`，实车 dump 读到 26，作为 lane 自证。 */
+        private const val FID_AC_TEMP_MAIN = 0x40400028
+
+        /** 订阅后等一拍再读，给服务端下发订阅的时间。 */
+        private const val SUBSCRIBE_WAIT_MS = 800L
+
+        /** 回调行最多打几条，避免转速事件把 `client.log` 刷爆。 */
+        private const val MAX_CALLBACK_LINES = 8
+
+        /** `BYDAutoEventValue.INVAILD_INT`（SDK 原样拼写）：`intValue` 字段的「无值」哨兵。 */
+        private const val BYD_EVENT_INVALID_INT = -999_999_999
+
+        /** `BYDAutoEventValue.INVALID_DOUBLE` 是 -9.99999999E8；用阈值比较比等值安全（double 精度）。 */
+        private const val BYD_EVENT_INVALID_DOUBLE_THRESHOLD = -1.0E8
     }
 }
 
@@ -554,4 +900,88 @@ internal fun decideSpeedVerdict(evidence: BydSpeedEvidence): String {
     if (evidence.storedContext == CtxStored.NOT_WRAPPER) return VERDICT_CONTEXT_SWAPPED
     return VERDICT_UNCLEAR
 }
+
+/**
+ * #188 v2 的证据快照：只装「原始 FID 读取 + 订阅前后 + 事件回调」这三类新证据。
+ *
+ * 各字段为 `null` 表示那条 lane **抛了异常**（不是「读到 0」）；两者必须区分，
+ * 否则「反射写错」会被读成「车上没数据」。
+ */
+internal data class BydSubscribeEvidence(
+    /** `AbsBYDAutoDevice.get(1012, ENGINE_SPEED)`，正确设备号。 */
+    val rawEngine: Int?,
+    /** `get(1003, ENGINE_SPEED)`，复现 `HelperDaemon` / `FidDaemon` 的错误设备号。 */
+    val rawLegacy: Int?,
+    /** `get(1000, AC_TEMP_MAIN)`，lane 自证：这条链必须能读到非哨兵值。 */
+    val rawControl: Int?,
+    /** 只订阅转速 FID 之后再读一次。 */
+    val afterSubscribe: Int?,
+    /** 全量订阅之后再读一次。 */
+    val afterSubscribeAll: Int?,
+    /** 事件通道收到的原始值（`onDataChanged.getValue`）。 */
+    val callbackValues: List<Int>,
+    val listener: ListenerState,
+)
+
+internal const val SUBSCRIBE_HAS_VALUE = "subscribed-has-value"
+internal const val SUBSCRIBE_EVENT_ONLY = "event-only"
+internal const val SUBSCRIBE_NO_DATA = "no-data"
+
+/** 读数全无效、且对照 lane 也没通：**不能**判「本车没这个字段」，只能记「测不到」。 */
+internal const val SUBSCRIBE_NO_DATA_UNANCHORED = "no-data-unanchored"
+internal const val SUBSCRIBE_LANE_BROKEN = "lane-broken"
+
+/** 转速的物理有效区间来自 `ENGINE_SPEED_MIN/MAX = 0/8000`（`temp.java:44-45`）。 */
+internal fun isRealRpm(value: Int): Boolean =
+    value > 0 && value <= 8000 && value !in BYD_SENTINEL_VALUES
+
+/**
+ * 对照 lane 是否自证通过：AC 主温能读到**非哨兵**值。
+ *
+ * 这里只排除哨兵（8191 / 65535），**不**套转速的 `1..8000` 区间 —— AC 主温的量程是
+ * 17..33℃（`BYDAutoAcDevice.java:50-51`），室外温度还能到 -40℃，拿转速区间去检定会在
+ * 冬天把正常的对照判成「反射链坏了」。
+ */
+internal fun isLaneAnchored(control: Int?): Boolean =
+    control != null && control !in BYD_SENTINEL_VALUES
+
+/**
+ * #188 v2 的定性规则（纯函数，单测钉死）。顺序即优先级：
+ *
+ * 1. 没订阅成功 → `unclear`：这一轮根本没测到订阅，不能替订阅下结论；
+ * 2. 任一 lane 出现真实转速 → `subscribed-has-value`；只有回调有 → `event-only`。
+ *    **放在对照检查之前**：读到值本身就是自证的，对照挂了不影响「能读到」这个事实；
+ * 3. 一条读数都没拿到（全抛异常）→ `lane-broken`：反射链写错了，不是车上没数据；
+ * 4. 有读数但全是 0/哨兵，且对照 lane 自证通过 → `no-data`（字段在本车确实没数据）；
+ * 5. 同上但对照 lane 也没通（AC 设备缺失 / 读到哨兵）→ `no-data-unanchored`：
+ *    结论仍可用，但证据弱一档，上车要复核；
+ * 6. 其余 → `unclear`。
+ */
+internal fun decideSubscribeVerdict(evidence: BydSubscribeEvidence): String {
+    if (evidence.listener != ListenerState.REGISTERED &&
+        evidence.listener != ListenerState.REGISTERED_REAL_VALUE
+    ) {
+        return VERDICT_UNCLEAR
+    }
+
+    val visible = listOfNotNull(
+        evidence.rawEngine,
+        evidence.rawLegacy,
+        evidence.afterSubscribe,
+        evidence.afterSubscribeAll,
+    )
+    if (visible.any(::isRealRpm)) return SUBSCRIBE_HAS_VALUE
+    if (evidence.callbackValues.any(::isRealRpm)) return SUBSCRIBE_EVENT_ONLY
+
+    // 全部 lane 都抛异常（null）：反射链本身有问题，跟「车上没数据」是两码事。
+    val anyLaneRead = visible.isNotEmpty()
+    if (!anyLaneRead) {
+        return if (isLaneAnchored(evidence.rawControl)) SUBSCRIBE_LANE_BROKEN else VERDICT_UNCLEAR
+    }
+    return if (isLaneAnchored(evidence.rawControl)) SUBSCRIBE_NO_DATA else SUBSCRIBE_NO_DATA_UNANCHORED
+}
+
+/** 解析 `ok:<int>`；`err:` / `skip(...)` 一律 `null`（= 该 lane 没拿到数）。 */
+internal fun parseProbeInt(raw: String?): Int? =
+    raw?.removePrefix("ok:")?.trim()?.toIntOrNull()
 
